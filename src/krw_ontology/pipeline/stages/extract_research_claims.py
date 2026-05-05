@@ -1,0 +1,417 @@
+"""AI stage: Extract research claims from spans + quotes."""
+
+from __future__ import annotations
+
+import json
+import logging
+from pathlib import Path
+
+from krw_ontology.config.constants import DOCUMENT_TYPE_KEY
+from krw_ontology.errors import PipelineStageError
+from krw_ontology.extraction.prompts.claim_extraction import (
+    CLAIM_EXTRACTION_PROMPT,
+    CLAIM_TYPES,
+)
+from krw_ontology.extraction.worker import ExtractionWorker
+from krw_ontology.pipeline.ai_batches import (
+    clear_stage_batch_cache,
+    read_batch_cache,
+    run_limited_batches,
+    write_batch_cache,
+)
+from krw_ontology.pipeline.reference_aliases import alias_objects, resolve_references
+from krw_ontology.schema.id_utils import generate_scoped_id
+from krw_ontology.schema.objects import SCHEMA_VERSION
+from krw_ontology.utils.io import find_project_root, read_jsonl, write_jsonl
+
+logger = logging.getLogger("krw_ontology")
+
+BATCH_SIZE = 8
+
+_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "id": {"type": "string"},
+        "claim_text": {"type": "string"},
+        "claim_type": {"type": "string"},
+        "supported_by_quotes": {"type": "array", "items": {"type": "string"}},
+        "related_metrics": {"type": "array", "items": {"type": "string"}},
+        "confidence": {"type": "string"},
+    },
+    "required": ["id", "claim_text", "claim_type", "supported_by_quotes", "confidence"],
+}
+
+
+def _slugify(text: str) -> str:
+    import re
+    slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+    return slug[:80].rstrip("-")
+
+
+async def extract_research_claims(
+    worker: ExtractionWorker,
+    ontology_dir: Path,
+    ticker: str,
+    period: str,
+    doc_type: str,
+    quotes: list[dict] | None = None,
+    concurrency: int = 1,
+    force: bool = False,
+) -> list[dict]:
+    """Extract research claims from spans in batches with split retry."""
+    stage_name = "extract_research_claims"
+    doc_type_key = DOCUMENT_TYPE_KEY
+    source_document_id = f"source:{ticker}:{period}:{doc_type_key}"
+
+    spans_path = ontology_dir / "spans.jsonl"
+    quotes_path = ontology_dir / "evidence_quotes.jsonl"
+    output_path = ontology_dir / "claims.jsonl"
+    failures_path = ontology_dir / "batch_failures.jsonl"
+
+    spans = read_jsonl(spans_path)
+    if quotes is None:
+        quotes = read_jsonl(quotes_path)
+
+    if not spans:
+        logger.warning(f"{stage_name}: no spans found", extra={"stage": stage_name})
+        return []
+
+    all_claims: list[dict] = []
+    total_batches = (len(spans) + BATCH_SIZE - 1) // BATCH_SIZE
+    failed_span_count = 0
+    metrics_list = _load_metrics_list(ontology_dir)
+    _clear_stage_failures(failures_path, stage_name)
+    if force:
+        clear_stage_batch_cache(ontology_dir, stage_name)
+
+    # Build quote lookup by section/span for context
+    quotes_by_span: dict[str, list[dict]] = {}
+    for q in quotes:
+        sid = q.get("source_span_id", "")
+        quotes_by_span.setdefault(sid, []).append(q)
+
+    async def run_batch(batch_idx: int) -> tuple[list[dict], int, list[dict]]:
+        start = batch_idx * BATCH_SIZE
+        batch_spans = spans[start : start + BATCH_SIZE]
+        cached = read_batch_cache(ontology_dir, stage_name, batch_idx)
+        if cached is not None:
+            logger.info(
+                "%s batch %s/%s loaded from cache (%s claims)",
+                stage_name,
+                batch_idx + 1,
+                total_batches,
+                len(cached),
+                extra={"stage": stage_name},
+            )
+            return cached, 0, []
+        raw_items, failed_spans = await _extract_batch_with_split_retry(
+            worker=worker,
+            batch_spans=batch_spans,
+            quotes_by_span=quotes_by_span,
+            metrics_list=metrics_list,
+            batch_index=batch_idx,
+            failures_path=failures_path,
+            ticker=ticker,
+            doc_type=doc_type,
+            period=period,
+            source_document_id=source_document_id,
+            stage_name=stage_name,
+        )
+        batch_claims, rejected = _materialize_claim_batch(
+            raw_items=raw_items,
+            ticker=ticker,
+            period=period,
+            doc_type=doc_type,
+            doc_type_key=doc_type_key,
+            source_document_id=source_document_id,
+        )
+        write_batch_cache(
+            ontology_dir,
+            stage_name,
+            batch_idx,
+            batch_claims,
+            metadata={"status": "ok", "span_count": len(batch_spans), "failed_spans": failed_spans},
+        )
+        return batch_claims, failed_spans, rejected
+
+    def log_complete(batch_idx: int, result: tuple[list[dict], int, list[dict]]) -> None:
+        logger.info(
+            "%s batch %s/%s complete: %s claims, %s failed spans, %s rejected refs",
+            stage_name,
+            batch_idx + 1,
+            total_batches,
+            len(result[0]),
+            result[1],
+            len(result[2]),
+            extra={"stage": stage_name},
+        )
+
+    results = await run_limited_batches(
+        batch_indices=list(range(total_batches)),
+        concurrency=concurrency,
+        run_one=run_batch,
+        on_complete=log_complete,
+    )
+
+    seen_claim_ids: set[str] = set()
+    rejected_items: list[dict] = []
+    for _batch_idx, (batch_claims, failed_spans, rejected) in sorted(results, key=lambda row: row[0]):
+        failed_span_count += failed_spans
+        rejected_items.extend(rejected)
+        for claim in batch_claims:
+            claim_id = claim["id"]
+            if claim_id in seen_claim_ids:
+                continue
+            seen_claim_ids.add(claim_id)
+            all_claims.append(claim)
+
+    if spans and failed_span_count / len(spans) > 0.5:
+        raise PipelineStageError(
+            f"{stage_name}: {failed_span_count}/{len(spans)} spans failed after split retry (>50%)"
+        )
+
+    write_jsonl(output_path, all_claims)
+    if rejected_items:
+        _append_rejected_objects(ontology_dir, rejected_items)
+    logger.info(
+        f"{stage_name}: extracted {len(all_claims)} claims",
+        extra={"stage": stage_name},
+    )
+    return all_claims
+
+
+def _materialize_claim_batch(
+    *,
+    raw_items: list[dict],
+    ticker: str,
+    period: str,
+    doc_type: str,
+    doc_type_key: str,
+    source_document_id: str,
+) -> tuple[list[dict], list[dict]]:
+    claims: list[dict] = []
+    rejected: list[dict] = []
+    for item in raw_items:
+        claim_slug = _slugify(item.get("claim_text", f"claim-{len(claims)}"))
+        claim_obj = {
+            "id": generate_scoped_id("claim", ticker, period, doc_type_key, claim_slug),
+            "type": "ResearchClaim",
+            "ticker": ticker,
+            "source_document_id": source_document_id,
+            "document_type": doc_type,
+            "period": period,
+            "claim_text": item["claim_text"],
+            "claim_type": item["claim_type"],
+            "supported_by_quotes": item["supported_by_quotes"],
+            "confidence": item["confidence"],
+            "review_status": "accepted",
+            "schema_version": SCHEMA_VERSION,
+        }
+        if item.get("_rejection_reason"):
+            rejected.append({
+                **claim_obj,
+                "rejection_reason": item["_rejection_reason"],
+                "rejection_stage": "reference_alias_resolution",
+            })
+            continue
+        if item.get("related_metrics"):
+            claim_obj["related_metrics"] = item["related_metrics"]
+        claims.append(claim_obj)
+    return claims, rejected
+
+
+async def _extract_batch_with_split_retry(
+    *,
+    worker: ExtractionWorker,
+    batch_spans: list[dict],
+    quotes_by_span: dict[str, list[dict]],
+    metrics_list: str,
+    batch_index: int,
+    failures_path: Path,
+    ticker: str,
+    doc_type: str,
+    period: str,
+    source_document_id: str,
+    stage_name: str,
+) -> tuple[list[dict], int]:
+    if not batch_spans:
+        return [], 0
+    try:
+        return await _extract_span_batch(
+            worker=worker,
+            batch_spans=batch_spans,
+            quotes_by_span=quotes_by_span,
+            metrics_list=metrics_list,
+            stage_name=stage_name,
+        ), 0
+    except Exception as e:
+        if len(batch_spans) <= 1:
+            span_ids = [s["id"] for s in batch_spans]
+            logger.error(
+                f"{stage_name} leaf batch {batch_index} failed: {e}",
+                extra={"stage": stage_name},
+            )
+            _record_batch_failure(
+                failures_path, ticker, doc_type, period, source_document_id,
+                stage_name, batch_index, span_ids, str(e),
+            )
+            return [], len(batch_spans)
+
+        midpoint = max(1, len(batch_spans) // 2)
+        logger.warning(
+            "%s batch %s failed; retrying as %s and %s span sub-batches: %s",
+            stage_name,
+            batch_index,
+            midpoint,
+            len(batch_spans) - midpoint,
+            e,
+            extra={"stage": stage_name},
+        )
+        left_items, left_failed = await _extract_batch_with_split_retry(
+            worker=worker,
+            batch_spans=batch_spans[:midpoint],
+            quotes_by_span=quotes_by_span,
+            metrics_list=metrics_list,
+            batch_index=batch_index * 10 + 1,
+            failures_path=failures_path,
+            ticker=ticker,
+            doc_type=doc_type,
+            period=period,
+            source_document_id=source_document_id,
+            stage_name=stage_name,
+        )
+        right_items, right_failed = await _extract_batch_with_split_retry(
+            worker=worker,
+            batch_spans=batch_spans[midpoint:],
+            quotes_by_span=quotes_by_span,
+            metrics_list=metrics_list,
+            batch_index=batch_index * 10 + 2,
+            failures_path=failures_path,
+            ticker=ticker,
+            doc_type=doc_type,
+            period=period,
+            source_document_id=source_document_id,
+            stage_name=stage_name,
+        )
+        return [*left_items, *right_items], left_failed + right_failed
+
+
+async def _extract_span_batch(
+    *,
+    worker: ExtractionWorker,
+    batch_spans: list[dict],
+    quotes_by_span: dict[str, list[dict]],
+    metrics_list: str,
+    stage_name: str,
+) -> list[dict]:
+    batch_span_ids = [s["id"] for s in batch_spans]
+    batch_quotes: list[dict] = []
+    for sid in batch_span_ids:
+        batch_quotes.extend(quotes_by_span.get(sid, []))
+
+    input_data = {
+        "spans_json": json.dumps(
+            [
+                {
+                    "id": s["id"],
+                    "section_name": s.get("section_name", ""),
+                    "text": s["text"],
+                }
+                for s in batch_spans
+            ],
+            ensure_ascii=False,
+        ),
+        "quotes_json": json.dumps(
+            [
+                {
+                    "id": q["id"],
+                    "quote_text": q["quote_text"],
+                    "quote_type": q.get("quote_type", ""),
+                }
+                for q in batch_quotes
+            ],
+            ensure_ascii=False,
+        ),
+        "claim_types": ", ".join(CLAIM_TYPES),
+        "metrics_list": metrics_list,
+    }
+    aliased_quotes, quote_alias_to_id = alias_objects(batch_quotes, "q")
+    input_data["quotes_json"] = json.dumps(
+        [
+            {
+                "id": q["id"],
+                "quote_text": q["quote_text"],
+                "quote_type": q.get("quote_type", ""),
+            }
+            for q in aliased_quotes
+        ],
+        ensure_ascii=False,
+    )
+    items = await worker.extract(CLAIM_EXTRACTION_PROMPT, input_data, _SCHEMA, stage_name)
+    for item in items:
+        resolved, unknown = resolve_references(item.get("supported_by_quotes"), quote_alias_to_id)
+        item["supported_by_quotes"] = resolved
+        if unknown or not resolved:
+            item["_rejection_reason"] = (
+                "Unknown quote aliases in supported_by_quotes: "
+                f"{unknown or item.get('supported_by_quotes') or []}"
+            )
+    return items
+
+
+def _load_metrics_list(ontology_dir: Path) -> str:
+    """Load canonical metric names from the YAML schema."""
+    try:
+        import yaml
+        project_root = find_project_root(ontology_dir)
+        metric_path = project_root / "ontology" / "schema" / "metric_dictionary.yaml"
+        if metric_path.exists():
+            with open(metric_path) as f:
+                data = yaml.safe_load(f) or {}
+            metrics = list(data.get("canonical_metrics", {}).keys())
+            return ", ".join(metrics)
+    except Exception:
+        pass
+    return "revenue, revenue_growth, gross_margin, operating_margin, net_income, eps, operating_cash_flow, free_cash_flow"
+
+
+def _record_batch_failure(
+    failures_path: Path, ticker: str, doc_type: str, period: str,
+    source_document_id: str, stage: str, batch_index: int,
+    input_span_ids: list[str], error_message: str,
+) -> None:
+    from datetime import datetime, timezone
+
+    failure = {
+        "id": f"batch_failure:{ticker}:{period}:{DOCUMENT_TYPE_KEY}:{stage}:{batch_index:04d}",
+        "type": "BatchFailure",
+        "ticker": ticker,
+        "document_type": doc_type,
+        "period": period,
+        "source_document_id": source_document_id,
+        "stage": stage,
+        "batch_index": batch_index,
+        "input_span_ids": input_span_ids,
+        "attempts": 3,
+        "error_type": "ExtractionError",
+        "error_message": error_message[:500],
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "schema_version": SCHEMA_VERSION,
+    }
+    failures_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(failures_path, "a") as f:
+        f.write(json.dumps(failure, ensure_ascii=False) + "\n")
+
+
+def _clear_stage_failures(failures_path: Path, stage_name: str) -> None:
+    if not failures_path.exists():
+        return
+    failures = [row for row in read_jsonl(failures_path) if row.get("stage") != stage_name]
+    write_jsonl(failures_path, failures)
+
+
+def _append_rejected_objects(ontology_dir: Path, rejected: list[dict]) -> None:
+    if not rejected:
+        return
+    rejected_path = ontology_dir / "rejected_objects.jsonl"
+    write_jsonl(rejected_path, [*read_jsonl(rejected_path), *rejected])

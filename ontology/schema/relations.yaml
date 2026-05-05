@@ -1,0 +1,62 @@
+schema_version: "0.1.0"
+
+relations:
+  - id: contains
+    name: contains
+    from: SourceDocument
+    to: SourceSpan
+
+  - id: contains_quote
+    name: contains_quote
+    from: SourceSpan
+    to: EvidenceQuote
+
+  - id: has_signal
+    name: has_signal
+    from: EvidenceQuote
+    to: LanguageSignal
+
+  - id: supports
+    name: supports
+    from: EvidenceQuote
+    to: ResearchClaim
+
+  - id: describes_risk
+    name: describes_risk
+    from: ResearchClaim
+    to: RiskFactor
+
+  - id: describes_driver
+    name: describes_driver
+    from: ResearchClaim
+    to: GrowthDriver
+
+  - id: describes_headwind
+    name: describes_headwind
+    from: ResearchClaim
+    to: Headwind
+
+  - id: affects_risk
+    name: affects
+    from: RiskFactor
+    to: Metric
+
+  - id: affects_growth
+    name: affects
+    from: GrowthDriver
+    to: Metric
+
+  - id: affects_headwind
+    name: affects
+    from: Headwind
+    to: Metric
+
+  - id: supports_assumption
+    name: supports_assumption
+    from: EvidenceQuote
+    to: AssumptionCandidate
+
+  - id: derived_from
+    name: derived_from
+    from: AssumptionCandidate
+    to: ResearchClaim

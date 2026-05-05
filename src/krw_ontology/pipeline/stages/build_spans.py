@@ -41,9 +41,11 @@ def build_spans(
             section_name = section["name"]
             section_key = section.get("section_key", section_name)
             section_instance = section.get("section_instance", 0)
-            section_start_char = clean_md_text.find(section_text)
-            if section_start_char == -1:
-                section_start_char = section.get("start_char", 0)
+            section_start_char = section.get("start_char")
+            if section_start_char is None:
+                section_start_char = clean_md_text.find(section_text)
+            if section_start_char == -1 or section_start_char is None:
+                section_start_char = 0
 
             spans = _split_section(
                 section_text=section_text,

@@ -24,6 +24,7 @@ from krw_ontology.validators.relation_validator import (
 )
 
 logger = logging.getLogger("krw_ontology")
+LOG_EXTRA = {"stage": "validate_ontology"}
 
 # JSONL files to load (type -> filename)
 _JSONL_FILES: dict[str, str] = {
@@ -176,7 +177,7 @@ def run_validate_ontology(ontology_dir: Path, *, include_edges: bool = True) -> 
     # Load all artifact objects
     all_objects = _load_all_objects(ontology_dir, include_edges=include_edges)
     total_input = len(all_objects)
-    logger.info("Loaded %d objects from %s", len(all_objects), ontology_dir)
+    logger.info("Loaded %d objects from %s", len(all_objects), ontology_dir, extra=LOG_EXTRA)
 
     # Register canonical metrics as virtual objects so edges to metric:* validate.
     # These are not written as accepted artifacts.
@@ -191,6 +192,7 @@ def run_validate_ontology(ontology_dir: Path, *, include_edges: bool = True) -> 
     existing_rejected = read_jsonl(rejected_path)
 
     # --- Stage 1: Schema validation ---
+    schema_input_count = len(accepted)
     failed_ids: set[str] = set()
     for obj_id, obj in list(accepted.items()):
         is_valid, reason = validate_schema(obj)
@@ -203,7 +205,12 @@ def run_validate_ontology(ontology_dir: Path, *, include_edges: bool = True) -> 
             failed_ids.add(obj_id)
     for fid in failed_ids:
         del accepted[fid]
-    logger.info("Schema validation: %d passed, %d rejected", len(accepted) - (len(all_objects) - len(failed_ids)), len(failed_ids))
+    logger.info(
+        "Schema validation: %d passed, %d rejected",
+        schema_input_count - len(failed_ids),
+        len(failed_ids),
+        extra=LOG_EXTRA,
+    )
 
     # --- Stage 2: Exact match (EvidenceQuote only) ---
     spans = _get_spans(accepted)
@@ -220,7 +227,7 @@ def run_validate_ontology(ontology_dir: Path, *, include_edges: bool = True) -> 
     for fid in failed_ids:
         del accepted[fid]
     if failed_ids:
-        logger.info("Exact match: %d rejected", len(failed_ids))
+        logger.info("Exact match: %d rejected", len(failed_ids), extra=LOG_EXTRA)
 
     # --- Stage 3: Reference validation ---
     failed_ids = set()
@@ -236,7 +243,7 @@ def run_validate_ontology(ontology_dir: Path, *, include_edges: bool = True) -> 
     for fid in failed_ids:
         del accepted[fid]
     if failed_ids:
-        logger.info("Reference validation: %d rejected", len(failed_ids))
+        logger.info("Reference validation: %d rejected", len(failed_ids), extra=LOG_EXTRA)
 
     # --- Stage 4: Support validation ---
     failed_ids = set()
@@ -252,7 +259,7 @@ def run_validate_ontology(ontology_dir: Path, *, include_edges: bool = True) -> 
     for fid in failed_ids:
         del accepted[fid]
     if failed_ids:
-        logger.info("Support validation: %d rejected", len(failed_ids))
+        logger.info("Support validation: %d rejected", len(failed_ids), extra=LOG_EXTRA)
 
     # --- Stage 5: Metric validation (modifies objects in place, never rejects) ---
     for obj_id, obj in accepted.items():
@@ -274,7 +281,7 @@ def run_validate_ontology(ontology_dir: Path, *, include_edges: bool = True) -> 
     for fid in failed_ids:
         del accepted[fid]
     if failed_ids:
-        logger.info("Numeric guard: %d rejected", len(failed_ids))
+        logger.info("Numeric guard: %d rejected", len(failed_ids), extra=LOG_EXTRA)
 
     # Numeric rejection can invalidate parent support paths. Prune those
     # references immediately so later edge generation does not amplify a single
@@ -307,7 +314,11 @@ def run_validate_ontology(ontology_dir: Path, *, include_edges: bool = True) -> 
         if not failed_ids:
             break
     if pruned_rejections:
-        logger.info("Post numeric support pruning: %d rejected", pruned_rejections)
+        logger.info(
+            "Post numeric support pruning: %d rejected",
+            pruned_rejections,
+            extra=LOG_EXTRA,
+        )
 
     # --- Stage 7: Relation validation (Edge only) ---
     failed_ids = set()
@@ -323,7 +334,7 @@ def run_validate_ontology(ontology_dir: Path, *, include_edges: bool = True) -> 
     for fid in failed_ids:
         del accepted[fid]
     if failed_ids:
-        logger.info("Relation validation: %d rejected", len(failed_ids))
+        logger.info("Relation validation: %d rejected", len(failed_ids), extra=LOG_EXTRA)
 
     # --- Write results ---
     # Write accepted objects back to their type-specific JSONL files
@@ -356,6 +367,7 @@ def run_validate_ontology(ontology_dir: Path, *, include_edges: bool = True) -> 
         "Validation complete: %d accepted, %d rejected",
         total_accepted,
         total_rejected,
+        extra=LOG_EXTRA,
     )
 
     return {

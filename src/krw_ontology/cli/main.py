@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import tempfile
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -15,6 +17,7 @@ app = typer.Typer(
 )
 
 ACCEPTED_DOC_TYPES = {"10-K"}
+DEFAULT_E2E_TICKERS = ["AAPL", "NVDA", "JPM", "XOM"]
 
 
 def validate_document_type(doc_type: str) -> str:
@@ -54,6 +57,72 @@ def build_evidence_ontology(
         output_dir=output_dir,
     )
     typer.echo(f"Pipeline complete for {ticker}")
+
+
+@app.command("e2e-matrix")
+def e2e_matrix_cmd(
+    tickers: Optional[list[str]] = typer.Argument(
+        None,
+        help="Ticker symbols to run. Defaults to AAPL NVDA JPM XOM.",
+    ),
+    document_type: str = typer.Option("10-K", "--document-type", help="Document type (10-K only in v1)"),
+    latest: bool = typer.Option(True, "--latest/--no-latest", help="Use most recent filing"),
+    force: bool = typer.Option(True, "--force/--no-force", help="Re-process even if checkpoints exist"),
+    output_dir: Optional[Path] = typer.Option(
+        None,
+        "--output-dir",
+        help="Output root. Defaults to a timestamped directory under the system temp dir.",
+    ),
+    continue_on_error: bool = typer.Option(
+        False,
+        "--continue-on-error",
+        help="Continue remaining tickers if one pipeline run fails.",
+    ),
+) -> None:
+    """Run full e2e pipeline for a ticker matrix."""
+    validate_document_type(document_type)
+
+    from krw_ontology.pipeline.orchestrator import run_pipeline
+
+    run_tickers = [t.upper() for t in (tickers or DEFAULT_E2E_TICKERS)]
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    root = output_dir or (Path(tempfile.gettempdir()) / f"krw-e2e-refactor-{timestamp}")
+    root.mkdir(parents=True, exist_ok=True)
+
+    typer.echo(f"OUTPUT_ROOT={root}")
+    failures: list[tuple[str, str]] = []
+
+    for ticker in run_tickers:
+        typer.echo("")
+        typer.echo(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] START ticker={ticker}")
+        try:
+            run_pipeline(
+                ticker=ticker,
+                document_type=document_type,
+                latest=latest,
+                period=None,
+                force=force,
+                output_dir=root,
+            )
+        except Exception as exc:
+            failures.append((ticker, str(exc)))
+            typer.echo(
+                f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
+                f"FAILED ticker={ticker}: {exc}"
+            )
+            if not continue_on_error:
+                typer.echo(f"OUTPUT_ROOT={root}")
+                raise typer.Exit(1) from exc
+        else:
+            typer.echo(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] END ticker={ticker}")
+
+    typer.echo("")
+    typer.echo(f"OUTPUT_ROOT={root}")
+    if failures:
+        typer.echo("Failures:")
+        for ticker, reason in failures:
+            typer.echo(f"- {ticker}: {reason}")
+        raise typer.Exit(1)
 
 
 @app.command("validate")

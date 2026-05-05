@@ -33,7 +33,9 @@ Output format: exactly one JSON object:
 {{"items": [{{"id": "...", "claim_text": "...", "claim_type": "...", "supported_by_quotes": [...], "related_metrics": [...], "confidence": "..."}}]}}
 """
 
-CLAIM_EXTRACTION_USER = """## Source Spans
+CLAIM_EXTRACTION_USER = """## Source Context
+
+The source context is non-citable metadata only. Do not use source span IDs in supported_by_quotes.
 
 {spans_json}
 
@@ -52,10 +54,11 @@ CLAIM_EXTRACTION_USER = """## Source Spans
 ## Task
 
 Analyze the source spans and evidence quotes above. Extract research claims that:
-1. Capture key assertions from the document
+1. Capture key assertions from the provided evidence quotes
 2. Are supported by at least one evidence quote (use only the short quote alias, e.g. q1)
 3. Relate to financial metrics where applicable
 4. Preserve source numbers exactly; do not compute new derived numbers
+5. Never cite source span IDs; supported_by_quotes must contain quote aliases only
 
 Return exactly {{"items": [...]}} with claim objects."""
 

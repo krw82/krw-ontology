@@ -13,6 +13,10 @@ from krw_ontology.utils.io import atomic_write_json, read_jsonl, write_jsonl
 logger = logging.getLogger("krw_ontology")
 
 INDEX_FILE_KEYS = [
+    ("document_nodes", "document_nodes.jsonl"),
+    ("section_candidates", "section_candidates.jsonl"),
+    ("sections", "sections.jsonl"),
+    ("section_boundary_audit", "section_boundary_audit.jsonl"),
     ("spans", "spans.jsonl"),
     ("evidence_quotes", "evidence_quotes.jsonl"),
     ("language_signals", "language_signals.jsonl"),

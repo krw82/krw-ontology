@@ -197,8 +197,13 @@ def _execute_stage(stage: str, ctx: dict) -> None:
         ctx["clean_md_sha256"] = result["sha256"]
 
     elif stage == "extract_sections":
-        result = extract_sections(ctx["clean_md_path"])
+        result = extract_sections(
+            ctx["clean_md_path"],
+            raw_html_path=ctx.get("raw_html_path"),
+            output_dir=ctx["ontology_dir"],
+        )
         ctx["sections"] = result["sections"]
+        ctx["section_quality"] = result.get("section_quality", {})
         ctx["clean_md_text"] = ctx["clean_md_path"].read_text()
 
     elif stage == "build_source_spans":

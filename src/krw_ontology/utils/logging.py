@@ -24,8 +24,11 @@ class StructuredFormatter(logging.Formatter):
 def setup_logging(level: int = logging.INFO) -> logging.Logger:
     """Configure and return the pipeline logger."""
     logger = logging.getLogger("krw_ontology")
-    handler = logging.StreamHandler()
-    handler.setFormatter(StructuredFormatter())
-    logger.addHandler(handler)
+    if not any(getattr(handler, "_krw_structured_handler", False) for handler in logger.handlers):
+        handler = logging.StreamHandler()
+        handler.setFormatter(StructuredFormatter())
+        handler._krw_structured_handler = True  # type: ignore[attr-defined]
+        logger.addHandler(handler)
     logger.setLevel(level)
+    logger.propagate = False
     return logger

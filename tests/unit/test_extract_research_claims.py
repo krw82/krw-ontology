@@ -43,13 +43,16 @@ def test_extract_research_claims_splits_failed_batch(tmp_path: Path):
         async def extract(self, prompt_template, input_data, output_schema, stage_name):
             spans = json.loads(input_data["spans_json"])
             quotes = json.loads(input_data["quotes_json"])
-            self.calls.append(len(spans))
-            if len(spans) > 1:
+            self.calls.append(len(quotes))
+            if len(quotes) > 1:
                 raise TimeoutError("too large")
             return [
                 {
                     "id": "ignored",
-                    "claim_text": f"Revenue may be affected for span {spans[0]['id'].split(':')[-1]}.",
+                    "claim_text": (
+                        "Revenue may be affected for span "
+                        f"{spans[0]['source_span_id'].split(':')[-1]}."
+                    ),
                     "claim_type": "risk_assessment",
                     "supported_by_quotes": [quotes[0]["id"]],
                     "related_metrics": ["revenue"],
@@ -133,3 +136,117 @@ def test_extract_research_claims_rejects_unknown_quote_alias(tmp_path: Path):
     assert len(rejected) == 1
     assert rejected[0]["rejection_stage"] == "reference_alias_resolution"
     assert "q999" in rejected[0]["rejection_reason"]
+
+
+def test_extract_research_claims_skips_spans_without_quotes(tmp_path: Path):
+    write_jsonl(tmp_path / "spans.jsonl", [_span(0)])
+    write_jsonl(tmp_path / "evidence_quotes.jsonl", [])
+
+    class FakeWorker:
+        async def extract(self, prompt_template, input_data, output_schema, stage_name):
+            raise AssertionError("claim extraction should be quote-first")
+
+    claims = asyncio.run(
+        extract_research_claims(
+            worker=FakeWorker(),
+            ontology_dir=tmp_path,
+            ticker="AAPL",
+            period="FY2025",
+            doc_type="10-K",
+        )
+    )
+
+    assert claims == []
+    assert read_jsonl(tmp_path / "claims.jsonl") == []
+
+
+def test_extract_research_claims_rejects_span_reference(tmp_path: Path):
+    write_jsonl(tmp_path / "spans.jsonl", [_span(0)])
+    write_jsonl(tmp_path / "evidence_quotes.jsonl", [_quote(0)])
+
+    class FakeWorker:
+        async def extract(self, prompt_template, input_data, output_schema, stage_name):
+            quotes = json.loads(input_data["quotes_json"])
+            assert quotes[0]["id"] == "q1"
+            return [
+                {
+                    "id": "ignored",
+                    "claim_text": "Revenue may be affected by market conditions.",
+                    "claim_type": "risk_assessment",
+                    "supported_by_quotes": ["span:AAPL:FY2025:10K:item1a_00:0000"],
+                    "related_metrics": ["revenue"],
+                    "confidence": "high",
+                }
+            ]
+
+    claims = asyncio.run(
+        extract_research_claims(
+            worker=FakeWorker(),
+            ontology_dir=tmp_path,
+            ticker="AAPL",
+            period="FY2025",
+            doc_type="10-K",
+        )
+    )
+
+    rejected = read_jsonl(tmp_path / "rejected_objects.jsonl")
+    assert claims == []
+    assert len(rejected) == 1
+    assert rejected[0]["rejection_stage"] == "reference_alias_resolution"
+    assert "span:AAPL:FY2025:10K:item1a_00:0000" in rejected[0]["rejection_reason"]
+
+
+def test_extract_research_claims_ignores_legacy_span_cache(tmp_path: Path):
+    write_jsonl(tmp_path / "spans.jsonl", [_span(0)])
+    write_jsonl(tmp_path / "evidence_quotes.jsonl", [_quote(0)])
+    cache_dir = tmp_path / ".ai_batches" / "extract_research_claims"
+    cache_dir.mkdir(parents=True)
+    (cache_dir / "batch_0000.json").write_text(
+        json.dumps({
+            "stage": "extract_research_claims",
+            "batch_index": 0,
+            "metadata": {"status": "ok", "span_count": 1},
+            "items": [
+                {
+                    "id": "claim:AAPL:FY2025:10K:legacy",
+                    "type": "ResearchClaim",
+                    "ticker": "AAPL",
+                    "source_document_id": "source:AAPL:FY2025:10K",
+                    "document_type": "10-K",
+                    "period": "FY2025",
+                    "claim_text": "Legacy span-cached claim.",
+                    "claim_type": "factual",
+                    "supported_by_quotes": [_quote(0)["id"]],
+                    "confidence": "high",
+                    "review_status": "accepted",
+                    "schema_version": "0.1.0",
+                }
+            ],
+        })
+    )
+
+    class FakeWorker:
+        async def extract(self, prompt_template, input_data, output_schema, stage_name):
+            quotes = json.loads(input_data["quotes_json"])
+            return [
+                {
+                    "id": "ignored",
+                    "claim_text": "Fresh quote-first claim.",
+                    "claim_type": "factual",
+                    "supported_by_quotes": [quotes[0]["id"]],
+                    "related_metrics": [],
+                    "confidence": "high",
+                }
+            ]
+
+    claims = asyncio.run(
+        extract_research_claims(
+            worker=FakeWorker(),
+            ontology_dir=tmp_path,
+            ticker="AAPL",
+            period="FY2025",
+            doc_type="10-K",
+        )
+    )
+
+    assert [claim["claim_text"] for claim in claims] == ["Fresh quote-first claim."]

@@ -10,6 +10,10 @@ from krw_ontology.utils.io import read_jsonl
 
 
 _ARTIFACT_FILES = {
+    "document_nodes": "document_nodes.jsonl",
+    "section_candidates": "section_candidates.jsonl",
+    "sections": "sections.jsonl",
+    "section_boundary_audit": "section_boundary_audit.jsonl",
     "spans": "spans.jsonl",
     "evidence_quotes": "evidence_quotes.jsonl",
     "language_signals": "language_signals.jsonl",
@@ -75,6 +79,9 @@ def _render_graph_report(
         "",
         "## Evidence Layer",
         "",
+        f"- Document nodes: {counts['document_nodes']}",
+        f"- Selected sections: {counts['sections']}",
+        f"- Section boundary candidates: {counts['section_candidates']}",
         f"- Accepted evidence quotes: {counts['evidence_quotes']}",
         f"- Evidence-backed claims: {counts['claims']}",
         f"- Language signals normalized from quotes: {counts['language_signals']}",
@@ -125,6 +132,9 @@ def _render_audit_report(
         f"- Accepted artifacts: {sum(len(data[key]) for key in ('spans', 'evidence_quotes', 'language_signals', 'claims', 'risks', 'growth_drivers', 'headwinds', 'modeling_cues', 'edges', 'xbrl_facts', 'financial_metric_values', 'derived_metric_values', 'numeric_evidence', 'calculated_numeric_support'))}",
         f"- Rejected objects: {len(data['rejected_objects'])}",
         f"- Batch failures: {len(data['batch_failures'])}",
+        f"- Document nodes: {len(data['document_nodes'])}",
+        f"- Section candidates: {len(data['section_candidates'])}",
+        f"- Selected sections: {len(data['sections'])}",
         "",
         "## Rejections By Stage",
         "",

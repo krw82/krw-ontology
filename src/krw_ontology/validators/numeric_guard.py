@@ -71,6 +71,13 @@ _FINANCIAL_CONTEXT_WORDS = (
     "obligation", "obligations", "commitment", "commitments",
 )
 
+_OPERATING_COUNT_WORDS = {
+    "employee", "employees", "worker", "workers", "headcount",
+    "store", "stores", "office", "offices", "branch", "branches",
+    "facility", "facilities", "site", "sites", "location", "locations",
+    "country", "countries", "jurisdiction", "jurisdictions", "region", "regions",
+}
+
 
 @dataclass(frozen=True)
 class NumericToken:
@@ -180,6 +187,10 @@ def _should_ignore_number(text: str, match: re.Match, value: float, unit: str) -
     if re.match(r"^[\s|]*%", after):
         return False
 
+    if _is_enumeration_marker(text, match, value):
+        return True
+    if match.group("plus") and re.match(r"\s*(?:yrs?|years?)\b", after):
+        return True
     if _is_date_context(before, after, value):
         return True
     if _is_regulatory_code_context(text, match, value):
@@ -190,7 +201,7 @@ def _should_ignore_number(text: str, match: re.Match, value: float, unit: str) -
         return True
     if re.search(r"\bq$", before) and value in {1, 2, 3, 4}:
         return True
-    if re.match(r"\s*(days?|months?|years?)\b", after):
+    if re.match(r"\s*(days?|months?|yrs?|years?)\b", after):
         return True
     if value <= 20 and "article" in context:
         return True
@@ -232,10 +243,24 @@ def _is_regulatory_code_context(text: str, match: re.Match, value: float) -> boo
 def _is_duration_range_context(after: str) -> bool:
     return bool(
         re.match(
-            r"\s*(?:to|-|–|—)\s*\d+(?:\.\d+)?\s*(?:days?|months?|years?)\b",
+            r"\s*(?:to|-|–|—)\s*\d+(?:\.\d+)?\s*(?:days?|months?|yrs?|years?)\b",
             after,
         )
     )
+
+
+def _is_enumeration_marker(text: str, match: re.Match, value: float) -> bool:
+    """Detect list markers like "(1)" and "1)" in prose."""
+    if not value.is_integer() or not 1 <= value <= 100:
+        return False
+    start, end = match.span()
+    before = text[max(0, start - 3):start]
+    after = text[end:min(len(text), end + 3)]
+    if before.endswith("(") and after.startswith(")"):
+        return True
+    if after.startswith(")") and (not before or before[-1].isspace()):
+        return True
+    return False
 
 
 def _looks_like_non_financial_identifier(
@@ -269,7 +294,7 @@ def _looks_like_non_financial_identifier(
         return True
     if next_two_words in {"operating system"} and value <= 9999:
         return True
-    if next_word in {"countries", "country", "jurisdictions", "regions", "locations"}:
+    if next_word in _OPERATING_COUNT_WORDS:
         return True
 
     # Compact product/model identifiers such as a letter-prefixed model number.

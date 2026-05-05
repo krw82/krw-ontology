@@ -836,3 +836,57 @@ class TestNumericGuard:
         }
         ok, reason = validate_numeric(obj, quotes, {})
         assert ok, f"Expected large share count to match table count in thousands, got: {reason}"
+
+    def test_parenthesized_list_markers_are_not_numeric_requirements(self):
+        obj = {
+            "type": "ResearchClaim",
+            "claim_text": (
+                "The company identified two obligations: (1) hardware delivered "
+                "at sale and (2) bundled services delivered over time."
+            ),
+            "supported_by_quotes": ["quote:1"],
+        }
+        quotes = {
+            "quote:1": self._make_quote(
+                "quote:1",
+                "The company identified hardware and bundled services obligations.",
+            )
+        }
+        ok, reason = validate_numeric(obj, quotes, {})
+        assert ok, f"Expected prose list markers to be ignored, got: {reason}"
+
+    def test_plus_year_range_is_not_numeric_requirement(self):
+        obj = {
+            "type": "AssumptionCandidate",
+            "assumption_text": (
+                "Debt maturities include obligations due in one to five years, "
+                "five to ten years, and 10+ years."
+            ),
+            "supported_by_quotes": ["quote:1"],
+        }
+        quotes = {
+            "quote:1": self._make_quote(
+                "quote:1",
+                "Debt maturities are grouped by maturity bucket.",
+            )
+        }
+        ok, reason = validate_numeric(obj, quotes, {})
+        assert ok, f"Expected maturity range labels to be ignored, got: {reason}"
+
+    def test_bare_employee_count_is_not_financial_numeric_requirement(self):
+        obj = {
+            "type": "AssumptionCandidate",
+            "assumption_text": (
+                "The company has approximately 6,000 employees in the region, "
+                "which could affect operations."
+            ),
+            "supported_by_quotes": ["quote:1"],
+        }
+        quotes = {
+            "quote:1": self._make_quote(
+                "quote:1",
+                "The company has a large employee base in the region.",
+            )
+        }
+        ok, reason = validate_numeric(obj, quotes, {})
+        assert ok, f"Expected employee count to be ignored by numeric guard, got: {reason}"

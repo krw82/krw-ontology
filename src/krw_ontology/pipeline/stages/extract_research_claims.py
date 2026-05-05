@@ -14,8 +14,8 @@ from krw_ontology.extraction.prompts.claim_extraction import (
 )
 from krw_ontology.extraction.worker import ExtractionWorker
 from krw_ontology.pipeline.ai_batches import (
+    batch_cache_path,
     clear_stage_batch_cache,
-    read_batch_cache,
     run_limited_batches,
     write_batch_cache,
 )
@@ -58,7 +58,7 @@ async def extract_research_claims(
     concurrency: int = 1,
     force: bool = False,
 ) -> list[dict]:
-    """Extract research claims from spans in batches with split retry."""
+    """Extract research claims from evidence quotes in batches with split retry."""
     stage_name = "extract_research_claims"
     doc_type_key = DOCUMENT_TYPE_KEY
     source_document_id = f"source:{ticker}:{period}:{doc_type_key}"
@@ -72,28 +72,30 @@ async def extract_research_claims(
     if quotes is None:
         quotes = read_jsonl(quotes_path)
 
-    if not spans:
-        logger.warning(f"{stage_name}: no spans found", extra={"stage": stage_name})
+    quotes = [
+        quote for quote in quotes
+        if quote.get("id") and quote.get("quote_text")
+    ]
+
+    if not quotes:
+        logger.warning(f"{stage_name}: no evidence quotes found", extra={"stage": stage_name})
+        write_jsonl(output_path, [])
         return []
 
     all_claims: list[dict] = []
-    total_batches = (len(spans) + BATCH_SIZE - 1) // BATCH_SIZE
-    failed_span_count = 0
+    total_batches = (len(quotes) + BATCH_SIZE - 1) // BATCH_SIZE
+    failed_quote_count = 0
     metrics_list = _load_metrics_list(ontology_dir)
     _clear_stage_failures(failures_path, stage_name)
     if force:
         clear_stage_batch_cache(ontology_dir, stage_name)
 
-    # Build quote lookup by section/span for context
-    quotes_by_span: dict[str, list[dict]] = {}
-    for q in quotes:
-        sid = q.get("source_span_id", "")
-        quotes_by_span.setdefault(sid, []).append(q)
+    spans_by_id = {span["id"]: span for span in spans if span.get("id")}
 
     async def run_batch(batch_idx: int) -> tuple[list[dict], int, list[dict]]:
         start = batch_idx * BATCH_SIZE
-        batch_spans = spans[start : start + BATCH_SIZE]
-        cached = read_batch_cache(ontology_dir, stage_name, batch_idx)
+        batch_quotes = quotes[start : start + BATCH_SIZE]
+        cached = _read_quote_first_batch_cache(ontology_dir, stage_name, batch_idx)
         if cached is not None:
             logger.info(
                 "%s batch %s/%s loaded from cache (%s claims)",
@@ -104,10 +106,10 @@ async def extract_research_claims(
                 extra={"stage": stage_name},
             )
             return cached, 0, []
-        raw_items, failed_spans = await _extract_batch_with_split_retry(
+        raw_items, failed_quotes = await _extract_batch_with_split_retry(
             worker=worker,
-            batch_spans=batch_spans,
-            quotes_by_span=quotes_by_span,
+            batch_quotes=batch_quotes,
+            spans_by_id=spans_by_id,
             metrics_list=metrics_list,
             batch_index=batch_idx,
             failures_path=failures_path,
@@ -130,13 +132,19 @@ async def extract_research_claims(
             stage_name,
             batch_idx,
             batch_claims,
-            metadata={"status": "ok", "span_count": len(batch_spans), "failed_spans": failed_spans},
+            metadata={
+                "status": "ok",
+                "input_mode": "evidence_quotes",
+                "cache_version": 2,
+                "quote_count": len(batch_quotes),
+                "failed_quotes": failed_quotes,
+            },
         )
-        return batch_claims, failed_spans, rejected
+        return batch_claims, failed_quotes, rejected
 
     def log_complete(batch_idx: int, result: tuple[list[dict], int, list[dict]]) -> None:
         logger.info(
-            "%s batch %s/%s complete: %s claims, %s failed spans, %s rejected refs",
+            "%s batch %s/%s complete: %s claims, %s failed quotes, %s rejected refs",
             stage_name,
             batch_idx + 1,
             total_batches,
@@ -155,8 +163,8 @@ async def extract_research_claims(
 
     seen_claim_ids: set[str] = set()
     rejected_items: list[dict] = []
-    for _batch_idx, (batch_claims, failed_spans, rejected) in sorted(results, key=lambda row: row[0]):
-        failed_span_count += failed_spans
+    for _batch_idx, (batch_claims, failed_quotes, rejected) in sorted(results, key=lambda row: row[0]):
+        failed_quote_count += failed_quotes
         rejected_items.extend(rejected)
         for claim in batch_claims:
             claim_id = claim["id"]
@@ -165,9 +173,9 @@ async def extract_research_claims(
             seen_claim_ids.add(claim_id)
             all_claims.append(claim)
 
-    if spans and failed_span_count / len(spans) > 0.5:
+    if quotes and failed_quote_count / len(quotes) > 0.5:
         raise PipelineStageError(
-            f"{stage_name}: {failed_span_count}/{len(spans)} spans failed after split retry (>50%)"
+            f"{stage_name}: {failed_quote_count}/{len(quotes)} quotes failed after split retry (>50%)"
         )
 
     write_jsonl(output_path, all_claims)
@@ -223,8 +231,8 @@ def _materialize_claim_batch(
 async def _extract_batch_with_split_retry(
     *,
     worker: ExtractionWorker,
-    batch_spans: list[dict],
-    quotes_by_span: dict[str, list[dict]],
+    batch_quotes: list[dict],
+    spans_by_id: dict[str, dict],
     metrics_list: str,
     batch_index: int,
     failures_path: Path,
@@ -234,19 +242,19 @@ async def _extract_batch_with_split_retry(
     source_document_id: str,
     stage_name: str,
 ) -> tuple[list[dict], int]:
-    if not batch_spans:
+    if not batch_quotes:
         return [], 0
     try:
-        return await _extract_span_batch(
+        return await _extract_quote_batch(
             worker=worker,
-            batch_spans=batch_spans,
-            quotes_by_span=quotes_by_span,
+            batch_quotes=batch_quotes,
+            spans_by_id=spans_by_id,
             metrics_list=metrics_list,
             stage_name=stage_name,
         ), 0
     except Exception as e:
-        if len(batch_spans) <= 1:
-            span_ids = [s["id"] for s in batch_spans]
+        if len(batch_quotes) <= 1:
+            span_ids = _quote_source_span_ids(batch_quotes)
             logger.error(
                 f"{stage_name} leaf batch {batch_index} failed: {e}",
                 extra={"stage": stage_name},
@@ -255,22 +263,22 @@ async def _extract_batch_with_split_retry(
                 failures_path, ticker, doc_type, period, source_document_id,
                 stage_name, batch_index, span_ids, str(e),
             )
-            return [], len(batch_spans)
+            return [], len(batch_quotes)
 
-        midpoint = max(1, len(batch_spans) // 2)
+        midpoint = max(1, len(batch_quotes) // 2)
         logger.warning(
-            "%s batch %s failed; retrying as %s and %s span sub-batches: %s",
+            "%s batch %s failed; retrying as %s and %s quote sub-batches: %s",
             stage_name,
             batch_index,
             midpoint,
-            len(batch_spans) - midpoint,
+            len(batch_quotes) - midpoint,
             e,
             extra={"stage": stage_name},
         )
         left_items, left_failed = await _extract_batch_with_split_retry(
             worker=worker,
-            batch_spans=batch_spans[:midpoint],
-            quotes_by_span=quotes_by_span,
+            batch_quotes=batch_quotes[:midpoint],
+            spans_by_id=spans_by_id,
             metrics_list=metrics_list,
             batch_index=batch_index * 10 + 1,
             failures_path=failures_path,
@@ -282,8 +290,8 @@ async def _extract_batch_with_split_retry(
         )
         right_items, right_failed = await _extract_batch_with_split_retry(
             worker=worker,
-            batch_spans=batch_spans[midpoint:],
-            quotes_by_span=quotes_by_span,
+            batch_quotes=batch_quotes[midpoint:],
+            spans_by_id=spans_by_id,
             metrics_list=metrics_list,
             batch_index=batch_index * 10 + 2,
             failures_path=failures_path,
@@ -296,29 +304,20 @@ async def _extract_batch_with_split_retry(
         return [*left_items, *right_items], left_failed + right_failed
 
 
-async def _extract_span_batch(
+async def _extract_quote_batch(
     *,
     worker: ExtractionWorker,
-    batch_spans: list[dict],
-    quotes_by_span: dict[str, list[dict]],
+    batch_quotes: list[dict],
+    spans_by_id: dict[str, dict],
     metrics_list: str,
     stage_name: str,
 ) -> list[dict]:
-    batch_span_ids = [s["id"] for s in batch_spans]
-    batch_quotes: list[dict] = []
-    for sid in batch_span_ids:
-        batch_quotes.extend(quotes_by_span.get(sid, []))
+    source_context = _source_context_for_quotes(batch_quotes, spans_by_id)
+    aliased_quotes, quote_alias_to_id = alias_objects(batch_quotes, "q")
 
     input_data = {
         "spans_json": json.dumps(
-            [
-                {
-                    "id": s["id"],
-                    "section_name": s.get("section_name", ""),
-                    "text": s["text"],
-                }
-                for s in batch_spans
-            ],
+            source_context,
             ensure_ascii=False,
         ),
         "quotes_json": json.dumps(
@@ -335,11 +334,12 @@ async def _extract_span_batch(
         "claim_types": ", ".join(CLAIM_TYPES),
         "metrics_list": metrics_list,
     }
-    aliased_quotes, quote_alias_to_id = alias_objects(batch_quotes, "q")
     input_data["quotes_json"] = json.dumps(
         [
             {
                 "id": q["id"],
+                "source_span_id": q.get("source_span_id", ""),
+                "section_name": q.get("section_name", ""),
                 "quote_text": q["quote_text"],
                 "quote_type": q.get("quote_type", ""),
             }
@@ -357,6 +357,53 @@ async def _extract_span_batch(
                 f"{unknown or item.get('supported_by_quotes') or []}"
             )
     return items
+
+
+def _quote_source_span_ids(quotes: list[dict]) -> list[str]:
+    seen: set[str] = set()
+    span_ids: list[str] = []
+    for quote in quotes:
+        source_span_id = quote.get("source_span_id")
+        if source_span_id and source_span_id not in seen:
+            seen.add(source_span_id)
+            span_ids.append(source_span_id)
+    return span_ids
+
+
+def _source_context_for_quotes(quotes: list[dict], spans_by_id: dict[str, dict]) -> list[dict]:
+    context: list[dict] = []
+    seen: set[str] = set()
+    for quote in quotes:
+        source_span_id = quote.get("source_span_id")
+        if not source_span_id or source_span_id in seen:
+            continue
+        seen.add(source_span_id)
+        span = spans_by_id.get(source_span_id, {})
+        context.append({
+            "source_span_id": source_span_id,
+            "section_name": span.get("section_name") or quote.get("section_name", ""),
+            "note": "non-citable context; use quote aliases only in supported_by_quotes",
+        })
+    return context
+
+
+def _read_quote_first_batch_cache(
+    ontology_dir: Path, stage_name: str, batch_index: int
+) -> list[dict] | None:
+    path = batch_cache_path(ontology_dir, stage_name, batch_index)
+    if not path.exists():
+        return None
+    with open(path) as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        return None
+    metadata = data.get("metadata") or {}
+    if metadata.get("input_mode") != "evidence_quotes" or metadata.get("cache_version") != 2:
+        return None
+    items = data.get("items")
+    if isinstance(items, list):
+        return items
+    return None
 
 
 def _load_metrics_list(ontology_dir: Path) -> str:

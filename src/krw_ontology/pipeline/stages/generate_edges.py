@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from krw_ontology.config.constants import DOCUMENT_TYPE_KEY
+from krw_ontology.config.constants import normalize_doc_type
 from krw_ontology.extraction.worker import ExtractionWorker
 from krw_ontology.schema.id_utils import (
     generate_edge_local_id,
@@ -52,7 +52,7 @@ async def generate_edges(
     """
     del worker
     stage_name = "generate_edges"
-    doc_type_key = DOCUMENT_TYPE_KEY
+    doc_type_key = normalize_doc_type(doc_type)
     source_document_id = f"source:{ticker}:{period}:{doc_type_key}"
 
     spans = read_jsonl(ontology_dir / "spans.jsonl")
@@ -185,7 +185,7 @@ def _add_edge(
         return
     seen.add(key)
 
-    doc_type_key = DOCUMENT_TYPE_KEY
+    doc_type_key = normalize_doc_type(doc_type)
     local_id = generate_edge_local_id(relation_id, from_id, to_id)
     edges.append({
         "id": generate_scoped_id("edge", ticker, period, doc_type_key, local_id),

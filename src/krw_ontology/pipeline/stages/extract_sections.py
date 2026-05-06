@@ -20,8 +20,9 @@ def extract_sections(
     *,
     raw_html_path: Path | None = None,
     output_dir: Path | None = None,
+    document_type: str = "10-K",
 ) -> dict:
-    """Detect and extract 10-K sections from clean markdown and raw HTML hints.
+    """Detect and extract sections from clean markdown and raw HTML hints.
 
     Returns dict with: sections, document_nodes, section_candidates,
     section_boundary_audit, and section_quality.
@@ -38,9 +39,13 @@ def extract_sections(
         except OSError:
             raw_html_text = None
 
-    document_nodes = build_document_nodes(text, raw_html_text)
-    section_candidates = build_section_candidates(document_nodes)
-    sections, section_boundary_audit, section_quality = select_section_boundaries(text, section_candidates)
+    document_nodes = build_document_nodes(text, raw_html_text, document_type=document_type)
+    section_candidates = build_section_candidates(document_nodes, document_type=document_type)
+    sections, section_boundary_audit, section_quality = select_section_boundaries(
+        text,
+        section_candidates,
+        document_type=document_type,
+    )
 
     if output_dir:
         output_dir.mkdir(parents=True, exist_ok=True)

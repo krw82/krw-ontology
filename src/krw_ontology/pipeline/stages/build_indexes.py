@@ -18,6 +18,7 @@ INDEX_FILE_KEYS = [
     ("sections", "sections.jsonl"),
     ("section_boundary_audit", "section_boundary_audit.jsonl"),
     ("spans", "spans.jsonl"),
+    ("span_eligibility_audit", "span_eligibility_audit.jsonl"),
     ("evidence_quotes", "evidence_quotes.jsonl"),
     ("language_signals", "language_signals.jsonl"),
     ("claims", "claims.jsonl"),
@@ -43,6 +44,7 @@ def build_indexes(
     ontology_dir: Path,
     sources_dir: Path,
     output_dir: Path,
+    document_type: str = "10-K",
 ) -> dict:
     """Build artifact_index.json from all existing JSONL files.
 
@@ -77,7 +79,7 @@ def build_indexes(
 
         artifact_index = {
             "ticker": ticker,
-            "document_type": "10-K",
+            "document_type": document_type,
             "doc_type_key": doc_type_key,
             "period": period,
             "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -99,6 +101,7 @@ def build_indexes(
             "schema_version": SCHEMA_VERSION,
             "documents": {
                 period: {
+                    "document_type": document_type,
                     "doc_type_key": doc_type_key,
                     "artifact_index": f"{ontology_rel}/artifact_index.json",
                 },

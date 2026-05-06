@@ -54,3 +54,41 @@ def test_extract_xbrl_builds_financial_and_derived_values(tmp_path: Path):
     gross_margin = next(row for row in derived_values if row["metric_name"] == "gross_margin")
     assert round(revenue_growth["value"], 1) == 6.4
     assert round(gross_margin["value"], 1) == 46.9
+
+
+def test_extract_xbrl_preserves_10q_document_and_period_context(tmp_path: Path):
+    raw_html = tmp_path / "raw.html"
+    raw_html.write_text(
+        """
+        <html xmlns:ix="http://www.xbrl.org/2013/inlineXBRL"
+              xmlns:xbrli="http://www.xbrl.org/2003/instance"
+              xmlns:us-gaap="http://fasb.org/us-gaap/2025">
+          <body>
+            <xbrli:context id="q-current">
+              <xbrli:entity><xbrli:identifier>0000320193</xbrli:identifier></xbrli:entity>
+              <xbrli:period><xbrli:startDate>2025-04-01</xbrli:startDate><xbrli:endDate>2025-06-30</xbrli:endDate></xbrli:period>
+            </xbrli:context>
+            <ix:nonFraction name="us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax" contextRef="q-current" unitRef="usd" scale="6">95,000</ix:nonFraction>
+          </body>
+        </html>
+        """
+    )
+    output_path = tmp_path / "xbrl_facts.jsonl"
+
+    extract_xbrl(
+        raw_html_path=raw_html,
+        ticker="AAPL",
+        period="FY2025Q2",
+        doc_type_key="10Q",
+        source_document_id="source:AAPL:FY2025Q2:10Q",
+        output_path=output_path,
+        document_type="10-Q",
+    )
+
+    fact = read_jsonl(output_path)[0]
+    metric = next(row for row in read_jsonl(tmp_path / "financial_metric_values.jsonl") if row["metric_name"] == "revenue")
+    assert fact["id"].startswith("xbrl:AAPL:FY2025Q2:10Q:")
+    assert fact["document_type"] == "10-Q"
+    assert metric["document_type"] == "10-Q"
+    assert metric["fiscal_period"] == "Q2"
+    assert metric["period_type"] == "quarter"

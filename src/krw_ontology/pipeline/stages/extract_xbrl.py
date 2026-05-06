@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -30,8 +31,9 @@ def extract_xbrl(
     doc_type_key: str,
     source_document_id: str,
     output_path: Path,
+    document_type: str = "10-K",
 ) -> dict:
-    """Parse inline XBRL facts from 10-K HTML.
+    """Parse inline XBRL facts from SEC filing HTML.
 
     Returns dict with: facts, output_path, status.
     """
@@ -93,7 +95,7 @@ def extract_xbrl(
             "type": "XBRLFact",
             "ticker": ticker,
             "source_document_id": source_document_id,
-            "document_type": "10-K",
+            "document_type": document_type,
             "period": period,
             "taxonomy_tag": taxonomy_tag,
             "safe_taxonomy_tag": safe_tag,
@@ -114,6 +116,7 @@ def extract_xbrl(
         ticker=ticker,
         period=period,
         doc_type_key=doc_type_key,
+        document_type=document_type,
         source_document_id=source_document_id,
     )
     derived_values = _build_derived_metric_values(
@@ -121,6 +124,7 @@ def extract_xbrl(
         ticker=ticker,
         period=period,
         doc_type_key=doc_type_key,
+        document_type=document_type,
         source_document_id=source_document_id,
     )
     write_jsonl(output_path.parent / "financial_metric_values.jsonl", metric_values)
@@ -160,6 +164,7 @@ def _extract_contexts(soup: BeautifulSoup) -> dict[str, dict]:
             "end_date": end_date,
             "instant": instant,
             "period_type": "instant" if instant else "duration",
+            "duration_days": _duration_days(start_date, end_date),
             "fiscal_year": _year_from_date(end_date or instant),
             "dimensions": explicit_members,
             "has_dimensions": bool(explicit_members),
@@ -174,11 +179,12 @@ def _build_financial_metric_values(
     ticker: str,
     period: str,
     doc_type_key: str,
+    document_type: str,
     source_document_id: str,
 ) -> list[dict]:
     metric_specs = _load_metric_specs(raw_html_path)
     values: list[dict] = []
-    selected: set[tuple[str, int | None]] = set()
+    selected: set[tuple[str, int | None, str, str | None, str | None]] = set()
 
     for metric_name, spec in metric_specs.items():
         tags = set(spec.get("xbrl_tags") or [])
@@ -189,7 +195,10 @@ def _build_financial_metric_values(
         for fact in candidates:
             context = fact.get("context") or {}
             fiscal_year = context.get("fiscal_year")
-            key = (metric_name, fiscal_year)
+            period_type = _metric_period_type(context)
+            start_date = context.get("start_date")
+            end_date = context.get("end_date") or context.get("instant")
+            key = (metric_name, fiscal_year, period_type, start_date, end_date)
             if key in selected:
                 continue
             if context.get("has_dimensions"):
@@ -206,12 +215,16 @@ def _build_financial_metric_values(
                 "type": "FinancialMetricValue",
                 "ticker": ticker,
                 "source_document_id": source_document_id,
-                "document_type": "10-K",
+                "document_type": document_type,
                 "period": period,
                 "metric_name": metric_name,
                 "value": fact["value"],
                 "unit": spec.get("unit", fact.get("unit", "")),
                 "fiscal_year": fiscal_year,
+                "fiscal_period": _period_quarter(period),
+                "period_type": period_type,
+                "start_date": start_date,
+                "end_date": end_date,
                 "source_xbrl_fact_id": fact["id"],
                 "source": "filing_inline_xbrl",
                 "schema_version": SCHEMA_VERSION,
@@ -225,6 +238,7 @@ def _build_derived_metric_values(
     ticker: str,
     period: str,
     doc_type_key: str,
+    document_type: str,
     source_document_id: str,
 ) -> list[dict]:
     by_metric_year: dict[tuple[str, int | None], dict] = {
@@ -232,7 +246,7 @@ def _build_derived_metric_values(
         for row in metric_values
     }
     years = sorted({row.get("fiscal_year") for row in metric_values if row.get("fiscal_year")})
-    current_year = int(period.removeprefix("FY")) if period.startswith("FY") else (years[-1] if years else None)
+    current_year = _period_year(period) or (years[-1] if years else None)
     prior_year = current_year - 1 if current_year else None
     derived: list[dict] = []
 
@@ -244,7 +258,7 @@ def _build_derived_metric_values(
         value = (numerator["value"] / denominator["value"]) * 100
         _append_derived(
             derived, ticker, period, doc_type_key, source_document_id,
-            metric_name, value, "percent", formula, [numerator["id"], denominator["id"]],
+            document_type, metric_name, value, "percent", formula, [numerator["id"], denominator["id"]],
         )
 
     def add_growth(metric_name: str, base_name: str) -> None:
@@ -255,7 +269,7 @@ def _build_derived_metric_values(
         value = ((current["value"] - prior["value"]) / prior["value"]) * 100
         _append_derived(
             derived, ticker, period, doc_type_key, source_document_id,
-            metric_name, value, "percent", f"({base_name}_{current_year} - {base_name}_{prior_year}) / {base_name}_{prior_year}", [current["id"], prior["id"]],
+            document_type, metric_name, value, "percent", f"({base_name}_{current_year} - {base_name}_{prior_year}) / {base_name}_{prior_year}", [current["id"], prior["id"]],
         )
 
     def add_difference(metric_name: str, left_name: str, right_name: str, formula: str) -> None:
@@ -266,7 +280,7 @@ def _build_derived_metric_values(
         value = left["value"] - abs(right["value"])
         _append_derived(
             derived, ticker, period, doc_type_key, source_document_id,
-            metric_name, value, "USD", formula, [left["id"], right["id"]],
+            document_type, metric_name, value, "USD", formula, [left["id"], right["id"]],
         )
 
     add_growth("revenue_growth", "revenue")
@@ -320,6 +334,42 @@ def _year_from_date(value: str | None) -> int | None:
         return None
 
 
+def _duration_days(start_date: str | None, end_date: str | None) -> int | None:
+    if not start_date or not end_date:
+        return None
+    try:
+        start = date.fromisoformat(start_date)
+        end = date.fromisoformat(end_date)
+    except ValueError:
+        return None
+    return (end - start).days + 1
+
+
+def _metric_period_type(context: dict) -> str:
+    if context.get("instant"):
+        return "instant"
+    days = context.get("duration_days")
+    if not isinstance(days, int):
+        return context.get("period_type") or "duration"
+    if 70 <= days <= 115:
+        return "quarter"
+    if 160 <= days <= 300:
+        return "year_to_date"
+    if days >= 330:
+        return "annual"
+    return "duration"
+
+
+def _period_year(period: str) -> int | None:
+    match = re.match(r"^FY(\d{4})", period)
+    return int(match.group(1)) if match else None
+
+
+def _period_quarter(period: str) -> str | None:
+    match = re.match(r"^FY\d{4}(Q[1-4])$", period)
+    return match.group(1) if match else None
+
+
 def _parse_int(value: str | None) -> int | None:
     if value is None:
         return None
@@ -371,6 +421,7 @@ def _append_derived(
     period: str,
     doc_type_key: str,
     source_document_id: str,
+    document_type: str,
     metric_name: str,
     value: float,
     unit: str,
@@ -388,11 +439,14 @@ def _append_derived(
         "type": "DerivedMetricValue",
         "ticker": ticker,
         "source_document_id": source_document_id,
-        "document_type": "10-K",
+        "document_type": document_type,
         "period": period,
         "metric_name": metric_name,
         "value": value,
         "unit": unit,
+        "fiscal_year": _period_year(period),
+        "fiscal_period": _period_quarter(period),
+        "period_type": "derived",
         "formula": formula,
         "input_metric_ids": input_metric_ids,
         "source": "code_calculated",

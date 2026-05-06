@@ -187,6 +187,10 @@ class FinancialMetricValue(BaseModel):
     value: float
     unit: str
     fiscal_year: int | None = None
+    fiscal_period: str | None = None
+    period_type: str | None = None
+    start_date: str | None = None
+    end_date: str | None = None
     source_xbrl_fact_id: str
     source: str = "filing_inline_xbrl"
     schema_version: str = SCHEMA_VERSION
@@ -202,6 +206,9 @@ class DerivedMetricValue(BaseModel):
     metric_name: str
     value: float
     unit: str
+    fiscal_year: int | None = None
+    fiscal_period: str | None = None
+    period_type: str | None = None
     formula: str
     input_metric_ids: list[str]
     source: str = "code_calculated"

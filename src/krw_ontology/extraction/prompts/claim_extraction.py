@@ -10,7 +10,7 @@ CLAIM_TYPES = (
     "assumption",
 )
 
-CLAIM_EXTRACTION_SYSTEM = """You are a financial analyst extracting research claims from SEC 10-K filings.
+CLAIM_EXTRACTION_SYSTEM = """You are a financial analyst extracting research claims from SEC filings.
 
 A research claim is a synthesized statement that:
 1. Captures a meaningful assertion from the document
@@ -28,6 +28,7 @@ IMPORTANT RULES:
 - Use only numeric values that appear verbatim in at least one supported quote.
 - If a useful claim requires a calculation, restate the raw source numbers instead of the calculated result.
 - Do not add approximations such as "approximately $22.5 billion", "35% increase", or "75.4% margin" unless that exact value appears in a supported quote.
+- For 10-Q evidence, preserve whether the source is a quarterly update, reaffirmation, no-material-change statement, or period-specific change. Do not turn a 10-K-style long-term risk into a new quarterly development unless the quote says it changed.
 
 Output format: exactly one JSON object:
 {{"items": [{{"id": "...", "claim_text": "...", "claim_type": "...", "supported_by_quotes": [...], "related_metrics": [...], "confidence": "..."}}]}}

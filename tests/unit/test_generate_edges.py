@@ -83,3 +83,41 @@ def test_generate_edges_uses_existing_references_without_sdk(tmp_path: Path):
         "derived_from": 1,
     }
     assert not read_jsonl(tmp_path / "batch_failures.jsonl")
+
+
+def test_generate_edges_respects_10q_document_type_key(tmp_path: Path):
+    base = {
+        "ticker": "AAPL",
+        "source_document_id": "source:AAPL:FY2025Q2:10Q",
+        "document_type": "10-Q",
+        "period": "FY2025Q2",
+        "schema_version": "0.1.0",
+    }
+    span_id = "span:AAPL:FY2025Q2:10Q:part1_item2:0000"
+    quote_id = "quote:AAPL:FY2025Q2:10Q:part1_item2:0000:001"
+
+    write_jsonl(tmp_path / "spans.jsonl", [{"id": span_id, "type": "SourceSpan", **base}])
+    write_jsonl(tmp_path / "evidence_quotes.jsonl", [{
+        "id": quote_id,
+        "type": "EvidenceQuote",
+        **base,
+        "source_span_id": span_id,
+    }])
+    write_jsonl(tmp_path / "language_signals.jsonl", [])
+    write_jsonl(tmp_path / "claims.jsonl", [])
+    write_jsonl(tmp_path / "risks.jsonl", [])
+    write_jsonl(tmp_path / "growth_drivers.jsonl", [])
+    write_jsonl(tmp_path / "headwinds.jsonl", [])
+    write_jsonl(tmp_path / "assumption_candidates.jsonl", [])
+
+    class FakeWorker:
+        async def extract(self, *args, **kwargs):
+            raise AssertionError("generate_edges should not call the SDK")
+
+    edges = asyncio.run(
+        generate_edges(FakeWorker(), tmp_path, "AAPL", "FY2025Q2", "10-Q")
+    )
+
+    assert edges[0]["id"].startswith("edge:AAPL:FY2025Q2:10Q:")
+    assert edges[0]["source_document_id"] == "source:AAPL:FY2025Q2:10Q"
+    assert edges[0]["document_type"] == "10-Q"

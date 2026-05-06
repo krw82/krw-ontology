@@ -99,6 +99,22 @@ class TestE2EMatrixCommand:
         assert result.exit_code == 0
         assert [call["ticker"] for call in calls] == ["MSFT", "UNH"]
 
+    def test_e2e_matrix_accepts_10q_document_type(self, tmp_path: Path, monkeypatch):
+        calls = []
+
+        def fake_run_pipeline(**kwargs):
+            calls.append(kwargs)
+
+        monkeypatch.setattr(orchestrator, "run_pipeline", fake_run_pipeline)
+
+        result = runner.invoke(
+            app,
+            ["e2e-matrix", "aapl", "--document-type", "10-Q", "--output-dir", str(tmp_path)],
+        )
+
+        assert result.exit_code == 0
+        assert calls[0]["document_type"] == "10-Q"
+
     def test_e2e_matrix_stops_on_first_failure(self, tmp_path: Path, monkeypatch):
         calls = []
 

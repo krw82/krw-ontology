@@ -13,10 +13,10 @@ from krw_ontology.cli.init_workspace import init_workspace
 
 app = typer.Typer(
     name="krw-ontology",
-    help="10-K Evidence Ontology Builder — file-canonical equity research pipeline",
+    help="Evidence Ontology Builder - file-canonical equity research pipeline",
 )
 
-ACCEPTED_DOC_TYPES = {"10-K"}
+ACCEPTED_DOC_TYPES = {"10-K", "10-Q"}
 DEFAULT_E2E_TICKERS = ["AAPL", "NVDA", "JPM", "XOM"]
 
 
@@ -24,7 +24,7 @@ def validate_document_type(doc_type: str) -> str:
     """Raise typer.BadParameter if not in ACCEPTED_DOC_TYPES."""
     if doc_type not in ACCEPTED_DOC_TYPES:
         raise typer.BadParameter(
-            f"Document type '{doc_type}' not supported in v1. "
+            f"Document type '{doc_type}' not supported. "
             f"Supported: {', '.join(sorted(ACCEPTED_DOC_TYPES))}"
         )
     return doc_type
@@ -39,7 +39,7 @@ def init_workspace_cmd() -> None:
 @app.command("build-evidence-ontology")
 def build_evidence_ontology(
     ticker: str = typer.Argument(..., help="Stock ticker symbol"),
-    document_type: str = typer.Option("10-K", "--document-type", help="Document type (10-K only in v1)"),
+    document_type: str = typer.Option("10-K", "--document-type", help="Document type (10-K or 10-Q)"),
     latest: bool = typer.Option(False, "--latest", help="Use most recent filing"),
     period: Optional[str] = typer.Option(None, "--period", help="Explicit period override (e.g., FY2025)"),
     force: bool = typer.Option(False, "--force", help="Re-process even if content hash matches"),
@@ -65,7 +65,7 @@ def e2e_matrix_cmd(
         None,
         help="Ticker symbols to run. Defaults to AAPL NVDA JPM XOM.",
     ),
-    document_type: str = typer.Option("10-K", "--document-type", help="Document type (10-K only in v1)"),
+    document_type: str = typer.Option("10-K", "--document-type", help="Document type (10-K or 10-Q)"),
     latest: bool = typer.Option(True, "--latest/--no-latest", help="Use most recent filing"),
     force: bool = typer.Option(True, "--force/--no-force", help="Re-process even if checkpoints exist"),
     output_dir: Optional[Path] = typer.Option(
@@ -133,11 +133,11 @@ def validate_cmd(
 ) -> None:
     """Re-run validation on existing ontology artifacts."""
     validate_document_type(document_type)
-    from krw_ontology.config.constants import DOCUMENT_TYPE_KEY
+    from krw_ontology.config.constants import normalize_doc_type
     from krw_ontology.pipeline.stages.validate_ontology import run_validate_ontology
 
     ticker = ticker.upper()
-    doc_type_key = DOCUMENT_TYPE_KEY
+    doc_type_key = normalize_doc_type(document_type)
 
     if period is None:
         ontology_base = Path.cwd() / "companies" / ticker / "ontology" / doc_type_key
@@ -173,12 +173,12 @@ def build_report_cmd(
     """Regenerate graph_report.md and audit_report.md from existing artifacts."""
     validate_document_type(document_type)
 
-    from krw_ontology.config.constants import DOCUMENT_TYPE_KEY
+    from krw_ontology.config.constants import normalize_doc_type
     from krw_ontology.pipeline.stages.build_indexes import build_indexes
     from krw_ontology.pipeline.stages.build_reports import build_reports
 
     ticker = ticker.upper()
-    doc_type_key = DOCUMENT_TYPE_KEY
+    doc_type_key = normalize_doc_type(document_type)
 
     if period is None:
         ontology_base = Path.cwd() / "companies" / ticker / "ontology" / doc_type_key
@@ -202,6 +202,7 @@ def build_report_cmd(
         ticker=ticker,
         period=period,
         doc_type_key=doc_type_key,
+        document_type=document_type,
         ontology_dir=ontology_dir,
         sources_dir=sources_dir,
         output_dir=Path.cwd(),

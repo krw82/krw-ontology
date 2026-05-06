@@ -8,7 +8,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from krw_ontology.config.constants import DOCUMENT_TYPE_KEY
+from krw_ontology.config.constants import normalize_doc_type
 from krw_ontology.config.settings import PipelineConfig
 from krw_ontology.errors import PipelineStageError
 from krw_ontology.extraction.worker import ExtractionWorker
@@ -64,6 +64,36 @@ def _next_stage(current: str) -> str | None:
     return None
 
 
+def _derive_period_from_dates(
+    document_type: str,
+    report_date: str | None,
+    filing_date: str | None,
+) -> str:
+    """Derive a stable period key before source contents are parsed.
+
+    SEC submissions expose reportDate before download. For 10-Q, this is a
+    fallback calendar-quarter key; callers can pass --period when they need an
+    issuer-specific fiscal-quarter override.
+    """
+    date_value = report_date or filing_date or ""
+    year = date_value[:4] if len(date_value) >= 4 and date_value[:4].isdigit() else "unknown"
+    if document_type == "10-Q":
+        month = _month_from_date(date_value)
+        quarter = ((month - 1) // 3 + 1) if month else 0
+        return f"FY{year}Q{quarter}" if quarter else f"FY{year}Q?"
+    return f"FY{year}"
+
+
+def _month_from_date(value: str | None) -> int | None:
+    if not value or len(value) < 7:
+        return None
+    try:
+        month = int(value[5:7])
+    except ValueError:
+        return None
+    return month if 1 <= month <= 12 else None
+
+
 def run_pipeline(
     ticker: str,
     document_type: str = "10-K",
@@ -77,7 +107,7 @@ def run_pipeline(
     config = PipelineConfig.load()
 
     ticker = ticker.upper()
-    doc_type_key = DOCUMENT_TYPE_KEY
+    doc_type_key = normalize_doc_type(document_type)
     base_dir = output_dir or Path.cwd()
 
     # Context dict shared across stages
@@ -158,10 +188,17 @@ def _execute_stage(stage: str, ctx: dict) -> None:
         if ctx.get("period"):
             pass  # Use explicit period from CLI
         elif ctx.get("report_date"):
-            year = ctx["report_date"][:4]
-            ctx["period"] = f"FY{year}"
+            ctx["period"] = _derive_period_from_dates(
+                ctx["document_type"],
+                ctx.get("report_date"),
+                ctx.get("filing_date"),
+            )
         elif ctx.get("filing_date"):
-            ctx["period"] = "FY" + ctx["filing_date"][:4]
+            ctx["period"] = _derive_period_from_dates(
+                ctx["document_type"],
+                None,
+                ctx.get("filing_date"),
+            )
 
         # Now we know period, set up paths
         period = ctx["period"]
@@ -201,15 +238,24 @@ def _execute_stage(stage: str, ctx: dict) -> None:
             ctx["clean_md_path"],
             raw_html_path=ctx.get("raw_html_path"),
             output_dir=ctx["ontology_dir"],
+            document_type=ctx["document_type"],
         )
         ctx["sections"] = result["sections"]
         ctx["section_quality"] = result.get("section_quality", {})
+        if (
+            config.fail_on_section_quality
+            and ctx["section_quality"].get("status") == "fail"
+        ):
+            fail_reasons = ctx["section_quality"].get("fail_reasons", [])
+            reason_text = ", ".join(fail_reasons) if fail_reasons else "unknown"
+            raise PipelineStageError(f"extract_sections: section_quality=fail ({reason_text})")
         ctx["clean_md_text"] = ctx["clean_md_path"].read_text()
 
     elif stage == "build_source_spans":
         result = build_spans(
             sections=ctx["sections"],
             doc_type_key=doc_type_key,
+            document_type=ctx["document_type"],
             ticker=ticker,
             period=ctx["period"],
             source_document_id=ctx["source_document_id"],
@@ -224,6 +270,7 @@ def _execute_stage(stage: str, ctx: dict) -> None:
             ticker=ticker,
             period=ctx["period"],
             doc_type_key=doc_type_key,
+            document_type=ctx["document_type"],
             source_document_id=ctx["source_document_id"],
             output_path=ctx["ontology_dir"] / "xbrl_facts.jsonl",
         )
@@ -239,6 +286,7 @@ def _execute_stage(stage: str, ctx: dict) -> None:
             doc_type=ctx["document_type"],
             concurrency=config.concurrency_for_stage(stage),
             force=ctx["force"],
+            span_pruning=config.span_pruning,
         ))
         ctx["quotes"] = quotes
 
@@ -321,6 +369,7 @@ def _execute_stage(stage: str, ctx: dict) -> None:
             ticker=ticker,
             period=ctx["period"],
             doc_type_key=doc_type_key,
+            document_type=ctx["document_type"],
             ontology_dir=ctx["ontology_dir"],
             sources_dir=ctx["sources_dir"],
             output_dir=base_dir,
@@ -359,6 +408,8 @@ def _write_pipeline_config(ctx: dict, ontology_dir: Path) -> None:
         "stage_concurrency": ctx["config"].stage_concurrency,
         "max_turns": ctx["config"].max_turns,
         "call_timeout_seconds": ctx["config"].call_timeout_seconds,
+        "fail_on_section_quality": ctx["config"].fail_on_section_quality,
+        "span_pruning": ctx["config"].span_pruning,
         "schema_version": SCHEMA_VERSION,
         "cli_flags": {
             "document_type": ctx["document_type"],

@@ -28,6 +28,8 @@ class PipelineConfig:
         "claim_extraction": 15,
     })
     max_context_tokens: int = 180000
+    fail_on_section_quality: bool = False
+    span_pruning: str = "conservative"
 
     @classmethod
     def load(cls) -> PipelineConfig:
@@ -44,6 +46,13 @@ class PipelineConfig:
             config.max_turns = _parse_positive_int(env_max_turns, config.max_turns)
         if env_timeout := os.environ.get("KRW_CALL_TIMEOUT_SECONDS"):
             config.call_timeout_seconds = _parse_positive_int(env_timeout, config.call_timeout_seconds)
+        if env_fail_on_section_quality := os.environ.get("KRW_FAIL_ON_SECTION_QUALITY"):
+            config.fail_on_section_quality = _parse_bool(
+                env_fail_on_section_quality,
+                config.fail_on_section_quality,
+            )
+        if env_span_pruning := os.environ.get("KRW_SPAN_PRUNING"):
+            config.span_pruning = _parse_span_pruning_mode(env_span_pruning, config.span_pruning)
         _apply_stage_env(config)
 
         # File-based config
@@ -73,6 +82,16 @@ class PipelineConfig:
                 config.batch_sizes.update(data["batch_sizes"])
             if "max_context_tokens" in data:
                 config.max_context_tokens = data["max_context_tokens"]
+            if "fail_on_section_quality" in data:
+                config.fail_on_section_quality = _coerce_bool(
+                    data["fail_on_section_quality"],
+                    config.fail_on_section_quality,
+                )
+            if "span_pruning" in data:
+                config.span_pruning = _parse_span_pruning_mode(
+                    str(data["span_pruning"]),
+                    config.span_pruning,
+                )
 
         # Env var always wins over file
         if env_model := os.environ.get("KRW_MODEL"):
@@ -83,6 +102,13 @@ class PipelineConfig:
             config.max_turns = _parse_positive_int(env_max_turns, config.max_turns)
         if env_timeout := os.environ.get("KRW_CALL_TIMEOUT_SECONDS"):
             config.call_timeout_seconds = _parse_positive_int(env_timeout, config.call_timeout_seconds)
+        if env_fail_on_section_quality := os.environ.get("KRW_FAIL_ON_SECTION_QUALITY"):
+            config.fail_on_section_quality = _parse_bool(
+                env_fail_on_section_quality,
+                config.fail_on_section_quality,
+            )
+        if env_span_pruning := os.environ.get("KRW_SPAN_PRUNING"):
+            config.span_pruning = _parse_span_pruning_mode(env_span_pruning, config.span_pruning)
         _apply_stage_env(config)
 
         return config
@@ -100,6 +126,32 @@ def _parse_positive_int(value: str, default: int) -> int:
     except ValueError:
         return default
     return max(1, parsed)
+
+
+def _parse_bool(value: str, default: bool) -> bool:
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
+
+def _coerce_bool(value: object, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return _parse_bool(value, default)
+    if isinstance(value, int):
+        return bool(value)
+    return default
+
+
+def _parse_span_pruning_mode(value: str, default: str) -> str:
+    normalized = value.strip().lower()
+    if normalized in {"off", "conservative"}:
+        return normalized
+    return default
 
 
 def _load_dotenv() -> None:

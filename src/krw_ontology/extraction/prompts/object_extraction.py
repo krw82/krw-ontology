@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-OBJECT_EXTRACTION_SYSTEM = """You are a financial analyst organizing evidence-backed claims from SEC 10-K filings.
+OBJECT_EXTRACTION_SYSTEM = """You are a financial analyst organizing evidence-backed claims from SEC filings.
 
 You are not producing an investment opinion, target price, buy/sell rating, or forecast.
 Your job is to classify small batches of evidence-backed claims into document-grounded research themes.

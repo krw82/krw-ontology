@@ -6,7 +6,7 @@ import logging
 import re
 from pathlib import Path
 
-from krw_ontology.config.constants import DOCUMENT_TYPE_KEY
+from krw_ontology.config.constants import normalize_doc_type
 from krw_ontology.extraction.worker import ExtractionWorker
 from krw_ontology.schema.id_utils import generate_scoped_id
 from krw_ontology.schema.objects import SCHEMA_VERSION
@@ -71,7 +71,7 @@ async def extract_risks_drivers_headwinds(
     """
     del worker, quotes
     stage_name = "extract_risks_drivers_headwinds"
-    doc_type_key = DOCUMENT_TYPE_KEY
+    doc_type_key = normalize_doc_type(doc_type)
     source_document_id = f"source:{ticker}:{period}:{doc_type_key}"
 
     claims_path = ontology_dir / "claims.jsonl"

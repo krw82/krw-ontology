@@ -189,6 +189,10 @@ types:
       value: {type: number, required: true}
       unit: {type: string, required: true}
       fiscal_year: {type: integer, required: false}
+      fiscal_period: {type: string, required: false}
+      period_type: {type: string, required: false}
+      start_date: {type: string, required: false}
+      end_date: {type: string, required: false}
       source_xbrl_fact_id: {type: string, required: true}
       source: {type: string, required: true}
       schema_version: {type: string, required: true}
@@ -205,6 +209,9 @@ types:
       metric_name: {type: string, required: true}
       value: {type: number, required: true}
       unit: {type: string, required: true}
+      fiscal_year: {type: integer, required: false}
+      fiscal_period: {type: string, required: false}
+      period_type: {type: string, required: false}
       formula: {type: string, required: true}
       input_metric_ids: {type: array, items: string, required: true}
       source: {type: string, required: true}

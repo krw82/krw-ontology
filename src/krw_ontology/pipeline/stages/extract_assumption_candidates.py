@@ -12,7 +12,7 @@ import logging
 import re
 from pathlib import Path
 
-from krw_ontology.config.constants import DOCUMENT_TYPE_KEY
+from krw_ontology.config.constants import normalize_doc_type
 from krw_ontology.extraction.worker import ExtractionWorker
 from krw_ontology.pipeline.ai_batches import (
     clear_stage_batch_cache,
@@ -51,7 +51,7 @@ _CUE_METRICS = {
     "fcf_margin", "cash_and_equivalents", "total_debt", "roe", "roa",
 }
 
-ASSUMPTION_EXTRACTION_SYSTEM = """You are a financial analyst extracting modeling cues from SEC 10-K filings.
+ASSUMPTION_EXTRACTION_SYSTEM = """You are a financial analyst extracting modeling cues from SEC filings.
 
 An AssumptionCandidate is a reviewable modeling cue, not a final assumption, investment opinion, target price, or forecast.
 It highlights evidence that a human or downstream AI may want to inspect when building a model:
@@ -144,7 +144,7 @@ async def extract_assumption_candidates(
 ) -> list[dict]:
     """Extract modeling cues from filtered claim batches."""
     stage_name = "extract_assumption_candidates"
-    doc_type_key = DOCUMENT_TYPE_KEY
+    doc_type_key = normalize_doc_type(doc_type)
     source_document_id = f"source:{ticker}:{period}:{doc_type_key}"
 
     claims_path = ontology_dir / "claims.jsonl"
@@ -268,7 +268,7 @@ async def extract_assumption_candidates(
         except Exception as e:
             _record_batch_failure(
                 failures_path, ticker, doc_type, period, source_document_id,
-                stage_name, batch_idx, [c["id"] for c in batch_claims], str(e),
+                doc_type_key, stage_name, batch_idx, [c["id"] for c in batch_claims], str(e),
             )
             logger.error(
                 "%s batch %s failed; continuing: %s",
@@ -460,13 +460,13 @@ def _load_metrics_list(ontology_dir: Path) -> str:
 
 def _record_batch_failure(
     failures_path: Path, ticker: str, doc_type: str, period: str,
-    source_document_id: str, stage: str, batch_index: int,
+    source_document_id: str, doc_type_key: str, stage: str, batch_index: int,
     input_span_ids: list[str], error_message: str,
 ) -> None:
     from datetime import datetime, timezone
 
     failure = {
-        "id": f"batch_failure:{ticker}:{period}:{DOCUMENT_TYPE_KEY}:{stage}:{batch_index:04d}",
+        "id": f"batch_failure:{ticker}:{period}:{doc_type_key}:{stage}:{batch_index:04d}",
         "type": "BatchFailure",
         "ticker": ticker,
         "document_type": doc_type,

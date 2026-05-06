@@ -8,7 +8,7 @@ import logging
 import re
 from pathlib import Path
 
-from krw_ontology.config.constants import DOCUMENT_TYPE_KEY
+from krw_ontology.config.constants import normalize_doc_type
 from krw_ontology.errors import PipelineStageError
 from krw_ontology.extraction.prompts.quote_extraction import (
     QUOTE_EXTRACTION_PROMPT,
@@ -17,8 +17,8 @@ from krw_ontology.extraction.prompts.quote_extraction import (
 )
 from krw_ontology.extraction.worker import ExtractionWorker
 from krw_ontology.pipeline.ai_batches import (
+    batch_cache_path,
     clear_stage_batch_cache,
-    read_batch_cache,
     run_limited_batches,
     write_batch_cache,
 )
@@ -29,6 +29,10 @@ from krw_ontology.utils.io import read_jsonl, write_jsonl
 logger = logging.getLogger("krw_ontology")
 
 BATCH_SIZE = 5
+SPAN_PRUNING_OFF = "off"
+SPAN_PRUNING_CONSERVATIVE = "conservative"
+SPAN_PRUNING_MODES = {SPAN_PRUNING_OFF, SPAN_PRUNING_CONSERVATIVE}
+CACHE_VERSION = 2
 
 _SCHEMA = {
     "type": "object",
@@ -77,6 +81,12 @@ _TARGET_SECTIONS = {
     "item7",
     "item7a",
     "item8",
+    "part1_item1",
+    "part1_item2",
+    "part1_item3",
+    "part1_item4",
+    "part2_item1",
+    "part2_item1a",
 }
 _QUOTE_KEYWORDS = (
     "adverse", "affect", "risk", "uncertain", "competition", "competitive",
@@ -86,6 +96,17 @@ _QUOTE_KEYWORDS = (
     "cash", "liquidity", "capital", "expected", "anticipate", "believe",
     "may", "could", "material",
 )
+_LOW_VALUE_EXHIBIT_SECTIONS = {"item15", "item16", "part2_item6"}
+_STRUCTURAL_LABELS = {
+    "table of contents",
+    "part i",
+    "part ii",
+    "part iii",
+    "part iv",
+    "signatures",
+    "exhibits",
+    "index",
+}
 
 
 def _build_quote_candidates(spans: list[dict]) -> list[dict]:
@@ -153,6 +174,169 @@ def _is_candidate_worth_review(text: str, section_name: str) -> bool:
     return any(keyword in lower for keyword in _QUOTE_KEYWORDS)
 
 
+def _normalize_span_pruning_mode(mode: str | None) -> str:
+    normalized = (mode or SPAN_PRUNING_CONSERVATIVE).strip().lower()
+    if normalized in SPAN_PRUNING_MODES:
+        return normalized
+    return SPAN_PRUNING_CONSERVATIVE
+
+
+def _filter_spans_for_quote_extraction(
+    spans: list[dict],
+    *,
+    span_pruning: str,
+) -> tuple[list[dict], list[dict]]:
+    """Return spans eligible for quote extraction and an auditable decision row per span."""
+    mode = _normalize_span_pruning_mode(span_pruning)
+    eligible: list[dict] = []
+    audit_rows: list[dict] = []
+
+    for span in spans:
+        decision, reason, candidate_count = _classify_span_eligibility(span, mode)
+        audit_rows.append({
+            "span_id": span.get("id", ""),
+            "section_name": span.get("section_name", ""),
+            "section_key": span.get("section_key", span.get("section_name", "")),
+            "span_index": span.get("span_index"),
+            "char_count": span.get("char_count", len(span.get("text", ""))),
+            "decision": decision,
+            "reason": reason,
+            "candidate_count": candidate_count,
+            "span_pruning": mode,
+        })
+        if decision == "keep":
+            eligible.append(span)
+
+    return eligible, audit_rows
+
+
+def _classify_span_eligibility(span: dict, mode: str) -> tuple[str, str, int]:
+    if mode == SPAN_PRUNING_OFF:
+        return "keep", "pruning_disabled", len(_build_quote_candidates([span]))
+
+    text = span.get("text", "")
+    normalized = _normalize_text(text)
+    lowered = normalized.lower()
+    section_name = span.get("section_name", "")
+
+    if not normalized:
+        return "skip", "empty_span", 0
+    if _is_layout_fragment(normalized):
+        return "skip", "layout_fragment", 0
+    if _is_toc_like_span(text):
+        return "skip", "toc_like", 0
+    if _is_structural_label_span(normalized):
+        return "skip", "structural_label", 0
+    if section_name == "cover":
+        return "skip", "cover_metadata", 0
+    if _is_signature_or_certification_span(lowered):
+        return "skip", "signature_or_certification_boilerplate", 0
+    if _is_exhibit_index_span(text, section_name):
+        return "skip", "exhibit_index_or_list", 0
+
+    candidate_count = len(_build_quote_candidates([span]))
+    if candidate_count == 0:
+        return "skip", "no_quote_candidates", 0
+    if section_name in _TARGET_SECTIONS:
+        return "keep", "core_section", candidate_count
+    return "keep", "has_quote_candidates", candidate_count
+
+
+def _is_layout_fragment(normalized: str) -> bool:
+    alnum_count = sum(1 for ch in normalized if ch.isalnum())
+    return alnum_count < 12
+
+
+def _is_toc_like_span(text: str) -> bool:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return False
+    lowered = _normalize_text(text).lower()
+    item_page_lines = [
+        line for line in lines
+        if re.match(r"(?i)^(item\s+\d{1,2}[a-z]?|part\s+[ivx]+)\b.+\s+\d{1,4}$", line)
+    ]
+    if len(item_page_lines) >= 3 and len(item_page_lines) / len(lines) >= 0.5:
+        return True
+    return lowered.startswith("table of contents") and len(item_page_lines) >= 2
+
+
+def _is_structural_label_span(normalized: str) -> bool:
+    lowered = normalized.lower().strip(" .:-")
+    if lowered in _STRUCTURAL_LABELS:
+        return True
+    if len(lowered) > 180:
+        return False
+    if re.match("(?i)^item\\s+\\d{1,2}[a-z]?[.:\\-\\u2014\\u2013]?\\s+[a-z ,&'/-]+$", lowered):
+        return "." not in lowered.strip().rstrip(".")
+    return False
+
+
+def _is_signature_or_certification_span(lowered: str) -> bool:
+    return (
+        "pursuant to the requirements" in lowered
+        and (
+            "has duly caused this report to be signed" in lowered
+            or "signed on its behalf" in lowered
+            or "certifies that" in lowered
+        )
+    )
+
+
+def _is_exhibit_index_span(text: str, section_name: str) -> bool:
+    if section_name not in _LOW_VALUE_EXHIBIT_SECTIONS:
+        return False
+    lowered = _normalize_text(text).lower()
+    if "exhibit" not in lowered and "financial statement schedule" not in lowered:
+        return False
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    exhibit_lines = [
+        line for line in lines
+        if re.match(r"(?i)^(exhibit\s+)?\d+(\.\d+)?\b", line)
+        or "incorporated by reference" in line.lower()
+    ]
+    return lowered.count("exhibit") >= 3 or len(exhibit_lines) >= 3 or "exhibit index" in lowered[:300]
+
+
+def _batch_input_hash(batch: list[dict], span_pruning: str) -> str:
+    payload = [
+        {
+            "id": span.get("id", ""),
+            "text_hash": span.get("text_hash", ""),
+            "section_name": span.get("section_name", ""),
+        }
+        for span in batch
+    ]
+    raw = json.dumps(
+        {"cache_version": CACHE_VERSION, "span_pruning": span_pruning, "spans": payload},
+        sort_keys=True,
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def _read_quote_batch_cache(
+    ontology_dir: Path,
+    stage_name: str,
+    batch_idx: int,
+    input_hash: str,
+) -> list[dict] | None:
+    path = batch_cache_path(ontology_dir, stage_name, batch_idx)
+    if not path.exists():
+        return None
+    with open(path) as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        return None
+    metadata = data.get("metadata") or {}
+    if metadata.get("cache_version") != CACHE_VERSION:
+        return None
+    if metadata.get("input_hash") != input_hash:
+        return None
+    items = data.get("items")
+    return items if isinstance(items, list) else None
+
+
 async def extract_evidence_quotes(
     worker: ExtractionWorker,
     ontology_dir: Path,
@@ -161,25 +345,54 @@ async def extract_evidence_quotes(
     doc_type: str,
     concurrency: int = 1,
     force: bool = False,
+    span_pruning: str = SPAN_PRUNING_CONSERVATIVE,
 ) -> list[dict]:
     """Extract evidence quotes from spans in batches with split retry."""
     stage_name = "extract_evidence_quotes"
-    doc_type_key = DOCUMENT_TYPE_KEY
+    doc_type_key = normalize_doc_type(doc_type)
     source_document_id = f"source:{ticker}:{period}:{doc_type_key}"
 
     spans_path = ontology_dir / "spans.jsonl"
     output_path = ontology_dir / "evidence_quotes.jsonl"
     signals_output_path = ontology_dir / "language_signals.jsonl"
+    span_eligibility_path = ontology_dir / "span_eligibility_audit.jsonl"
     failures_path = ontology_dir / "batch_failures.jsonl"
 
     spans = read_jsonl(spans_path)
     if not spans:
         logger.warning(f"{stage_name}: no spans found", extra={"stage": stage_name})
+        write_jsonl(span_eligibility_path, [])
+        return []
+
+    span_pruning = _normalize_span_pruning_mode(span_pruning)
+    eligible_spans, span_eligibility_audit = _filter_spans_for_quote_extraction(
+        spans,
+        span_pruning=span_pruning,
+    )
+    write_jsonl(span_eligibility_path, span_eligibility_audit)
+    skipped_count = len(spans) - len(eligible_spans)
+    if skipped_count:
+        logger.info(
+            "%s: span pruning kept %s/%s spans, skipped %s",
+            stage_name,
+            len(eligible_spans),
+            len(spans),
+            skipped_count,
+            extra={"stage": stage_name},
+        )
+    if not eligible_spans:
+        write_jsonl(output_path, [])
+        write_jsonl(signals_output_path, [])
+        logger.warning(
+            "%s: no eligible spans found after span pruning",
+            stage_name,
+            extra={"stage": stage_name},
+        )
         return []
 
     quotes: list[dict] = []
     seen_keys: set[str] = set()
-    total_batches = (len(spans) + BATCH_SIZE - 1) // BATCH_SIZE
+    total_batches = (len(eligible_spans) + BATCH_SIZE - 1) // BATCH_SIZE
     failed_span_count = 0
     _clear_stage_failures(failures_path, stage_name)
     if force:
@@ -187,19 +400,27 @@ async def extract_evidence_quotes(
 
     async def run_batch(batch_idx: int) -> tuple[list[dict], int]:
         start = batch_idx * BATCH_SIZE
-        batch = spans[start : start + BATCH_SIZE]
+        batch = eligible_spans[start : start + BATCH_SIZE]
         candidates = _build_quote_candidates(batch)
+        input_hash = _batch_input_hash(batch, span_pruning)
         if not candidates:
             write_batch_cache(
                 ontology_dir,
                 stage_name,
                 batch_idx,
                 [],
-                metadata={"status": "empty", "span_count": len(batch), "candidate_count": 0},
+                metadata={
+                    "status": "empty",
+                    "cache_version": CACHE_VERSION,
+                    "input_hash": input_hash,
+                    "span_pruning": span_pruning,
+                    "span_count": len(batch),
+                    "candidate_count": 0,
+                },
             )
             return [], 0
 
-        cached = read_batch_cache(ontology_dir, stage_name, batch_idx)
+        cached = _read_quote_batch_cache(ontology_dir, stage_name, batch_idx, input_hash)
         if cached is not None:
             logger.info(
                 "%s batch %s/%s loaded from cache (%s quotes)",
@@ -218,6 +439,7 @@ async def extract_evidence_quotes(
             failures_path=failures_path,
             ticker=ticker,
             doc_type=doc_type,
+            doc_type_key=doc_type_key,
             period=period,
             source_document_id=source_document_id,
             stage_name=stage_name,
@@ -239,6 +461,10 @@ async def extract_evidence_quotes(
             batch_quotes,
             metadata={
                 "status": "ok",
+                "cache_version": CACHE_VERSION,
+                "input_hash": input_hash,
+                "span_pruning": span_pruning,
+                "input_span_ids": [span.get("id", "") for span in batch],
                 "span_count": len(batch),
                 "candidate_count": len(candidates),
                 "failed_spans": failed_spans,
@@ -274,9 +500,9 @@ async def extract_evidence_quotes(
             quotes.append(quote)
 
     # Check failure threshold
-    if spans and failed_span_count / len(spans) > 0.5:
+    if eligible_spans and failed_span_count / len(eligible_spans) > 0.5:
         raise PipelineStageError(
-            f"{stage_name}: {failed_span_count}/{len(spans)} spans failed after split retry (>50%)"
+            f"{stage_name}: {failed_span_count}/{len(eligible_spans)} spans failed after split retry (>50%)"
         )
 
     write_jsonl(output_path, quotes)
@@ -368,6 +594,7 @@ async def _extract_batch_with_split_retry(
     failures_path: Path,
     ticker: str,
     doc_type: str,
+    doc_type_key: str,
     period: str,
     source_document_id: str,
     stage_name: str,
@@ -387,7 +614,7 @@ async def _extract_batch_with_split_retry(
             )
             _record_batch_failure(
                 failures_path, ticker, doc_type, period, source_document_id,
-                stage_name, batch_index, batch_span_ids, str(e),
+                doc_type_key, stage_name, batch_index, batch_span_ids, str(e),
             )
             return [], len(batch)
 
@@ -408,6 +635,7 @@ async def _extract_batch_with_split_retry(
             failures_path=failures_path,
             ticker=ticker,
             doc_type=doc_type,
+            doc_type_key=doc_type_key,
             period=period,
             source_document_id=source_document_id,
             stage_name=stage_name,
@@ -419,6 +647,7 @@ async def _extract_batch_with_split_retry(
             failures_path=failures_path,
             ticker=ticker,
             doc_type=doc_type,
+            doc_type_key=doc_type_key,
             period=period,
             source_document_id=source_document_id,
             stage_name=stage_name,
@@ -529,13 +758,13 @@ def _extract_span_section_key(span_id: str) -> str | None:
 
 def _record_batch_failure(
     failures_path: Path, ticker: str, doc_type: str, period: str,
-    source_document_id: str, stage: str, batch_index: int,
+    source_document_id: str, doc_type_key: str, stage: str, batch_index: int,
     input_span_ids: list[str], error_message: str,
 ) -> None:
     from datetime import datetime, timezone
 
     failure = {
-        "id": f"batch_failure:{ticker}:{period}:{DOCUMENT_TYPE_KEY}:{stage}:{batch_index:04d}",
+        "id": f"batch_failure:{ticker}:{period}:{doc_type_key}:{stage}:{batch_index:04d}",
         "type": "BatchFailure",
         "ticker": ticker,
         "document_type": doc_type,

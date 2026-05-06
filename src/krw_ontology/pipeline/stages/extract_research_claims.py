@@ -6,7 +6,7 @@ import json
 import logging
 from pathlib import Path
 
-from krw_ontology.config.constants import DOCUMENT_TYPE_KEY
+from krw_ontology.config.constants import normalize_doc_type
 from krw_ontology.errors import PipelineStageError
 from krw_ontology.extraction.prompts.claim_extraction import (
     CLAIM_EXTRACTION_PROMPT,
@@ -60,7 +60,7 @@ async def extract_research_claims(
 ) -> list[dict]:
     """Extract research claims from evidence quotes in batches with split retry."""
     stage_name = "extract_research_claims"
-    doc_type_key = DOCUMENT_TYPE_KEY
+    doc_type_key = normalize_doc_type(doc_type)
     source_document_id = f"source:{ticker}:{period}:{doc_type_key}"
 
     spans_path = ontology_dir / "spans.jsonl"
@@ -115,6 +115,7 @@ async def extract_research_claims(
             failures_path=failures_path,
             ticker=ticker,
             doc_type=doc_type,
+            doc_type_key=doc_type_key,
             period=period,
             source_document_id=source_document_id,
             stage_name=stage_name,
@@ -238,6 +239,7 @@ async def _extract_batch_with_split_retry(
     failures_path: Path,
     ticker: str,
     doc_type: str,
+    doc_type_key: str,
     period: str,
     source_document_id: str,
     stage_name: str,
@@ -261,7 +263,7 @@ async def _extract_batch_with_split_retry(
             )
             _record_batch_failure(
                 failures_path, ticker, doc_type, period, source_document_id,
-                stage_name, batch_index, span_ids, str(e),
+                doc_type_key, stage_name, batch_index, span_ids, str(e),
             )
             return [], len(batch_quotes)
 
@@ -284,6 +286,7 @@ async def _extract_batch_with_split_retry(
             failures_path=failures_path,
             ticker=ticker,
             doc_type=doc_type,
+            doc_type_key=doc_type_key,
             period=period,
             source_document_id=source_document_id,
             stage_name=stage_name,
@@ -297,6 +300,7 @@ async def _extract_batch_with_split_retry(
             failures_path=failures_path,
             ticker=ticker,
             doc_type=doc_type,
+            doc_type_key=doc_type_key,
             period=period,
             source_document_id=source_document_id,
             stage_name=stage_name,
@@ -424,13 +428,13 @@ def _load_metrics_list(ontology_dir: Path) -> str:
 
 def _record_batch_failure(
     failures_path: Path, ticker: str, doc_type: str, period: str,
-    source_document_id: str, stage: str, batch_index: int,
+    source_document_id: str, doc_type_key: str, stage: str, batch_index: int,
     input_span_ids: list[str], error_message: str,
 ) -> None:
     from datetime import datetime, timezone
 
     failure = {
-        "id": f"batch_failure:{ticker}:{period}:{DOCUMENT_TYPE_KEY}:{stage}:{batch_index:04d}",
+        "id": f"batch_failure:{ticker}:{period}:{doc_type_key}:{stage}:{batch_index:04d}",
         "type": "BatchFailure",
         "ticker": ticker,
         "document_type": doc_type,

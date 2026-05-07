@@ -16,7 +16,10 @@ def validate_has_support(obj: dict) -> tuple[bool, str | None]:
         "RiskFactor",
         "GrowthDriver",
         "Headwind",
+        "BusinessActivity",
+        "ExternalFactorExposure",
         "AssumptionCandidate",
+        "ChangeEvent",
     ):
         return True, None
 

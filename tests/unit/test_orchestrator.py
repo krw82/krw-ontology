@@ -194,13 +194,56 @@ class TestSectionQualityGate:
         assert ctx["section_quality"]["status"] == "fail"
 
 
+class TestBatchSizeConfig:
+    def test_quote_stage_receives_configured_batch_size(self, tmp_path: Path):
+        config = PipelineConfig(batch_sizes={"quote_extraction": 10})
+        ctx = _make_ctx(
+            tmp_path,
+            period="FY2025",
+            config=config,
+            ontology_dir=tmp_path / "ontology",
+        )
+
+        async def fake_extract_evidence_quotes(**kwargs):
+            assert kwargs["batch_size"] == 10
+            return []
+
+        with patch("krw_ontology.pipeline.orchestrator._make_extraction_worker") as mock_worker, \
+             patch("krw_ontology.pipeline.orchestrator.extract_evidence_quotes", fake_extract_evidence_quotes):
+            mock_worker.return_value = object()
+            _execute_stage("extract_evidence_quotes", ctx)
+
+        assert ctx["quotes"] == []
+
+    def test_claim_stage_receives_configured_batch_size(self, tmp_path: Path):
+        config = PipelineConfig(batch_sizes={"claim_extraction": 12})
+        ctx = _make_ctx(
+            tmp_path,
+            period="FY2025",
+            config=config,
+            ontology_dir=tmp_path / "ontology",
+            quotes=[],
+        )
+
+        async def fake_extract_research_claims(**kwargs):
+            assert kwargs["batch_size"] == 12
+            return []
+
+        with patch("krw_ontology.pipeline.orchestrator._make_extraction_worker") as mock_worker, \
+             patch("krw_ontology.pipeline.orchestrator.extract_research_claims", fake_extract_research_claims):
+            mock_worker.return_value = object()
+            _execute_stage("extract_research_claims", ctx)
+
+        assert ctx["claims"] == []
+
+
 class TestPipelineStages:
     def test_all_stages_are_code_stages(self):
         for stage in PIPELINE_STAGES:
             assert _is_code_stage(stage), f"{stage} not in _is_code_stage"
 
-    def test_seventeen_stages(self):
-        assert len(PIPELINE_STAGES) == 17
+    def test_nineteen_stages(self):
+        assert len(PIPELINE_STAGES) == 19
 
     def test_numeric_evidence_runs_after_quotes_before_claims(self):
         assert PIPELINE_STAGES.index("extract_evidence_quotes") < PIPELINE_STAGES.index("build_numeric_evidence")
@@ -209,3 +252,14 @@ class TestPipelineStages:
     def test_validation_runs_before_and_after_edge_generation(self):
         assert PIPELINE_STAGES.index("validate_ontology") < PIPELINE_STAGES.index("generate_edges")
         assert PIPELINE_STAGES.index("generate_edges") < PIPELINE_STAGES.index("validate_edges")
+
+    def test_business_context_stages_run_after_research_objects_before_assumptions(self):
+        assert PIPELINE_STAGES.index("extract_risks_drivers_headwinds") < PIPELINE_STAGES.index(
+            "extract_business_activities"
+        )
+        assert PIPELINE_STAGES.index("extract_business_activities") < PIPELINE_STAGES.index(
+            "extract_external_factor_exposures"
+        )
+        assert PIPELINE_STAGES.index("extract_external_factor_exposures") < PIPELINE_STAGES.index(
+            "extract_assumption_candidates"
+        )

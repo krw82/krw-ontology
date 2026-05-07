@@ -25,6 +25,8 @@ INDEX_FILE_KEYS = [
     ("risks", "risks.jsonl"),
     ("growth_drivers", "growth_drivers.jsonl"),
     ("headwinds", "headwinds.jsonl"),
+    ("business_activities", "business_activities.jsonl"),
+    ("external_factor_exposures", "external_factor_exposures.jsonl"),
     ("assumption_candidates", "assumption_candidates.jsonl"),
     ("edges", "edges.jsonl"),
     ("xbrl_facts", "xbrl_facts.jsonl"),

@@ -1,4 +1,4 @@
-"""Regression tests for metric edges through the full validator chain."""
+"""Regression tests for redundant metric edges through the validator chain."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from krw_ontology.pipeline.stages.validate_ontology import run_validate_ontology
 from krw_ontology.utils.io import read_jsonl, write_jsonl
 
 
-def test_metric_edge_survives_full_validation(tmp_path: Path):
+def test_metric_edge_is_rejected_by_minimal_graph_whitelist(tmp_path: Path):
     base = {
         "ticker": "AAPL",
         "source_document_id": "source:AAPL:FY2025:10K",
@@ -69,16 +69,22 @@ def test_metric_edge_survives_full_validation(tmp_path: Path):
         "to_id": "metric:revenue",
         "relation_name": "affects",
         "relation_id": "affects_risk",
+        "edge_class": "metric_impact",
+        "evidence_level": "derived",
+        "generation_method": "deterministic_reference",
+        "rationale": "RiskFactor declares impact on revenue.",
         "confidence": "high",
         "review_status": "accepted",
     }])
 
     result = run_validate_ontology(tmp_path)
 
-    assert result["accepted"].get("Edge") == 1
-    assert result["stats"]["total_rejected"] == 0
-    assert read_jsonl(tmp_path / "edges.jsonl")[0]["id"] == edge_id
-    assert not read_jsonl(tmp_path / "rejected_objects.jsonl")
+    assert result["accepted"].get("Edge", 0) == 0
+    assert result["stats"]["total_rejected"] == 1
+    assert read_jsonl(tmp_path / "edges.jsonl") == []
+    rejected = read_jsonl(tmp_path / "rejected_objects.jsonl")
+    assert rejected[0]["id"] == edge_id
+    assert rejected[0]["rejection_stage"] == "relation_validation"
 
 
 def test_pre_edge_validation_ignores_and_clears_stale_edges(tmp_path: Path):

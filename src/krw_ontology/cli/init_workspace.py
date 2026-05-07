@@ -230,6 +230,10 @@ types:
       to_id: {type: string, required: true}
       relation_name: {type: string, required: true}
       relation_id: {type: string, required: true}
+      edge_class: {type: string, required: true}
+      evidence_level: {type: string, required: true}
+      generation_method: {type: string, required: true}
+      rationale: {type: string, required: true}
       confidence: {type: string, enum: ["high", "medium", "low"], required: true}
       review_status: {type: string, enum: ["accepted", "needs_review", "rejected"], default: "accepted"}
       schema_version: {type: string, required: true}
@@ -243,61 +247,126 @@ relations:
     name: contains
     from: SourceDocument
     to: SourceSpan
+    edge_class: source_structure
+    evidence_level: direct
 
   - id: contains_quote
     name: contains_quote
     from: SourceSpan
     to: EvidenceQuote
+    edge_class: evidence
+    evidence_level: direct
 
   - id: has_signal
     name: has_signal
     from: EvidenceQuote
     to: LanguageSignal
+    edge_class: evidence
+    evidence_level: derived
 
   - id: supports
     name: supports
     from: EvidenceQuote
     to: ResearchClaim
+    edge_class: evidence
+    evidence_level: direct
 
   - id: describes_risk
     name: describes_risk
     from: ResearchClaim
     to: RiskFactor
+    edge_class: interpretation
+    evidence_level: derived
 
   - id: describes_driver
     name: describes_driver
     from: ResearchClaim
     to: GrowthDriver
+    edge_class: interpretation
+    evidence_level: derived
 
   - id: describes_headwind
     name: describes_headwind
     from: ResearchClaim
     to: Headwind
+    edge_class: interpretation
+    evidence_level: derived
 
-  - id: affects_risk
-    name: affects
-    from: RiskFactor
-    to: Metric
+  - id: describes_activity
+    name: describes_activity
+    from: ResearchClaim
+    to: BusinessActivity
+    edge_class: interpretation
+    evidence_level: derived
 
-  - id: affects_growth
-    name: affects
-    from: GrowthDriver
-    to: Metric
+  - id: describes_exposure
+    name: describes_exposure
+    from: ResearchClaim
+    to: ExternalFactorExposure
+    edge_class: interpretation
+    evidence_level: derived
 
-  - id: affects_headwind
-    name: affects
-    from: Headwind
-    to: Metric
+  - id: manifests_as
+    name: manifests_as
+    from: ExternalFactorExposure
+    to:
+      - RiskFactor
+      - GrowthDriver
+      - Headwind
+    edge_class: exposure_link
+    evidence_level: derived
 
   - id: supports_assumption
     name: supports_assumption
     from: EvidenceQuote
     to: AssumptionCandidate
+    edge_class: evidence
+    evidence_level: direct
 
   - id: derived_from
     name: derived_from
     from: AssumptionCandidate
     to: ResearchClaim
+    edge_class: interpretation
+    evidence_level: derived
+
+  - id: continues_as
+    name: continues_as
+    from:
+      - BusinessActivity
+      - ExternalFactorExposure
+      - RiskFactor
+      - GrowthDriver
+      - Headwind
+    to:
+      - BusinessActivity
+      - ExternalFactorExposure
+      - RiskFactor
+      - GrowthDriver
+      - Headwind
+    same_type_required: true
+    edge_class: temporal
+    evidence_level: inferred
+
+  - id: supports_change_event
+    name: supports_change_event
+    from: ResearchClaim
+    to: ChangeEvent
+    edge_class: event
+    evidence_level: direct
+
+  - id: affects_object
+    name: affects_object
+    from: ChangeEvent
+    to:
+      - BusinessActivity
+      - ExternalFactorExposure
+      - RiskFactor
+      - GrowthDriver
+      - Headwind
+    edge_class: event
+    evidence_level: derived
+
 """
 
 QUOTE_TYPES_YAML_TEMPLATE = """\
@@ -652,9 +721,21 @@ def init_workspace(schema_dir: Path | None = None) -> None:
         schema_dir = Path("ontology/schema")
 
     schema_dir.mkdir(parents=True, exist_ok=True)
+    source_schema_dir = Path(__file__).resolve().parents[3] / "ontology" / "schema"
+    source_taxonomy_dir = Path(__file__).resolve().parents[3] / "ontology" / "taxonomy"
 
     for filename, template in YAML_TEMPLATES.items():
         filepath = schema_dir / filename
-        filepath.write_text(template)
+        source_path = source_schema_dir / filename
+        if source_path.exists():
+            filepath.write_text(source_path.read_text())
+        else:
+            filepath.write_text(template)
+
+    if source_taxonomy_dir.exists():
+        taxonomy_dir = schema_dir.parent / "taxonomy"
+        taxonomy_dir.mkdir(parents=True, exist_ok=True)
+        for source_path in sorted(source_taxonomy_dir.glob("*.yaml")):
+            (taxonomy_dir / source_path.name).write_text(source_path.read_text())
 
     typer.echo(f"Workspace initialized. Schema configs written to {schema_dir}/")

@@ -5,6 +5,9 @@ from __future__ import annotations
 import asyncio
 import json
 
+import pytest
+
+from krw_ontology.errors import PipelineStageError, RateLimitError
 from krw_ontology.pipeline.stages.extract_evidence_quotes import (
     _build_quote_candidates,
     _filter_spans_for_quote_extraction,
@@ -328,3 +331,59 @@ def test_extract_evidence_quotes_splits_failed_batch(tmp_path):
     assert worker.calls == [2, 1, 1]
     assert len(quotes) == 2
     assert not read_jsonl(ontology_dir / "batch_failures.jsonl")
+
+
+def test_extract_evidence_quotes_does_not_split_rate_limited_batch(tmp_path):
+    ontology_dir = tmp_path / "ontology"
+    spans = []
+    for idx in range(2):
+        span_text = (
+            f"The Company faces intense competition in market {idx}, which could "
+            "adversely affect sales and margins over time."
+        )
+        spans.append({
+            "id": f"span:AAPL:FY2025:10K:item1a:{idx:04d}",
+            "type": "SourceSpan",
+            "ticker": "AAPL",
+            "source_document_id": "source:AAPL:FY2025:10K",
+            "document_type": "10-K",
+            "period": "FY2025",
+            "section_name": "item1a",
+            "section_number": "1A",
+            "span_index": idx,
+            "start_char": idx * 1000,
+            "end_char": idx * 1000 + len(span_text),
+            "text": span_text,
+            "text_hash": "sha256:test",
+            "char_count": len(span_text),
+            "section_detection_confidence": "high",
+            "section_detection_method": "test",
+            "schema_version": "0.1.0",
+        })
+    write_jsonl(ontology_dir / "spans.jsonl", spans)
+
+    class FakeWorker:
+        def __init__(self):
+            self.calls = []
+
+        async def extract(self, prompt_template, input_data, output_schema, stage_name):
+            candidates = json.loads(input_data["candidates_json"])
+            self.calls.append(len(candidates))
+            raise RateLimitError("HTTP 429 too many requests")
+
+    worker = FakeWorker()
+    with pytest.raises(PipelineStageError):
+        asyncio.run(
+            extract_evidence_quotes(
+                worker=worker,
+                ontology_dir=ontology_dir,
+                ticker="AAPL",
+                period="FY2025",
+                doc_type="10-K",
+            )
+        )
+
+    failures = read_jsonl(ontology_dir / "batch_failures.jsonl")
+    assert worker.calls == [2]
+    assert len(failures) == 1
+    assert failures[0]["error_type"] == "RateLimitError"

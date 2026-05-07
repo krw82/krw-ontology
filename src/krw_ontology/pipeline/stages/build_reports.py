@@ -22,6 +22,8 @@ _ARTIFACT_FILES = {
     "risks": "risks.jsonl",
     "growth_drivers": "growth_drivers.jsonl",
     "headwinds": "headwinds.jsonl",
+    "business_activities": "business_activities.jsonl",
+    "external_factor_exposures": "external_factor_exposures.jsonl",
     "modeling_cues": "assumption_candidates.jsonl",
     "edges": "edges.jsonl",
     "xbrl_facts": "xbrl_facts.jsonl",
@@ -93,6 +95,8 @@ def _render_graph_report(
         f"- Risks: {counts['risks']}",
         f"- Growth drivers: {counts['growth_drivers']}",
         f"- Headwinds: {counts['headwinds']}",
+        f"- Business activities: {counts['business_activities']}",
+        f"- External factor exposures: {counts['external_factor_exposures']}",
         f"- Modeling cues requiring review: {counts['modeling_cues']}",
         f"- Financial metric values: {counts['financial_metric_values']}",
         f"- Derived metric values: {counts['derived_metric_values']}",
@@ -105,6 +109,10 @@ def _render_graph_report(
         "## Sample Risks / Drivers / Headwinds",
         "",
         *_render_items([*data["risks"], *data["growth_drivers"], *data["headwinds"]], "description"),
+        "",
+        "## Sample Business / Exposure Objects",
+        "",
+        *_render_business_and_exposure_items(data["business_activities"], data["external_factor_exposures"]),
         "",
         "## Sample Claims",
         "",
@@ -162,6 +170,28 @@ def _render_items(items: list[dict], text_key: str, limit: int = 8) -> list[str]
     for item in items[:limit]:
         name = item.get("name") or item.get("id", "")
         text = item.get(text_key, "")
+        support = item.get("supported_by_claims") or item.get("supported_by_quotes") or []
+        lines.append(f"- **{name}**: {text}")
+        if support:
+            lines.append(f"  - Support: {', '.join(support[:3])}")
+    return lines
+
+
+def _render_business_and_exposure_items(
+    activities: list[dict],
+    exposures: list[dict],
+    limit: int = 8,
+) -> list[str]:
+    items = [*activities, *exposures]
+    if not items:
+        return ["_None generated._"]
+    lines = []
+    for item in items[:limit]:
+        name = item.get("name") or item.get("factor") or item.get("id", "")
+        if item.get("type") == "ExternalFactorExposure":
+            text = item.get("mechanism", "")
+        else:
+            text = item.get("description", "")
         support = item.get("supported_by_claims") or item.get("supported_by_quotes") or []
         lines.append(f"- **{name}**: {text}")
         if support:

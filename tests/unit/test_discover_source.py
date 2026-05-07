@@ -35,6 +35,20 @@ def _submissions_payload() -> dict:
     }
 
 
+def _quarterly_submissions_payload() -> dict:
+    return {
+        "filings": {
+            "recent": {
+                "form": ["10-Q", "10-Q", "10-Q"],
+                "accessionNumber": ["000-q3", "000-q2", "000-q1"],
+                "filingDate": ["2025-11-01", "2025-08-01", "2025-05-01"],
+                "reportDate": ["2025-09-30", "2025-06-30", "2025-03-31"],
+                "primaryDocument": ["q3.htm", "q2.htm", "q1.htm"],
+            }
+        }
+    }
+
+
 def test_discover_source_uses_matching_period(monkeypatch: pytest.MonkeyPatch):
     def fake_get(*args, **kwargs):
         return _Response(_submissions_payload())
@@ -54,6 +68,25 @@ def test_discover_source_uses_matching_period(monkeypatch: pytest.MonkeyPatch):
     assert result["source_url"].endswith("/older.htm")
 
 
+def test_discover_source_uses_matching_quarter_period(monkeypatch: pytest.MonkeyPatch):
+    def fake_get(*args, **kwargs):
+        return _Response(_quarterly_submissions_payload())
+
+    monkeypatch.setattr(httpx, "get", fake_get)
+
+    result = discover_source(
+        cik="0000320193",
+        document_type="10-Q",
+        latest=False,
+        config=PipelineConfig(),
+        period="FY2025Q2",
+    )
+
+    assert result["accession_number"] == "000-q2"
+    assert result["report_date"] == "2025-06-30"
+    assert result["source_url"].endswith("/q2.htm")
+
+
 def test_discover_source_rejects_missing_period(monkeypatch: pytest.MonkeyPatch):
     def fake_get(*args, **kwargs):
         return _Response(_submissions_payload())
@@ -68,4 +101,3 @@ def test_discover_source_rejects_missing_period(monkeypatch: pytest.MonkeyPatch)
             config=PipelineConfig(),
             period="FY2023",
         )
-

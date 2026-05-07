@@ -291,8 +291,8 @@ max_retries: 3
 retry_base_delay_seconds: 5
 sec_user_agent: "krw-ontology/0.1 contact@example.com"
 batch_sizes:
-  quote_extraction: 20
-  claim_extraction: 15
+  quote_extraction: 10
+  claim_extraction: 12
 max_context_tokens: 180000
 ```
 

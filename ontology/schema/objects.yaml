@@ -88,6 +88,16 @@ types:
       claim_type: {type: string, enum_ref: "claim_types.yaml", required: true}
       supported_by_quotes: {type: array, items: string, required: true, min_items: 1}
       related_metrics: {type: array, items: string, required: false}
+      object_type_hints: {type: array, items: string, required: false, description: "AI semantic hints. Allowed canonical values include RiskFactor, GrowthDriver, Headwind, BusinessActivity, ExternalFactorExposure, ChangeEvent."}
+      theme_hint: {type: string, required: false, description: "Canonical-ish short theme label for grouping related claims."}
+      factor_hint: {type: string, required: false, description: "Canonical external factor candidate, snake_case when possible."}
+      activity_hint: {type: string, required: false, description: "Canonical business activity candidate, snake_case when possible."}
+      benchmark_hint: {type: string, required: false, description: "Named benchmark/index/reference price if directly supported, e.g. Henry Hub."}
+      impact_channels: {type: array, items: string, required: false, description: "Business/financial channels affected by the claim, e.g. revenue, cost_of_revenue, operating_margin."}
+      effect_direction: {type: string, enum: ["positive", "negative", "mixed", "uncertain"], required: false}
+      materiality_hint: {type: string, enum: ["high", "medium", "low", "unknown"], required: false}
+      time_horizon: {type: string, enum: ["short", "medium", "long", "ongoing", "unknown"], required: false}
+      sector_hint: {type: string, required: false}
       confidence: {type: string, enum: ["high", "medium", "low"], required: true}
       review_status: {type: string, enum: ["accepted", "needs_review", "rejected"], default: "accepted"}
       schema_version: {type: string, required: true}
@@ -116,6 +126,58 @@ types:
       review_status: {type: string, enum: ["accepted", "needs_review", "rejected"], default: "accepted"}
       schema_version: {type: string, required: true}
 
+  BusinessActivity:
+    id_pattern: "business_activity:{ticker}:{period}:{doc_type_key}:{slug}"
+    description: "Evidence-backed business activity or operating activity extracted from company filings."
+    fields:
+      id: {type: string, required: true}
+      type: {type: string, enum: ["BusinessActivity"], required: true}
+      ticker: {type: string, required: true}
+      source_document_id: {type: string, required: true}
+      document_type: {type: string, required: true}
+      period: {type: string, required: true}
+      name: {type: string, required: true}
+      activity_type: {type: string, required: true}
+      description: {type: string, required: true}
+      revenue_relevance: {type: string, enum: ["primary", "secondary", "none", "unknown"], default: "unknown"}
+      cost_relevance: {type: string, enum: ["primary", "secondary", "none", "unknown"], default: "unknown"}
+      related_metrics: {type: array, items: string, required: false}
+      sector_tags: {type: array, items: string, required: false}
+      supported_by_claims: {type: array, items: string, required: false}
+      supported_by_quotes: {type: array, items: string, required: false}
+      confidence: {type: string, enum: ["high", "medium", "low"], required: true}
+      review_status: {type: string, enum: ["accepted", "needs_review", "rejected"], default: "accepted"}
+      schema_version: {type: string, required: true}
+
+  ExternalFactorExposure:
+    id_pattern: "external_factor_exposure:{ticker}:{period}:{doc_type_key}:{slug}"
+    description: "Evidence-backed exposure from external factors to operating, financial, or project channels."
+    fields:
+      id: {type: string, required: true}
+      type: {type: string, enum: ["ExternalFactorExposure"], required: true}
+      ticker: {type: string, required: true}
+      source_document_id: {type: string, required: true}
+      document_type: {type: string, required: true}
+      period: {type: string, required: true}
+      factor: {type: string, required: true}
+      factor_category: {type: string, required: true}
+      benchmark: {type: string, required: false}
+      direction: {type: string, enum: ["up", "down", "volatile", "mixed", "unknown"], default: "unknown"}
+      impact_channel: {type: string, required: true}
+      effect_direction: {type: string, enum: ["positive", "negative", "mixed", "uncertain"], default: "uncertain"}
+      mechanism: {type: string, required: true}
+      evidence_grade: {type: string, enum: ["direct", "indirect", "derived", "unsupported", "conflicting", "unknown"], default: "unknown"}
+      materiality: {type: string, enum: ["high", "medium", "low", "unknown"], default: "unknown"}
+      time_horizon: {type: string, enum: ["short", "medium", "long", "unknown"], default: "unknown"}
+      related_business_activities: {type: array, items: string, required: false}
+      related_metrics: {type: array, items: string, required: false}
+      sector_tags: {type: array, items: string, required: false}
+      supported_by_claims: {type: array, items: string, required: false}
+      supported_by_quotes: {type: array, items: string, required: false}
+      confidence: {type: string, enum: ["high", "medium", "low"], required: true}
+      review_status: {type: string, enum: ["accepted", "needs_review", "rejected"], default: "accepted"}
+      schema_version: {type: string, required: true}
+
   AssumptionCandidate:
     id_pattern: "assumption:{ticker}:{period}:{doc_type_key}:{slug}"
     fields:
@@ -135,6 +197,92 @@ types:
       unmapped_metrics: {type: array, items: string, required: false}
       confidence: {type: string, enum: ["high", "medium", "low"], required: true}
       review_status: {type: string, enum: ["accepted", "needs_review", "rejected"], default: "needs_review"}
+      schema_version: {type: string, required: true}
+
+  CompanyBusinessProfile:
+    id_pattern: "company_business_profile:{ticker}:ALL"
+    description: "Company-level profile summarizing business activities, revenue/cost sources, external factors, and uncertainties."
+    fields:
+      id: {type: string, required: true}
+      type: {type: string, enum: ["CompanyBusinessProfile"], required: true}
+      ticker: {type: string, required: true}
+      source_document_id: {type: string, required: true}
+      document_type: {type: string, required: true}
+      period: {type: string, required: true}
+      sector: {type: string, required: true}
+      business_model_summary: {type: string, required: true}
+      primary_business_activities: {type: array, items: string, required: false}
+      primary_revenue_sources: {type: array, items: string, required: false}
+      primary_cost_sources: {type: array, items: string, required: false}
+      key_external_factors: {type: array, items: string, required: false}
+      key_exposures: {type: array, items: string, required: false}
+      key_metrics: {type: array, items: string, required: false}
+      key_uncertainties: {type: array, items: string, required: false}
+      source_object_ids: {type: array, items: string, required: false}
+      confidence: {type: string, enum: ["high", "medium", "low"], required: true}
+      review_status: {type: string, enum: ["accepted", "needs_review", "rejected"], default: "accepted"}
+      schema_version: {type: string, required: true}
+
+  TemporalLink:
+    id_pattern: "temporal_link:{ticker}:ALL:{hash12}"
+    description: "Company-level link between comparable objects across periods."
+    fields:
+      id: {type: string, required: true}
+      type: {type: string, enum: ["TemporalLink"], required: true}
+      ticker: {type: string, required: true}
+      source_document_id: {type: string, required: true}
+      document_type: {type: string, required: true}
+      period: {type: string, required: true}
+      from_object_id: {type: string, required: true}
+      to_object_id: {type: string, required: true}
+      from_period: {type: string, required: true}
+      to_period: {type: string, required: true}
+      relation: {type: string, required: true}
+      rationale: {type: string, required: true}
+      confidence: {type: string, enum: ["high", "medium", "low"], required: true}
+      review_status: {type: string, enum: ["accepted", "needs_review", "rejected"], default: "accepted"}
+      schema_version: {type: string, required: true}
+
+  TrendObservation:
+    id_pattern: "trend_observation:{ticker}:ALL:{hash12}"
+    description: "Company-level metric or factor trend observed across periods."
+    fields:
+      id: {type: string, required: true}
+      type: {type: string, enum: ["TrendObservation"], required: true}
+      ticker: {type: string, required: true}
+      source_document_id: {type: string, required: true}
+      document_type: {type: string, required: true}
+      period: {type: string, required: true}
+      subject: {type: string, required: true}
+      metric_or_factor: {type: string, required: true}
+      from_period: {type: string, required: true}
+      to_period: {type: string, required: true}
+      direction: {type: string, enum: ["up", "down", "flat", "mixed", "unknown"], required: true}
+      magnitude_text: {type: string, required: false}
+      interpretation: {type: string, required: true}
+      supported_by_objects: {type: array, items: string, required: true}
+      confidence: {type: string, enum: ["high", "medium", "low"], required: true}
+      review_status: {type: string, enum: ["accepted", "needs_review", "rejected"], default: "accepted"}
+      schema_version: {type: string, required: true}
+
+  ChangeEvent:
+    id_pattern: "change_event:{ticker}:{period}:{hash12}"
+    description: "Company-level event extracted from evidence-backed claims across filings."
+    fields:
+      id: {type: string, required: true}
+      type: {type: string, enum: ["ChangeEvent"], required: true}
+      ticker: {type: string, required: true}
+      source_document_id: {type: string, required: true}
+      document_type: {type: string, required: true}
+      period: {type: string, required: true}
+      event_type: {type: string, required: true}
+      event_date: {type: string, required: false}
+      description: {type: string, required: true}
+      affected_objects: {type: array, items: string, required: false}
+      supported_by_claims: {type: array, items: string, required: false}
+      supported_by_quotes: {type: array, items: string, required: false}
+      confidence: {type: string, enum: ["high", "medium", "low"], required: true}
+      review_status: {type: string, enum: ["accepted", "needs_review", "rejected"], default: "accepted"}
       schema_version: {type: string, required: true}
 
   Metric:
@@ -262,6 +410,10 @@ types:
       to_id: {type: string, required: true}
       relation_name: {type: string, required: true}
       relation_id: {type: string, required: true}
+      edge_class: {type: string, required: true, description: "Semantic class of the edge, e.g. evidence, interpretation, metric_impact, business_model, exposure_link, temporal, event, summary."}
+      evidence_level: {type: string, required: true, description: "Support strength for the edge, e.g. direct, derived, inferred, summary."}
+      generation_method: {type: string, required: true, description: "Deterministic or AI-assisted method that produced this edge."}
+      rationale: {type: string, required: true, description: "Short reason explaining why this edge exists."}
       confidence: {type: string, enum: ["high", "medium", "low"], required: true}
       review_status: {type: string, enum: ["accepted", "needs_review", "rejected"], default: "accepted"}
       schema_version: {type: string, required: true}

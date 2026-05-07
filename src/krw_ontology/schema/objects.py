@@ -102,6 +102,16 @@ class ResearchClaim(BaseModel):
     claim_type: str
     supported_by_quotes: list[str] = Field(min_length=1)
     related_metrics: list[str] | None = None
+    object_type_hints: list[str] | None = None
+    theme_hint: str | None = None
+    factor_hint: str | None = None
+    activity_hint: str | None = None
+    benchmark_hint: str | None = None
+    impact_channels: list[str] | None = None
+    effect_direction: str | None = None
+    materiality_hint: str | None = None
+    time_horizon: str | None = None
+    sector_hint: str | None = None
     confidence: str
     review_status: str = "accepted"
     schema_version: str = SCHEMA_VERSION
@@ -124,6 +134,54 @@ class ResearchObject(BaseModel):
     unmapped_impacts: list[str] | None = None
     unmapped_metrics: list[str] | None = None
     qualitative_impact: str
+    confidence: str
+    review_status: str = "accepted"
+    schema_version: str = SCHEMA_VERSION
+
+
+class BusinessActivity(BaseModel):
+    id: str
+    type: str = "BusinessActivity"
+    ticker: str
+    source_document_id: str
+    document_type: str
+    period: str
+    name: str
+    activity_type: str
+    description: str
+    revenue_relevance: str = "unknown"
+    cost_relevance: str = "unknown"
+    related_metrics: list[str] | None = None
+    sector_tags: list[str] | None = None
+    supported_by_claims: list[str] | None = None
+    supported_by_quotes: list[str] | None = None
+    confidence: str
+    review_status: str = "accepted"
+    schema_version: str = SCHEMA_VERSION
+
+
+class ExternalFactorExposure(BaseModel):
+    id: str
+    type: str = "ExternalFactorExposure"
+    ticker: str
+    source_document_id: str
+    document_type: str
+    period: str
+    factor: str
+    factor_category: str
+    benchmark: str | None = None
+    direction: str = "unknown"
+    impact_channel: str
+    effect_direction: str = "uncertain"
+    mechanism: str
+    evidence_grade: str = "unknown"
+    materiality: str = "unknown"
+    time_horizon: str = "unknown"
+    related_business_activities: list[str] | None = None
+    related_metrics: list[str] | None = None
+    sector_tags: list[str] | None = None
+    supported_by_claims: list[str] | None = None
+    supported_by_quotes: list[str] | None = None
     confidence: str
     review_status: str = "accepted"
     schema_version: str = SCHEMA_VERSION
@@ -253,6 +311,84 @@ class CalculatedNumericSupport(BaseModel):
     schema_version: str = SCHEMA_VERSION
 
 
+class CompanyBusinessProfile(BaseModel):
+    id: str
+    type: str = "CompanyBusinessProfile"
+    ticker: str
+    source_document_id: str
+    document_type: str
+    period: str
+    sector: str
+    business_model_summary: str
+    primary_business_activities: list[str] | None = None
+    primary_revenue_sources: list[str] | None = None
+    primary_cost_sources: list[str] | None = None
+    key_external_factors: list[str] | None = None
+    key_exposures: list[str] | None = None
+    key_metrics: list[str] | None = None
+    key_uncertainties: list[str] | None = None
+    source_object_ids: list[str] | None = None
+    confidence: str
+    review_status: str = "accepted"
+    schema_version: str = SCHEMA_VERSION
+
+
+class TemporalLink(BaseModel):
+    id: str
+    type: str = "TemporalLink"
+    ticker: str
+    source_document_id: str
+    document_type: str
+    period: str
+    from_object_id: str
+    to_object_id: str
+    from_period: str
+    to_period: str
+    relation: str
+    rationale: str
+    confidence: str
+    review_status: str = "accepted"
+    schema_version: str = SCHEMA_VERSION
+
+
+class TrendObservation(BaseModel):
+    id: str
+    type: str = "TrendObservation"
+    ticker: str
+    source_document_id: str
+    document_type: str
+    period: str
+    subject: str
+    metric_or_factor: str
+    from_period: str
+    to_period: str
+    direction: str
+    magnitude_text: str | None = None
+    interpretation: str
+    supported_by_objects: list[str]
+    confidence: str
+    review_status: str = "accepted"
+    schema_version: str = SCHEMA_VERSION
+
+
+class ChangeEvent(BaseModel):
+    id: str
+    type: str = "ChangeEvent"
+    ticker: str
+    source_document_id: str
+    document_type: str
+    period: str
+    event_type: str
+    event_date: str | None = None
+    description: str
+    affected_objects: list[str] | None = None
+    supported_by_claims: list[str] | None = None
+    supported_by_quotes: list[str] | None = None
+    confidence: str
+    review_status: str = "accepted"
+    schema_version: str = SCHEMA_VERSION
+
+
 class Edge(BaseModel):
     id: str
     type: str = "Edge"
@@ -264,6 +400,10 @@ class Edge(BaseModel):
     to_id: str
     relation_name: str
     relation_id: str
+    edge_class: str | None = None
+    evidence_level: str | None = None
+    generation_method: str | None = None
+    rationale: str | None = None
     confidence: str
     review_status: str = "accepted"
     schema_version: str = SCHEMA_VERSION
@@ -279,6 +419,8 @@ OBJECT_TYPE_MODELS = {
     "RiskFactor": ResearchObject,
     "GrowthDriver": ResearchObject,
     "Headwind": ResearchObject,
+    "BusinessActivity": BusinessActivity,
+    "ExternalFactorExposure": ExternalFactorExposure,
     "AssumptionCandidate": AssumptionCandidate,
     "Metric": Metric,
     "XBRLFact": XBRLFact,
@@ -286,5 +428,9 @@ OBJECT_TYPE_MODELS = {
     "DerivedMetricValue": DerivedMetricValue,
     "NumericEvidence": NumericEvidence,
     "CalculatedNumericSupport": CalculatedNumericSupport,
+    "CompanyBusinessProfile": CompanyBusinessProfile,
+    "TemporalLink": TemporalLink,
+    "TrendObservation": TrendObservation,
+    "ChangeEvent": ChangeEvent,
     "Edge": Edge,
 }

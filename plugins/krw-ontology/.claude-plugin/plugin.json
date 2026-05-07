@@ -1,0 +1,38 @@
+{
+  "name": "krw-ontology",
+  "version": "0.1.0",
+  "description": "Source-grounded equity research ontology tools for 10-K and 10-Q evidence retrieval.",
+  "author": {
+    "name": "Jeong Woncheol",
+    "email": "local@example.com",
+    "url": "file://~/krw-ontology"
+  },
+  "homepage": "file://~/krw-ontology",
+  "repository": "file://~/krw-ontology",
+  "license": "UNLICENSED",
+  "keywords": [
+    "ontology",
+    "equity-research",
+    "sec-filings",
+    "mcp"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "KRW Ontology",
+    "shortDescription": "Query source-grounded 10-K and 10-Q ontology evidence.",
+    "longDescription": "Provides read-only MCP tools and agent guidance for querying KRW ontology data, tracing claims to quotes and spans, inspecting quality signals, and comparing companies.",
+    "developerName": "Jeong Woncheol",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "Read"
+    ],
+    "defaultPrompt": [
+      "Find VG 10-K evidence for revenue growth.",
+      "Trace this ontology object to source quotes.",
+      "Compare VG and XOM capex evidence."
+    ],
+    "brandColor": "#2563EB"
+  }
+}

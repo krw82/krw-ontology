@@ -25,10 +25,19 @@ def validate_edge(
 ) -> tuple[bool, str | None]:
     """Check Edge endpoints and relation fields match the whitelist.
 
-    All four fields must match: relation_id, relation_name, from type, to type.
+    Relation identity, endpoint types, and edge metadata must match the
+    whitelist. Endpoint specs can be a single type or a list of allowed types.
     """
     if edge.get("type") != "Edge":
         return True, None
+
+    missing_metadata = [
+        field
+        for field in ("edge_class", "evidence_level", "generation_method", "rationale")
+        if not edge.get(field)
+    ]
+    if missing_metadata:
+        return False, f"Edge missing required metadata fields: {missing_metadata}"
 
     from_id = edge.get("from_id", "")
     to_id = edge.get("to_id", "")
@@ -47,15 +56,35 @@ def validate_edge(
     relation_id = edge.get("relation_id", "")
 
     for rel in relations_whitelist:
-        if (
-            rel["id"] == relation_id
-            and rel["name"] == relation_name
-            and rel["from"] == from_type
-            and rel["to"] == to_type
-        ):
+        if rel.get("id") != relation_id or rel.get("name") != relation_name:
+            continue
+        if from_type not in _allowed_types(rel.get("from")):
+            continue
+        if to_type not in _allowed_types(rel.get("to")):
+            continue
+        if rel.get("same_type_required") and from_type != to_type:
+            return False, (
+                f"Edge relation ({relation_id}/{relation_name}) requires same endpoint type, "
+                f"got {from_type} -> {to_type}"
+            )
+        for field in ("edge_class", "evidence_level"):
+            expected = rel.get(field)
+            if expected and edge.get(field) != expected:
+                return False, (
+                    f"Edge relation ({relation_id}/{relation_name}) has {field}="
+                    f"{edge.get(field)!r}; expected {expected!r}"
+                )
             return True, None
 
     return False, (
         f"Edge relation ({relation_id}/{relation_name}) "
         f"from {from_type} to {to_type} not in whitelist"
     )
+
+
+def _allowed_types(spec: object) -> set[str]:
+    if isinstance(spec, str):
+        return {spec}
+    if isinstance(spec, list):
+        return {str(item) for item in spec}
+    return set()

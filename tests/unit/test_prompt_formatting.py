@@ -24,6 +24,7 @@ def test_claim_prompt_formats_with_structured_output_example():
         quotes_json="[]",
         claim_types="factual",
         metrics_list="revenue",
+        factor_taxonomy_list="- natural_gas_price",
     )
     assert '{"items":' in rendered
     assert "Do NOT calculate new numbers" in rendered

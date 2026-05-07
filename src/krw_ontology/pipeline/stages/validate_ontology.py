@@ -22,6 +22,7 @@ from krw_ontology.validators.relation_validator import (
     validate_edge,
     _load_relations,
 )
+from krw_ontology.validators.evidence_grade import apply_evidence_grade
 
 logger = logging.getLogger("krw_ontology")
 LOG_EXTRA = {"stage": "validate_ontology"}
@@ -35,6 +36,8 @@ _JSONL_FILES: dict[str, str] = {
     "RiskFactor": "risks.jsonl",
     "GrowthDriver": "growth_drivers.jsonl",
     "Headwind": "headwinds.jsonl",
+    "BusinessActivity": "business_activities.jsonl",
+    "ExternalFactorExposure": "external_factor_exposures.jsonl",
     "AssumptionCandidate": "assumption_candidates.jsonl",
     "Edge": "edges.jsonl",
     "XBRLFact": "xbrl_facts.jsonl",
@@ -42,6 +45,10 @@ _JSONL_FILES: dict[str, str] = {
     "DerivedMetricValue": "derived_metric_values.jsonl",
     "NumericEvidence": "numeric_evidence.jsonl",
     "CalculatedNumericSupport": "calculated_numeric_support.jsonl",
+    "CompanyBusinessProfile": "company_business_profiles.jsonl",
+    "TemporalLink": "temporal_links.jsonl",
+    "TrendObservation": "trend_observations.jsonl",
+    "ChangeEvent": "change_events.jsonl",
 }
 
 # Filename mapping for writing accepted objects back
@@ -53,6 +60,8 @@ _ACCEPTED_FILES: dict[str, str] = {
     "RiskFactor": "risks.jsonl",
     "GrowthDriver": "growth_drivers.jsonl",
     "Headwind": "headwinds.jsonl",
+    "BusinessActivity": "business_activities.jsonl",
+    "ExternalFactorExposure": "external_factor_exposures.jsonl",
     "AssumptionCandidate": "assumption_candidates.jsonl",
     "Edge": "edges.jsonl",
     "XBRLFact": "xbrl_facts.jsonl",
@@ -60,6 +69,10 @@ _ACCEPTED_FILES: dict[str, str] = {
     "DerivedMetricValue": "derived_metric_values.jsonl",
     "NumericEvidence": "numeric_evidence.jsonl",
     "CalculatedNumericSupport": "calculated_numeric_support.jsonl",
+    "CompanyBusinessProfile": "company_business_profiles.jsonl",
+    "TemporalLink": "temporal_links.jsonl",
+    "TrendObservation": "trend_observations.jsonl",
+    "ChangeEvent": "change_events.jsonl",
 }
 
 
@@ -144,7 +157,15 @@ def _prune_dangling_supports(accepted: dict[str, dict]) -> list[dict]:
             if quotes != (obj.get("supported_by_quotes") or []):
                 obj["supported_by_quotes"] = quotes
                 pruned.append(obj)
-        if obj_type in ("RiskFactor", "GrowthDriver", "Headwind", "AssumptionCandidate"):
+        if obj_type in (
+            "RiskFactor",
+            "GrowthDriver",
+            "Headwind",
+            "BusinessActivity",
+            "ExternalFactorExposure",
+            "AssumptionCandidate",
+            "ChangeEvent",
+        ):
             claims = [cid for cid in obj.get("supported_by_claims") or [] if cid in valid_ids]
             quotes = [qid for qid in obj.get("supported_by_quotes") or [] if qid in valid_ids]
             if claims != (obj.get("supported_by_claims") or []) or quotes != (obj.get("supported_by_quotes") or []):
@@ -264,6 +285,10 @@ def run_validate_ontology(ontology_dir: Path, *, include_edges: bool = True) -> 
     # --- Stage 5: Metric validation (modifies objects in place, never rejects) ---
     for obj_id, obj in accepted.items():
         validate_metric_fields(obj, canonical_metrics)
+
+    # --- Stage 5b: Evidence grading (modifies objects in place, never rejects) ---
+    for obj in accepted.values():
+        apply_evidence_grade(obj, accepted)
 
     # --- Stage 6: Numeric guard ---
     xbrl_facts = _get_xbrl_facts(accepted)

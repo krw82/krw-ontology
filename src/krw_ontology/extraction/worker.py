@@ -13,7 +13,7 @@ from typing import Any
 from claude_agent_sdk import ClaudeAgentOptions
 from claude_agent_sdk._internal.transport.subprocess_cli import SubprocessCLITransport
 
-from krw_ontology.errors import ExtractionError
+from krw_ontology.errors import ExtractionError, RateLimitError
 from krw_ontology.extraction.schemas import STAGE_OUTPUT_MODELS
 
 logger = logging.getLogger("krw_ontology")
@@ -68,6 +68,18 @@ class ExtractionWorker:
         for attempt in range(self.max_retries):
             try:
                 return await self._call_once(prompt_text, sdk_schema, stage_name)
+            except RateLimitError as e:
+                if attempt < self.max_retries - 1:
+                    sleep_for = min(delay, _MAX_DELAY) + random.uniform(0, min(delay, _MAX_DELAY))
+                    logger.warning(
+                        f"{stage_name} attempt {attempt + 1}/{self.max_retries} rate limited: {e}. "
+                        f"Retrying same request in {sleep_for:.1f}s",
+                        extra={"stage": stage_name, "rate_limited": True},
+                    )
+                    await asyncio.sleep(sleep_for)
+                    delay = min(delay * 2, _MAX_DELAY)
+                else:
+                    raise
             except ExtractionError:
                 raise
             except Exception as e:
@@ -138,9 +150,14 @@ class ExtractionWorker:
         stdout_text = stdout.decode(errors="replace").strip()
         stderr_text = stderr.decode(errors="replace").strip()
         if proc.returncode != 0:
+            message = stderr_text or stdout_text[:500]
+            if _is_rate_limit_message(message):
+                raise RateLimitError(
+                    f"{stage_name}: Claude CLI rate limited: {message}"
+                )
             raise ExtractionError(
                 f"{stage_name}: Claude CLI exited {proc.returncode}: "
-                f"{stderr_text or stdout_text[:500]}"
+                f"{message}"
             )
         if not stdout_text:
             raise ExtractionError(f"{stage_name}: empty response from Claude CLI")
@@ -154,6 +171,9 @@ class ExtractionWorker:
             ) from e
 
         if data.get("is_error"):
+            message = str(data.get("subtype") or data)
+            if _is_rate_limit_message(message):
+                raise RateLimitError(f"{stage_name}: Claude CLI rate limited: {message}")
             raise ExtractionError(f"{stage_name}: Claude CLI result error: {data.get('subtype')}")
         if "structured_output" in data:
             return data["structured_output"]
@@ -175,6 +195,20 @@ def _wrap_items_schema(item_schema: dict) -> dict:
         "required": ["items"],
         "additionalProperties": False,
     }
+
+
+def _is_rate_limit_message(message: str) -> bool:
+    text = str(message or "").lower()
+    return any(
+        token in text
+        for token in (
+            "429",
+            "rate limit",
+            "rate_limit",
+            "too many requests",
+            "overloaded",
+        )
+    )
 
 
 def parse_structured_output(

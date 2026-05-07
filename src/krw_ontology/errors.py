@@ -13,6 +13,10 @@ class ExtractionError(KrwOntologyError):
     """AI extraction failed after all retries."""
 
 
+class RateLimitError(ExtractionError):
+    """AI provider rejected the request due to rate limiting or overload."""
+
+
 class ValidationError(KrwOntologyError):
     """Validation found issues with extracted objects."""
 

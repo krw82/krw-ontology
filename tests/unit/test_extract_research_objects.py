@@ -70,3 +70,40 @@ def test_extract_research_objects_batches_claims_and_merges(tmp_path):
         "claim:AAPL:FY2025:10K:c8",
     ]
     assert len(read_jsonl(ontology_dir / "headwinds.jsonl")) == 1
+
+
+def test_extract_research_objects_prefers_claim_semantic_hints(tmp_path):
+    ontology_dir = tmp_path / "ontology"
+    claims = [
+        {
+            "id": "claim:AAPL:FY2025:10K:hinted",
+            "type": "ResearchClaim",
+            "claim_text": "The filing describes a customer adoption signal.",
+            "claim_type": "factual",
+            "object_type_hints": ["GrowthDriver"],
+            "theme_hint": "services_customer_adoption",
+            "factor_hint": "end_market_demand",
+            "impact_channels": ["revenue"],
+            "effect_direction": "positive",
+            "materiality_hint": "medium",
+            "supported_by_quotes": ["quote:AAPL:FY2025:10K:q1"],
+            "confidence": "high",
+        }
+    ]
+    write_jsonl(ontology_dir / "claims.jsonl", claims)
+    write_jsonl(ontology_dir / "evidence_quotes.jsonl", [])
+
+    result = asyncio.run(
+        extract_risks_drivers_headwinds(
+            worker=None,
+            ontology_dir=ontology_dir,
+            ticker="AAPL",
+            period="FY2025",
+            doc_type="10-K",
+        )
+    )
+
+    assert not result["risks"]
+    assert result["growth_drivers"][0]["name"] == "Services Customer Adoption growth driver"
+    assert result["growth_drivers"][0]["category"] == "end_market_demand"
+    assert result["growth_drivers"][0]["qualitative_impact"] == "medium_positive"

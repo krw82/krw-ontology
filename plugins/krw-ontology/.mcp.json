@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "krw-ontology": {
+      "command": "uv",
+      "args": [
+        "--directory",
+        "~/krw-ontology",
+        "run",
+        "krw-ontology-mcp"
+      ],
+      "env": {
+        "KRW_ONTOLOGY_ROOT": "~/krw-ontology-data"
+      }
+    }
+  }
+}

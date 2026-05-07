@@ -13,6 +13,7 @@ dependencies = [
     "claude-agent-sdk",
     "pyyaml>=6.0",
     "rich>=13.0",
+    "mcp>=1.0",
 ]
 
 [project.optional-dependencies]
@@ -25,6 +26,7 @@ dev = [
 
 [project.scripts]
 krw-ontology = "krw_ontology.cli.main:app"
+krw-ontology-mcp = "krw_ontology.mcp_server.server:main"
 
 [build-system]
 requires = ["hatchling"]

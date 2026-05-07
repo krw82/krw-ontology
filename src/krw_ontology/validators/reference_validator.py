@@ -37,6 +37,18 @@ def validate_references(
             if qid not in all_objects:
                 dangling.append(("supported_by_quotes", qid))
 
+    # Business/exposure objects: supported evidence and local activity links
+    if obj_type in ("BusinessActivity", "ExternalFactorExposure"):
+        for cid in obj.get("supported_by_claims") or []:
+            if cid not in all_objects:
+                dangling.append(("supported_by_claims", cid))
+        for qid in obj.get("supported_by_quotes") or []:
+            if qid not in all_objects:
+                dangling.append(("supported_by_quotes", qid))
+        for activity_id in obj.get("related_business_activities") or []:
+            if activity_id not in all_objects:
+                dangling.append(("related_business_activities", activity_id))
+
     # AssumptionCandidate: supported_by_claims and supported_by_quotes
     if obj_type == "AssumptionCandidate":
         for cid in obj.get("supported_by_claims") or []:
@@ -57,6 +69,38 @@ def validate_references(
         for input_id in obj.get("input_object_ids") or []:
             if input_id not in all_objects:
                 dangling.append(("input_object_ids", input_id))
+
+    # ChangeEvent can be document-scoped; company-level temporal events are
+    # generated after document validation and are indexed separately.
+    if obj_type == "ChangeEvent":
+        for cid in obj.get("supported_by_claims") or []:
+            if cid not in all_objects:
+                dangling.append(("supported_by_claims", cid))
+        for qid in obj.get("supported_by_quotes") or []:
+            if qid not in all_objects:
+                dangling.append(("supported_by_quotes", qid))
+        for affected_id in obj.get("affected_objects") or []:
+            if affected_id not in all_objects:
+                dangling.append(("affected_objects", affected_id))
+
+    if obj_type == "CompanyBusinessProfile":
+        for source_id in obj.get("source_object_ids") or []:
+            if source_id not in all_objects:
+                dangling.append(("source_object_ids", source_id))
+        for exposure_id in obj.get("key_exposures") or []:
+            if exposure_id not in all_objects:
+                dangling.append(("key_exposures", exposure_id))
+
+    if obj_type == "TemporalLink":
+        for field in ("from_object_id", "to_object_id"):
+            ref_id = obj.get(field)
+            if ref_id and ref_id not in all_objects:
+                dangling.append((field, ref_id))
+
+    if obj_type == "TrendObservation":
+        for ref_id in obj.get("supported_by_objects") or []:
+            if ref_id not in all_objects:
+                dangling.append(("supported_by_objects", ref_id))
 
     # NumericEvidence: source object and optional inputs must exist
     if obj_type == "NumericEvidence":

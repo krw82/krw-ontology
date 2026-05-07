@@ -5,7 +5,10 @@ from __future__ import annotations
 import asyncio
 import json
 
+import pytest
+
 import krw_ontology.extraction.worker as worker_module
+from krw_ontology.errors import RateLimitError
 from krw_ontology.extraction.worker import ExtractionWorker
 from krw_ontology.extraction.worker import (
     parse_structured_output,
@@ -177,9 +180,108 @@ def test_extract_uses_claude_cli_structured_output(monkeypatch, tmp_path):
             "claim_type": "financial_performance",
             "supported_by_quotes": ["quote:1"],
             "related_metrics": None,
+            "object_type_hints": None,
+            "theme_hint": None,
+            "factor_hint": None,
+            "activity_hint": None,
+            "benchmark_hint": None,
+            "impact_channels": None,
+            "effect_direction": None,
+            "materiality_hint": None,
+            "time_horizon": None,
+            "sector_hint": None,
             "confidence": "high",
         }
     ]
+
+
+def test_extract_retries_rate_limit_same_request(monkeypatch, tmp_path):
+    calls = {"count": 0}
+    sleeps = []
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+
+    async def fake_call_once(prompt_text, sdk_schema, stage_name):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise RateLimitError("HTTP 429 too many requests")
+        return {
+            "items": [
+                {
+                    "id": "claim:1",
+                    "claim_text": "Revenue increased.",
+                    "claim_type": "factual",
+                    "supported_by_quotes": ["quote:1"],
+                    "confidence": "high",
+                }
+            ]
+        }
+
+    monkeypatch.setattr(worker_module.asyncio, "sleep", fake_sleep)
+    extraction_worker = ExtractionWorker(model="claude-test", cwd=tmp_path)
+    monkeypatch.setattr(extraction_worker, "_call_once", fake_call_once)
+
+    items = asyncio.run(
+        extraction_worker.extract(
+            "Analyze.",
+            {},
+            {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "claim_text": {"type": "string"},
+                    "claim_type": {"type": "string"},
+                    "supported_by_quotes": {"type": "array", "items": {"type": "string"}},
+                    "confidence": {"type": "string"},
+                },
+                "required": ["id", "claim_text", "claim_type", "supported_by_quotes", "confidence"],
+            },
+            "extract_research_claims",
+        )
+    )
+
+    assert calls["count"] == 2
+    assert len(sleeps) == 1
+    assert items[0]["id"] == "claim:1"
+
+
+def test_call_once_classifies_cli_429_as_rate_limit(monkeypatch, tmp_path):
+    class RateLimitedProcess:
+        returncode = 1
+
+        async def communicate(self, stdin):
+            return b"", b"HTTP 429 too many requests"
+
+        def kill(self):
+            pass
+
+        async def wait(self):
+            return self.returncode
+
+    async def fake_create_subprocess_exec(*cmd, **kwargs):
+        return RateLimitedProcess()
+
+    monkeypatch.setattr(
+        worker_module.SubprocessCLITransport,
+        "_find_cli",
+        lambda self: "/bin/claude",
+    )
+    monkeypatch.setattr(
+        worker_module.asyncio,
+        "create_subprocess_exec",
+        fake_create_subprocess_exec,
+    )
+
+    extraction_worker = ExtractionWorker(model="claude-test", cwd=tmp_path)
+    with pytest.raises(RateLimitError):
+        asyncio.run(
+            extraction_worker._call_once(
+                "Analyze.",
+                {"type": "object", "properties": {}, "additionalProperties": False},
+                "extract_research_claims",
+            )
+        )
 
 
 def test_extract_kills_claude_cli_on_timeout(monkeypatch, tmp_path):

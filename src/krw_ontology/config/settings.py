@@ -16,16 +16,20 @@ _DEFAULT_MODEL = "claude-sonnet-4-20250514"
 class PipelineConfig:
     model: str = _DEFAULT_MODEL
     stage_models: dict[str, str] = field(default_factory=dict)
-    ai_concurrency: int = 1
-    stage_concurrency: dict[str, int] = field(default_factory=dict)
-    max_turns: int = 6
-    call_timeout_seconds: int = 180
+    ai_concurrency: int = 10
+    stage_concurrency: dict[str, int] = field(default_factory=lambda: {
+        "extract_evidence_quotes": 10,
+        "extract_research_claims": 10,
+        "extract_assumption_candidates": 10,
+    })
+    max_turns: int = 10
+    call_timeout_seconds: int = 600
     max_retries: int = 3
     retry_base_delay_seconds: int = 5
     sec_user_agent: str = "krw-ontology/0.1 contact@example.com"
     batch_sizes: dict[str, int] = field(default_factory=lambda: {
-        "quote_extraction": 20,
-        "claim_extraction": 15,
+        "quote_extraction": 10,
+        "claim_extraction": 12,
     })
     max_context_tokens: int = 180000
     fail_on_section_quality: bool = False
@@ -54,6 +58,7 @@ class PipelineConfig:
         if env_span_pruning := os.environ.get("KRW_SPAN_PRUNING"):
             config.span_pruning = _parse_span_pruning_mode(env_span_pruning, config.span_pruning)
         _apply_stage_env(config)
+        _apply_batch_size_env(config)
 
         # File-based config
         config_path = _find_config_file()
@@ -110,6 +115,7 @@ class PipelineConfig:
         if env_span_pruning := os.environ.get("KRW_SPAN_PRUNING"):
             config.span_pruning = _parse_span_pruning_mode(env_span_pruning, config.span_pruning)
         _apply_stage_env(config)
+        _apply_batch_size_env(config)
 
         return config
 
@@ -118,6 +124,14 @@ class PipelineConfig:
 
     def concurrency_for_stage(self, stage_name: str) -> int:
         return max(1, int(self.stage_concurrency.get(stage_name, self.ai_concurrency)))
+
+    def batch_size_for_stage(self, stage_name: str, default: int) -> int:
+        key_by_stage = {
+            "extract_evidence_quotes": "quote_extraction",
+            "extract_research_claims": "claim_extraction",
+        }
+        key = key_by_stage.get(stage_name, stage_name)
+        return max(1, int(self.batch_sizes.get(key, default)))
 
 
 def _parse_positive_int(value: str, default: int) -> int:
@@ -179,6 +193,19 @@ def _apply_stage_env(config: PipelineConfig) -> None:
             config.stage_concurrency[stage_name] = _parse_positive_int(
                 concurrency,
                 config.concurrency_for_stage(stage_name),
+            )
+
+
+def _apply_batch_size_env(config: PipelineConfig) -> None:
+    env_keys = {
+        "quote_extraction": "KRW_BATCH_SIZE_QUOTE_EXTRACTION",
+        "claim_extraction": "KRW_BATCH_SIZE_CLAIM_EXTRACTION",
+    }
+    for key, env_name in env_keys.items():
+        if value := os.environ.get(env_name):
+            config.batch_sizes[key] = _parse_positive_int(
+                value,
+                int(config.batch_sizes.get(key, 1)),
             )
 
 

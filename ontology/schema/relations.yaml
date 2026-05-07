@@ -5,58 +5,122 @@ relations:
     name: contains
     from: SourceDocument
     to: SourceSpan
+    edge_class: source_structure
+    evidence_level: direct
 
   - id: contains_quote
     name: contains_quote
     from: SourceSpan
     to: EvidenceQuote
+    edge_class: evidence
+    evidence_level: direct
 
   - id: has_signal
     name: has_signal
     from: EvidenceQuote
     to: LanguageSignal
+    edge_class: evidence
+    evidence_level: derived
 
   - id: supports
     name: supports
     from: EvidenceQuote
     to: ResearchClaim
+    edge_class: evidence
+    evidence_level: direct
 
   - id: describes_risk
     name: describes_risk
     from: ResearchClaim
     to: RiskFactor
+    edge_class: interpretation
+    evidence_level: derived
 
   - id: describes_driver
     name: describes_driver
     from: ResearchClaim
     to: GrowthDriver
+    edge_class: interpretation
+    evidence_level: derived
 
   - id: describes_headwind
     name: describes_headwind
     from: ResearchClaim
     to: Headwind
+    edge_class: interpretation
+    evidence_level: derived
 
-  - id: affects_risk
-    name: affects
-    from: RiskFactor
-    to: Metric
+  - id: describes_activity
+    name: describes_activity
+    from: ResearchClaim
+    to: BusinessActivity
+    edge_class: interpretation
+    evidence_level: derived
 
-  - id: affects_growth
-    name: affects
-    from: GrowthDriver
-    to: Metric
+  - id: describes_exposure
+    name: describes_exposure
+    from: ResearchClaim
+    to: ExternalFactorExposure
+    edge_class: interpretation
+    evidence_level: derived
 
-  - id: affects_headwind
-    name: affects
-    from: Headwind
-    to: Metric
+  - id: manifests_as
+    name: manifests_as
+    from: ExternalFactorExposure
+    to:
+      - RiskFactor
+      - GrowthDriver
+      - Headwind
+    edge_class: exposure_link
+    evidence_level: derived
 
   - id: supports_assumption
     name: supports_assumption
     from: EvidenceQuote
     to: AssumptionCandidate
+    edge_class: evidence
+    evidence_level: direct
 
   - id: derived_from
     name: derived_from
     from: AssumptionCandidate
     to: ResearchClaim
+    edge_class: interpretation
+    evidence_level: derived
+
+  - id: continues_as
+    name: continues_as
+    from:
+      - BusinessActivity
+      - ExternalFactorExposure
+      - RiskFactor
+      - GrowthDriver
+      - Headwind
+    to:
+      - BusinessActivity
+      - ExternalFactorExposure
+      - RiskFactor
+      - GrowthDriver
+      - Headwind
+    same_type_required: true
+    edge_class: temporal
+    evidence_level: inferred
+
+  - id: supports_change_event
+    name: supports_change_event
+    from: ResearchClaim
+    to: ChangeEvent
+    edge_class: event
+    evidence_level: direct
+
+  - id: affects_object
+    name: affects_object
+    from: ChangeEvent
+    to:
+      - BusinessActivity
+      - ExternalFactorExposure
+      - RiskFactor
+      - GrowthDriver
+      - Headwind
+    edge_class: event
+    evidence_level: derived

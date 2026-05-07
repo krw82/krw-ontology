@@ -78,10 +78,13 @@ def test_generate_edges_uses_existing_references_without_sdk(tmp_path: Path):
         "has_signal": 1,
         "supports": 1,
         "describes_risk": 1,
-        "affects_risk": 1,
         "supports_assumption": 1,
         "derived_from": 1,
     }
+    assert all(edge.get("edge_class") for edge in edges)
+    assert all(edge.get("evidence_level") for edge in edges)
+    assert all(edge.get("generation_method") for edge in edges)
+    assert all(edge.get("rationale") for edge in edges)
     assert not read_jsonl(tmp_path / "batch_failures.jsonl")
 
 

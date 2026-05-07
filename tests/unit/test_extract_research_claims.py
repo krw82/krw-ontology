@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from krw_ontology.errors import PipelineStageError
+from krw_ontology.errors import PipelineStageError, RateLimitError
 from krw_ontology.pipeline.stages.extract_research_claims import extract_research_claims
 from krw_ontology.utils.io import read_jsonl, write_jsonl
 
@@ -43,6 +43,8 @@ def test_extract_research_claims_splits_failed_batch(tmp_path: Path):
         async def extract(self, prompt_template, input_data, output_schema, stage_name):
             spans = json.loads(input_data["spans_json"])
             quotes = json.loads(input_data["quotes_json"])
+            assert "natural_gas_price" in input_data["factor_taxonomy_list"]
+            assert "tariff_policy" in input_data["factor_taxonomy_list"]
             self.calls.append(len(quotes))
             if len(quotes) > 1:
                 raise TimeoutError("too large")
@@ -56,6 +58,14 @@ def test_extract_research_claims_splits_failed_batch(tmp_path: Path):
                     "claim_type": "risk_assessment",
                     "supported_by_quotes": [quotes[0]["id"]],
                     "related_metrics": ["revenue"],
+                    "object_type_hints": ["ExternalFactorExposure"],
+                    "theme_hint": "market_conditions_revenue_exposure",
+                    "factor_hint": "end_market_demand",
+                    "activity_hint": "product_sales",
+                    "impact_channels": ["revenue"],
+                    "effect_direction": "negative",
+                    "materiality_hint": "medium",
+                    "time_horizon": "ongoing",
                     "confidence": "high",
                 }
             ]
@@ -73,8 +83,43 @@ def test_extract_research_claims_splits_failed_batch(tmp_path: Path):
 
     assert worker.calls == [2, 1, 1]
     assert len(claims) == 2
+    assert claims[0]["object_type_hints"] == ["ExternalFactorExposure"]
+    assert claims[0]["factor_hint"] == "end_market_demand"
+    assert claims[0]["impact_channels"] == ["revenue"]
+    assert claims[0]["effect_direction"] == "negative"
     assert not read_jsonl(tmp_path / "batch_failures.jsonl")
     assert len(read_jsonl(tmp_path / "claims.jsonl")) == 2
+
+
+def test_extract_research_claims_does_not_split_rate_limited_batch(tmp_path: Path):
+    write_jsonl(tmp_path / "spans.jsonl", [_span(0), _span(1)])
+    write_jsonl(tmp_path / "evidence_quotes.jsonl", [_quote(0), _quote(1)])
+
+    class FakeWorker:
+        def __init__(self):
+            self.calls = []
+
+        async def extract(self, prompt_template, input_data, output_schema, stage_name):
+            quotes = json.loads(input_data["quotes_json"])
+            self.calls.append(len(quotes))
+            raise RateLimitError("HTTP 429 too many requests")
+
+    worker = FakeWorker()
+    with pytest.raises(PipelineStageError):
+        asyncio.run(
+            extract_research_claims(
+                worker=worker,
+                ontology_dir=tmp_path,
+                ticker="AAPL",
+                period="FY2025",
+                doc_type="10-K",
+            )
+        )
+
+    failures = read_jsonl(tmp_path / "batch_failures.jsonl")
+    assert worker.calls == [2]
+    assert len(failures) == 1
+    assert failures[0]["error_type"] == "RateLimitError"
 
 
 def test_extract_research_claims_records_leaf_failure(tmp_path: Path):

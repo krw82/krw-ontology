@@ -38,19 +38,12 @@ def extract_xbrl(
     Returns dict with: facts, output_path, status.
     """
     try:
-        html_content = raw_html_path.read_bytes()
-        soup = BeautifulSoup(html_content, "lxml")
+        xbrl_source_path, soup, ix_tags = _load_inline_xbrl_source(raw_html_path)
     except OSError as e:
         raise PipelineStageError(f"extract_xbrl: cannot read {raw_html_path}: {e}") from e
 
     facts: list[dict] = []
     contexts = _extract_contexts(soup)
-
-    # Find inline XBRL elements: <ix:nonFraction> and <ix:nonNumeric>
-    ix_tags = soup.find_all(re.compile(r"^ix:"))
-    if not ix_tags:
-        # Try namespaced version
-        ix_tags = soup.find_all(re.compile(r"ix:", re.IGNORECASE))
 
     if not ix_tags:
         logger.warning(
@@ -58,7 +51,7 @@ def extract_xbrl(
             extra={"stage": "extract_xbrl_facts", "status": "missing_or_failed"},
         )
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        write_jsonl(output_path, [])
+        _write_empty_xbrl_outputs(output_path)
         return {"facts": [], "output_path": output_path, "status": "missing_or_failed"}
 
     for tag in ix_tags:
@@ -103,7 +96,7 @@ def extract_xbrl(
             "unit": unit_ref,
             "context_ref": context_ref,
             "context": contexts.get(context_ref, {}),
-            "source_filing_detail": str(raw_html_path),
+            "source_filing_detail": str(xbrl_source_path),
             "decimals": _parse_int(decimals),
             "schema_version": SCHEMA_VERSION,
         })
@@ -140,6 +133,59 @@ def extract_xbrl(
         extra={"stage": "extract_xbrl_facts"},
     )
     return {"facts": facts, "output_path": output_path, "status": status}
+
+
+def _load_inline_xbrl_source(raw_html_path: Path) -> tuple[Path, BeautifulSoup, list[Any]]:
+    """Load primary HTML or a sibling filing document that contains inline XBRL."""
+    soup = BeautifulSoup(raw_html_path.read_bytes(), "lxml")
+    ix_tags = _inline_xbrl_tags(soup)
+    if ix_tags:
+        return raw_html_path, soup, ix_tags
+
+    best_path: Path | None = None
+    best_soup: BeautifulSoup | None = None
+    best_tags: list[Any] = []
+    for candidate in _sibling_html_candidates(raw_html_path):
+        candidate_soup = BeautifulSoup(candidate.read_bytes(), "lxml")
+        candidate_tags = _inline_xbrl_tags(candidate_soup)
+        if len(candidate_tags) > len(best_tags):
+            best_path = candidate
+            best_soup = candidate_soup
+            best_tags = candidate_tags
+
+    if best_path and best_soup and best_tags:
+        logger.info(
+            "extract_xbrl: using sibling inline XBRL source %s instead of %s",
+            best_path,
+            raw_html_path,
+            extra={"stage": "extract_xbrl_facts", "xbrl_source_recovered": True},
+        )
+        return best_path, best_soup, best_tags
+    return raw_html_path, soup, ix_tags
+
+
+def _sibling_html_candidates(raw_html_path: Path) -> list[Path]:
+    candidates: list[Path] = []
+    for candidate in sorted(raw_html_path.parent.iterdir()):
+        if candidate == raw_html_path or not candidate.is_file():
+            continue
+        if candidate.suffix.lower() in {".htm", ".html"}:
+            candidates.append(candidate)
+    return candidates
+
+
+def _inline_xbrl_tags(soup: BeautifulSoup) -> list[Any]:
+    # Find inline XBRL elements: <ix:nonFraction> and <ix:nonNumeric>.
+    ix_tags = soup.find_all(re.compile(r"^ix:"))
+    if ix_tags:
+        return ix_tags
+    return soup.find_all(re.compile(r"ix:", re.IGNORECASE))
+
+
+def _write_empty_xbrl_outputs(output_path: Path) -> None:
+    write_jsonl(output_path, [])
+    write_jsonl(output_path.parent / "financial_metric_values.jsonl", [])
+    write_jsonl(output_path.parent / "derived_metric_values.jsonl", [])
 
 
 def _extract_contexts(soup: BeautifulSoup) -> dict[str, dict]:

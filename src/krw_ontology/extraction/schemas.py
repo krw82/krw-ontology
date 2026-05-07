@@ -83,12 +83,31 @@ class ClaimExtractionOutput(BaseModel):
     claim_type: str
     supported_by_quotes: list[str] = Field(min_length=1)
     related_metrics: list[str] | None = None
+    object_type_hints: list[str] | None = None
+    theme_hint: str | None = None
+    factor_hint: str | None = None
+    activity_hint: str | None = None
+    benchmark_hint: str | None = None
+    impact_channels: list[str] | None = None
+    effect_direction: str | None = None
+    materiality_hint: str | None = None
+    time_horizon: str | None = None
+    sector_hint: str | None = None
     confidence: str
 
     @field_validator("confidence", mode="before")
     @classmethod
     def _normalize_confidence(cls, value):
         return _coerce_confidence(value)
+
+    @field_validator("related_metrics", "object_type_hints", "impact_channels", mode="before")
+    @classmethod
+    def _coerce_string_lists(cls, value):
+        if value is None:
+            return None
+        if isinstance(value, str):
+            return [value]
+        return value
 
 
 class ObjectExtractionOutput(BaseModel):

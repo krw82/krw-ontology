@@ -92,3 +92,57 @@ def test_extract_xbrl_preserves_10q_document_and_period_context(tmp_path: Path):
     assert metric["document_type"] == "10-Q"
     assert metric["fiscal_period"] == "Q2"
     assert metric["period_type"] == "quarter"
+
+
+def test_extract_xbrl_uses_sibling_inline_document_when_primary_has_no_ix_tags(tmp_path: Path):
+    raw_html = tmp_path / "raw.html"
+    raw_html.write_text("<html><body>Primary filing shell without inline XBRL.</body></html>")
+    inline_html = tmp_path / "inline-document.htm"
+    inline_html.write_text(
+        """
+        <html xmlns:ix="http://www.xbrl.org/2013/inlineXBRL"
+              xmlns:xbrli="http://www.xbrl.org/2003/instance"
+              xmlns:us-gaap="http://fasb.org/us-gaap/2025">
+          <body>
+            <xbrli:context id="c-current">
+              <xbrli:entity><xbrli:identifier>0000320193</xbrli:identifier></xbrli:entity>
+              <xbrli:period><xbrli:startDate>2024-01-01</xbrli:startDate><xbrli:endDate>2024-12-31</xbrli:endDate></xbrli:period>
+            </xbrli:context>
+            <ix:nonFraction name="us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax" contextRef="c-current" unitRef="usd" scale="6">10</ix:nonFraction>
+          </body>
+        </html>
+        """
+    )
+
+    result = extract_xbrl(
+        raw_html_path=raw_html,
+        ticker="VG",
+        period="FY2024",
+        doc_type_key="10K",
+        source_document_id="source:VG:FY2024:10K",
+        output_path=tmp_path / "xbrl_facts.jsonl",
+    )
+
+    facts = read_jsonl(tmp_path / "xbrl_facts.jsonl")
+    assert result["status"] == "ok"
+    assert facts[0]["source_filing_detail"] == str(inline_html)
+    assert facts[0]["value"] == 10_000_000
+
+
+def test_extract_xbrl_writes_empty_metric_outputs_when_no_inline_xbrl(tmp_path: Path):
+    raw_html = tmp_path / "raw.html"
+    raw_html.write_text("<html><body>No inline XBRL.</body></html>")
+
+    result = extract_xbrl(
+        raw_html_path=raw_html,
+        ticker="VG",
+        period="FY2024",
+        doc_type_key="10K",
+        source_document_id="source:VG:FY2024:10K",
+        output_path=tmp_path / "xbrl_facts.jsonl",
+    )
+
+    assert result["status"] == "missing_or_failed"
+    assert read_jsonl(tmp_path / "xbrl_facts.jsonl") == []
+    assert read_jsonl(tmp_path / "financial_metric_values.jsonl") == []
+    assert read_jsonl(tmp_path / "derived_metric_values.jsonl") == []

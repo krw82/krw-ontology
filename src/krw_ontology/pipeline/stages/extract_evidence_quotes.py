@@ -9,7 +9,7 @@ import re
 from pathlib import Path
 
 from krw_ontology.config.constants import normalize_doc_type
-from krw_ontology.errors import PipelineStageError
+from krw_ontology.errors import PipelineStageError, RateLimitError
 from krw_ontology.extraction.prompts.quote_extraction import (
     QUOTE_EXTRACTION_PROMPT,
     QUOTE_TYPES,
@@ -346,9 +346,11 @@ async def extract_evidence_quotes(
     concurrency: int = 1,
     force: bool = False,
     span_pruning: str = SPAN_PRUNING_CONSERVATIVE,
+    batch_size: int = BATCH_SIZE,
 ) -> list[dict]:
     """Extract evidence quotes from spans in batches with split retry."""
     stage_name = "extract_evidence_quotes"
+    batch_size = max(1, int(batch_size))
     doc_type_key = normalize_doc_type(doc_type)
     source_document_id = f"source:{ticker}:{period}:{doc_type_key}"
 
@@ -392,15 +394,15 @@ async def extract_evidence_quotes(
 
     quotes: list[dict] = []
     seen_keys: set[str] = set()
-    total_batches = (len(eligible_spans) + BATCH_SIZE - 1) // BATCH_SIZE
+    total_batches = (len(eligible_spans) + batch_size - 1) // batch_size
     failed_span_count = 0
     _clear_stage_failures(failures_path, stage_name)
     if force:
         clear_stage_batch_cache(ontology_dir, stage_name)
 
     async def run_batch(batch_idx: int) -> tuple[list[dict], int]:
-        start = batch_idx * BATCH_SIZE
-        batch = eligible_spans[start : start + BATCH_SIZE]
+        start = batch_idx * batch_size
+        batch = eligible_spans[start : start + batch_size]
         candidates = _build_quote_candidates(batch)
         input_hash = _batch_input_hash(batch, span_pruning)
         if not candidates:
@@ -605,6 +607,21 @@ async def _extract_batch_with_split_retry(
 
     try:
         return await _extract_candidate_batch(worker, candidates, stage_name), 0
+    except RateLimitError as e:
+        batch_span_ids = [s["id"] for s in batch]
+        logger.warning(
+            "%s batch %s rate limited after same-batch retries; not splitting: %s",
+            stage_name,
+            batch_index,
+            e,
+            extra={"stage": stage_name, "rate_limited": True},
+        )
+        _record_batch_failure(
+            failures_path, ticker, doc_type, period, source_document_id,
+            doc_type_key, stage_name, batch_index, batch_span_ids, str(e),
+            error_type="RateLimitError",
+        )
+        return [], len(batch)
     except Exception as e:
         if len(batch) <= 1:
             batch_span_ids = [s["id"] for s in batch]
@@ -759,7 +776,7 @@ def _extract_span_section_key(span_id: str) -> str | None:
 def _record_batch_failure(
     failures_path: Path, ticker: str, doc_type: str, period: str,
     source_document_id: str, doc_type_key: str, stage: str, batch_index: int,
-    input_span_ids: list[str], error_message: str,
+    input_span_ids: list[str], error_message: str, error_type: str = "ExtractionError",
 ) -> None:
     from datetime import datetime, timezone
 
@@ -774,7 +791,7 @@ def _record_batch_failure(
         "batch_index": batch_index,
         "input_span_ids": input_span_ids,
         "attempts": 3,
-        "error_type": "ExtractionError",
+        "error_type": error_type,
         "error_message": error_message[:500],
         "created_at": datetime.now(timezone.utc).isoformat(),
         "schema_version": SCHEMA_VERSION,

@@ -21,7 +21,9 @@ from krw_ontology.pipeline.stages.clean_to_markdown import clean_to_markdown
 from krw_ontology.pipeline.stages.discover_source import discover_source
 from krw_ontology.pipeline.stages.download_source import download_source
 from krw_ontology.pipeline.stages.extract_assumption_candidates import extract_assumption_candidates
+from krw_ontology.pipeline.stages.extract_business_activities import extract_business_activities
 from krw_ontology.pipeline.stages.extract_evidence_quotes import extract_evidence_quotes
+from krw_ontology.pipeline.stages.extract_external_factor_exposures import extract_external_factor_exposures
 from krw_ontology.pipeline.stages.extract_research_claims import extract_research_claims
 from krw_ontology.pipeline.stages.extract_risks_drivers_headwinds import extract_risks_drivers_headwinds
 from krw_ontology.pipeline.stages.extract_sections import extract_sections
@@ -48,6 +50,8 @@ PIPELINE_STAGES = [
     "build_numeric_evidence",
     "extract_research_claims",
     "extract_risks_drivers_headwinds",
+    "extract_business_activities",
+    "extract_external_factor_exposures",
     "extract_assumption_candidates",
     "validate_ontology",
     "generate_edges",
@@ -154,7 +158,8 @@ def _is_code_stage(stage: str) -> bool:
         "clean_to_markdown", "extract_sections", "build_source_spans",
         "extract_xbrl_facts", "extract_evidence_quotes", "build_numeric_evidence",
         "extract_research_claims",
-        "extract_risks_drivers_headwinds", "extract_assumption_candidates",
+        "extract_risks_drivers_headwinds", "extract_business_activities",
+        "extract_external_factor_exposures", "extract_assumption_candidates",
         "validate_ontology", "generate_edges", "validate_edges",
         "build_indexes", "build_graph_report",
     }
@@ -287,6 +292,7 @@ def _execute_stage(stage: str, ctx: dict) -> None:
             concurrency=config.concurrency_for_stage(stage),
             force=ctx["force"],
             span_pruning=config.span_pruning,
+            batch_size=config.batch_size_for_stage(stage, default=10),
         ))
         ctx["quotes"] = quotes
 
@@ -312,6 +318,7 @@ def _execute_stage(stage: str, ctx: dict) -> None:
             quotes=ctx.get("quotes"),
             concurrency=config.concurrency_for_stage(stage),
             force=ctx["force"],
+            batch_size=config.batch_size_for_stage(stage, default=12),
         ))
         ctx["claims"] = claims
 
@@ -329,6 +336,31 @@ def _execute_stage(stage: str, ctx: dict) -> None:
         ctx["risks"] = result.get("risks", [])
         ctx["growth_drivers"] = result.get("growth_drivers", [])
         ctx["headwinds"] = result.get("headwinds", [])
+
+    elif stage == "extract_business_activities":
+        worker = _make_extraction_worker(config, base_dir, stage)
+        activities = asyncio.run(extract_business_activities(
+            worker=worker,
+            ontology_dir=ctx["ontology_dir"],
+            ticker=ticker,
+            period=ctx["period"],
+            doc_type=ctx["document_type"],
+            claims=ctx.get("claims"),
+        ))
+        ctx["business_activities"] = activities
+
+    elif stage == "extract_external_factor_exposures":
+        worker = _make_extraction_worker(config, base_dir, stage)
+        exposures = asyncio.run(extract_external_factor_exposures(
+            worker=worker,
+            ontology_dir=ctx["ontology_dir"],
+            ticker=ticker,
+            period=ctx["period"],
+            doc_type=ctx["document_type"],
+            claims=ctx.get("claims"),
+            business_activities=ctx.get("business_activities"),
+        ))
+        ctx["external_factor_exposures"] = exposures
 
     elif stage == "extract_assumption_candidates":
         worker = _make_extraction_worker(config, base_dir, stage)

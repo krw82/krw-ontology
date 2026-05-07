@@ -156,13 +156,19 @@ def _group_claims(claims: list[dict]) -> list[list[dict]]:
         if not obj_type:
             continue
         category = _classify_category(claim)
-        metrics = claim.get("related_metrics") or []
+        metrics = [*(claim.get("related_metrics") or []), *(claim.get("impact_channels") or [])]
         metric_key = metrics[0] if metrics else "qualitative"
-        groups.setdefault((obj_type, category, metric_key), []).append(claim)
+        theme_key = _hint_key(claim.get("theme_hint") or claim.get("factor_hint") or metric_key)
+        groups.setdefault((obj_type, category, theme_key), []).append(claim)
     return list(groups.values())
 
 
 def _classify_object_type(claim: dict) -> str | None:
+    hints = set(claim.get("object_type_hints") or [])
+    for hinted_type in ("RiskFactor", "GrowthDriver", "Headwind"):
+        if hinted_type in hints:
+            return hinted_type
+
     claim_type = (claim.get("claim_type") or "").lower()
     text = (claim.get("claim_text") or "").lower()
     if claim_type == "risk_assessment":
@@ -185,6 +191,12 @@ def _classify_object_type(claim: dict) -> str | None:
 
 
 def _classify_category(claim: dict) -> str:
+    factor_hint = _hint_key(claim.get("factor_hint"))
+    if factor_hint:
+        return factor_hint
+    theme_hint = _hint_key(claim.get("theme_hint"))
+    if theme_hint:
+        return theme_hint
     text = (claim.get("claim_text") or "").lower()
     for category, keywords in _CATEGORY_RULES:
         if any(keyword in text for keyword in keywords):
@@ -199,7 +211,7 @@ def _theme_from_group(group: list[dict]) -> dict:
     metrics = _dedupe_list([
         metric
         for claim in group
-        for metric in claim.get("related_metrics", []) or []
+        for metric in [*(claim.get("related_metrics", []) or []), *(claim.get("impact_channels", []) or [])]
     ])
     claim_ids = [claim["id"] for claim in group]
     quote_ids = _dedupe_list([
@@ -209,24 +221,37 @@ def _theme_from_group(group: list[dict]) -> dict:
     ])
     metric_phrase = metrics[0] if metrics else "business performance"
     category_label = category.replace("_", " ")
+    theme_hint = _first_hint(group, "theme_hint")
 
     return {
         "type": obj_type,
-        "name": _theme_name(obj_type, category, metrics),
+        "name": _theme_name(obj_type, category, metrics, theme_hint),
         "category": category,
         "description": (
-            f"Evidence-backed claims describe {category_label} themes "
-            f"relevant to {metric_phrase}."
+            f"Evidence-backed claims describe {theme_hint or category_label} "
+            f"themes relevant to {metric_phrase}."
         ),
         "supported_by_claims": claim_ids,
         "supported_by_quotes": quote_ids,
         "affects": metrics,
-        "qualitative_impact": _qualitative_impact(obj_type, len(group)),
+        "qualitative_impact": _qualitative_impact(
+            obj_type,
+            len(group),
+            _first_hint(group, "effect_direction"),
+            _first_hint(group, "materiality_hint"),
+        ),
         "confidence": _group_confidence(group),
     }
 
 
-def _theme_name(obj_type: str, category: str, metrics: list[str]) -> str:
+def _theme_name(obj_type: str, category: str, metrics: list[str], theme_hint: str | None = None) -> str:
+    if theme_hint:
+        base = theme_hint.replace("_", " ").title()
+        if obj_type == "GrowthDriver":
+            return f"{base} growth driver"
+        if obj_type == "RiskFactor":
+            return f"{base} risk"
+        return f"{base} headwind"
     category_label = category.replace("_", " ").title()
     metric_label = metrics[0].replace("_", " ") if metrics else ""
     if obj_type == "GrowthDriver":
@@ -239,12 +264,40 @@ def _theme_name(obj_type: str, category: str, metrics: list[str]) -> str:
     return f"{category_label} headwind{suffix}"
 
 
-def _qualitative_impact(obj_type: str, group_size: int) -> str:
+def _qualitative_impact(
+    obj_type: str,
+    group_size: int,
+    effect_direction: str | None = None,
+    materiality_hint: str | None = None,
+) -> str:
+    strength = "high" if materiality_hint == "high" or group_size >= 5 else "medium"
+    if materiality_hint == "low" and group_size < 3:
+        strength = "low"
+    if effect_direction == "positive":
+        return f"{strength}_positive"
+    if effect_direction == "negative":
+        return f"{strength}_negative"
+    if effect_direction == "mixed":
+        return "mixed"
     if obj_type == "GrowthDriver":
         return "medium_positive" if group_size >= 3 else "low_positive"
     if obj_type == "RiskFactor":
         return "high_negative" if group_size >= 5 else "medium_negative"
     return "medium_negative" if group_size >= 3 else "low_negative"
+
+
+def _hint_key(value: str | None) -> str:
+    if not value:
+        return ""
+    return re.sub(r"[^a-z0-9]+", "_", str(value).lower()).strip("_")
+
+
+def _first_hint(group: list[dict], field: str) -> str | None:
+    for claim in group:
+        value = claim.get(field)
+        if value:
+            return str(value)
+    return None
 
 
 def _group_confidence(group: list[dict]) -> str:

@@ -42,17 +42,29 @@ For detailed object usage guidance, see `references/ontology-structure.md`.
 5. Call `krw_ontology_quality` when section quality, rejected objects, batch failures, or trustworthiness matter.
 6. Call `krw_ontology_compare` for multi-company topic or metric comparisons.
 
+## Search Principles
+
+These are the high-priority rules. Follow them before applying the more detailed protocols below.
+
+1. For broad, scenario, sensitivity, and business-model questions, inspect `CompanyBusinessProfile` early to discover company-specific vocabulary, key exposures, activities, and factors.
+2. Prefer `krw_ontology_topic_map` as the first search-planning step for broad, scenario, sensitivity, business-model, and external market report impact questions. It is not final evidence; use it to choose focused `krw_ontology_query` terms.
+3. Do not query an entire object type without topic, period, metric, or subject constraints just because an initial topic search returned no results.
+4. If a topic search returns no results, inspect `search_diagnostics` before broadening scope. If `normalized_terms` is empty, translate the question into English/canonical company exposure terms or call `krw_ontology_topic_map`. If the strict query is too narrow, split it into smaller topic searches.
+5. For exact dates, amounts, contract terms, project milestones, guidance, or thresholds, verify direct filing evidence through `EvidenceQuote`, `ResearchClaim`, or quant objects before using web, memory, or inference.
+6. If the user provides or references an external market, macro, commodity, policy, or industry report, treat that report as a market premise and map it to company-level ontology exposures. Do not stop at "the ontology has no evidence on the market report topic" unless the user only asked whether the report itself is indexed.
+
 ## Broad Research Questions
 
 For open-ended prompts such as "What are the key risks for VG?" or "compare demand and margin pressure across these companies":
 
 1. Build a short private research plan: identify tickers, document scope, periods, likely topics, object types, and the evidence needed for a trustworthy answer.
 2. Use `krw_ontology_catalog` to verify the available company/document/period coverage unless the user supplied it and it is already known.
-3. Start broad with compact search results: use `response_detail="compact"`, small limits, and object types such as `ResearchClaim`, `RiskFactor`, `Headwind`, `GrowthDriver`, and `EvidenceQuote`.
-4. Refine with follow-up `krw_ontology_query` calls by topic/category/period. For key risks, prefer latest 10-K first, then use 10-Q only if the question asks for current or recent changes.
-5. Trace the most important returned IDs with `krw_ontology_trace`. Trace accepts exact IDs and unique ID prefixes returned by query.
-6. Check `krw_ontology_quality` before making a reliability statement.
-7. Only use `response_detail="full"` when compact output lacks necessary fields; full output can be very large.
+3. For broad or scenario-style questions, call `krw_ontology_topic_map` for the relevant ticker before the first evidence query so the search uses company-specific vocabulary.
+4. Start broad with compact search results: use `response_detail="compact"`, small limits, and object types such as `ResearchClaim`, `RiskFactor`, `Headwind`, `GrowthDriver`, and `EvidenceQuote`.
+5. Refine with follow-up `krw_ontology_query` calls by topic/category/period. For key risks, prefer latest 10-K first, then use 10-Q only if the question asks for current or recent changes.
+6. Trace the most important returned IDs with `krw_ontology_trace`. Trace accepts exact IDs and unique ID prefixes returned by query.
+7. Check `krw_ontology_quality` before making a reliability statement.
+8. Only use `response_detail="full"` when compact output lacks necessary fields; full output can be very large.
 
 ## Factual Lookup Questions
 
@@ -73,12 +85,49 @@ Use this protocol for questions asking for exact facts, dates, target dates, amo
 For prompts like "what happens if...", "if this falls/rises", "below what level", "이 아래로 내려가면", or "큰일 나는 조건":
 
 1. Identify the external factor, benchmark, and likely financial channels. Example: Henry Hub maps to natural gas price; likely channels are revenue, cost of revenue, operating margin, cash flow, and liquidity.
-2. Start with `krw_ontology_query` over `ExternalFactorExposure`, `RiskFactor`, `Headwind`, and `ResearchClaim` for the factor and benchmark terms.
-3. Do not stop after the first result. Use terms from returned `impact_channel`, `related_metrics`, and quote text for follow-up queries. For price scenarios, check at least revenue, cost, margin, cash flow, and liquidity if those channels appear relevant.
-4. Search separately for explicit threshold terms such as breakeven, covenant, minimum, deadline, termination, impairment, default, settlement, or liability cap when the user asks "how low/high is dangerous".
-5. Treat direct quotes and `evidence_grade=direct` as stronger than indirect or derived evidence. If the object is strong but the numeric threshold is not found, say that the ontology has structural evidence but no explicit threshold.
-6. If revenue and cost effects point in different directions, answer mixed or uncertain instead of forcing a single net effect.
-7. Check `krw_ontology_quality` when the answer depends on completeness, latest-period coverage, rejected objects, or coverage-gap warnings.
+2. Call `krw_ontology_topic_map` for the relevant ticker when the factor/channel vocabulary is unclear or the question is broad.
+3. Start with `krw_ontology_query` over `ExternalFactorExposure`, `RiskFactor`, `Headwind`, and `ResearchClaim` for the factor and benchmark terms.
+4. Do not stop after the first result. Use terms from returned `impact_channel`, `related_metrics`, and quote text for follow-up queries. For price scenarios, check at least revenue, cost, margin, cash flow, and liquidity if those channels appear relevant.
+5. Search separately for explicit threshold terms such as breakeven, covenant, minimum, deadline, termination, impairment, default, settlement, or liability cap when the user asks "how low/high is dangerous".
+6. Treat direct quotes and `evidence_grade=direct` as stronger than indirect or derived evidence. If the object is strong but the numeric threshold is not found, say that the ontology has structural evidence but no explicit threshold.
+7. If revenue and cost effects point in different directions, answer mixed or uncertain instead of forcing a single net effect.
+8. Check `krw_ontology_quality` when the answer depends on completeness, latest-period coverage, rejected objects, or coverage-gap warnings.
+
+## External Market Report To Company Impact Questions
+
+Use this protocol when the user provides or references an outside market report, macro view, commodity outlook, policy update, geopolitical event, weather event, supply-demand balance, or industry thesis and asks what it means for companies. Examples include Argus/IEA/EIA/WoodMac gas or LNG reports, oil market balances, AI capex cycle reports, power market reports, regulatory proposals, tariffs, sanctions, supply disruptions, or demand shocks.
+
+The key rule: the external report is a market premise, not SEC filing evidence. The ontology is still useful because it contains company-specific exposures, business activities, contracts, risks, and financial channels. Do not answer only "the ontology does not contain this market report." Instead, use the report premise to search company exposures and explain the bridge.
+
+1. Separate the evidence layers before searching:
+   - Market premise: facts, scenarios, prices, volumes, regulations, or events from the external report or user-provided text.
+   - Company exposure: SEC filing ontology evidence about how each company is exposed.
+   - Analyst bridge: your explicit inference connecting the market premise to company exposure.
+2. Extract the market premise into normalized factors and channels. Examples:
+   - TTF, JKM, LNG spot tightness, EU storage deficit, Hormuz disruption, Qatar supply outage -> `global_lng_price`, `international_lng_price`, `natural_gas_price`, `lng_demand`, `commodity_price_realization`, `supply_disruption`.
+   - Henry Hub, feed gas, basis differential, transport cost -> `natural_gas_price`, `feed_gas_cost`, `cost_of_revenue`, `operating_margin`.
+   - Carbon rules, permitting, sanctions, import bans, tariffs -> `regulatory_approval`, `environmental_regulation`, `trade_policy`, `sanctions`, `capital_expenditures`, `revenue`.
+3. Select the company universe deliberately. Use the user's tickers if supplied. If not supplied, use `krw_ontology_catalog` and then screen likely exposed companies with `CompanyBusinessProfile`, `BusinessActivity`, and `ExternalFactorExposure`. Do not assume all energy or industrial companies have the same exposure.
+4. For each relevant ticker, call `krw_ontology_topic_map` and search ontology by company exposure terms rather than only the market report's vocabulary. If "TTF" or "EU storage" returns nothing, search related company terms such as LNG price, international LNG, natural gas price, commodity price realization, feed gas, SPA, spot cargo, liquefaction, export terminal, customer demand, derivatives, fuel switching, or the asset/project names.
+5. Query at least these object types for company impact: `CompanyBusinessProfile`, `BusinessActivity`, `ExternalFactorExposure`, `RiskFactor`, `Headwind`, `GrowthDriver`, `ResearchClaim`, and `EvidenceQuote`. For exact volumes, prices, capacity, dates, or guidance, also query quant objects.
+6. Trace the strongest company-specific objects before finalizing. Prefer direct filing quotes and `ResearchClaim` evidence for factual company exposure. Use `ExternalFactorExposure` to organize direction and channels, but do not cite it alone if the conclusion depends on a precise fact.
+7. Analyze both benefit and risk channels. For commodity or market-tightness reports, always check revenue/realized price, cost/feedstock, margin, cash flow/liquidity, capex/project timing, contracts/SPAs, customer performance, hedging/derivatives, and regulatory/geopolitical risk where relevant.
+8. Keep the conclusion company-specific and avoid sector-general shortcuts:
+   - LNG exporter with spot exposure may benefit from LNG price spikes, but feed gas cost, basis, shipping cost, SPA pricing, COD timing, or volatility may offset.
+   - Integrated oil/gas companies may have indirect LNG or commodity realization exposure, but the effect can be diluted by upstream oil, refining, chemicals, or downstream segments.
+   - Oilfield service companies may benefit from upstream capex cycles, not necessarily from gas prices directly.
+9. Label inference strength:
+   - Direct: the filing explicitly links the factor to a financial channel or contract/project exposure.
+   - Indirect: the filing shows relevant exposure, but the market report factor is one step removed.
+   - Inferred: the bridge is economically plausible but not directly disclosed in the filing.
+   - Unsupported: do not present as a conclusion.
+10. Final answer structure should separate:
+   - Market premise: from the external report/user text.
+   - Ontology evidence: company-specific filing objects and quotes.
+   - Impact bridge: your inference and confidence.
+   - Caveats: missing market data in ontology, stale filings, weak/derived evidence, or offsetting channels.
+11. If ontology searches find no company-specific exposure for a ticker, say that the indexed filings did not surface a material exposure and explain why the company is likely less directly affected. Do not force a thesis.
+12. If the user asks for investment implications, distinguish operational exposure from stock-price recommendation. The ontology supports exposure analysis, not a complete valuation call unless valuation inputs are separately provided.
 
 ## Question Type Protocols
 
@@ -87,6 +136,7 @@ For prompts like "what happens if...", "if this falls/rises", "below what level"
 - Change over time: query `ChangeEvent`, `TemporalLink`, `TrendObservation`, and comparable-period claims; do not state a trend from one period only.
 - Metric explanation: query the metric first, then search related `ResearchClaim`, `ExternalFactorExposure`, `RiskFactor`, and `Headwind` using the metric name and major drivers found in the metric evidence.
 - Business model: query `CompanyBusinessProfile`, `BusinessActivity`, and `ExternalFactorExposure`; check quality for coverage gaps before claiming the profile is complete.
+- External market report impact: treat the external report as a premise, map it to company exposure factors and financial channels, query company-specific ontology evidence, then separate market premise, SEC filing evidence, and analyst bridge in the answer.
 - Comparison: use `krw_ontology_compare`, then trace or query the most important differences per ticker/period.
 
 ## Answering Rules

@@ -185,6 +185,7 @@ def query_tool(
             include_rejected=include_rejected,
             limit=fetch_limit,
         )
+        search_diagnostics = store.search_diagnostics(topic, result_count=len(bundles))
 
     page = bundles[offset : offset + limit]
     detail = _coerce_response_detail(response_detail)
@@ -200,10 +201,34 @@ def query_tool(
             "include_rejected": include_rejected,
         },
         "response_detail": detail.value,
+        "search_diagnostics": search_diagnostics,
         "results": results,
         "pagination": _pagination(len(bundles), offset, len(page), limit),
     }
     return _format_response(payload, response_format, _markdown_bundles)
+
+
+def topic_map_tool(
+    *,
+    root: str | None = None,
+    index_path: str | None = None,
+    ticker: str,
+    document_types: list[str] | None = None,
+    periods: list[str] | None = None,
+    limit: int = DEFAULT_LIMIT,
+    response_format: ResponseFormat = ResponseFormat.JSON,
+) -> str:
+    """Return company-specific search vocabulary for broad research questions."""
+    index = _index(root, index_path)
+    limit = _bounded_limit(limit)
+    with _store(index) as store:
+        payload = store.topic_map(
+            ticker=ticker,
+            document_types=document_types,
+            periods=periods,
+            limit=limit,
+        )
+    return _format_response(payload, response_format, _markdown_topic_map)
 
 
 def retrieve_tool(
@@ -651,8 +676,41 @@ def _markdown_catalog(payload: dict[str, Any]) -> str:
 
 def _markdown_bundles(payload: dict[str, Any]) -> str:
     lines = ["# Ontology Query Results", f"- Results: {payload['pagination']['count']}"]
+    diagnostics = payload.get("search_diagnostics") or {}
+    warnings = diagnostics.get("warnings") or []
+    if warnings:
+        lines.append(f"- Search warnings: {', '.join(warnings)}")
+    if diagnostics.get("fts_query"):
+        lines.append(f"- FTS query: `{diagnostics['fts_query']}`")
     for item in payload["results"]:
         lines.extend(_bundle_lines(item))
+    return "\n".join(lines)
+
+
+def _markdown_topic_map(payload: dict[str, Any]) -> str:
+    lines = [
+        "# Ontology Topic Map",
+        f"- Ticker: `{payload.get('ticker')}`",
+        f"- Profile IDs: {', '.join(payload.get('source', {}).get('company_business_profile_ids') or []) or '(none)'}",
+        f"- Fallback used: {payload.get('source', {}).get('fallback_used')}",
+    ]
+    topics = payload.get("topics") or {}
+    for section in ("external_factors", "business_activities", "metrics", "projects_assets"):
+        entries = topics.get(section) or []
+        lines.append(f"## {section}")
+        if not entries:
+            lines.append("- No entries")
+            continue
+        for entry in entries[:10]:
+            search_terms = ", ".join(entry.get("search_terms") or [])
+            lines.append(f"- `{entry.get('term')}` search_terms={search_terms}")
+    suggestions = payload.get("suggested_first_queries") or []
+    if suggestions:
+        lines.append("## Suggested First Queries")
+        for suggestion in suggestions[:10]:
+            lines.append(
+                f"- topic=`{suggestion.get('topic')}` object_types={suggestion.get('object_types')}"
+            )
     return "\n".join(lines)
 
 

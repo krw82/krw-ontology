@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import sqlite3
+
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
+from krw_ontology.config.paths import resolve_agent_index_path, resolve_ontology_root
 from krw_ontology.mcp_server.tools import (
     ResponseDetail,
     ResponseFormat,
@@ -14,6 +19,7 @@ from krw_ontology.mcp_server.tools import (
     quality_tool,
     query_tool,
     retrieve_tool,
+    topic_map_tool,
     trace_tool,
 )
 
@@ -25,6 +31,49 @@ READ_ONLY = ToolAnnotations(
     idempotentHint=True,
     openWorldHint=False,
 )
+
+
+def health_payload(
+    *,
+    root: str | None = None,
+    index_path: str | None = None,
+) -> tuple[dict, int]:
+    """Return health metadata for the configured read-only ontology index."""
+    root_path = resolve_ontology_root(root, fallback_to_cwd=False)
+    resolved_index_path = resolve_agent_index_path(
+        root_path,
+        index_path,
+        fallback_to_cwd=False,
+    )
+    payload = {
+        "ok": False,
+        "root": str(root_path),
+        "index_path": str(resolved_index_path),
+        "documents": 0,
+        "objects": 0,
+        "tools": sorted(tool.name for tool in mcp._tool_manager.list_tools()),
+    }
+    if not resolved_index_path.exists():
+        payload["error"] = "agent_index_not_found"
+        return payload, 503
+
+    try:
+        with sqlite3.connect(resolved_index_path) as conn:
+            payload["documents"] = conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
+            payload["objects"] = conn.execute("SELECT COUNT(*) FROM objects").fetchone()[0]
+    except sqlite3.Error as exc:
+        payload["error"] = f"sqlite_error: {exc}"
+        return payload, 503
+
+    payload["ok"] = True
+    return payload, 200
+
+
+@mcp.custom_route("/health", methods=["GET"], include_in_schema=False)
+async def krw_ontology_health(_request: Request) -> JSONResponse:
+    """Health endpoint for local web and agent clients."""
+    payload, status_code = health_payload()
+    return JSONResponse(payload, status_code=status_code)
 
 
 @mcp.tool(
@@ -86,6 +135,32 @@ async def krw_ontology_query(
         offset=offset,
         response_format=response_format,
         response_detail=response_detail,
+    )
+
+
+@mcp.tool(
+    name="krw_ontology_topic_map",
+    title="Discover KRW ontology search topics",
+    annotations=READ_ONLY,
+)
+async def krw_ontology_topic_map(
+    ticker: str,
+    root: str | None = None,
+    index_path: str | None = None,
+    document_types: list[str] | None = None,
+    periods: list[str] | None = None,
+    limit: int = 10,
+    response_format: ResponseFormat = ResponseFormat.JSON,
+) -> str:
+    """Return company-specific vocabulary for planning ontology searches."""
+    return topic_map_tool(
+        root=root,
+        index_path=index_path,
+        ticker=ticker,
+        document_types=document_types,
+        periods=periods,
+        limit=limit,
+        response_format=response_format,
     )
 
 

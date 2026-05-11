@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 
 from krw_ontology.agent_index import build_agent_index
-from krw_ontology.mcp_server.server import mcp
+from krw_ontology.mcp_server.server import health_payload, mcp
 from krw_ontology.mcp_server.tools import (
     catalog_tool,
     compare_tool,
@@ -14,6 +14,7 @@ from krw_ontology.mcp_server.tools import (
     quality_tool,
     query_tool,
     trace_tool,
+    topic_map_tool,
 )
 from krw_ontology.utils.io import atomic_write_json, write_jsonl
 
@@ -42,6 +43,8 @@ def test_mcp_tools_query_trace_quality_and_compare(tmp_path: Path, monkeypatch):
     assert query["results"][0]["evidence"]["quotes"]
     assert "events" in query["results"][0]["quality"]
     assert "evidence_grade" in query["results"][0]["quality"]
+    assert query["search_diagnostics"]["normalized_terms"] == ["revenue", "growth"]
+    assert query["search_diagnostics"]["fts_query"] == "revenue* growth*"
     assert query["response_detail"] == "compact"
     assert "object" not in query["results"][0]
     assert "document" not in query["results"][0]
@@ -51,7 +54,7 @@ def test_mcp_tools_query_trace_quality_and_compare(tmp_path: Path, monkeypatch):
     assert trace["evidence"]["quotes"][0]["id"] == "quote:VG:FY2025:10K:0001"
 
     quality = json.loads(quality_tool(ticker="VG"))
-    assert quality["summary"]["documents"] == 1
+    assert quality["summary"]["documents"] == 2
     assert quality["summary"]["section_warnings"] == 0
 
     compare = json.loads(
@@ -98,6 +101,54 @@ def test_mcp_query_normalizes_object_type_aliases(tmp_path: Path, monkeypatch):
     )
     assert metric_query["query"]["object_types_requested"] == ["FinancialMetric"]
     assert metric_query["query"]["object_types"] == ["FinancialMetricValue", "DerivedMetricValue"]
+
+
+def test_mcp_query_returns_search_diagnostics_for_empty_topic(tmp_path: Path, monkeypatch):
+    _write_fixture(tmp_path)
+    build_agent_index(tmp_path)
+    monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
+
+    query = json.loads(
+        query_tool(
+            topic="유럽 가스 비축 부족",
+            tickers=["VG"],
+            object_types=["ResearchClaim"],
+            limit=5,
+        )
+    )
+
+    assert query["results"] == []
+    assert query["search_diagnostics"]["normalized_terms"] == []
+    assert query["search_diagnostics"]["fts_query"] == ""
+    assert "empty_topic_after_tokenization" in query["search_diagnostics"]["warnings"]
+
+
+def test_mcp_topic_map_repackages_company_vocabulary(tmp_path: Path, monkeypatch):
+    _write_fixture(tmp_path)
+    build_agent_index(tmp_path)
+    monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
+
+    topic_map = json.loads(topic_map_tool(ticker="VG", limit=10))
+
+    assert topic_map["ticker"] == "VG"
+    assert topic_map["source"]["company_business_profile_ids"] == [
+        "company_business_profile:VG:ALL"
+    ]
+    assert topic_map["source"]["fallback_used"] is False
+    factor_terms = {
+        entry["term"] for entry in topic_map["topics"]["external_factors"]
+    }
+    activity_terms = {
+        entry["term"] for entry in topic_map["topics"]["business_activities"]
+    }
+    metric_terms = {entry["term"] for entry in topic_map["topics"]["metrics"]}
+    assert "natural_gas_price" in factor_terms
+    assert "lng_sales" in activity_terms
+    assert "revenue" in metric_terms
+    assert any(
+        suggestion["topic"] == "natural gas price"
+        for suggestion in topic_map["suggested_first_queries"]
+    )
 
 
 def test_mcp_compare_allows_single_ticker_period_comparison(tmp_path: Path, monkeypatch):
@@ -153,12 +204,35 @@ def test_mcp_server_registers_expected_tools():
     assert {
         "krw_ontology_catalog",
         "krw_ontology_query",
+        "krw_ontology_topic_map",
         "krw_ontology_retrieve",
         "krw_ontology_trace",
         "krw_ontology_quality",
         "krw_ontology_compare",
         "krw_ontology_plan_query",
     }.issubset(tool_names)
+
+
+def test_mcp_health_payload_reports_index_counts(tmp_path: Path):
+    _write_fixture(tmp_path)
+    build_agent_index(tmp_path)
+
+    payload, status_code = health_payload(root=str(tmp_path))
+
+    assert status_code == 200
+    assert payload["ok"] is True
+    assert payload["root"] == str(tmp_path.resolve())
+    assert payload["documents"] == 2
+    assert payload["objects"] >= 1
+    assert "krw_ontology_topic_map" in payload["tools"]
+
+
+def test_mcp_health_payload_reports_missing_index(tmp_path: Path):
+    payload, status_code = health_payload(root=str(tmp_path))
+
+    assert status_code == 503
+    assert payload["ok"] is False
+    assert payload["error"] == "agent_index_not_found"
 
 
 def _write_fixture(
@@ -179,6 +253,8 @@ def _write_fixture(
     risk_claim_id = f"claim:VG:{period}:10K:regulatory-risk"
     driver_id = f"growth_driver:VG:{period}:10K:revenue-growth"
     risk_id = f"risk:VG:{period}:10K:regulatory-risk"
+    activity_id = f"business_activity:VG:{period}:10K:lng-sales"
+    exposure_id = f"external_factor_exposure:VG:{period}:10K:natural-gas-price-operating-margin"
     span = {
         "id": span_id,
         "type": "SourceSpan",
@@ -257,6 +333,37 @@ def _write_fixture(
         "supported_by_claims": [risk_claim_id],
         "review_status": "accepted",
     }
+    activity = {
+        "id": activity_id,
+        "type": "BusinessActivity",
+        "ticker": "VG",
+        "source_document_id": source_document_id,
+        "document_type": "10-K",
+        "period": period,
+        "name": "LNG sales",
+        "activity_type": "lng_sales",
+        "description": "VG sells LNG under long-term SPAs and spot cargoes.",
+        "related_metrics": ["revenue", "cash_flow"],
+        "supported_by_claims": [claim_id],
+        "review_status": "accepted",
+    }
+    exposure = {
+        "id": exposure_id,
+        "type": "ExternalFactorExposure",
+        "ticker": "VG",
+        "source_document_id": source_document_id,
+        "document_type": "10-K",
+        "period": period,
+        "factor": "natural_gas_price",
+        "factor_category": "commodity_price",
+        "benchmark": "Henry Hub",
+        "impact_channel": "operating_margin",
+        "effect_direction": "negative",
+        "mechanism": "Feed gas costs can affect operating margin.",
+        "evidence_grade": "direct",
+        "supported_by_claims": [claim_id],
+        "review_status": "accepted",
+    }
     edges = [
         {
             "id": "edge:quote-claim",
@@ -304,6 +411,8 @@ def _write_fixture(
     write_jsonl(ontology_dir / "claims.jsonl", [claim, risk_claim])
     write_jsonl(ontology_dir / "risks.jsonl", [risk])
     write_jsonl(ontology_dir / "growth_drivers.jsonl", [driver])
+    write_jsonl(ontology_dir / "business_activities.jsonl", [activity])
+    write_jsonl(ontology_dir / "external_factor_exposures.jsonl", [exposure])
     write_jsonl(ontology_dir / "edges.jsonl", edges)
     atomic_write_json(
         ontology_dir / "section_quality.json",
@@ -322,6 +431,8 @@ def _write_fixture(
                 "claims": f"companies/VG/ontology/10K/{period}/claims.jsonl",
                 "risks": f"companies/VG/ontology/10K/{period}/risks.jsonl",
                 "growth_drivers": f"companies/VG/ontology/10K/{period}/growth_drivers.jsonl",
+                "business_activities": f"companies/VG/ontology/10K/{period}/business_activities.jsonl",
+                "external_factor_exposures": f"companies/VG/ontology/10K/{period}/external_factor_exposures.jsonl",
                 "edges": f"companies/VG/ontology/10K/{period}/edges.jsonl",
             },
             "counts": {
@@ -330,7 +441,60 @@ def _write_fixture(
                 "claims": 2,
                 "risks": 1,
                 "growth_drivers": 1,
+                "business_activities": 1,
+                "external_factor_exposures": 1,
                 "edges": 3,
             },
+        },
+    )
+    _write_context_fixture(root, period=period, activity_id=activity_id, exposure_id=exposure_id)
+
+
+def _write_context_fixture(
+    root: Path,
+    *,
+    period: str,
+    activity_id: str,
+    exposure_id: str,
+) -> None:
+    context_dir = root / "companies" / "VG" / "context"
+    context_dir.mkdir(parents=True, exist_ok=True)
+    profile = {
+        "id": "company_business_profile:VG:ALL",
+        "type": "CompanyBusinessProfile",
+        "ticker": "VG",
+        "source_document_id": "source:VG:ALL:COMPANY",
+        "document_type": "COMPANY",
+        "period": "ALL",
+        "sector": "energy_lng",
+        "business_model_summary": "Primary activities: LNG sales. Key external factors: natural_gas_price.",
+        "primary_business_activities": ["LNG sales"],
+        "primary_revenue_sources": ["LNG sales"],
+        "primary_cost_sources": ["Feed gas procurement"],
+        "key_external_factors": ["natural_gas_price"],
+        "key_metrics": ["revenue", "operating_margin"],
+        "key_uncertainties": ["natural_gas_price via operating_margin"],
+        "source_object_ids": [activity_id, exposure_id],
+        "review_status": "accepted",
+    }
+    write_jsonl(context_dir / "company_business_profiles.jsonl", [profile])
+    write_jsonl(context_dir / "edges.jsonl", [])
+    atomic_write_json(
+        context_dir / "artifact_index.json",
+        {
+            "ticker": "VG",
+            "document_type": "COMPANY",
+            "doc_type_key": "COMPANY",
+            "period": "ALL",
+            "files": {
+                "company_business_profiles": "companies/VG/context/company_business_profiles.jsonl",
+                "edges": "companies/VG/context/edges.jsonl",
+            },
+            "counts": {
+                "company_business_profiles": 1,
+                "edges": 0,
+            },
+            "schema_version": "0.1.0",
+            "source_period": period,
         },
     )

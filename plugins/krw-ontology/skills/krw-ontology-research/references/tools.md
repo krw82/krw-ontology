@@ -28,6 +28,24 @@ Useful parameters:
 
 Returns compact evidence bundles by default. Each result should include the object summary, supporting claims, supporting quotes, source spans when available, related objects sharing support, document quality counts, and a small quality-event summary. Do not assume one query is enough for scenario questions; use returned channels and metrics to plan follow-up searches.
 
+Each response also includes `search_diagnostics` for topic searches. If results are empty, inspect `normalized_terms`, `fts_query`, and `warnings` before broadening the query. Common warnings:
+- `empty_topic_after_tokenization`: the topic produced no searchable English/canonical tokens, often from Korean-only or overly natural-language input.
+- `strict_and_query_may_be_too_narrow`: the strict FTS query likely required too many terms at once. Split the topic into smaller searches.
+- `long_strict_topic`: prefer several small topic queries over one long topic.
+
+## `krw_ontology_topic_map`
+
+Return company-specific search vocabulary for broad, scenario, business-model, and external-report impact questions.
+
+Useful parameters:
+- `ticker`: required company ticker
+- `document_types`: optional scope for fallback activity/exposure objects
+- `periods`: optional scope for fallback activity/exposure objects
+- `limit`
+- `response_format`: `"json"` or `"markdown"`
+
+This is a search-planning helper, not final evidence. It repackages `CompanyBusinessProfile` and falls back to `BusinessActivity`, `ExternalFactorExposure`, and metric objects. Use its terms to plan focused `krw_ontology_query` calls, then trace important objects before answering.
+
 ## `krw_ontology_trace`
 
 Trace a returned object ID to supporting quotes, source spans, document metadata, and quality signals. Exact IDs are best, but a unique returned ID prefix is accepted; ambiguous prefixes return candidates.

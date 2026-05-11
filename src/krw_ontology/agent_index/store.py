@@ -23,6 +23,7 @@ DEFAULT_QUERY_TYPES = (
 )
 
 _TERM_RE = re.compile(r"[A-Za-z0-9_]+")
+_STRICT_TOPIC_WARNING_TERM_COUNT = 5
 
 
 class OntologyStore:
@@ -121,6 +122,139 @@ class OntologyStore:
                 limit=limit,
             )
         return [self.bundle(row["id"]) for row in rows if row["id"]]
+
+    def search_diagnostics(
+        self,
+        topic: str | None,
+        *,
+        result_count: int | None = None,
+    ) -> dict[str, Any]:
+        """Return deterministic diagnostics for the FTS topic query."""
+        return _search_diagnostics(topic, result_count=result_count)
+
+    def topic_map(
+        self,
+        *,
+        ticker: str,
+        document_types: Iterable[str] | None = None,
+        periods: Iterable[str] | None = None,
+        limit: int = 20,
+    ) -> dict[str, Any]:
+        """Return a search-vocabulary map for a company from accepted objects.
+
+        This is a retrieval helper, not a new ontology artifact. It repackages
+        CompanyBusinessProfile and falls back to BusinessActivity and
+        ExternalFactorExposure when a profile is unavailable.
+        """
+        ticker = ticker.upper()
+        limit = max(1, int(limit))
+        profiles = self._topic_map_objects(
+            ticker=ticker,
+            object_types=("CompanyBusinessProfile",),
+            document_types=None,
+            periods=None,
+            limit=3,
+        )
+        activities = self._topic_map_objects(
+            ticker=ticker,
+            object_types=("BusinessActivity",),
+            document_types=document_types,
+            periods=periods,
+            limit=limit,
+        )
+        exposures = self._topic_map_objects(
+            ticker=ticker,
+            object_types=("ExternalFactorExposure",),
+            document_types=document_types,
+            periods=periods,
+            limit=limit,
+        )
+        metric_objects = self._topic_map_objects(
+            ticker=ticker,
+            object_types=("FinancialMetricValue", "DerivedMetricValue"),
+            document_types=document_types,
+            periods=periods,
+            limit=limit * 2,
+        )
+
+        external_factors: dict[str, dict[str, Any]] = {}
+        business_activities: dict[str, dict[str, Any]] = {}
+        metrics: dict[str, dict[str, Any]] = {}
+        projects_assets: dict[str, dict[str, Any]] = {}
+
+        for profile in profiles:
+            source_id = profile.get("id")
+            for factor in _string_values(profile.get("key_external_factors")):
+                _merge_topic_entry(external_factors, factor, source_id=source_id)
+            for activity in _string_values(profile.get("primary_business_activities")):
+                _merge_topic_entry(business_activities, activity, source_id=source_id)
+            for metric in _string_values(profile.get("key_metrics")):
+                _merge_topic_entry(metrics, metric, source_id=source_id)
+            for value in _explicit_project_asset_values(profile):
+                _merge_topic_entry(projects_assets, value, source_id=source_id)
+
+        for activity in activities:
+            source_id = activity.get("id")
+            term = activity.get("activity_type") or activity.get("name")
+            _merge_topic_entry(
+                business_activities,
+                term,
+                source_id=source_id,
+                related_metrics=_object_metrics(activity),
+                search_terms=[activity.get("name"), activity.get("activity_type")],
+            )
+            for metric in _object_metrics(activity):
+                _merge_topic_entry(metrics, metric, source_id=source_id)
+
+        for exposure in exposures:
+            source_id = exposure.get("id")
+            term = exposure.get("factor")
+            related_channels = _string_values(
+                exposure.get("impact_channel")
+                or exposure.get("impact_channels")
+                or exposure.get("affects")
+            )
+            _merge_topic_entry(
+                external_factors,
+                term,
+                source_id=source_id,
+                related_channels=related_channels,
+                search_terms=[exposure.get("factor"), exposure.get("benchmark")],
+                evidence_grade=exposure.get("evidence_grade"),
+            )
+            for channel in related_channels:
+                _merge_topic_entry(metrics, channel, source_id=source_id)
+
+        for metric_obj in metric_objects:
+            metric = metric_obj.get("metric_name")
+            _merge_topic_entry(metrics, metric, source_id=metric_obj.get("id"))
+
+        suggested_first_queries = _suggest_topic_queries(
+            external_factors=external_factors,
+            business_activities=business_activities,
+        )
+
+        return {
+            "ticker": ticker,
+            "query": {
+                "document_types": list(document_types or []),
+                "periods": list(periods or []),
+                "limit": limit,
+            },
+            "source": {
+                "company_business_profile_ids": [profile.get("id") for profile in profiles],
+                "fallback_used": not bool(profiles),
+                "business_activity_count": len(activities),
+                "external_factor_exposure_count": len(exposures),
+            },
+            "topics": {
+                "external_factors": _topic_entries(external_factors, limit=limit),
+                "business_activities": _topic_entries(business_activities, limit=limit),
+                "metrics": _topic_entries(metrics, limit=limit),
+                "projects_assets": _topic_entries(projects_assets, limit=limit),
+            },
+            "suggested_first_queries": suggested_first_queries[: min(limit, 10)],
+        }
 
     def trace(self, object_id: str) -> dict[str, Any] | None:
         """Trace an object back to supporting evidence and document metadata."""
@@ -342,6 +476,33 @@ class OntologyStore:
             """,
             [*params, metric, limit],
         ).fetchall()
+
+    def _topic_map_objects(
+        self,
+        *,
+        ticker: str,
+        object_types: Iterable[str],
+        document_types: Iterable[str] | None,
+        periods: Iterable[str] | None,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        where, params = _object_filters(
+            tickers=[ticker],
+            document_types=document_types,
+            periods=periods,
+            object_types=object_types,
+            include_rejected=False,
+        )
+        rows = self.conn.execute(
+            f"""
+            SELECT * FROM objects
+            {where}
+            ORDER BY period DESC, type, id
+            LIMIT ?
+            """,
+            [*params, max(1, int(limit))],
+        ).fetchall()
+        return [_object_from_row(row) for row in rows]
 
     def _expand_evidence(self, obj: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
         claims: list[dict[str, Any]] = []
@@ -581,6 +742,36 @@ def _fts_query(topic: str, *, operator: str) -> str:
     return " ".join(f"{term}*" for term in terms)
 
 
+def _search_diagnostics(topic: str | None, *, result_count: int | None) -> dict[str, Any]:
+    original_topic = topic or None
+    terms = _unique(term.lower() for term in _TERM_RE.findall(topic or "") if len(term) > 1)
+    fts_query = _fts_query(topic or "", operator="AND") if topic else None
+    warnings: list[str] = []
+    suggestions: list[str] = []
+
+    if topic and not terms:
+        warnings.append("empty_topic_after_tokenization")
+        suggestions.append(
+            "Use English/canonical company exposure terms or call krw_ontology_topic_map first."
+        )
+    if topic and terms and result_count == 0 and len(terms) >= 3:
+        warnings.append("strict_and_query_may_be_too_narrow")
+        suggestions.append("Split the topic into shorter focused queries.")
+    elif topic and len(terms) >= _STRICT_TOPIC_WARNING_TERM_COUNT:
+        warnings.append("long_strict_topic")
+        suggestions.append("Prefer several small topic queries over one long topic.")
+
+    return {
+        "original_topic": original_topic,
+        "normalized_terms": terms,
+        "fts_query": fts_query,
+        "operator": "AND" if topic else None,
+        "result_count": result_count,
+        "warnings": warnings,
+        "suggestions": _unique(suggestions),
+    }
+
+
 def _object_from_row(row: sqlite3.Row) -> dict[str, Any]:
     obj = json.loads(row["json"])
     if row["review_status"]:
@@ -635,6 +826,162 @@ def _display_text(obj: dict[str, Any]) -> str:
     if obj.get("metric_name"):
         return f"{obj['metric_name']}: {obj.get('value')} {obj.get('unit')}"
     return obj.get("name") or obj.get("id", "")
+
+
+def _string_values(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value] if value.strip() else []
+    if isinstance(value, (list, tuple, set)):
+        output: list[str] = []
+        for item in value:
+            output.extend(_string_values(item))
+        return output
+    return [str(value)] if str(value).strip() else []
+
+
+def _object_metrics(obj: dict[str, Any]) -> list[str]:
+    return _unique(
+        [
+            *_string_values(obj.get("related_metrics")),
+            *_string_values(obj.get("affects")),
+            *_string_values(obj.get("impact_channel")),
+            *_string_values(obj.get("impact_channels")),
+        ]
+    )
+
+
+def _explicit_project_asset_values(obj: dict[str, Any]) -> list[str]:
+    values: list[str] = []
+    for key in (
+        "projects",
+        "key_projects",
+        "major_projects",
+        "project_names",
+        "assets",
+        "key_assets",
+        "major_assets",
+        "projects_assets",
+    ):
+        values.extend(_string_values(obj.get(key)))
+    return _unique(values)
+
+
+def _canonical_topic_term(value: Any) -> str | None:
+    values = _string_values(value)
+    if not values:
+        return None
+    term = values[0].strip()
+    return term or None
+
+
+def _search_terms_for(value: Any) -> list[str]:
+    terms: list[str] = []
+    for item in _string_values(value):
+        cleaned = " ".join(item.replace("_", " ").replace("-", " ").split())
+        if cleaned:
+            terms.append(cleaned)
+        if item and item != cleaned:
+            terms.append(item)
+    return _unique(terms)
+
+
+def _merge_topic_entry(
+    collection: dict[str, dict[str, Any]],
+    term_value: Any,
+    *,
+    source_id: str | None = None,
+    search_terms: Iterable[Any] | None = None,
+    related_channels: Iterable[str] | None = None,
+    related_metrics: Iterable[str] | None = None,
+    evidence_grade: str | None = None,
+) -> None:
+    term = _canonical_topic_term(term_value)
+    if not term:
+        return
+    key = term.lower().replace(" ", "_").replace("-", "_")
+    entry = collection.setdefault(
+        key,
+        {
+            "term": key,
+            "label": term,
+            "search_terms": [],
+            "related_channels": [],
+            "related_metrics": [],
+            "source_object_ids": [],
+            "evidence_grades": [],
+        },
+    )
+    entry["search_terms"] = _unique(
+        [
+            *entry["search_terms"],
+            *_search_terms_for(term),
+            *[
+                search_term
+                for value in search_terms or []
+                for search_term in _search_terms_for(value)
+            ],
+        ]
+    )
+    entry["related_channels"] = _unique(
+        [*entry["related_channels"], *_string_values(list(related_channels or []))]
+    )
+    entry["related_metrics"] = _unique(
+        [*entry["related_metrics"], *_string_values(list(related_metrics or []))]
+    )
+    if source_id:
+        entry["source_object_ids"] = _unique([*entry["source_object_ids"], source_id])
+    if evidence_grade:
+        entry["evidence_grades"] = _unique([*entry["evidence_grades"], evidence_grade])
+
+
+def _topic_entries(collection: dict[str, dict[str, Any]], *, limit: int) -> list[dict[str, Any]]:
+    entries = sorted(
+        collection.values(),
+        key=lambda item: (-len(item.get("source_object_ids") or []), item.get("term") or ""),
+    )
+    compacted: list[dict[str, Any]] = []
+    for entry in entries[:limit]:
+        compacted.append(
+            {
+                "term": entry["term"],
+                "label": entry["label"],
+                "search_terms": entry["search_terms"][:6],
+                "related_channels": entry["related_channels"][:8],
+                "related_metrics": entry["related_metrics"][:8],
+                "source_object_ids": entry["source_object_ids"][:8],
+                "evidence_grades": entry["evidence_grades"][:4],
+            }
+        )
+    return compacted
+
+
+def _suggest_topic_queries(
+    *,
+    external_factors: dict[str, dict[str, Any]],
+    business_activities: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    suggestions: list[dict[str, Any]] = []
+    for entry in _topic_entries(external_factors, limit=5):
+        topic = (entry.get("search_terms") or [entry["label"]])[0]
+        suggestions.append(
+            {
+                "topic": topic,
+                "object_types": ["ExternalFactorExposure", "RiskFactor", "ResearchClaim"],
+                "source_object_ids": entry.get("source_object_ids", [])[:3],
+            }
+        )
+    for entry in _topic_entries(business_activities, limit=5):
+        topic = (entry.get("search_terms") or [entry["label"]])[0]
+        suggestions.append(
+            {
+                "topic": topic,
+                "object_types": ["BusinessActivity", "ResearchClaim", "EvidenceQuote"],
+                "source_object_ids": entry.get("source_object_ids", [])[:3],
+            }
+        )
+    return suggestions
 
 
 def _compact_object(obj: dict[str, Any]) -> dict[str, Any]:

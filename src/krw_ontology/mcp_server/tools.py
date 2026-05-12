@@ -302,6 +302,60 @@ def trace_tool(
     return _format_response(payload, response_format, _markdown_trace)
 
 
+def chain_tool(
+    *,
+    object_id: str,
+    root: str | None = None,
+    index_path: str | None = None,
+    max_depth: int = 2,
+    direction: str = "both",
+    include_quote_text: bool = False,
+    response_format: ResponseFormat = ResponseFormat.JSON,
+) -> str:
+    """Return compact evidence, semantic, and temporal chains around one object."""
+    index = _index(root, index_path)
+    max_depth = max(0, min(int(max_depth), 4))
+    with _store(index) as store:
+        chain = store.chain(
+            object_id,
+            max_depth=max_depth,
+            direction=direction,
+            include_quote_text=include_quote_text,
+        )
+        resolved_from_prefix = None
+        candidates = []
+        if chain is None:
+            candidates = store.find_object_ids(object_id, limit=11)
+            if len(candidates) == 1:
+                resolved_from_prefix = object_id
+                object_id = candidates[0]["id"]
+                chain = store.chain(
+                    object_id,
+                    max_depth=max_depth,
+                    direction=direction,
+                    include_quote_text=include_quote_text,
+                )
+    if chain is None:
+        if candidates:
+            payload = _error_payload(
+                "ambiguous_object_id",
+                f"Object id prefix is ambiguous: {object_id}",
+                "Pass one exact candidate id from candidates.",
+            )
+            payload["candidates"] = candidates[:10]
+        else:
+            payload = _error_payload(
+                "not_found",
+                f"Object not found: {object_id}",
+                "Call krw_ontology_query first, then pass one returned id or a unique id prefix to chain.",
+            )
+    else:
+        payload = chain
+        if resolved_from_prefix:
+            payload["resolved_from_prefix"] = resolved_from_prefix
+    return _format_response(payload, response_format, _markdown_chain)
+
+
 def quality_tool(
     *,
     root: str | None = None,
@@ -743,6 +797,41 @@ def _markdown_trace(payload: dict[str, Any]) -> str:
         lines.append(f"- Quote `{quote.get('id')}`: {_short_text(quote.get('text'))}")
     for span in payload.get("evidence", {}).get("spans", [])[:3]:
         lines.append(f"- Span `{span.get('id')}`: {_short_text(span.get('text'))}")
+    return "\n".join(lines)
+
+
+def _markdown_chain(payload: dict[str, Any]) -> str:
+    if payload.get("error"):
+        return _markdown_error(payload)
+    obj = payload.get("object", {})
+    chain = payload.get("chain") or {}
+    evidence_chain = chain.get("evidence_chain") or {}
+    lines = [
+        "# Ontology Chain",
+        f"- Object: `{obj.get('id')}` ({obj.get('type')})",
+        f"- Scope: `{obj.get('ticker')}` `{obj.get('document_type')}` `{obj.get('period')}`",
+        f"- Text: {_short_text(obj.get('text'))}",
+        f"- Direction: {chain.get('direction')} max_depth={chain.get('max_depth')}",
+        f"- Evidence: claims={len(evidence_chain.get('claims') or [])}, "
+        f"quotes={len(evidence_chain.get('quotes') or [])}, "
+        f"spans={len(evidence_chain.get('spans') or [])}",
+        f"- Semantic neighbors: {len(chain.get('semantic_neighbors') or [])}",
+        f"- Temporal context: {len(chain.get('temporal_context') or [])}",
+    ]
+    warnings = (payload.get("quality") or {}).get("warnings") or []
+    if warnings:
+        lines.append(f"- Warnings: {', '.join(warnings)}")
+    for neighbor in (chain.get("semantic_neighbors") or [])[:5]:
+        neighbor_obj = neighbor.get("object") or {}
+        lines.append(
+            f"- Neighbor `{neighbor_obj.get('id')}` ({neighbor_obj.get('type')}): "
+            f"{_short_text(neighbor_obj.get('text'))}"
+        )
+    for temporal in (chain.get("temporal_context") or [])[:5]:
+        lines.append(
+            f"- Temporal `{temporal.get('id')}` ({temporal.get('type')}): "
+            f"{_short_text(temporal.get('text'))}"
+        )
     return "\n".join(lines)
 
 

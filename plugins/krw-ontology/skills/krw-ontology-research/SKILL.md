@@ -32,6 +32,7 @@ Use the ontology as layered evidence, not as one flat search result list.
 Object priority matters. For exact facts, dates, amounts, thresholds, project milestones, contract terms, capacity, ownership, debt maturity, covenant terms, or guidance, search direct evidence, claims, and quant objects before high-level risk/headwind objects. For scenario, risk, business model, and trend questions, use semantic and context objects, then trace back to claims and quotes before making the answer final.
 
 For detailed object usage guidance, see `references/ontology-structure.md`.
+For web artifact output guidance, see `references/artifact-contract.md`.
 
 ## Workflow
 
@@ -39,8 +40,9 @@ For detailed object usage guidance, see `references/ontology-structure.md`.
 2. For evidence questions, call `krw_ontology_query` with explicit `tickers`, `document_types`, `periods` or `period_policy` reasoning, `topics`, and relevant `object_types`.
 3. For natural-language convenience, `krw_ontology_retrieve` is available, but prefer structured `krw_ontology_query` when you can infer filters yourself. `retrieve` is a fallback for ambiguous questions, not the primary path.
 4. Call `krw_ontology_trace` on important returned object IDs before making a final claim.
-5. Call `krw_ontology_quality` when section quality, rejected objects, batch failures, or trustworthiness matter.
-6. Call `krw_ontology_compare` for multi-company topic or metric comparisons.
+5. Call `krw_ontology_chain` for the most important objects when the answer depends on how evidence, claims, semantic objects, and temporal context connect.
+6. Call `krw_ontology_quality` when section quality, rejected objects, batch failures, or trustworthiness matter.
+7. Call `krw_ontology_compare` for multi-company topic or metric comparisons.
 
 ## Search Principles
 
@@ -52,6 +54,24 @@ These are the high-priority rules. Follow them before applying the more detailed
 4. If a topic search returns no results, inspect `search_diagnostics` before broadening scope. If `normalized_terms` is empty, translate the question into English/canonical company exposure terms or call `krw_ontology_topic_map`. If the strict query is too narrow, split it into smaller topic searches.
 5. For exact dates, amounts, contract terms, project milestones, guidance, or thresholds, verify direct filing evidence through `EvidenceQuote`, `ResearchClaim`, or quant objects before using web, memory, or inference.
 6. If the user provides or references an external market, macro, commodity, policy, or industry report, treat that report as a market premise and map it to company-level ontology exposures. Do not stop at "the ontology has no evidence on the market report topic" unless the user only asked whether the report itself is indexed.
+7. Trace and source IDs are internal evidence controls. Use them to verify the answer, but do not expose raw ontology IDs or filing quote text in the final user-facing answer unless the user explicitly asks for raw evidence, trace details, debug output, or exportable citations.
+
+## Chain-First Research Protocol
+
+Use the ontology chain when a conclusion depends on more than one object. The chain is the system's main advantage: filing text supports quotes, quotes support claims, claims support normalized research objects, and those objects connect to related semantic and temporal context.
+
+1. Start with `krw_ontology_query` or `krw_ontology_topic_map` to find candidate objects.
+2. For the top object behind each important conclusion, call `krw_ontology_chain` with `max_depth=2`, `direction="both"`, and `include_quote_text=false`.
+3. Read the chain in layers:
+   - `evidence_chain`: checks whether the object is actually grounded in claims, quotes, and source spans.
+   - `semantic_neighbors`: reveals connected risks, drivers, headwinds, activities, exposures, and assumptions.
+   - `temporal_context`: reveals related change events, trend observations, and cross-period links.
+   - `quality`: shows weak evidence grade, rejected status, section warnings, or missing support.
+4. Use `krw_ontology_trace` instead of `chain` when you only need the source evidence for one exact fact. Use `chain` when you need to understand connected business meaning.
+5. For factual dates, amounts, project milestones, contract terms, and guidance, do not let semantic neighbors override direct filing evidence. Use the chain to catch context and contradictions, not to replace direct support.
+6. For scenario and external-market-report questions, use `chain` on the strongest `ExternalFactorExposure`, `BusinessActivity`, `RiskFactor`, or `Headwind` objects before finalizing the impact bridge.
+7. If `quality.warnings` includes `no_supporting_evidence_found`, `object_is_rejected`, or weak evidence grade, either downgrade the conclusion or say the filing support is weak.
+8. Keep chain details internal by default. The visible answer should summarize the relationship in plain language without raw object IDs or quote text unless the user asks for audit/debug output.
 
 ## Broad Research Questions
 
@@ -139,12 +159,36 @@ The key rule: the external report is a market premise, not SEC filing evidence. 
 - External market report impact: treat the external report as a premise, map it to company exposure factors and financial channels, query company-specific ontology evidence, then separate market premise, SEC filing evidence, and analyst bridge in the answer.
 - Comparison: use `krw_ontology_compare`, then trace or query the most important differences per ticker/period.
 
+## Final Answer Evidence Contract
+
+The web UI may render evidence separately. The final natural-language answer should therefore be clean and reader-facing by default.
+
+- Do not include raw ontology object IDs such as `claim:...`, `quote:...`, `risk:...`, `external_factor_exposure:...`, or `numeric_evidence:...` in the final answer unless the user explicitly asks for IDs, trace output, citations, or debugging.
+- Do not paste original filing quote text by default. Summarize the evidence in your own words.
+- Do not add lines like `근거: claim:...`, `Quote ...`, or `source_object_id: ...` in the visible answer.
+- Do not include data coverage, index inventory, object counts, section-quality status, batch-failure counts, rejected-object counts, or catalog summaries in the final answer unless the user explicitly asks about coverage, quality, indexing, debugging, auditability, or data availability.
+- Still use `krw_ontology_trace` internally when the question requires it. Hidden trace verification should improve accuracy, not clutter the answer.
+- Use human-readable source labels instead, such as "NVDA FY2026 10-K", "latest 10-Q", "company filing evidence", or "direct filing evidence".
+- For exact dates, amounts, contract terms, and project milestones, say whether the support is direct filing evidence, indirect filing evidence, or an inference.
+- If the user asks "근거 보여줘", "trace 해줘", "object id 줘", "원문 보여줘", "데이터 커버리지", "품질 상태", or requests audit/debug/export output, then provide the relevant IDs, short source excerpts, coverage, and quality details.
+
+## Web Artifact Contract
+
+When the runtime supports structured artifacts, keep the visible answer short and produce artifact-ready structure separately according to `references/artifact-contract.md`.
+
+- The canonical artifact is structured JSON plus evidence references, not HTML.
+- HTML is a render/export target only.
+- The agent may synthesize titles, summaries, takeaways, mechanisms, caveats, and inference labels.
+- The frontend owns React components, mobile cards, HTML export, debounce/search UI, storage migrations, and visual layout.
+- Do not paste artifact JSON into the visible answer unless the user explicitly asks for export/debug output.
+
 ## Answering Rules
 
-- Cite object IDs, ticker, document type, period, and short quote snippets.
+- Use ticker, document type, and period as reader-facing source labels; hide raw object IDs and quote snippets by default.
 - Treat `quality.section_quality=warn` or batch failures as caveats.
 - Do not cite rejected objects unless the user explicitly asks for rejected data.
 - If evidence is weak, say that the retrieved evidence is weak instead of overstating.
+- Do not end customer-facing answers with operational follow-up prompts such as "더 구체적인 주제가 궁금하면 말씀해 주세요" unless the user is explicitly exploring next research directions.
 - Prefer direct quotes and `ResearchClaim` objects over high-level theme objects when answering factual questions.
 - Use 10-Q evidence for quarterly/current updates and 10-K evidence for annual or long-horizon context.
 - For cross-company comparisons, state that comparison is ad-hoc unless a dedicated cross-company edge or temporal/thread object is returned.

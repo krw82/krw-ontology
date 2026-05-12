@@ -50,6 +50,25 @@ This is a search-planning helper, not final evidence. It repackages `CompanyBusi
 
 Trace a returned object ID to supporting quotes, source spans, document metadata, and quality signals. Exact IDs are best, but a unique returned ID prefix is accepted; ambiguous prefixes return candidates.
 
+## `krw_ontology_chain`
+
+Return a compact relationship chain around one object. Use it when the answer depends on how evidence, claims, semantic objects, and temporal context connect.
+
+Useful parameters:
+- `object_id`: exact object ID or unique returned prefix
+- `max_depth`: default `2`; limits graph edge expansion
+- `direction`: `"both"`, `"incoming"`, or `"outgoing"`; aliases such as `"upstream"` and `"downstream"` are accepted
+- `include_quote_text`: default `false`; keep it false for normal customer-facing research
+- `response_format`: `"json"` or `"markdown"`
+
+Returns:
+- `evidence_chain`: supporting claims, quotes, and source spans
+- `semantic_neighbors`: related risks, drivers, headwinds, activities, exposures, or assumptions
+- `temporal_context`: related change events, trend observations, or temporal links
+- `quality`: evidence grade and warnings such as missing support, rejected object status, or weak evidence
+
+Use `trace` for one object's source evidence. Use `chain` when connected business meaning matters.
+
 ## `krw_ontology_quality`
 
 Inspect rejected objects, batch failures, section-quality warnings, and company-context coverage warnings. Use this before declaring a dataset reliable or complete.

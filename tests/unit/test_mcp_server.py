@@ -9,6 +9,7 @@ from krw_ontology.agent_index import build_agent_index
 from krw_ontology.mcp_server.server import health_payload, mcp
 from krw_ontology.mcp_server.tools import (
     catalog_tool,
+    chain_tool,
     compare_tool,
     plan_query_tool,
     quality_tool,
@@ -52,6 +53,18 @@ def test_mcp_tools_query_trace_quality_and_compare(tmp_path: Path, monkeypatch):
     trace = json.loads(trace_tool(object_id="claim:VG:FY2025:10K:revenue-growth"))
     assert trace["object"]["type"] == "ResearchClaim"
     assert trace["evidence"]["quotes"][0]["id"] == "quote:VG:FY2025:10K:0001"
+
+    chain = json.loads(chain_tool(object_id="growth_driver:VG:FY2025:10K:revenue-growth"))
+    assert chain["object"]["type"] == "GrowthDriver"
+    assert chain["chain"]["evidence_chain"]["claims"][0]["id"] == "claim:VG:FY2025:10K:revenue-growth"
+    assert chain["chain"]["evidence_chain"]["quotes"][0]["id"] == "quote:VG:FY2025:10K:0001"
+    assert "text" not in chain["chain"]["evidence_chain"]["quotes"][0]
+    assert {
+        neighbor["object"]["id"] for neighbor in chain["chain"]["semantic_neighbors"]
+    } >= {
+        "business_activity:VG:FY2025:10K:lng-sales",
+        "external_factor_exposure:VG:FY2025:10K:natural-gas-price-operating-margin",
+    }
 
     quality = json.loads(quality_tool(ticker="VG"))
     assert quality["summary"]["documents"] == 2
@@ -151,6 +164,95 @@ def test_mcp_topic_map_repackages_company_vocabulary(tmp_path: Path, monkeypatch
     )
 
 
+def test_mcp_chain_returns_object_specific_chains(tmp_path: Path, monkeypatch):
+    _write_fixture(tmp_path)
+    build_agent_index(tmp_path)
+    monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
+
+    exposure_chain = json.loads(
+        chain_tool(
+            object_id="external_factor_exposure:VG:FY2025:10K:natural-gas-price-operating-margin"
+        )
+    )
+    assert exposure_chain["object"]["type"] == "ExternalFactorExposure"
+    assert exposure_chain["quality"]["evidence_grade"] == "direct"
+    assert exposure_chain["quality"]["warnings"] == []
+    assert exposure_chain["chain"]["evidence_chain"]["claims"][0]["type"] == "ResearchClaim"
+    assert "text" not in exposure_chain["chain"]["evidence_chain"]["quotes"][0]
+
+    activity_chain = json.loads(chain_tool(object_id="business_activity:VG:FY2025:10K:lng-sales"))
+    assert activity_chain["object"]["type"] == "BusinessActivity"
+    assert {
+        item["id"] for item in activity_chain["chain"]["temporal_context"]
+    } >= {
+        "trend:VG:ALL:lng-sales-revenue",
+        "change_event:VG:ALL:revenue-growth",
+    }
+
+    claim_chain = json.loads(chain_tool(object_id="claim:VG:FY2025:10K:revenue-growth"))
+    assert claim_chain["object"]["type"] == "ResearchClaim"
+    assert claim_chain["chain"]["evidence_chain"]["quotes"][0]["id"] == "quote:VG:FY2025:10K:0001"
+
+    quote_chain = json.loads(chain_tool(object_id="quote:VG:FY2025:10K:0001"))
+    assert quote_chain["object"]["type"] == "EvidenceQuote"
+    assert quote_chain["chain"]["evidence_chain"]["claims"][0]["id"] == "claim:VG:FY2025:10K:revenue-growth"
+
+
+def test_mcp_chain_respects_depth_and_quote_text_option(tmp_path: Path, monkeypatch):
+    _write_fixture(tmp_path)
+    build_agent_index(tmp_path)
+    monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
+
+    shallow = json.loads(
+        chain_tool(
+            object_id="growth_driver:VG:FY2025:10K:revenue-growth",
+            max_depth=1,
+            direction="incoming",
+        )
+    )
+    shallow_path_ids = [
+        step["object"]["id"]
+        for path in shallow["chain"]["edge_paths"]
+        for step in path["steps"]
+    ]
+    assert "claim:VG:FY2025:10K:revenue-growth" in shallow_path_ids
+    assert "quote:VG:FY2025:10K:0001" not in shallow_path_ids
+
+    deeper = json.loads(
+        chain_tool(
+            object_id="growth_driver:VG:FY2025:10K:revenue-growth",
+            max_depth=2,
+            direction="incoming",
+            include_quote_text=True,
+        )
+    )
+    deep_path_ids = [
+        step["object"]["id"]
+        for path in deeper["chain"]["edge_paths"]
+        for step in path["steps"]
+    ]
+    assert "quote:VG:FY2025:10K:0001" in deep_path_ids
+    assert deeper["chain"]["evidence_chain"]["quotes"][0]["text"]
+
+
+def test_mcp_chain_reports_missing_ambiguous_and_unsupported_objects(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _write_fixture(tmp_path)
+    build_agent_index(tmp_path)
+    monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
+
+    missing = json.loads(chain_tool(object_id="risk:VG:missing"))
+    assert missing["error"]["code"] == "not_found"
+
+    ambiguous = json.loads(chain_tool(object_id="claim:VG"))
+    assert ambiguous["error"]["code"] == "ambiguous_object_id"
+
+    unsupported = json.loads(chain_tool(object_id="risk:VG:FY2025:10K:unsupported-risk"))
+    assert "no_supporting_evidence_found" in unsupported["quality"]["warnings"]
+
+
 def test_mcp_compare_allows_single_ticker_period_comparison(tmp_path: Path, monkeypatch):
     _write_fixture(tmp_path, period="FY2024", text="Revenue growth faced operational risk.")
     _write_fixture(tmp_path, period="FY2025", text="Revenue growth faced regulatory risk.")
@@ -207,6 +309,7 @@ def test_mcp_server_registers_expected_tools():
         "krw_ontology_topic_map",
         "krw_ontology_retrieve",
         "krw_ontology_trace",
+        "krw_ontology_chain",
         "krw_ontology_quality",
         "krw_ontology_compare",
         "krw_ontology_plan_query",
@@ -253,6 +356,7 @@ def _write_fixture(
     risk_claim_id = f"claim:VG:{period}:10K:regulatory-risk"
     driver_id = f"growth_driver:VG:{period}:10K:revenue-growth"
     risk_id = f"risk:VG:{period}:10K:regulatory-risk"
+    unsupported_risk_id = f"risk:VG:{period}:10K:unsupported-risk"
     activity_id = f"business_activity:VG:{period}:10K:lng-sales"
     exposure_id = f"external_factor_exposure:VG:{period}:10K:natural-gas-price-operating-margin"
     span = {
@@ -333,6 +437,19 @@ def _write_fixture(
         "supported_by_claims": [risk_claim_id],
         "review_status": "accepted",
     }
+    unsupported_risk = {
+        "id": unsupported_risk_id,
+        "type": "RiskFactor",
+        "ticker": "VG",
+        "source_document_id": source_document_id,
+        "document_type": "10-K",
+        "period": period,
+        "name": "Unsupported risk",
+        "description": "Unsupported risk has no supporting claim.",
+        "category": "operational",
+        "supported_by_claims": [],
+        "review_status": "accepted",
+    }
     activity = {
         "id": activity_id,
         "type": "BusinessActivity",
@@ -409,7 +526,7 @@ def _write_fixture(
     write_jsonl(ontology_dir / "spans.jsonl", [span])
     write_jsonl(ontology_dir / "evidence_quotes.jsonl", [quote])
     write_jsonl(ontology_dir / "claims.jsonl", [claim, risk_claim])
-    write_jsonl(ontology_dir / "risks.jsonl", [risk])
+    write_jsonl(ontology_dir / "risks.jsonl", [risk, unsupported_risk])
     write_jsonl(ontology_dir / "growth_drivers.jsonl", [driver])
     write_jsonl(ontology_dir / "business_activities.jsonl", [activity])
     write_jsonl(ontology_dir / "external_factor_exposures.jsonl", [exposure])
@@ -439,7 +556,7 @@ def _write_fixture(
                 "spans": 1,
                 "evidence_quotes": 1,
                 "claims": 2,
-                "risks": 1,
+                "risks": 2,
                 "growth_drivers": 1,
                 "business_activities": 1,
                 "external_factor_exposures": 1,
@@ -447,7 +564,14 @@ def _write_fixture(
             },
         },
     )
-    _write_context_fixture(root, period=period, activity_id=activity_id, exposure_id=exposure_id)
+    _write_context_fixture(
+        root,
+        period=period,
+        activity_id=activity_id,
+        exposure_id=exposure_id,
+        claim_id=claim_id,
+        quote_id=quote_id,
+    )
 
 
 def _write_context_fixture(
@@ -456,6 +580,8 @@ def _write_context_fixture(
     period: str,
     activity_id: str,
     exposure_id: str,
+    claim_id: str,
+    quote_id: str,
 ) -> None:
     context_dir = root / "companies" / "VG" / "context"
     context_dir.mkdir(parents=True, exist_ok=True)
@@ -477,8 +603,82 @@ def _write_context_fixture(
         "source_object_ids": [activity_id, exposure_id],
         "review_status": "accepted",
     }
+    trend = {
+        "id": "trend:VG:ALL:lng-sales-revenue",
+        "type": "TrendObservation",
+        "ticker": "VG",
+        "source_document_id": "source:VG:ALL:COMPANY",
+        "document_type": "COMPANY",
+        "period": "ALL",
+        "subject": "LNG sales",
+        "metric_or_factor": "revenue",
+        "from_period": "FY2024",
+        "to_period": period,
+        "direction": "increased",
+        "magnitude_text": None,
+        "interpretation": "LNG sales activity and natural gas exposure are context for revenue growth.",
+        "supported_by_objects": [activity_id, exposure_id],
+        "confidence": "medium",
+        "review_status": "accepted",
+    }
+    change = {
+        "id": "change_event:VG:ALL:revenue-growth",
+        "type": "ChangeEvent",
+        "ticker": "VG",
+        "source_document_id": "source:VG:ALL:COMPANY",
+        "document_type": "COMPANY",
+        "period": "ALL",
+        "event_type": "growth_signal",
+        "event_date": None,
+        "description": "Revenue growth was tied to customer demand and LNG sales context.",
+        "affected_objects": [activity_id],
+        "supported_by_claims": [claim_id],
+        "supported_by_quotes": [quote_id],
+        "confidence": "medium",
+        "review_status": "accepted",
+    }
+    edges = [
+        {
+            "id": "edge:VG:ALL:claim-change",
+            "type": "Edge",
+            "ticker": "VG",
+            "source_document_id": "source:VG:ALL:COMPANY",
+            "document_type": "COMPANY",
+            "period": "ALL",
+            "from_id": claim_id,
+            "to_id": change["id"],
+            "relation_id": "supports_change_event",
+            "relation_name": "supports_change_event",
+            "edge_class": "event",
+            "evidence_level": "direct",
+            "generation_method": "test_fixture",
+            "rationale": "The claim supports this change event.",
+            "confidence": "high",
+            "review_status": "accepted",
+        },
+        {
+            "id": "edge:VG:ALL:change-activity",
+            "type": "Edge",
+            "ticker": "VG",
+            "source_document_id": "source:VG:ALL:COMPANY",
+            "document_type": "COMPANY",
+            "period": "ALL",
+            "from_id": change["id"],
+            "to_id": activity_id,
+            "relation_id": "affects_object",
+            "relation_name": "affects_object",
+            "edge_class": "event",
+            "evidence_level": "inferred",
+            "generation_method": "test_fixture",
+            "rationale": "The change event affects this business activity.",
+            "confidence": "medium",
+            "review_status": "accepted",
+        },
+    ]
     write_jsonl(context_dir / "company_business_profiles.jsonl", [profile])
-    write_jsonl(context_dir / "edges.jsonl", [])
+    write_jsonl(context_dir / "trend_observations.jsonl", [trend])
+    write_jsonl(context_dir / "change_events.jsonl", [change])
+    write_jsonl(context_dir / "edges.jsonl", edges)
     atomic_write_json(
         context_dir / "artifact_index.json",
         {
@@ -488,11 +688,15 @@ def _write_context_fixture(
             "period": "ALL",
             "files": {
                 "company_business_profiles": "companies/VG/context/company_business_profiles.jsonl",
+                "trend_observations": "companies/VG/context/trend_observations.jsonl",
+                "change_events": "companies/VG/context/change_events.jsonl",
                 "edges": "companies/VG/context/edges.jsonl",
             },
             "counts": {
                 "company_business_profiles": 1,
-                "edges": 0,
+                "trend_observations": 1,
+                "change_events": 1,
+                "edges": 2,
             },
             "schema_version": "0.1.0",
             "source_period": period,

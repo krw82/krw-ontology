@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 import json
 import re
 import sqlite3
@@ -24,6 +25,17 @@ DEFAULT_QUERY_TYPES = (
 
 _TERM_RE = re.compile(r"[A-Za-z0-9_]+")
 _STRICT_TOPIC_WARNING_TERM_COUNT = 5
+_CHAIN_MAX_DEPTH = 4
+_CHAIN_MAX_PATHS = 40
+_CHAIN_MAX_TEMPORAL_CONTEXT = 12
+_SEMANTIC_NEIGHBOR_TYPES = {
+    "RiskFactor",
+    "GrowthDriver",
+    "Headwind",
+    "BusinessActivity",
+    "ExternalFactorExposure",
+    "AssumptionCandidate",
+}
 
 
 class OntologyStore:
@@ -270,6 +282,71 @@ class OntologyStore:
             "quality": self._quality_for_object(obj),
         }
 
+    def chain(
+        self,
+        object_id: str,
+        *,
+        max_depth: int = 2,
+        direction: str = "both",
+        include_quote_text: bool = False,
+    ) -> dict[str, Any] | None:
+        """Return a compact evidence and graph chain around one ontology object."""
+        obj = self.get_object(object_id)
+        if not obj:
+            return None
+
+        max_depth = max(0, min(int(max_depth), _CHAIN_MAX_DEPTH))
+        direction = _normalize_chain_direction(direction)
+        evidence = self._expand_evidence(obj)
+        graph_paths = self._edge_paths(
+            obj["id"],
+            direction=direction,
+            max_depth=max_depth,
+            include_quote_text=include_quote_text,
+        )
+        temporal_context = self._temporal_context_for_object(
+            obj,
+            evidence=evidence,
+            graph_paths=graph_paths,
+            include_quote_text=include_quote_text,
+        )
+        quality = self._quality_for_object(obj)
+        quality["evidence_grade"] = obj.get("evidence_grade")
+        quality["warnings"] = _chain_warnings(obj, evidence, quality)
+
+        return {
+            "object": _chain_node(obj, include_quote_text=include_quote_text),
+            "document": self._document_for(obj),
+            "chain": {
+                "max_depth": max_depth,
+                "direction": direction,
+                "include_quote_text": include_quote_text,
+                "evidence_chain": {
+                    "claims": [
+                        _chain_node(claim, include_quote_text=include_quote_text)
+                        for claim in evidence.get("claims", [])
+                    ],
+                    "quotes": [
+                        _chain_node(quote, include_quote_text=include_quote_text)
+                        for quote in evidence.get("quotes", [])
+                    ],
+                    "spans": [
+                        _chain_node(span, include_quote_text=include_quote_text)
+                        for span in evidence.get("spans", [])
+                    ],
+                },
+                "semantic_neighbors": self._semantic_neighbors_for_chain(
+                    obj,
+                    evidence=evidence,
+                    graph_paths=graph_paths,
+                    include_quote_text=include_quote_text,
+                ),
+                "temporal_context": temporal_context,
+                "edge_paths": graph_paths,
+            },
+            "quality": quality,
+        }
+
     def bundle(self, object_id: str) -> dict[str, Any]:
         """Return a compact evidence bundle for query results."""
         trace = self.trace(object_id)
@@ -503,6 +580,165 @@ class OntologyStore:
             [*params, max(1, int(limit))],
         ).fetchall()
         return [_object_from_row(row) for row in rows]
+
+    def _edge_paths(
+        self,
+        object_id: str,
+        *,
+        direction: str,
+        max_depth: int,
+        include_quote_text: bool,
+    ) -> list[dict[str, Any]]:
+        if max_depth <= 0:
+            return []
+
+        paths: list[dict[str, Any]] = []
+        queue: deque[tuple[str, list[dict[str, Any]], set[str]]] = deque()
+        queue.append((object_id, [], {object_id}))
+        while queue and len(paths) < _CHAIN_MAX_PATHS:
+            current_id, current_steps, seen_ids = queue.popleft()
+            if len(current_steps) >= max_depth:
+                continue
+            for edge, neighbor in self._direct_edge_neighbors(current_id, direction=direction):
+                neighbor_id = neighbor.get("id")
+                if not neighbor_id or neighbor_id in seen_ids:
+                    continue
+                step = {
+                    "direction": edge.pop("_chain_direction"),
+                    "edge": _compact_edge(edge),
+                    "object": _chain_node(neighbor, include_quote_text=include_quote_text),
+                }
+                next_steps = [*current_steps, step]
+                paths.append({"depth": len(next_steps), "steps": next_steps})
+                queue.append((neighbor_id, next_steps, {*seen_ids, neighbor_id}))
+                if len(paths) >= _CHAIN_MAX_PATHS:
+                    break
+        return paths
+
+    def _direct_edge_neighbors(
+        self,
+        object_id: str,
+        *,
+        direction: str,
+    ) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+        rows: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        if direction in {"both", "outgoing"}:
+            rows.extend(self._edge_neighbor_rows(object_id, outgoing=True))
+        if direction in {"both", "incoming"}:
+            rows.extend(self._edge_neighbor_rows(object_id, outgoing=False))
+        return rows
+
+    def _edge_neighbor_rows(
+        self,
+        object_id: str,
+        *,
+        outgoing: bool,
+    ) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+        from_column, to_column = ("from_id", "to_id") if outgoing else ("to_id", "from_id")
+        rows = self.conn.execute(
+            f"""
+            SELECT edges.*, objects.json AS object_json, objects.review_status AS object_review_status
+            FROM edges
+            JOIN objects ON objects.id = edges.{to_column}
+            WHERE edges.{from_column} = ?
+              AND (objects.review_status IS NULL OR objects.review_status != 'rejected')
+            ORDER BY edges.relation_id, objects.type, objects.id
+            LIMIT 20
+            """,
+            (object_id,),
+        ).fetchall()
+        neighbors: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        for row in rows:
+            edge = _edge_from_row(row)
+            edge["_chain_direction"] = "outgoing" if outgoing else "incoming"
+            neighbor = json.loads(row["object_json"])
+            if row["object_review_status"]:
+                neighbor["review_status"] = row["object_review_status"]
+            neighbors.append((edge, neighbor))
+        return neighbors
+
+    def _semantic_neighbors_for_chain(
+        self,
+        obj: dict[str, Any],
+        *,
+        evidence: dict[str, list[dict[str, Any]]],
+        graph_paths: list[dict[str, Any]],
+        include_quote_text: bool,
+    ) -> list[dict[str, Any]]:
+        neighbors: dict[str, dict[str, Any]] = {}
+
+        def add_neighbor(candidate: dict[str, Any], *, via: dict[str, Any]) -> None:
+            candidate_id = candidate.get("id")
+            if (
+                not candidate_id
+                or candidate_id == obj.get("id")
+                or candidate.get("type") not in _SEMANTIC_NEIGHBOR_TYPES
+            ):
+                return
+            entry = neighbors.setdefault(
+                candidate_id,
+                {
+                    "object": _chain_node(candidate, include_quote_text=include_quote_text),
+                    "via": [],
+                },
+            )
+            entry["via"].append(via)
+
+        for related in evidence.get("related_objects", []):
+            add_neighbor(related, via={"source": "shared_claim"})
+
+        for path in graph_paths:
+            for step in path.get("steps", []):
+                candidate = step.get("object") or {}
+                add_neighbor(
+                    candidate,
+                    via={
+                        "source": "edge",
+                        "depth": path.get("depth"),
+                        "direction": step.get("direction"),
+                        "relation_id": (step.get("edge") or {}).get("relation_id"),
+                    },
+                )
+
+        return list(neighbors.values())[:20]
+
+    def _temporal_context_for_object(
+        self,
+        obj: dict[str, Any],
+        *,
+        evidence: dict[str, list[dict[str, Any]]],
+        graph_paths: list[dict[str, Any]],
+        include_quote_text: bool,
+    ) -> list[dict[str, Any]]:
+        object_ids = {obj.get("id")}
+        object_ids.update(claim.get("id") for claim in evidence.get("claims", []) if claim.get("id"))
+        object_ids.update(quote.get("id") for quote in evidence.get("quotes", []) if quote.get("id"))
+        for path in graph_paths:
+            for step in path.get("steps", []):
+                step_object = step.get("object") or {}
+                if step_object.get("id"):
+                    object_ids.add(step_object["id"])
+
+        rows = self.conn.execute(
+            """
+            SELECT *
+            FROM objects
+            WHERE ticker = ?
+              AND type IN ('TemporalLink', 'TrendObservation', 'ChangeEvent')
+              AND (review_status IS NULL OR review_status != 'rejected')
+            ORDER BY period DESC, type, id
+            LIMIT 200
+            """,
+            (obj.get("ticker"),),
+        ).fetchall()
+        temporal: list[dict[str, Any]] = []
+        for row in rows:
+            candidate = _object_from_row(row)
+            if candidate.get("id") == obj.get("id") or _temporal_references_object(candidate, object_ids):
+                temporal.append(_chain_node(candidate, include_quote_text=include_quote_text))
+            if len(temporal) >= _CHAIN_MAX_TEMPORAL_CONTEXT:
+                break
+        return temporal
 
     def _expand_evidence(self, obj: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
         claims: list[dict[str, Any]] = []
@@ -806,6 +1042,105 @@ def _quality_from_row(row: sqlite3.Row) -> dict[str, Any]:
         "message": row["message"],
         "payload": json.loads(row["json"]),
     }
+
+
+def _edge_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    edge = json.loads(row["json"])
+    for key in (
+        "id",
+        "ticker",
+        "document_type",
+        "period",
+        "source_document_id",
+        "from_id",
+        "to_id",
+        "relation_id",
+        "relation_name",
+        "confidence",
+        "review_status",
+    ):
+        if row[key] is not None:
+            edge[key] = row[key]
+    return edge
+
+
+def _compact_edge(edge: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": edge.get("id"),
+        "relation_id": edge.get("relation_id"),
+        "relation_name": edge.get("relation_name"),
+        "from_id": edge.get("from_id"),
+        "to_id": edge.get("to_id"),
+        "edge_class": edge.get("edge_class"),
+        "evidence_level": edge.get("evidence_level"),
+        "generation_method": edge.get("generation_method"),
+        "confidence": edge.get("confidence"),
+        "review_status": edge.get("review_status"),
+        "rationale": edge.get("rationale"),
+    }
+
+
+def _chain_node(obj: dict[str, Any], *, include_quote_text: bool) -> dict[str, Any]:
+    node = _compact_object(obj)
+    if obj.get("type") in {"EvidenceQuote", "SourceSpan"} and not include_quote_text:
+        node.pop("text", None)
+        node["text_available"] = bool(_display_text(obj))
+    return node
+
+
+def _normalize_chain_direction(direction: str) -> str:
+    value = str(direction or "both").strip().lower()
+    if value in {"incoming", "in", "upstream", "up"}:
+        return "incoming"
+    if value in {"outgoing", "out", "downstream", "down"}:
+        return "outgoing"
+    return "both"
+
+
+def _temporal_references_object(candidate: dict[str, Any], object_ids: set[str | None]) -> bool:
+    if not object_ids:
+        return False
+    candidate_type = candidate.get("type")
+    if candidate_type == "TemporalLink":
+        return candidate.get("from_object_id") in object_ids or candidate.get("to_object_id") in object_ids
+    if candidate_type == "TrendObservation":
+        return bool(set(candidate.get("supported_by_objects") or []).intersection(object_ids))
+    if candidate_type == "ChangeEvent":
+        referenced_ids = {
+            *(candidate.get("affected_objects") or []),
+            *(candidate.get("supported_by_claims") or []),
+            *(candidate.get("supported_by_quotes") or []),
+        }
+        return bool(referenced_ids.intersection(object_ids))
+    return False
+
+
+def _chain_warnings(
+    obj: dict[str, Any],
+    evidence: dict[str, list[dict[str, Any]]],
+    quality: dict[str, Any],
+) -> list[str]:
+    warnings: list[str] = []
+    if obj.get("review_status") == "rejected":
+        warnings.append("object_is_rejected")
+    if not evidence.get("claims") and not evidence.get("quotes") and obj.get("type") not in {
+        "EvidenceQuote",
+        "ResearchClaim",
+        "SourceSpan",
+        "FinancialMetricValue",
+        "DerivedMetricValue",
+        "NumericEvidence",
+        "XBRLFact",
+    }:
+        warnings.append("no_supporting_evidence_found")
+    evidence_grade = obj.get("evidence_grade")
+    if evidence_grade in {"derived", "unsupported"}:
+        warnings.append(f"weak_evidence_grade:{evidence_grade}")
+    if quality.get("section_quality") in {"warn", "fail"}:
+        warnings.append(f"section_quality:{quality.get('section_quality')}")
+    if quality.get("events"):
+        warnings.append("quality_events_present")
+    return _unique(warnings)
 
 
 def _display_text(obj: dict[str, Any]) -> str:

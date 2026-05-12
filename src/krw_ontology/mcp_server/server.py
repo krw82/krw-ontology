@@ -14,6 +14,7 @@ from krw_ontology.mcp_server.tools import (
     ResponseDetail,
     ResponseFormat,
     catalog_tool,
+    chain_tool,
     compare_tool,
     plan_query_tool,
     quality_tool,
@@ -212,6 +213,32 @@ async def krw_ontology_trace(
         object_id=object_id,
         root=root,
         index_path=index_path,
+        response_format=response_format,
+    )
+
+
+@mcp.tool(
+    name="krw_ontology_chain",
+    title="Trace KRW ontology object relationship chain",
+    annotations=READ_ONLY,
+)
+async def krw_ontology_chain(
+    object_id: str,
+    root: str | None = None,
+    index_path: str | None = None,
+    max_depth: int = 2,
+    direction: str = "both",
+    include_quote_text: bool = False,
+    response_format: ResponseFormat = ResponseFormat.JSON,
+) -> str:
+    """Return evidence, semantic-neighbor, and temporal-context chains around an object."""
+    return chain_tool(
+        object_id=object_id,
+        root=root,
+        index_path=index_path,
+        max_depth=max_depth,
+        direction=direction,
+        include_quote_text=include_quote_text,
         response_format=response_format,
     )
 

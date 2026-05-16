@@ -1,7 +1,7 @@
 {
   "name": "krw-ontology",
   "version": "0.1.0",
-  "description": "Source-grounded equity research ontology tools for 10-K and 10-Q evidence retrieval.",
+  "description": "Source-grounded equity research ontology workflow for 10-K and 10-Q evidence, canonical answer synthesis, and frontend display planning.",
   "author": {
     "name": "Jeong Woncheol",
     "email": "local@example.com",
@@ -20,8 +20,8 @@
   "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "KRW Ontology",
-    "shortDescription": "Query source-grounded 10-K and 10-Q ontology evidence.",
-    "longDescription": "Provides read-only MCP tools and agent guidance for querying KRW ontology data, tracing claims to quotes and spans, inspecting quality signals, and comparing companies.",
+    "shortDescription": "Create source-grounded canonical answers and display plans from 10-K and 10-Q evidence.",
+    "longDescription": "Provides read-only MCP tools and two product skills for KRW ontology research: the runner first calls the research skill to build validated ResearchSynthesis with canonical_answer units from filing evidence, then calls the answer-composer skill to produce a frontend display_plan without rewriting the content.",
     "developerName": "Jeong Woncheol",
     "category": "Productivity",
     "capabilities": [
@@ -29,9 +29,9 @@
       "Read"
     ],
     "defaultPrompt": [
-      "Find VG 10-K evidence for revenue growth.",
-      "Trace this ontology object to source quotes.",
-      "Compare VG and XOM capex evidence."
+      "Summarize AMZN from filing evidence.",
+      "Analyze VG's key risks with canonical answer units.",
+      "Compare VG and XOM capex evidence for the web UI."
     ],
     "brandColor": "#2563EB"
   }

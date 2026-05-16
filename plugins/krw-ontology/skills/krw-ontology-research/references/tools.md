@@ -30,8 +30,11 @@ Returns compact evidence bundles by default. Each result should include the obje
 
 Each response also includes `search_diagnostics` for topic searches. If results are empty, inspect `normalized_terms`, `fts_query`, and `warnings` before broadening the query. Common warnings:
 - `empty_topic_after_tokenization`: the topic produced no searchable English/canonical tokens, often from Korean-only or overly natural-language input.
+- `topic_rewritten_for_search`: the original topic produced no English/canonical tokens, but deterministic query expansion found searchable fallback terms.
 - `strict_and_query_may_be_too_narrow`: the strict FTS query likely required too many terms at once. Split the topic into smaller searches.
 - `long_strict_topic`: prefer several small topic queries over one long topic.
+
+`search_diagnostics.search_strategy` records the attempted retrieval path. The tool first tries strict AND search, then deterministic canonical expansion, split-term searches, and finally relaxed OR search. This does not modify the ontology index or create new objects.
 
 ## `krw_ontology_topic_map`
 
@@ -76,6 +79,8 @@ Inspect rejected objects, batch failures, section-quality warnings, and company-
 ## `krw_ontology_compare`
 
 Compare companies by `topic` or canonical `metric`. Pass two or more tickers and a small `limit_per_ticker`. Default output is compact.
+
+The response preserves raw per-ticker or per-period `results` and also includes `comparison_rows`: normalized rows with `ticker`, `period`, `document_type`, `source_label`, selected object summary, confidence/evidence grade, evidence counts, caveats, and missing-result status. Use `comparison_rows` for comparison tables; trace or query the selected object when a row drives an important conclusion.
 
 ## `krw_ontology_retrieve`
 

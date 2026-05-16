@@ -32,7 +32,7 @@ Use the ontology as layered evidence, not as one flat search result list.
 Object priority matters. For exact facts, dates, amounts, thresholds, project milestones, contract terms, capacity, ownership, debt maturity, covenant terms, or guidance, search direct evidence, claims, and quant objects before high-level risk/headwind objects. For scenario, risk, business model, and trend questions, use semantic and context objects, then trace back to claims and quotes before making the answer final.
 
 For detailed object usage guidance, see `references/ontology-structure.md`.
-For web artifact output guidance, see `references/artifact-contract.md`.
+For product two-pass workflows, produce internal research synthesis with complete `canonical_answer.units` according to `references/research-synthesis-contract.md`. Display planning belongs to the separate `krw-ontology-answer-composer` skill.
 
 ## Workflow
 
@@ -43,6 +43,19 @@ For web artifact output guidance, see `references/artifact-contract.md`.
 5. Call `krw_ontology_chain` for the most important objects when the answer depends on how evidence, claims, semantic objects, and temporal context connect.
 6. Call `krw_ontology_quality` when section quality, rejected objects, batch failures, or trustworthiness matter.
 7. Call `krw_ontology_compare` for multi-company topic or metric comparisons.
+
+## Two-Pass Product Boundary
+
+In product runtimes, this skill is pass 1: research, evidence validation, analytical judgment, and canonical answer content. It should not choose visual blocks, plan layout, or emit `display_plan`/`answer_blocks`.
+
+1. Use MCP tools to gather and validate evidence.
+2. Build a complete `ResearchSynthesis` when the runtime expects structured handoff to a renderer or display planner.
+3. Put every user-visible sentence, number, caveat, and conclusion into `canonical_answer.units`.
+4. Keep raw object IDs, trace IDs, quote text, diagnostics, and coverage details internal unless the user explicitly requests audit/debug output.
+5. Hand the completed synthesis to `krw-ontology-answer-composer` only for `display_plan` generation.
+6. If this skill is invoked standalone in a normal chat, answer naturally using the final-answer evidence rules below; do not force structured output.
+
+The research synthesis must be materially complete before display planning. Do not rely on the answer-composer to discover missing evidence, repair weak numeric support, write missing prose, or run broad ontology searches.
 
 ## Search Principles
 
@@ -171,16 +184,6 @@ The web UI may render evidence separately. The final natural-language answer sho
 - Use human-readable source labels instead, such as "NVDA FY2026 10-K", "latest 10-Q", "company filing evidence", or "direct filing evidence".
 - For exact dates, amounts, contract terms, and project milestones, say whether the support is direct filing evidence, indirect filing evidence, or an inference.
 - If the user asks "근거 보여줘", "trace 해줘", "object id 줘", "원문 보여줘", "데이터 커버리지", "품질 상태", or requests audit/debug/export output, then provide the relevant IDs, short source excerpts, coverage, and quality details.
-
-## Web Artifact Contract
-
-When the runtime supports structured artifacts, keep the visible answer short and produce artifact-ready structure separately according to `references/artifact-contract.md`.
-
-- The canonical artifact is structured JSON plus evidence references, not HTML.
-- HTML is a render/export target only.
-- The agent may synthesize titles, summaries, takeaways, mechanisms, caveats, and inference labels.
-- The frontend owns React components, mobile cards, HTML export, debounce/search UI, storage migrations, and visual layout.
-- Do not paste artifact JSON into the visible answer unless the user explicitly asks for export/debug output.
 
 ## Answering Rules
 

@@ -12,7 +12,17 @@ from krw_ontology.config.paths import resolve_ontology_root
 
 CLI_CONFIG_ENV = "KRW_ONTOLOGY_CLI_CONFIG"
 DEFAULT_CLI_CONFIG_PATH = Path.home() / ".config" / "krw-ontology" / "config.json"
-CONFIG_KEYS = {"running-root", "publish-root", "publish-index-path"}
+CONFIG_KEYS = {
+    "running-root",
+    "publish-root",
+    "publish-index-path",
+    "prod-host",
+    "prod-root",
+    "prod-reload-command",
+    "prod-health-url",
+    "prod-keep-releases",
+}
+PATH_CONFIG_KEYS = {"running-root", "publish-root", "publish-index-path"}
 
 
 @dataclass
@@ -20,6 +30,11 @@ class CliConfig:
     running_root: str | None = None
     publish_root: str | None = None
     publish_index_path: str | None = None
+    prod_host: str | None = None
+    prod_root: str | None = None
+    prod_reload_command: str | None = None
+    prod_health_url: str | None = None
+    prod_keep_releases: str | None = None
 
     @classmethod
     def from_dict(cls, payload: dict) -> "CliConfig":
@@ -27,6 +42,11 @@ class CliConfig:
             running_root=payload.get("running_root"),
             publish_root=payload.get("publish_root"),
             publish_index_path=payload.get("publish_index_path"),
+            prod_host=payload.get("prod_host"),
+            prod_root=payload.get("prod_root"),
+            prod_reload_command=payload.get("prod_reload_command"),
+            prod_health_url=payload.get("prod_health_url"),
+            prod_keep_releases=payload.get("prod_keep_releases"),
         )
 
     def to_dict(self) -> dict:
@@ -69,8 +89,11 @@ def config_attr(key: str) -> str:
 def set_config_value(key: str, value: str, path: Path | str | None = None) -> CliConfig:
     config = load_cli_config(path)
     attr = config_attr(key)
-    resolved = Path(value).expanduser().resolve()
-    setattr(config, attr, str(resolved))
+    if key in PATH_CONFIG_KEYS:
+        stored_value = str(Path(value).expanduser().resolve())
+    else:
+        stored_value = value
+    setattr(config, attr, stored_value)
     save_cli_config(config, path)
     return config
 

@@ -176,7 +176,7 @@ def query_tool(
         return _format_response(payload, response_format, _markdown_error)
 
     with _store(index) as store:
-        bundles = store.query(
+        bundles, search_diagnostics = store.query_with_diagnostics(
             topic=topic,
             tickers=tickers,
             document_types=document_types,
@@ -185,7 +185,6 @@ def query_tool(
             include_rejected=include_rejected,
             limit=fetch_limit,
         )
-        search_diagnostics = store.search_diagnostics(topic, result_count=len(bundles))
 
     page = bundles[offset : offset + limit]
     detail = _coerce_response_detail(response_detail)
@@ -437,6 +436,7 @@ def compare_tool(
                 periods=periods,
                 limit_per_ticker=limit_per_ticker,
             )
+    result["comparison_rows"] = _comparison_rows(result)
     detail = _coerce_response_detail(response_detail)
     payload = result if detail == ResponseDetail.FULL else _compact_compare(result)
     payload["response_detail"] = detail.value
@@ -577,6 +577,147 @@ def _compact_compare(result: dict[str, Any]) -> dict[str, Any]:
             for ticker, items in result.get("results", {}).items()
         },
     }
+
+
+def _comparison_rows(result: dict[str, Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    results = result.get("results") or {}
+    mode = result.get("mode")
+    if mode in {"period_topic", "period_metric"}:
+        ticker = result.get("ticker")
+        for period, items in results.items():
+            rows.append(
+                _comparison_row(
+                    comparison_key=str(period),
+                    ticker=ticker,
+                    period=str(period),
+                    items=items,
+                    topic=result.get("topic"),
+                    metric=result.get("metric"),
+                )
+            )
+        return rows
+
+    for ticker, items in results.items():
+        rows.append(
+            _comparison_row(
+                comparison_key=str(ticker),
+                ticker=str(ticker),
+                period=None,
+                items=items,
+                topic=result.get("topic"),
+                metric=result.get("metric"),
+            )
+        )
+    return rows
+
+
+def _comparison_row(
+    *,
+    comparison_key: str,
+    ticker: str | None,
+    period: str | None,
+    items: list[dict[str, Any]],
+    topic: str | None,
+    metric: str | None,
+) -> dict[str, Any]:
+    if not items:
+        return {
+            "comparison_key": comparison_key,
+            "ticker": ticker,
+            "period": period,
+            "document_type": None,
+            "topic": topic,
+            "metric": metric,
+            "source_label": None,
+            "summary": "",
+            "object_id": None,
+            "object_type": None,
+            "confidence": "unsupported",
+            "evidence_grade": None,
+            "evidence_counts": {"claims": 0, "quotes": 0, "spans": 0},
+            "caveats": ["No matching ontology objects were returned for this comparison key."],
+            "missing": True,
+            "missing_reason": "no_matching_ontology_objects",
+        }
+
+    item = _best_comparison_item(items)
+    obj = item.get("object") or {}
+    evidence = item.get("evidence") or {}
+    quality = item.get("quality") or {}
+    row_period = period or item.get("period")
+    document_type = item.get("document_type")
+    row_ticker = ticker or item.get("ticker")
+    return {
+        "comparison_key": comparison_key,
+        "ticker": row_ticker,
+        "period": row_period,
+        "document_type": document_type,
+        "topic": topic,
+        "metric": metric,
+        "source_label": _source_label(row_ticker, row_period, document_type),
+        "summary": _short_text(item.get("text"), 500),
+        "object_id": item.get("id"),
+        "object_type": item.get("type"),
+        "confidence": obj.get("confidence") or "unknown",
+        "evidence_grade": obj.get("evidence_grade") or quality.get("evidence_grade"),
+        "evidence_counts": {
+            "claims": len(evidence.get("claims") or []),
+            "quotes": len(evidence.get("quotes") or []),
+            "spans": len(evidence.get("spans") or []),
+        },
+        "caveats": _comparison_caveats(item),
+        "missing": False,
+        "missing_reason": None,
+    }
+
+
+def _best_comparison_item(items: list[dict[str, Any]]) -> dict[str, Any]:
+    return max(items, key=_comparison_item_score)
+
+
+def _comparison_item_score(item: dict[str, Any]) -> tuple[int, int, int, str]:
+    obj = item.get("object") or {}
+    evidence = item.get("evidence") or {}
+    grade_score = {
+        "direct": 4,
+        "indirect": 3,
+        "derived": 2,
+        "unknown": 1,
+        "unsupported": 0,
+    }.get(str(obj.get("evidence_grade") or "").lower(), 1)
+    type_score = {
+        "EvidenceQuote": 5,
+        "ResearchClaim": 4,
+        "ExternalFactorExposure": 3,
+        "BusinessActivity": 3,
+        "FinancialMetricValue": 3,
+        "DerivedMetricValue": 3,
+        "RiskFactor": 2,
+        "GrowthDriver": 2,
+        "Headwind": 2,
+    }.get(str(item.get("type") or ""), 1)
+    support_count = len(evidence.get("claims") or []) + len(evidence.get("quotes") or [])
+    return (grade_score, type_score, support_count, str(item.get("id") or ""))
+
+
+def _comparison_caveats(item: dict[str, Any]) -> list[str]:
+    caveats: list[str] = []
+    obj = item.get("object") or {}
+    quality = item.get("quality") or {}
+    evidence_grade = obj.get("evidence_grade") or quality.get("evidence_grade")
+    if evidence_grade in {"derived", "unsupported"}:
+        caveats.append(f"Evidence grade is {evidence_grade}.")
+    if quality.get("section_quality") in {"warn", "fail"}:
+        caveats.append(f"Section quality is {quality.get('section_quality')}.")
+    if quality.get("events"):
+        caveats.append("Quality events are present for the selected source.")
+    return caveats
+
+
+def _source_label(ticker: Any, period: Any, document_type: Any) -> str | None:
+    parts = [str(value) for value in (ticker, period, document_type) if value]
+    return " ".join(parts) if parts else None
 
 
 def _compact_quality_payload(quality: dict[str, Any]) -> dict[str, Any]:
@@ -861,6 +1002,15 @@ def _markdown_compare(payload: dict[str, Any]) -> str:
         f"- Topic: {payload.get('topic')}",
         f"- Metric: {payload.get('metric')}",
     ]
+    comparison_rows = payload.get("comparison_rows") or []
+    if comparison_rows:
+        lines.append("## Comparison Rows")
+        for row in comparison_rows:
+            status = "missing" if row.get("missing") else "matched"
+            lines.append(
+                f"- `{row.get('comparison_key')}` {status}: "
+                f"{_short_text(row.get('summary') or row.get('missing_reason'))}"
+            )
     for ticker, items in payload.get("results", {}).items():
         lines.append(f"## {ticker}")
         if not items:

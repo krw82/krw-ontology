@@ -80,6 +80,15 @@ def test_mcp_tools_query_trace_quality_and_compare(tmp_path: Path, monkeypatch):
     )
     assert compare["results"]["VG"]
     assert compare["results"]["XOM"] == []
+    assert {row["comparison_key"] for row in compare["comparison_rows"]} == {"VG", "XOM"}
+    vg_row = next(row for row in compare["comparison_rows"] if row["comparison_key"] == "VG")
+    xom_row = next(row for row in compare["comparison_rows"] if row["comparison_key"] == "XOM")
+    assert vg_row["missing"] is False
+    assert vg_row["ticker"] == "VG"
+    assert vg_row["source_label"] == "VG FY2025 10-K"
+    assert vg_row["object_id"]
+    assert xom_row["missing"] is True
+    assert xom_row["missing_reason"] == "no_matching_ontology_objects"
 
     plan = json.loads(plan_query_tool(question="VG 최근 10-K revenue growth 근거 찾아줘"))
     assert plan["plan"]["tickers"] == ["VG"]
@@ -116,7 +125,7 @@ def test_mcp_query_normalizes_object_type_aliases(tmp_path: Path, monkeypatch):
     assert metric_query["query"]["object_types"] == ["FinancialMetricValue", "DerivedMetricValue"]
 
 
-def test_mcp_query_returns_search_diagnostics_for_empty_topic(tmp_path: Path, monkeypatch):
+def test_mcp_query_falls_back_for_korean_topic(tmp_path: Path, monkeypatch):
     _write_fixture(tmp_path)
     build_agent_index(tmp_path)
     monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
@@ -125,15 +134,19 @@ def test_mcp_query_returns_search_diagnostics_for_empty_topic(tmp_path: Path, mo
         query_tool(
             topic="유럽 가스 비축 부족",
             tickers=["VG"],
-            object_types=["ResearchClaim"],
+            object_types=["ExternalFactorExposure", "BusinessActivity", "ResearchClaim"],
             limit=5,
         )
     )
 
-    assert query["results"] == []
+    assert query["results"]
     assert query["search_diagnostics"]["normalized_terms"] == []
-    assert query["search_diagnostics"]["fts_query"] == ""
-    assert "empty_topic_after_tokenization" in query["search_diagnostics"]["warnings"]
+    assert "natural_gas_price" in query["search_diagnostics"]["expanded_terms"]
+    assert query["search_diagnostics"]["search_strategy"]["selected_mode"] in {
+        "split_and",
+        "relaxed_or",
+    }
+    assert "topic_rewritten_for_search" in query["search_diagnostics"]["warnings"]
 
 
 def test_mcp_topic_map_repackages_company_vocabulary(tmp_path: Path, monkeypatch):
@@ -273,6 +286,9 @@ def test_mcp_compare_allows_single_ticker_period_comparison(tmp_path: Path, monk
     assert set(compare["results"]) == {"FY2024", "FY2025"}
     assert compare["results"]["FY2024"]
     assert compare["results"]["FY2025"]
+    assert {row["comparison_key"] for row in compare["comparison_rows"]} == {"FY2024", "FY2025"}
+    assert all(row["ticker"] == "VG" for row in compare["comparison_rows"])
+    assert all(row["missing"] is False for row in compare["comparison_rows"])
 
 
 def test_mcp_trace_accepts_unique_id_prefix(tmp_path: Path, monkeypatch):

@@ -683,6 +683,225 @@ class TestConfigCommand:
         assert final_show.exit_code == 0
         assert "running-root: <unset>" in final_show.output
 
+    def test_config_set_keeps_prod_values_raw(self):
+        set_result = runner.invoke(app, ["config", "set", "prod-host", "ubuntu@prod"])
+        show_result = runner.invoke(app, ["config", "show"])
+
+        assert set_result.exit_code == 0
+        assert "Set prod-host=ubuntu@prod" in set_result.output
+        assert show_result.exit_code == 0
+        assert "prod-host: ubuntu@prod" in show_result.output
+
+
+class TestProdCommand:
+    def test_prod_configure_saves_settings(self):
+        result = runner.invoke(
+            app,
+            [
+                "prod",
+                "configure",
+                "--host",
+                "ubuntu@prod",
+                "--remote-root",
+                "/srv/krw-ontology-data",
+                "--reload-command",
+                "sudo systemctl restart krw-ontology-mcp",
+                "--health-url",
+                "http://127.0.0.1:8000/health",
+                "--keep-releases",
+                "3",
+            ],
+        )
+        show_result = runner.invoke(app, ["config", "show"])
+
+        assert result.exit_code == 0
+        assert show_result.exit_code == 0
+        assert "prod-host: ubuntu@prod" in show_result.output
+        assert "prod-root: /srv/krw-ontology-data" in show_result.output
+        assert "prod-reload-command: sudo systemctl restart krw-ontology-mcp" in show_result.output
+        assert "prod-health-url: http://127.0.0.1:8000/health" in show_result.output
+        assert "prod-keep-releases: 3" in show_result.output
+
+    def test_prod_publish_uploads_bundle_and_activates_release(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+    ):
+        stable = tmp_path / "stable"
+        (stable / "companies" / "AAPL").mkdir(parents=True)
+        (stable / "companies" / "AAPL" / "artifact.txt").write_text("ok")
+        (stable / "indexes").mkdir()
+        (stable / "indexes" / "agent_index.sqlite").write_text("sqlite")
+        runner.invoke(
+            app,
+            [
+                "prod",
+                "configure",
+                "--host",
+                "ubuntu@prod",
+                "--remote-root",
+                "/srv/krw-ontology-data",
+                "--reload-command",
+                "sudo systemctl restart krw-ontology-mcp",
+                "--health-url",
+                "http://127.0.0.1:8000/health",
+                "--keep-releases",
+                "2",
+            ],
+        )
+        run_calls = []
+
+        class FakeCompleted:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        def fake_run(command, *, input=None, text, capture_output):
+            run_calls.append((command, input))
+            return FakeCompleted()
+
+        monkeypatch.setattr(cli_main, "_new_release_id", lambda: "20260515-000000")
+        monkeypatch.setattr(
+            cli_main,
+            "_try_get_prod_status",
+            lambda **kwargs: {
+                "current_kind": "symlink",
+                "current_target": "releases/old-release",
+                "current_release": "old-release",
+                "releases": ["old-release"],
+            },
+        )
+        monkeypatch.setattr(cli_main.subprocess, "run", fake_run)
+
+        result = runner.invoke(app, ["prod", "publish", "--root", str(stable)])
+
+        assert result.exit_code == 0
+        assert "Activated: releases/20260515-000000" in result.output
+        assert [call[0][0] for call in run_calls] == ["ssh", "scp", "ssh"]
+        assert "/srv/krw-ontology-data/incoming" in run_calls[0][0]
+        assert run_calls[1][0][2] == "ubuntu@prod:/srv/krw-ontology-data/incoming/20260515-000000.tar.gz"
+        activation_script = run_calls[2][1]
+        assert "RELEASE_ID=20260515-000000" in activation_script
+        assert "RELOAD_COMMAND='sudo systemctl restart krw-ontology-mcp'" in activation_script
+        assert "HEALTH_URL=http://127.0.0.1:8000/health" in activation_script
+
+    def test_prod_publish_dry_run_skips_subprocess(self, tmp_path: Path, monkeypatch):
+        stable = tmp_path / "stable"
+        stable.mkdir()
+        runner.invoke(
+            app,
+            [
+                "prod",
+                "configure",
+                "--host",
+                "ubuntu@prod",
+                "--remote-root",
+                "/srv/krw-ontology-data",
+            ],
+        )
+        run_calls = []
+        monkeypatch.setattr(
+            cli_main,
+            "_try_get_prod_status",
+            lambda **kwargs: {"current_kind": "missing", "releases": []},
+        )
+        monkeypatch.setattr(cli_main.subprocess, "run", lambda *args, **kwargs: run_calls.append(args))
+
+        result = runner.invoke(app, ["prod", "publish", "--root", str(stable), "--dry-run"])
+
+        assert result.exit_code == 0
+        assert "Prod publish dry run" in result.output
+        assert "No upload performed." in result.output
+        assert run_calls == []
+
+    def test_prod_status_shows_current_release(self, monkeypatch):
+        runner.invoke(
+            app,
+            [
+                "prod",
+                "configure",
+                "--host",
+                "ubuntu@prod",
+                "--remote-root",
+                "/srv/krw-ontology-data",
+            ],
+        )
+
+        class FakeCompleted:
+            returncode = 0
+            stderr = ""
+            stdout = "\n".join(
+                [
+                    "remote_root=/srv/krw-ontology-data",
+                    "current_kind=symlink",
+                    "current_target=releases/20260516-090000",
+                    "current_release=20260516-090000",
+                    "index_present=yes",
+                    "manifest_present=yes",
+                    "release=20260516-090000",
+                    "release=20260515-120000",
+                    "",
+                ]
+            )
+
+        monkeypatch.setattr(cli_main.subprocess, "run", lambda *args, **kwargs: FakeCompleted())
+
+        result = runner.invoke(app, ["prod", "status"])
+
+        assert result.exit_code == 0
+        assert "Prod status" in result.output
+        assert "Current: releases/20260516-090000" in result.output
+        assert "Index: present" in result.output
+        assert "20260515-120000" in result.output
+
+    def test_prod_doctor_warns_on_pre_symlink_current(self, tmp_path: Path, monkeypatch):
+        stable = tmp_path / "stable"
+        stable.mkdir()
+        runner.invoke(
+            app,
+            [
+                "prod",
+                "configure",
+                "--host",
+                "ubuntu@prod",
+                "--remote-root",
+                "/srv/krw-ontology-data",
+            ],
+        )
+        calls = []
+
+        class FakeCompleted:
+            returncode = 0
+            stderr = ""
+            stdout = ""
+
+        def fake_run(command, *, input=None, text, capture_output):
+            calls.append((command, input))
+            completed = FakeCompleted()
+            if input and "required_commands_missing" in input:
+                completed.stdout = "\n".join(
+                    [
+                        "required_commands_missing=",
+                        "root_state=exists",
+                        "root_writable=yes",
+                        "parent_writable=unknown",
+                        "current_kind=directory",
+                        "current_target=/srv/krw-ontology-data/current",
+                        "",
+                    ]
+                )
+            return completed
+
+        monkeypatch.setattr(cli_main.subprocess, "run", fake_run)
+
+        result = runner.invoke(app, ["prod", "doctor", "--root", str(stable)])
+
+        assert result.exit_code == 0
+        assert "OK ssh connectivity" in result.output
+        assert "WARN Remote current is a directory" in result.output
+        assert "Prod doctor passed." in result.output
+        assert [call[0][0] for call in calls] == ["ssh", "ssh"]
+
 
 class TestQueueCommands:
     def test_queue_add_creates_ticker_jobs(self, tmp_path: Path):
@@ -745,6 +964,95 @@ class TestQueueCommands:
         assert [job.job_id for job in jobs] == [first.job_id]
         assert "Skipped CVX" in result.output
         assert "Added 0 job(s)" in result.output
+
+    def test_queue_update_creates_filing_update_job(self, tmp_path: Path):
+        stable = tmp_path / "stable"
+
+        result = runner.invoke(
+            app,
+            [
+                "queue-update",
+                "vg",
+                "--document-type",
+                "10-Q",
+                "--period",
+                "FY2026Q1",
+                "--root",
+                str(tmp_path),
+                "--publish-root",
+                str(stable),
+            ],
+        )
+
+        assert result.exit_code == 0
+        jobs = pipeline_queue.PipelineQueue(tmp_path.resolve()).list_jobs()
+        assert len(jobs) == 1
+        job = jobs[0]
+        assert job.ticker == "VG"
+        assert job.job_type == pipeline_queue.FILING_UPDATE
+        assert job.document_type == "10-Q"
+        assert job.periods == ["FY2026Q1"]
+        assert job.latest is False
+        assert job.publish_root == str(stable.resolve())
+        assert "Queued update VG" in result.output
+
+    def test_queue_update_latest_creates_filing_update_job(self, tmp_path: Path):
+        result = runner.invoke(
+            app,
+            [
+                "queue",
+                "update",
+                "vg",
+                "--document-type",
+                "10-Q",
+                "--latest",
+                "--root",
+                str(tmp_path),
+            ],
+        )
+
+        assert result.exit_code == 0
+        job = pipeline_queue.PipelineQueue(tmp_path.resolve()).list_jobs()[0]
+        assert job.job_type == pipeline_queue.FILING_UPDATE
+        assert job.document_type == "10-Q"
+        assert job.periods == []
+        assert job.latest is True
+        assert "10-Q latest" in result.output
+
+    def test_queue_update_requires_period_or_latest(self, tmp_path: Path):
+        result = runner.invoke(
+            app,
+            [
+                "queue-update",
+                "vg",
+                "--document-type",
+                "10-Q",
+                "--root",
+                str(tmp_path),
+            ],
+        )
+
+        assert result.exit_code == 1
+        assert "Specify at least one --period" in result.output
+
+    def test_queue_update_rejects_latest_with_period(self, tmp_path: Path):
+        result = runner.invoke(
+            app,
+            [
+                "queue-update",
+                "vg",
+                "--document-type",
+                "10-Q",
+                "--latest",
+                "--period",
+                "FY2026Q1",
+                "--root",
+                str(tmp_path),
+            ],
+        )
+
+        assert result.exit_code == 1
+        assert "Use either --latest or --period" in result.output
 
     def test_queue_run_processes_job_and_publishes_once(
         self,
@@ -867,6 +1175,177 @@ class TestQueueCommands:
         assert index_calls == []
         assert "FAILED" in result.output
 
+    def test_queue_run_publish_prod_after_stable_publish(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+    ):
+        stable = tmp_path / "stable"
+        store = pipeline_queue.PipelineQueue(tmp_path)
+        job = store.add_job(
+            "cvx",
+            years=1,
+            force=False,
+            publish_root=stable,
+            publish_index_path=None,
+        )
+        prod_calls = []
+
+        def fake_discover(ticker, *, years, config):
+            return [
+                ResearchFilingTarget(
+                    ticker=ticker,
+                    document_type="10-K",
+                    period="FY2025",
+                    accession_number="k",
+                    filing_date="2026-02-01",
+                    report_date="2025-12-31",
+                )
+            ]
+
+        def fake_run_pipeline(**kwargs):
+            ticker_dir = kwargs["output_dir"] / "companies" / kwargs["ticker"]
+            ticker_dir.mkdir(parents=True, exist_ok=True)
+            (ticker_dir / "artifact.txt").write_text(kwargs["period"])
+
+        def fake_build_company_context(root, ticker):
+            return {
+                "artifact_index_path": root / "companies" / ticker / "company_context" / "artifact_index.json",
+                "counts": {"company_business_profiles": 1},
+            }
+
+        def fake_build_agent_index(root, *, index_path=None, force=True):
+            return {
+                "index_path": root / "indexes" / "agent_index.sqlite",
+                "totals": {"documents": 1, "objects": 2, "edges": 0, "quality_events": 0},
+            }
+
+        def fake_publish_prod_root(*, stable_root, **kwargs):
+            prod_calls.append(stable_root)
+            return {
+                "release_id": "release-1",
+                "host": "ubuntu@prod",
+                "remote_root": "/srv/krw-ontology-data",
+            }
+
+        monkeypatch.setattr(research_plan, "discover_research_filing_targets", fake_discover)
+        monkeypatch.setattr(orchestrator, "run_pipeline", fake_run_pipeline)
+        monkeypatch.setattr(company_context_stage, "build_company_context", fake_build_company_context)
+        monkeypatch.setattr(agent_index, "build_agent_index", fake_build_agent_index)
+        monkeypatch.setattr(cli_main, "_publish_prod_root", fake_publish_prod_root)
+
+        result = runner.invoke(
+            app,
+            ["queue-run", "--root", str(tmp_path), "--max-jobs", "1", "--publish-prod"],
+        )
+
+        assert result.exit_code == 0
+        assert store.load_job(job.job_id).status == pipeline_queue.SUCCEEDED
+        assert prod_calls == [stable.resolve()]
+        assert "Prod release activated: release=release-1" in result.output
+
+    def test_queue_run_publish_prod_requires_publish_root(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+    ):
+        store = pipeline_queue.PipelineQueue(tmp_path)
+        job = store.add_job(
+            "cvx",
+            years=1,
+            force=False,
+            publish_root=None,
+            publish_index_path=None,
+        )
+        pipeline_calls = []
+        monkeypatch.setattr(
+            orchestrator,
+            "run_pipeline",
+            lambda **kwargs: pipeline_calls.append(kwargs),
+        )
+
+        result = runner.invoke(
+            app,
+            ["queue-run", "--root", str(tmp_path), "--max-jobs", "1", "--publish-prod"],
+        )
+
+        failed_job = store.load_job(job.job_id)
+        assert result.exit_code == 0
+        assert failed_job.status == pipeline_queue.FAILED
+        assert "--publish-prod requires jobs with a stable publish root" in failed_job.error
+        assert pipeline_calls == []
+
+    def test_queue_run_processes_filing_update_job_and_publishes_once(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+    ):
+        stable = tmp_path / "stable"
+        store = pipeline_queue.PipelineQueue(tmp_path)
+        job = store.add_update_job(
+            "vg",
+            document_type="10-Q",
+            periods=["FY2026Q1"],
+            latest=False,
+            force=True,
+            publish_root=stable,
+            publish_index_path=None,
+        )
+        events = []
+
+        def fake_discover(*args, **kwargs):
+            raise AssertionError("filing_update jobs should not run full-refresh planning")
+
+        def fake_run_pipeline(**kwargs):
+            events.append(
+                (
+                    "pipeline",
+                    kwargs["ticker"],
+                    kwargs["document_type"],
+                    kwargs["period"],
+                    kwargs["latest"],
+                    kwargs["force"],
+                )
+            )
+            ticker_dir = kwargs["output_dir"] / "companies" / kwargs["ticker"]
+            ticker_dir.mkdir(parents=True, exist_ok=True)
+            (ticker_dir / "artifact.txt").write_text(kwargs["period"])
+
+        def fake_build_company_context(root, ticker):
+            events.append(("context", ticker))
+            return {
+                "artifact_index_path": root / "companies" / ticker / "company_context" / "artifact_index.json",
+                "counts": {"company_business_profiles": 1},
+            }
+
+        def fake_build_agent_index(root, *, index_path=None, force=True):
+            events.append(("index", root, index_path, force))
+            return {
+                "index_path": root / "indexes" / "agent_index.sqlite",
+                "totals": {"documents": 1, "objects": 2, "edges": 0, "quality_events": 0},
+            }
+
+        monkeypatch.setattr(research_plan, "discover_research_filing_targets", fake_discover)
+        monkeypatch.setattr(orchestrator, "run_pipeline", fake_run_pipeline)
+        monkeypatch.setattr(company_context_stage, "build_company_context", fake_build_company_context)
+        monkeypatch.setattr(agent_index, "build_agent_index", fake_build_agent_index)
+
+        result = runner.invoke(
+            app,
+            ["queue-run", "--root", str(tmp_path), "--max-jobs", "1"],
+        )
+
+        assert result.exit_code == 0
+        assert store.load_job(job.job_id).status == pipeline_queue.SUCCEEDED
+        assert (stable / "companies" / "VG" / "artifact.txt").read_text() == "FY2026Q1"
+        assert events == [
+            ("pipeline", "VG", "10-Q", "FY2026Q1", False, True),
+            ("context", "VG"),
+            ("index", stable.resolve(), None, True),
+        ]
+        assert "START update VG 10-Q FY2026Q1" in result.output
+        assert "SUCCEEDED" in result.output
+
     def test_queue_start_launches_detached_worker(self, tmp_path: Path, monkeypatch):
         calls = []
 
@@ -895,6 +1374,26 @@ class TestQueueCommands:
         assert calls[0][2] is True
         assert "Started queue worker pid=12345" in result.output
         assert (tmp_path / ".krw_pipeline" / "logs" / "worker.log").exists()
+
+    def test_queue_start_can_publish_prod(self, tmp_path: Path, monkeypatch):
+        calls = []
+
+        class FakeProcess:
+            pid = 12345
+
+        def fake_popen(command, *, stdout, stderr, start_new_session):
+            calls.append(command)
+            return FakeProcess()
+
+        monkeypatch.setattr(cli_main.subprocess, "Popen", fake_popen)
+
+        result = runner.invoke(
+            app,
+            ["queue-start", "--root", str(tmp_path), "--publish-prod"],
+        )
+
+        assert result.exit_code == 0
+        assert "--publish-prod" in calls[0]
 
     def test_queue_stop_requests_graceful_worker_stop(self, tmp_path: Path, monkeypatch):
         store = pipeline_queue.PipelineQueue(tmp_path)
@@ -1144,6 +1643,7 @@ class TestHelpOutput:
         assert "update-ticker" in result.output
         assert "queue" in result.output
         assert "config" in result.output
+        assert "prod" in result.output
         assert "publish-ticker" in result.output
         assert "validate" in result.output
         assert "build-report" in result.output
@@ -1153,6 +1653,7 @@ class TestHelpOutput:
         result = runner.invoke(app, ["queue", "--help"])
         assert result.exit_code == 0
         assert "add" in result.output
+        assert "update" in result.output
         assert "start" in result.output
         assert "status" in result.output
         assert "log" in result.output

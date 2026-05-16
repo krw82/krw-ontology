@@ -1,0 +1,4 @@
+interface:
+  display_name: "KRW Ontology Answer Composer"
+  short_description: "Create display plans for validated KRW canonical answer units"
+  default_prompt: "Use $krw-ontology-answer-composer only after ResearchSynthesis with canonical_answer.units exists. Return display_plan only; do not rewrite content or add facts."

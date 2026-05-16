@@ -17,6 +17,8 @@ SUCCEEDED = "succeeded"
 FAILED = "failed"
 CANCELLED = "cancelled"
 TERMINAL_STATUSES = {SUCCEEDED, FAILED, CANCELLED}
+FULL_REFRESH = "full_refresh"
+FILING_UPDATE = "filing_update"
 
 
 def utc_now() -> str:
@@ -40,7 +42,11 @@ class QueueJob:
     job_id: str
     ticker: str
     years: int
+    job_type: str = FULL_REFRESH
     force: bool = False
+    document_type: str | None = None
+    periods: list[str] | None = None
+    latest: bool = False
     publish_root: str | None = None
     publish_index_path: str | None = None
     status: str = PENDING
@@ -67,7 +73,37 @@ class QueueJob:
             job_id=f"{stamp}-{normalized_ticker}-{suffix}",
             ticker=normalized_ticker,
             years=years,
+            job_type=FULL_REFRESH,
             force=force,
+            publish_root=str(publish_root) if publish_root is not None else None,
+            publish_index_path=str(publish_index_path) if publish_index_path is not None else None,
+            created_at=utc_now(),
+        )
+
+    @classmethod
+    def create_update(
+        cls,
+        ticker: str,
+        *,
+        document_type: str,
+        periods: list[str],
+        latest: bool,
+        force: bool,
+        publish_root: Path | None,
+        publish_index_path: Path | None,
+    ) -> "QueueJob":
+        normalized_ticker = ticker.upper()
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+        suffix = uuid.uuid4().hex[:8]
+        return cls(
+            job_id=f"{stamp}-{normalized_ticker}-{suffix}",
+            ticker=normalized_ticker,
+            years=0,
+            job_type=FILING_UPDATE,
+            force=force,
+            document_type=document_type,
+            periods=periods,
+            latest=latest,
             publish_root=str(publish_root) if publish_root is not None else None,
             publish_index_path=str(publish_index_path) if publish_index_path is not None else None,
             created_at=utc_now(),
@@ -78,8 +114,12 @@ class QueueJob:
         return cls(
             job_id=payload["job_id"],
             ticker=payload["ticker"],
-            years=int(payload["years"]),
+            years=int(payload.get("years", 0)),
+            job_type=payload.get("job_type", FULL_REFRESH),
             force=bool(payload.get("force", False)),
+            document_type=payload.get("document_type"),
+            periods=list(payload.get("periods") or []),
+            latest=bool(payload.get("latest", False)),
             publish_root=payload.get("publish_root"),
             publish_index_path=payload.get("publish_index_path"),
             status=payload.get("status", PENDING),
@@ -191,6 +231,31 @@ class PipelineQueue:
         self.append_event("queued", job)
         return job
 
+    def add_update_job(
+        self,
+        ticker: str,
+        *,
+        document_type: str,
+        periods: list[str],
+        latest: bool,
+        force: bool,
+        publish_root: Path | None,
+        publish_index_path: Path | None = None,
+    ) -> QueueJob:
+        self.ensure_dirs()
+        job = QueueJob.create_update(
+            ticker,
+            document_type=document_type,
+            periods=periods,
+            latest=latest,
+            force=force,
+            publish_root=publish_root,
+            publish_index_path=publish_index_path,
+        )
+        self.save_job(job)
+        self.append_event("queued", job)
+        return job
+
     def save_job(self, job: QueueJob) -> None:
         self.ensure_dirs()
         path = self.job_path(job.job_id)
@@ -265,6 +330,7 @@ class PipelineQueue:
             "timestamp": utc_now(),
             "event": event,
             "job_id": job.job_id,
+            "job_type": job.job_type,
             "ticker": job.ticker,
             "status": job.status,
         }

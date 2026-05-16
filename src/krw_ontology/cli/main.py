@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import io
+import json
 import os
 import signal
 import shutil
+import shlex
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -22,6 +26,7 @@ from krw_ontology.cli.config import (
     resolve_publish_index_path,
     resolve_publish_root,
     resolve_running_root,
+    save_cli_config,
     set_config_value,
     unset_config_value,
 )
@@ -30,6 +35,8 @@ from krw_ontology.config.paths import ONTOLOGY_ROOT_ENV, resolve_ontology_root
 from krw_ontology.pipeline.queue import (
     CANCELLED,
     FAILED,
+    FILING_UPDATE,
+    FULL_REFRESH,
     PENDING,
     RUNNING,
     SUCCEEDED,
@@ -50,9 +57,12 @@ app = typer.Typer(
         "Recommended first setup:\n"
         "  krw-ontology config set running-root ~/krw-ontology-data-running\n"
         "  krw-ontology config set publish-root ~/krw-ontology-data\n\n"
+        "Optional prod setup:\n"
+        "  krw-ontology prod configure --host ubuntu@prod --remote-root /var/krw-ontology-data\n\n"
         "Daily queue flow:\n"
         "  krw-ontology queue add CVX XOM COP\n"
-        "  krw-ontology queue start\n"
+        "  krw-ontology queue update VG --document-type 10-Q --latest\n"
+        "  krw-ontology queue start --publish-prod\n"
         "  krw-ontology queue status\n"
         "  krw-ontology queue watch"
     ),
@@ -67,6 +77,7 @@ queue_app = typer.Typer(
     epilog=(
         "Typical flow:\n"
         "  krw-ontology queue add CVX XOM --years 3\n"
+        "  krw-ontology queue update VG --document-type 10-Q --period FY2026Q1\n"
         "  krw-ontology queue start\n"
         "  krw-ontology queue status\n"
         "  krw-ontology queue watch\n\n"
@@ -88,7 +99,12 @@ config_app = typer.Typer(
         "Supported keys:\n"
         "  running-root        staging root where active pipeline artifacts are written\n"
         "  publish-root        stable root published for research/MCP use\n"
-        "  publish-index-path  optional explicit stable SQLite index path\n\n"
+        "  publish-index-path  optional explicit stable SQLite index path\n"
+        "  prod-host           SSH host for production data releases\n"
+        "  prod-root           production data root containing releases/current\n"
+        "  prod-reload-command command run on prod after current release activation\n"
+        "  prod-health-url     optional health URL checked on prod after reload\n"
+        "  prod-keep-releases  number of prod releases to keep\n\n"
         "Examples:\n"
         "  krw-ontology config set running-root ~/krw-ontology-data-running\n"
         "  krw-ontology config set publish-root ~/krw-ontology-data\n"
@@ -96,8 +112,27 @@ config_app = typer.Typer(
     ),
     no_args_is_help=True,
 )
+prod_app = typer.Typer(
+    name="prod",
+    help=(
+        "Publish stable ontology data to a production server using versioned releases, "
+        "an atomic current symlink swap, and optional MCP reload/health checks."
+    ),
+    epilog=(
+        "Typical flow:\n"
+        "  krw-ontology prod configure --host ubuntu@prod --remote-root /var/krw-ontology-data "
+        "--reload-command 'sudo systemctl restart krw-ontology-mcp'\n"
+        "  krw-ontology prod doctor\n"
+        "  krw-ontology prod status\n"
+        "  krw-ontology prod publish\n\n"
+        "Queue automation:\n"
+        "  krw-ontology queue start --publish-prod"
+    ),
+    no_args_is_help=True,
+)
 app.add_typer(queue_app, name="queue")
 app.add_typer(config_app, name="config")
+app.add_typer(prod_app, name="prod")
 
 ACCEPTED_DOC_TYPES = {"10-K", "10-Q"}
 DEFAULT_E2E_TICKERS = ["AAPL", "NVDA", "JPM", "XOM"]
@@ -129,20 +164,26 @@ def config_show_cmd() -> None:
     typer.echo(f"running-root: {config.running_root or '<unset>'}")
     typer.echo(f"publish-root: {config.publish_root or '<unset>'}")
     typer.echo(f"publish-index-path: {config.publish_index_path or '<unset>'}")
+    typer.echo(f"prod-host: {config.prod_host or '<unset>'}")
+    typer.echo(f"prod-root: {config.prod_root or '<unset>'}")
+    typer.echo(f"prod-reload-command: {config.prod_reload_command or '<unset>'}")
+    typer.echo(f"prod-health-url: {config.prod_health_url or '<unset>'}")
+    typer.echo(f"prod-keep-releases: {config.prod_keep_releases or '<unset>'}")
 
 
 @config_app.command("set")
 def config_set_cmd(
     key: str = typer.Argument(
         ...,
-        help="Config key to set: running-root, publish-root, or publish-index-path.",
+        help="Config key to set. Run `krw-ontology config show` to inspect saved values.",
     ),
-    value: str = typer.Argument(..., help="Filesystem path to save for this key."),
+    value: str = typer.Argument(..., help="Value to save for this key."),
 ) -> None:
     """Set a persistent path default used by queue/update commands."""
     key = validate_config_key(key)
     set_config_value(key, value)
-    typer.echo(f"Set {key}={Path(value).expanduser().resolve()}")
+    shown_value = str(Path(value).expanduser().resolve()) if key in {"running-root", "publish-root", "publish-index-path"} else value
+    typer.echo(f"Set {key}={shown_value}")
     typer.echo(f"Config file: {cli_config_path()}")
 
 
@@ -150,7 +191,7 @@ def config_set_cmd(
 def config_unset_cmd(
     key: str = typer.Argument(
         ...,
-        help="Config key to clear: running-root, publish-root, or publish-index-path.",
+        help="Config key to clear. Run `krw-ontology config show` to inspect saved values.",
     ),
 ) -> None:
     """Clear a persistent path default."""
@@ -158,6 +199,287 @@ def config_unset_cmd(
     unset_config_value(key)
     typer.echo(f"Unset {key}")
     typer.echo(f"Config file: {cli_config_path()}")
+
+
+@prod_app.command("status")
+def prod_status_cmd(
+    host: Optional[str] = typer.Option(None, "--host", help="Override configured prod SSH host."),
+    remote_root: Optional[str] = typer.Option(
+        None,
+        "--remote-root",
+        help="Override configured production data root.",
+    ),
+    health_url: Optional[str] = typer.Option(
+        None,
+        "--health-url",
+        help="Override configured prod health URL.",
+    ),
+) -> None:
+    """Show current production release state without changing anything."""
+    try:
+        settings = _resolve_prod_settings(host=host, remote_root=remote_root, health_url=health_url)
+        status = _get_prod_status(
+            host=str(settings["host"]),
+            remote_root=str(settings["remote_root"]),
+        )
+        if settings["health_url"]:
+            try:
+                _check_prod_health(
+                    host=str(settings["host"]),
+                    health_url=str(settings["health_url"]),
+                )
+                status["health"] = "ok"
+            except Exception as exc:
+                status["health"] = f"failed: {exc}"
+    except Exception as exc:
+        typer.echo(f"FAILED prod status: {exc}")
+        raise typer.Exit(1) from exc
+    _print_prod_status(
+        status,
+        health_url=str(settings["health_url"]) if settings["health_url"] else None,
+    )
+
+
+@prod_app.command("doctor")
+def prod_doctor_cmd(
+    root: Optional[Path] = typer.Option(
+        None,
+        "--root",
+        help="Local stable publish root. Defaults to configured publish-root.",
+    ),
+    host: Optional[str] = typer.Option(None, "--host", help="Override configured prod SSH host."),
+    remote_root: Optional[str] = typer.Option(
+        None,
+        "--remote-root",
+        help="Override configured production data root.",
+    ),
+    health_url: Optional[str] = typer.Option(
+        None,
+        "--health-url",
+        help="Override configured prod health URL.",
+    ),
+) -> None:
+    """Check local and remote requirements before publishing to production."""
+    stable_root = resolve_publish_root(root)
+    failures: list[str] = []
+    warnings: list[str] = []
+    typer.echo("Prod publish doctor")
+    if stable_root is None:
+        failures.append("Local publish root is not configured. Set publish-root or pass --root.")
+    elif not stable_root.exists() or not stable_root.is_dir():
+        failures.append(f"Local publish root does not exist: {stable_root}")
+    else:
+        typer.echo(f"OK local publish root: {stable_root}")
+
+    try:
+        settings = _resolve_prod_settings(host=host, remote_root=remote_root, health_url=health_url)
+    except Exception as exc:
+        typer.echo(f"FAIL prod config: {exc}")
+        raise typer.Exit(1) from exc
+
+    typer.echo(f"OK prod host: {settings['host']}")
+    typer.echo(f"OK prod root: {settings['remote_root']}")
+
+    try:
+        _run_checked(["ssh", str(settings["host"]), "true"])
+        typer.echo("OK ssh connectivity")
+    except Exception as exc:
+        failures.append(f"SSH connectivity failed: {exc}")
+
+    try:
+        doctor = _run_prod_doctor_checks(
+            host=str(settings["host"]),
+            remote_root=str(settings["remote_root"]),
+            need_curl=bool(settings["health_url"]),
+        )
+        if doctor.get("required_commands_missing"):
+            failures.append(f"Missing remote commands: {doctor['required_commands_missing']}")
+        else:
+            typer.echo("OK remote publish commands: tar ln mv rm mkdir ls readlink xargs")
+        if doctor.get("root_state") == "exists" and doctor.get("root_writable") == "yes":
+            typer.echo("OK remote root is writable")
+        elif doctor.get("root_state") == "missing" and doctor.get("parent_writable") == "yes":
+            warnings.append(
+                f"Remote root does not exist yet, but parent is writable: {settings['remote_root']}"
+            )
+        else:
+            failures.append(f"Remote root is not writable: {settings['remote_root']}")
+        if doctor.get("current_kind") == "directory":
+            warnings.append(
+                "Remote current is a directory. First publish will preserve it as "
+                "releases/pre-prod-<release_id> and convert current to a release symlink."
+            )
+        elif doctor.get("current_kind") == "symlink":
+            typer.echo(f"OK current release symlink: {doctor.get('current_target') or '<unknown>'}")
+    except Exception as exc:
+        failures.append(f"Remote publish checks failed: {exc}")
+
+    configured_health_url = str(settings["health_url"]) if settings["health_url"] else None
+    if configured_health_url:
+        try:
+            _check_prod_health(host=str(settings["host"]), health_url=configured_health_url)
+            typer.echo(f"OK health URL: {configured_health_url}")
+        except Exception as exc:
+            failures.append(f"Health URL failed: {exc}")
+    else:
+        warnings.append("No prod-health-url configured; publish will rely on reload-command success.")
+
+    for warning in warnings:
+        typer.echo(f"WARN {warning}")
+    if failures:
+        for failure in failures:
+            typer.echo(f"FAIL {failure}")
+        raise typer.Exit(1)
+    typer.echo("Prod doctor passed.")
+
+
+@prod_app.command("configure")
+def prod_configure_cmd(
+    host: Optional[str] = typer.Option(
+        None,
+        "--host",
+        help="SSH host for production, e.g. ubuntu@1.2.3.4.",
+    ),
+    remote_root: Optional[str] = typer.Option(
+        None,
+        "--remote-root",
+        help="Production data root. MCP should read <remote-root>/current.",
+    ),
+    reload_command: Optional[str] = typer.Option(
+        None,
+        "--reload-command",
+        help="Command to run on prod after activating a release, e.g. 'sudo systemctl restart krw-ontology-mcp'.",
+    ),
+    health_url: Optional[str] = typer.Option(
+        None,
+        "--health-url",
+        help="Optional URL checked on prod after reload, e.g. http://127.0.0.1:8000/health.",
+    ),
+    keep_releases: Optional[int] = typer.Option(
+        None,
+        "--keep-releases",
+        min=1,
+        help="Number of production releases to keep for rollback.",
+    ),
+) -> None:
+    """Save production publish defaults."""
+    config = load_cli_config()
+    if host is not None:
+        config.prod_host = host
+    if remote_root is not None:
+        config.prod_root = remote_root
+    if reload_command is not None:
+        config.prod_reload_command = reload_command
+    if health_url is not None:
+        config.prod_health_url = health_url
+    if keep_releases is not None:
+        config.prod_keep_releases = str(keep_releases)
+    save_cli_config(config)
+    typer.echo(f"Config file: {cli_config_path()}")
+    typer.echo(f"prod-host: {config.prod_host or '<unset>'}")
+    typer.echo(f"prod-root: {config.prod_root or '<unset>'}")
+    typer.echo(f"prod-reload-command: {config.prod_reload_command or '<unset>'}")
+    typer.echo(f"prod-health-url: {config.prod_health_url or '<unset>'}")
+    typer.echo(f"prod-keep-releases: {config.prod_keep_releases or '<unset>'}")
+
+
+@prod_app.command("publish")
+def prod_publish_cmd(
+    root: Optional[Path] = typer.Option(
+        None,
+        "--root",
+        help="Local stable publish root. Defaults to configured publish-root.",
+    ),
+    host: Optional[str] = typer.Option(None, "--host", help="Override configured prod SSH host."),
+    remote_root: Optional[str] = typer.Option(
+        None,
+        "--remote-root",
+        help="Override configured production data root.",
+    ),
+    reload_command: Optional[str] = typer.Option(
+        None,
+        "--reload-command",
+        help="Override configured prod reload command.",
+    ),
+    health_url: Optional[str] = typer.Option(
+        None,
+        "--health-url",
+        help="Override configured prod health URL.",
+    ),
+    keep_releases: Optional[int] = typer.Option(
+        None,
+        "--keep-releases",
+        min=1,
+        help="Override configured number of prod releases to keep.",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Show what would be published without uploading or activating.",
+    ),
+) -> None:
+    """Publish the local stable ontology root to production as a versioned release."""
+    stable_root = resolve_publish_root(root)
+    if stable_root is None:
+        typer.echo("Set publish-root or pass --root before publishing to prod.")
+        raise typer.Exit(1)
+    pre_status = _try_get_prod_status(
+        host=host,
+        remote_root=remote_root,
+        health_url=health_url,
+    )
+    try:
+        result = _publish_prod_root(
+            stable_root=stable_root,
+            host=host,
+            remote_root=remote_root,
+            reload_command=reload_command,
+            health_url=health_url,
+            keep_releases=keep_releases,
+            dry_run=dry_run,
+        )
+    except Exception as exc:
+        typer.echo(f"FAILED prod publish: {exc}")
+        raise typer.Exit(1) from exc
+    _print_prod_publish_result(result, dry_run=dry_run, pre_status=pre_status)
+
+
+@prod_app.command("rollback")
+def prod_rollback_cmd(
+    release_id: Optional[str] = typer.Argument(
+        None,
+        help="Release ID to activate. If omitted, activate the previous release.",
+    ),
+    host: Optional[str] = typer.Option(None, "--host", help="Override configured prod SSH host."),
+    remote_root: Optional[str] = typer.Option(
+        None,
+        "--remote-root",
+        help="Override configured production data root.",
+    ),
+    reload_command: Optional[str] = typer.Option(
+        None,
+        "--reload-command",
+        help="Override configured prod reload command.",
+    ),
+    health_url: Optional[str] = typer.Option(
+        None,
+        "--health-url",
+        help="Override configured prod health URL.",
+    ),
+) -> None:
+    """Rollback production current to a previous release."""
+    try:
+        result = _rollback_prod_release(
+            release_id=release_id,
+            host=host,
+            remote_root=remote_root,
+            reload_command=reload_command,
+            health_url=health_url,
+        )
+    except Exception as exc:
+        typer.echo(f"FAILED prod rollback: {exc}")
+        raise typer.Exit(1) from exc
+    typer.echo(f"Prod rollback activated release={result['release_id']} host={result['host']}")
 
 
 @app.command("init-workspace")
@@ -475,7 +797,78 @@ def _queue_emit(store: PipelineQueue, job: QueueJob, message: str) -> None:
     store.append_job_log(job.job_id, line)
 
 
-def _process_queue_job(store: PipelineQueue, job: QueueJob, output_root: Path) -> None:
+def _queue_publish_or_reindex(
+    *,
+    store: PipelineQueue,
+    job: QueueJob,
+    output_root: Path,
+    build_agent_index,
+) -> Path | None:
+    if job.publish_root:
+        stable_root = resolve_ontology_root(Path(job.publish_root), fallback_to_cwd=False)
+        stable_root.mkdir(parents=True, exist_ok=True)
+        publish_index_path = Path(job.publish_index_path) if job.publish_index_path is not None else None
+        _queue_emit(store, job, f"Publishing {job.ticker} to stable root {stable_root}")
+        with FileProcessLock(PipelineQueue(stable_root).publish_lock_path):
+            _publish_ticker_tree(output_root, stable_root, job.ticker)
+            index_result = build_agent_index(
+                stable_root,
+                index_path=publish_index_path,
+                force=True,
+            )
+        totals = index_result["totals"]
+        _queue_emit(
+            store,
+            job,
+            "Stable index built: "
+            f"{index_result['index_path']} "
+            f"documents={totals['documents']} "
+            f"objects={totals['objects']} "
+            f"edges={totals['edges']} "
+            f"quality_events={totals['quality_events']}",
+        )
+        return stable_root
+
+    _queue_emit(store, job, "No publish root configured; rebuilding staging agent index")
+    index_result = build_agent_index(output_root, force=True)
+    totals = index_result["totals"]
+    _queue_emit(
+        store,
+        job,
+        "Staging index built: "
+        f"{index_result['index_path']} "
+        f"documents={totals['documents']} "
+        f"objects={totals['objects']} "
+        f"edges={totals['edges']} "
+        f"quality_events={totals['quality_events']}",
+    )
+    return None
+
+
+def _queue_build_company_context(
+    *,
+    store: PipelineQueue,
+    job: QueueJob,
+    output_root: Path,
+    build_company_context,
+) -> None:
+    _queue_emit(store, job, f"Building company context for {job.ticker}")
+    context_result = build_company_context(output_root, job.ticker)
+    _queue_emit(
+        store,
+        job,
+        "Company context built: "
+        f"{context_result['artifact_index_path']} counts={context_result['counts']}",
+    )
+
+
+def _process_queue_job(
+    store: PipelineQueue,
+    job: QueueJob,
+    output_root: Path,
+    *,
+    publish_prod: bool = False,
+) -> None:
     from krw_ontology.agent_index import build_agent_index
     from krw_ontology.config.settings import PipelineConfig
     from krw_ontology.pipeline.orchestrator import run_pipeline
@@ -483,71 +876,74 @@ def _process_queue_job(store: PipelineQueue, job: QueueJob, output_root: Path) -
     from krw_ontology.pipeline.stages.build_company_context import build_company_context
 
     job = store.mark_running(job)
-    _queue_emit(store, job, f"START job={job.job_id} ticker={job.ticker}")
+    _queue_emit(store, job, f"START job={job.job_id} type={job.job_type} ticker={job.ticker}")
     try:
-        config = PipelineConfig.load()
-        targets = discover_research_filing_targets(job.ticker, years=job.years, config=config)
-        _queue_emit(store, job, f"Planned {len(targets)} filings for {job.ticker}")
-        for target in targets:
-            label = f"{target.ticker} {target.document_type} {target.period}"
-            _queue_emit(store, job, f"START {label}")
-            run_pipeline(
-                ticker=target.ticker,
-                document_type=target.document_type,
-                latest=False,
-                period=target.period,
-                force=job.force,
-                output_dir=output_root,
+        if publish_prod and not job.publish_root:
+            raise ValueError(
+                "--publish-prod requires jobs with a stable publish root. "
+                "Set `krw-ontology config set publish-root ...` before adding jobs, "
+                "or add jobs with --publish-root."
             )
-            _queue_emit(store, job, f"END {label}")
-
-        _queue_emit(store, job, f"Building company context for {job.ticker}")
-        context_result = build_company_context(output_root, job.ticker)
-        _queue_emit(
-            store,
-            job,
-            "Company context built: "
-            f"{context_result['artifact_index_path']} counts={context_result['counts']}",
-        )
-
-        if job.publish_root:
-            stable_root = resolve_ontology_root(Path(job.publish_root), fallback_to_cwd=False)
-            stable_root.mkdir(parents=True, exist_ok=True)
-            publish_index_path = (
-                Path(job.publish_index_path) if job.publish_index_path is not None else None
-            )
-            _queue_emit(store, job, f"Publishing {job.ticker} to stable root {stable_root}")
-            with FileProcessLock(PipelineQueue(stable_root).publish_lock_path):
-                _publish_ticker_tree(output_root, stable_root, job.ticker)
-                index_result = build_agent_index(
-                    stable_root,
-                    index_path=publish_index_path,
-                    force=True,
+        if job.job_type == FULL_REFRESH:
+            config = PipelineConfig.load()
+            targets = discover_research_filing_targets(job.ticker, years=job.years, config=config)
+            _queue_emit(store, job, f"Planned {len(targets)} filings for {job.ticker}")
+            for target in targets:
+                label = f"{target.ticker} {target.document_type} {target.period}"
+                _queue_emit(store, job, f"START {label}")
+                run_pipeline(
+                    ticker=target.ticker,
+                    document_type=target.document_type,
+                    latest=False,
+                    period=target.period,
+                    force=job.force,
+                    output_dir=output_root,
                 )
-            totals = index_result["totals"]
-            _queue_emit(
-                store,
-                job,
-                "Stable index built: "
-                f"{index_result['index_path']} "
-                f"documents={totals['documents']} "
-                f"objects={totals['objects']} "
-                f"edges={totals['edges']} "
-                f"quality_events={totals['quality_events']}",
-            )
+                _queue_emit(store, job, f"END {label}")
+        elif job.job_type == FILING_UPDATE:
+            document_type = job.document_type or "10-Q"
+            filing_periods: list[Optional[str]] = [None] if job.latest else list(job.periods or [])
+            if not filing_periods:
+                raise ValueError("filing_update job requires periods or latest=true")
+            for filing_period in filing_periods:
+                filing_label = f"{job.ticker} {document_type} {'latest' if job.latest else filing_period}"
+                _queue_emit(store, job, f"START update {filing_label}")
+                run_pipeline(
+                    ticker=job.ticker,
+                    document_type=document_type,
+                    latest=job.latest,
+                    period=filing_period,
+                    force=job.force,
+                    output_dir=output_root,
+                )
+                _queue_emit(store, job, f"END update {filing_label}")
         else:
-            _queue_emit(store, job, "No publish root configured; rebuilding staging agent index")
-            index_result = build_agent_index(output_root, force=True)
-            totals = index_result["totals"]
+            raise ValueError(f"Unsupported queue job_type: {job.job_type}")
+
+        _queue_build_company_context(
+            store=store,
+            job=job,
+            output_root=output_root,
+            build_company_context=build_company_context,
+        )
+        published_root = _queue_publish_or_reindex(
+            store=store,
+            job=job,
+            output_root=output_root,
+            build_agent_index=build_agent_index,
+        )
+        if publish_prod:
+            if published_root is None:
+                raise RuntimeError("Prod publish requires a stable publish root for the queue job.")
+            _queue_emit(store, job, f"Publishing stable root to prod from {published_root}")
+            prod_result = _publish_prod_root(stable_root=published_root)
             _queue_emit(
                 store,
                 job,
-                "Staging index built: "
-                f"{index_result['index_path']} "
-                f"documents={totals['documents']} "
-                f"objects={totals['objects']} "
-                f"edges={totals['edges']} "
-                f"quality_events={totals['quality_events']}",
+                "Prod release activated: "
+                f"release={prod_result['release_id']} "
+                f"host={prod_result['host']} "
+                f"remote_root={prod_result['remote_root']}",
             )
     except Exception as exc:
         store.mark_failed(job, str(exc))
@@ -636,11 +1032,116 @@ def queue_add_cmd(
 
 
 @queue_app.command(
+    "update",
+    epilog=(
+        "Examples:\n"
+        "  krw-ontology queue update VG --document-type 10-Q --period FY2026Q1\n"
+        "  krw-ontology queue update VG --document-type 10-Q --latest\n"
+        "  krw-ontology queue update VG --period FY2026Q1 --root /path/to/running "
+        "--publish-root /path/to/stable\n\n"
+        "A filing update job runs only the selected filing(s), then rebuilds company context "
+        "and publishes the ticker once."
+    ),
+)
+@app.command("queue-update", hidden=True)
+def queue_update_cmd(
+    ticker: str = typer.Argument(..., help="Ticker symbol to append as a filing update job."),
+    document_type: str = typer.Option(
+        "10-Q",
+        "--document-type",
+        help="Document type to update (10-K or 10-Q).",
+    ),
+    periods: Optional[list[str]] = typer.Option(
+        None,
+        "--period",
+        help=(
+            "Explicit period to update, e.g. FY2026Q1. Repeat this option to update "
+            "multiple filings before publishing."
+        ),
+    ),
+    latest: bool = typer.Option(
+        False,
+        "--latest",
+        help="Update the latest filing for the selected document type.",
+    ),
+    force: bool = typer.Option(
+        False,
+        "--force/--no-force",
+        help="Re-process even if checkpoints exist.",
+    ),
+    root: Optional[Path] = typer.Option(
+        None,
+        "--root",
+        "--output-dir",
+        help="Staging/running ontology data root.",
+    ),
+    publish_root: Optional[Path] = typer.Option(
+        None,
+        "--publish-root",
+        help="Stable ontology data root to publish the completed ticker into.",
+    ),
+    publish_index_path: Optional[Path] = typer.Option(
+        None,
+        "--publish-index-path",
+        help="Stable SQLite index path. Defaults to <publish-root>/indexes/agent_index.sqlite.",
+    ),
+    allow_duplicate: bool = typer.Option(
+        False,
+        "--allow-duplicate/--skip-duplicate",
+        help="Allow adding a ticker even if it already has a pending/running job.",
+    ),
+) -> None:
+    """Append one ticker filing-update job to the local queue."""
+    validate_document_type(document_type)
+    selected_periods = list(periods or [])
+    if latest and selected_periods:
+        typer.echo("Use either --latest or --period, not both.")
+        raise typer.Exit(1)
+    if not latest and not selected_periods:
+        typer.echo("Specify at least one --period <PERIOD> or --latest.")
+        raise typer.Exit(1)
+
+    output_root = resolve_running_root(root, fallback_to_cwd=False)
+    stable_root = resolve_publish_root(publish_root)
+    resolved_publish_index_path = resolve_publish_index_path(publish_index_path)
+    store = PipelineQueue(output_root)
+    store.ensure_dirs()
+
+    normalized = ticker.upper()
+    typer.echo(f"QUEUE_ROOT={store.queue_dir}")
+    active = store.active_job_for_ticker(normalized)
+    if active is not None and not allow_duplicate:
+        typer.echo(
+            f"Skipped {normalized}; active job already exists: "
+            f"{active.job_id} status={active.status}"
+        )
+        typer.echo("Added 0 job(s)")
+        return
+
+    job = store.add_update_job(
+        normalized,
+        document_type=document_type,
+        periods=selected_periods,
+        latest=latest,
+        force=force,
+        publish_root=stable_root,
+        publish_index_path=resolved_publish_index_path,
+    )
+    target_label = "latest" if latest else ", ".join(selected_periods)
+    typer.echo(
+        f"Queued update {job.ticker} job={job.job_id} "
+        f"{document_type} {target_label}"
+    )
+    typer.echo("Added 1 job(s)")
+
+
+@queue_app.command(
     "run",
     epilog=(
         "Examples:\n"
         "  krw-ontology queue run\n"
         "  krw-ontology queue run --watch\n"
+        "  krw-ontology queue run --watch --publish-prod\n"
         "  krw-ontology queue run --max-jobs 1\n\n"
         "This runs in the foreground. Use `queue start` for a detached background worker."
     ),
@@ -670,6 +1171,14 @@ def queue_run_cmd(
         min=1,
         help="Stop after processing this many jobs. Primarily useful for tests/manual drains.",
     ),
+    publish_prod: bool = typer.Option(
+        False,
+        "--publish-prod/--no-publish-prod",
+        help=(
+            "After each successful ticker publish/index, upload the stable root to prod "
+            "and atomically activate a release."
+        ),
+    ),
 ) -> None:
     """Run queued ticker jobs in the foreground."""
     output_root = resolve_running_root(root, fallback_to_cwd=False)
@@ -695,7 +1204,7 @@ def queue_run_cmd(
                     time.sleep(poll_interval)
                     continue
 
-                _process_queue_job(store, job, output_root)
+                _process_queue_job(store, job, output_root, publish_prod=publish_prod)
                 processed += 1
                 if max_jobs is not None and processed >= max_jobs:
                     typer.echo(f"[{_now_label()}] Reached --max-jobs={max_jobs}")
@@ -712,7 +1221,8 @@ def queue_run_cmd(
     epilog=(
         "Examples:\n"
         "  krw-ontology queue start\n"
-        "  krw-ontology queue start --poll-interval 5\n\n"
+        "  krw-ontology queue start --poll-interval 5\n"
+        "  krw-ontology queue start --publish-prod\n\n"
         "The worker logs to <running-root>/.krw_pipeline/logs/worker.log. "
         "Use `queue watch` to follow that log."
     ),
@@ -730,6 +1240,14 @@ def queue_start_cmd(
         "--poll-interval",
         min=1.0,
         help="Seconds to wait between queue polls.",
+    ),
+    publish_prod: bool = typer.Option(
+        False,
+        "--publish-prod/--no-publish-prod",
+        help=(
+            "Start the worker in mode that publishes prod after each successful ticker "
+            "stable publish/index."
+        ),
     ),
 ) -> None:
     """Start a detached background queue worker."""
@@ -752,6 +1270,8 @@ def queue_start_cmd(
         "--poll-interval",
         str(poll_interval),
     ]
+    if publish_prod:
+        command.append("--publish-prod")
     with store.worker_log_path.open("a", encoding="utf-8") as log_handle:
         log_handle.write(f"\n[{_now_label()}] queue-start launching background worker\n")
         log_handle.flush()
@@ -935,6 +1455,14 @@ def queue_cancel_cmd(
     typer.echo(f"Cancelled {cancelled} job(s)")
 
 
+def _queue_job_description(job: QueueJob) -> str:
+    if job.job_type == FILING_UPDATE:
+        document_type = job.document_type or "10-Q"
+        target = "latest" if job.latest else ", ".join(job.periods or [])
+        return f"{job.ticker} filing_update {document_type} {target}".rstrip()
+    return f"{job.ticker} full_refresh years={job.years}"
+
+
 @queue_app.command(
     "status",
     epilog=(
@@ -978,7 +1506,7 @@ def queue_status_cmd(
     )
     for job in jobs[-limit:]:
         typer.echo(
-            f"- {job.status} {job.ticker} years={job.years} "
+            f"- {job.status} {_queue_job_description(job)} "
             f"attempts={job.attempts} job={job.job_id}"
         )
         if job.error:
@@ -1422,6 +1950,489 @@ def build_report_cmd(
         ontology_dir=ontology_dir,
     )
     typer.echo(f"Report generated at {ontology_dir}")
+
+
+def _new_release_id() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+
+
+def _resolve_prod_settings(
+    *,
+    host: str | None = None,
+    remote_root: str | None = None,
+    reload_command: str | None = None,
+    health_url: str | None = None,
+    keep_releases: int | None = None,
+) -> dict[str, str | int | None]:
+    config = load_cli_config()
+    resolved_host = host or config.prod_host
+    resolved_remote_root = remote_root or config.prod_root
+    resolved_reload_command = reload_command if reload_command is not None else config.prod_reload_command
+    resolved_health_url = health_url if health_url is not None else config.prod_health_url
+    keep_value = keep_releases
+    if keep_value is None and config.prod_keep_releases:
+        try:
+            keep_value = int(config.prod_keep_releases)
+        except ValueError as exc:
+            raise ValueError("prod-keep-releases must be an integer") from exc
+    if keep_value is None:
+        keep_value = 5
+    if keep_value < 1:
+        raise ValueError("prod keep releases must be at least 1")
+    if not resolved_host:
+        raise ValueError("Set prod-host with `krw-ontology prod configure --host ...`.")
+    if not resolved_remote_root:
+        raise ValueError("Set prod-root with `krw-ontology prod configure --remote-root ...`.")
+    return {
+        "host": resolved_host,
+        "remote_root": resolved_remote_root.rstrip("/"),
+        "reload_command": resolved_reload_command,
+        "health_url": resolved_health_url,
+        "keep_releases": keep_value,
+    }
+
+
+def _bundle_filter(path: Path) -> bool:
+    ignored_names = {
+        ".DS_Store",
+        ".krw_pipeline",
+        "releases",
+        "incoming",
+        "current",
+        "current.next",
+        "current.rollback",
+    }
+    if path.name in ignored_names:
+        return False
+    if path.name.endswith(".publish-tmp") or path.name.endswith(".publish-backup"):
+        return False
+    return True
+
+
+def _build_prod_release_bundle(stable_root: Path, bundle_path: Path, release_id: str) -> None:
+    if not stable_root.exists() or not stable_root.is_dir():
+        raise FileNotFoundError(f"Stable publish root not found: {stable_root}")
+    bundle_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest = {
+        "release_id": release_id,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "source_root": str(stable_root),
+        "format": "krw-ontology-prod-release/v1",
+    }
+    with tarfile.open(bundle_path, "w:gz") as archive:
+        for child in sorted(stable_root.iterdir()):
+            if not _bundle_filter(child):
+                continue
+            archive.add(child, arcname=child.name, recursive=True)
+        manifest_bytes = json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8")
+        info = tarfile.TarInfo("release_manifest.json")
+        info.size = len(manifest_bytes)
+        info.mtime = time.time()
+        archive.addfile(info, io.BytesIO(manifest_bytes))
+
+
+def _run_checked(command: list[str], *, input_text: str | None = None) -> subprocess.CompletedProcess:
+    result = subprocess.run(
+        command,
+        input=input_text,
+        text=True,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(f"{' '.join(command)} failed" + (f": {detail}" if detail else ""))
+    return result
+
+
+def _parse_shell_kv(stdout: str) -> dict[str, str | list[str]]:
+    parsed: dict[str, str | list[str]] = {"releases": []}
+    for line in stdout.splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if key == "release":
+            parsed.setdefault("releases", [])
+            releases = parsed["releases"]
+            if isinstance(releases, list):
+                releases.append(value)
+            continue
+        parsed[key] = value
+    return parsed
+
+
+def _prod_status_script(*, remote_root: str) -> str:
+    root_q = shlex.quote(remote_root)
+    return f"""set -eu
+ROOT={root_q}
+printf 'remote_root=%s\\n' "$ROOT"
+if [ -L "$ROOT/current" ]; then
+  CURRENT_TARGET="$(readlink "$ROOT/current" 2>/dev/null || true)"
+  printf 'current_kind=symlink\\n'
+  printf 'current_target=%s\\n' "$CURRENT_TARGET"
+  case "$CURRENT_TARGET" in
+    releases/*) printf 'current_release=%s\\n' "${{CURRENT_TARGET#releases/}}" ;;
+    *) printf 'current_release=%s\\n' "$CURRENT_TARGET" ;;
+  esac
+elif [ -d "$ROOT/current" ]; then
+  printf 'current_kind=directory\\n'
+  printf 'current_target=%s\\n' "$ROOT/current"
+  printf 'current_release=pre-symlink-directory\\n'
+elif [ -e "$ROOT/current" ]; then
+  printf 'current_kind=other\\n'
+  printf 'current_target=%s\\n' "$ROOT/current"
+  printf 'current_release=\\n'
+else
+  printf 'current_kind=missing\\n'
+  printf 'current_target=\\n'
+  printf 'current_release=\\n'
+fi
+if [ -f "$ROOT/current/indexes/agent_index.sqlite" ]; then
+  printf 'index_present=yes\\n'
+else
+  printf 'index_present=no\\n'
+fi
+if [ -f "$ROOT/current/release_manifest.json" ]; then
+  printf 'manifest_present=yes\\n'
+else
+  printf 'manifest_present=no\\n'
+fi
+if [ -d "$ROOT/releases" ]; then
+  for release_dir in $(cd "$ROOT/releases" && ls -1dt */ 2>/dev/null || true); do
+    printf 'release=%s\\n' "${{release_dir%/}}"
+  done
+fi
+"""
+
+
+def _prod_doctor_script(*, remote_root: str, need_curl: bool) -> str:
+    root_q = shlex.quote(remote_root)
+    required = "tar ln mv rm mkdir ls readlink xargs" + (" curl" if need_curl else "")
+    return f"""set -eu
+ROOT={root_q}
+REQUIRED={shlex.quote(required)}
+MISSING=""
+for cmd in $REQUIRED; do
+  command -v "$cmd" >/dev/null 2>&1 || MISSING="$MISSING $cmd"
+done
+printf 'required_commands_missing=%s\\n' "${{MISSING# }}"
+if [ -d "$ROOT" ]; then
+  printf 'root_state=exists\\n'
+  if [ -w "$ROOT" ]; then printf 'root_writable=yes\\n'; else printf 'root_writable=no\\n'; fi
+  printf 'parent_writable=unknown\\n'
+elif [ -e "$ROOT" ]; then
+  printf 'root_state=other\\n'
+  printf 'root_writable=no\\n'
+  printf 'parent_writable=unknown\\n'
+else
+  printf 'root_state=missing\\n'
+  printf 'root_writable=no\\n'
+  PARENT="${{ROOT%/*}}"
+  if [ -z "$PARENT" ] || [ "$PARENT" = "$ROOT" ]; then PARENT="."; fi
+  if [ -w "$PARENT" ]; then printf 'parent_writable=yes\\n'; else printf 'parent_writable=no\\n'; fi
+fi
+if [ -L "$ROOT/current" ]; then
+  printf 'current_kind=symlink\\n'
+  printf 'current_target=%s\\n' "$(readlink "$ROOT/current" 2>/dev/null || true)"
+elif [ -d "$ROOT/current" ]; then
+  printf 'current_kind=directory\\n'
+  printf 'current_target=%s\\n' "$ROOT/current"
+elif [ -e "$ROOT/current" ]; then
+  printf 'current_kind=other\\n'
+  printf 'current_target=%s\\n' "$ROOT/current"
+else
+  printf 'current_kind=missing\\n'
+  printf 'current_target=\\n'
+fi
+"""
+
+
+def _get_prod_status(*, host: str, remote_root: str) -> dict[str, str | list[str]]:
+    completed = _run_checked(
+        ["ssh", host, "sh", "-s"],
+        input_text=_prod_status_script(remote_root=remote_root),
+    )
+    status = _parse_shell_kv(completed.stdout)
+    status["host"] = host
+    return status
+
+
+def _try_get_prod_status(
+    *,
+    host: str | None = None,
+    remote_root: str | None = None,
+    health_url: str | None = None,
+) -> dict[str, str | list[str]]:
+    try:
+        settings = _resolve_prod_settings(host=host, remote_root=remote_root, health_url=health_url)
+        return _get_prod_status(
+            host=str(settings["host"]),
+            remote_root=str(settings["remote_root"]),
+        )
+    except Exception as exc:
+        return {"error": str(exc), "releases": []}
+
+
+def _run_prod_doctor_checks(
+    *,
+    host: str,
+    remote_root: str,
+    need_curl: bool,
+) -> dict[str, str | list[str]]:
+    completed = _run_checked(
+        ["ssh", host, "sh", "-s"],
+        input_text=_prod_doctor_script(remote_root=remote_root, need_curl=need_curl),
+    )
+    return _parse_shell_kv(completed.stdout)
+
+
+def _check_prod_health(*, host: str, health_url: str) -> None:
+    _run_checked(["ssh", host, "curl", "-fsS", health_url])
+
+
+def _current_status_label(status: dict[str, str | list[str]] | None) -> str:
+    if not status:
+        return "<unknown>"
+    if status.get("error"):
+        return f"<unavailable: {status['error']}>"
+    kind = str(status.get("current_kind") or "unknown")
+    target = str(status.get("current_target") or "")
+    release = str(status.get("current_release") or "")
+    if kind == "symlink":
+        return target or f"releases/{release}"
+    if kind == "directory":
+        return "existing current directory (will be preserved on first publish)"
+    if kind == "missing":
+        return "<missing>"
+    return target or f"<{kind}>"
+
+
+def _print_prod_status(
+    status: dict[str, str | list[str]],
+    *,
+    health_url: str | None = None,
+) -> None:
+    releases = status.get("releases")
+    release_list = releases if isinstance(releases, list) else []
+    typer.echo("Prod status")
+    typer.echo(f"Host: {status.get('host') or '<unknown>'}")
+    typer.echo(f"Remote root: {status.get('remote_root') or '<unknown>'}")
+    typer.echo(f"Current: {_current_status_label(status)}")
+    typer.echo(f"Current kind: {status.get('current_kind') or '<unknown>'}")
+    typer.echo(f"Index: {'present' if status.get('index_present') == 'yes' else 'missing'}")
+    typer.echo(f"Release manifest: {'present' if status.get('manifest_present') == 'yes' else 'missing'}")
+    if release_list:
+        typer.echo("Releases:")
+        for release in release_list[:10]:
+            marker = " current" if release == status.get("current_release") else ""
+            typer.echo(f"  - {release}{marker}")
+    else:
+        typer.echo("Releases: <none>")
+    if health_url:
+        typer.echo(f"Health URL: {health_url}")
+        typer.echo(f"Health: {status.get('health') or 'not checked'}")
+
+
+def _print_prod_publish_result(
+    result: dict[str, str | int | None],
+    *,
+    dry_run: bool,
+    pre_status: dict[str, str | list[str]] | None,
+) -> None:
+    release_path = f"releases/{result['release_id']}"
+    typer.echo("Prod publish dry run" if dry_run else "Prod publish completed")
+    typer.echo(f"Local stable root: {result['stable_root']}")
+    typer.echo(f"Host: {result['host']}")
+    typer.echo(f"Remote root: {result['remote_root']}")
+    typer.echo(f"Current release: {_current_status_label(pre_status)}")
+    typer.echo(f"New release: {release_path}")
+    typer.echo("Action: upload bundle, extract new release, atomically point current to new release")
+    typer.echo(f"Keep releases: {result['keep_releases']}")
+    if dry_run:
+        typer.echo("No upload performed.")
+    else:
+        typer.echo(f"Activated: {release_path}")
+    typer.echo("Rollback: uv run krw-ontology prod rollback")
+
+
+def _prod_activation_script(
+    *,
+    remote_root: str,
+    release_id: str,
+    reload_command: str | None,
+    health_url: str | None,
+    keep_releases: int,
+) -> str:
+    root_q = shlex.quote(remote_root)
+    release_q = shlex.quote(release_id)
+    reload_q = shlex.quote(reload_command or "")
+    health_q = shlex.quote(health_url or "")
+    return f"""set -eu
+ROOT={root_q}
+RELEASE_ID={release_q}
+RELOAD_COMMAND={reload_q}
+HEALTH_URL={health_q}
+KEEP_RELEASES={keep_releases}
+BUNDLE="$ROOT/incoming/$RELEASE_ID.tar.gz"
+mkdir -p "$ROOT/incoming" "$ROOT/releases"
+rm -rf "$ROOT/releases/$RELEASE_ID.tmp" "$ROOT/releases/$RELEASE_ID"
+mkdir -p "$ROOT/releases/$RELEASE_ID.tmp"
+tar -xzf "$BUNDLE" -C "$ROOT/releases/$RELEASE_ID.tmp"
+mv "$ROOT/releases/$RELEASE_ID.tmp" "$ROOT/releases/$RELEASE_ID"
+PREV=""
+if [ -L "$ROOT/current" ]; then
+  PREV="$(readlink "$ROOT/current" 2>/dev/null || true)"
+elif [ -e "$ROOT/current" ]; then
+  PREV="releases/pre-prod-$RELEASE_ID"
+  rm -rf "$ROOT/$PREV"
+  mv "$ROOT/current" "$ROOT/$PREV"
+fi
+rollback() {{
+  if [ -n "$PREV" ]; then
+    ln -sfn "$PREV" "$ROOT/current.rollback"
+    mv -Tf "$ROOT/current.rollback" "$ROOT/current"
+    if [ -n "$RELOAD_COMMAND" ]; then sh -c "$RELOAD_COMMAND" >/dev/null 2>&1 || true; fi
+  fi
+}}
+ln -sfn "releases/$RELEASE_ID" "$ROOT/current.next"
+mv -Tf "$ROOT/current.next" "$ROOT/current"
+if [ -n "$RELOAD_COMMAND" ]; then
+  sh -c "$RELOAD_COMMAND" || {{ rollback; exit 1; }}
+fi
+if [ -n "$HEALTH_URL" ]; then
+  curl -fsS "$HEALTH_URL" >/dev/null || {{ rollback; exit 1; }}
+fi
+rm -f "$BUNDLE"
+if [ "$KEEP_RELEASES" -gt 0 ]; then
+  cd "$ROOT/releases"
+  OLD="$(ls -1dt */ 2>/dev/null | tail -n +"$((KEEP_RELEASES + 1))" || true)"
+  if [ -n "$OLD" ]; then printf '%s\\n' "$OLD" | xargs rm -rf; fi
+fi
+"""
+
+
+def _prod_rollback_script(
+    *,
+    remote_root: str,
+    release_id: str | None,
+    reload_command: str | None,
+    health_url: str | None,
+) -> str:
+    root_q = shlex.quote(remote_root)
+    release_q = shlex.quote(release_id or "")
+    reload_q = shlex.quote(reload_command or "")
+    health_q = shlex.quote(health_url or "")
+    return f"""set -eu
+ROOT={root_q}
+REQUESTED_RELEASE={release_q}
+RELOAD_COMMAND={reload_q}
+HEALTH_URL={health_q}
+mkdir -p "$ROOT/releases"
+CURRENT="$(readlink "$ROOT/current" 2>/dev/null || true)"
+if [ -n "$REQUESTED_RELEASE" ]; then
+  TARGET="releases/$REQUESTED_RELEASE"
+else
+  TARGET=""
+  for candidate in $(cd "$ROOT" && ls -1dt releases/* 2>/dev/null || true); do
+    if [ "$candidate" != "$CURRENT" ]; then TARGET="$candidate"; break; fi
+  done
+fi
+if [ -z "$TARGET" ] || [ ! -d "$ROOT/$TARGET" ]; then
+  echo "No rollback target found" >&2
+  exit 1
+fi
+ln -sfn "$TARGET" "$ROOT/current.next"
+mv -Tf "$ROOT/current.next" "$ROOT/current"
+if [ -n "$RELOAD_COMMAND" ]; then sh -c "$RELOAD_COMMAND"; fi
+if [ -n "$HEALTH_URL" ]; then curl -fsS "$HEALTH_URL" >/dev/null; fi
+printf '%s\\n' "$TARGET"
+"""
+
+
+def _publish_prod_root(
+    *,
+    stable_root: Path,
+    host: str | None = None,
+    remote_root: str | None = None,
+    reload_command: str | None = None,
+    health_url: str | None = None,
+    keep_releases: int | None = None,
+    dry_run: bool = False,
+) -> dict[str, str | int | None]:
+    settings = _resolve_prod_settings(
+        host=host,
+        remote_root=remote_root,
+        reload_command=reload_command,
+        health_url=health_url,
+        keep_releases=keep_releases,
+    )
+    resolved_root = stable_root.expanduser().resolve()
+    if not resolved_root.exists() or not resolved_root.is_dir():
+        raise FileNotFoundError(f"Stable publish root not found: {resolved_root}")
+    release_id = _new_release_id()
+    result = {
+        "release_id": release_id,
+        "stable_root": str(resolved_root),
+        "host": settings["host"],
+        "remote_root": settings["remote_root"],
+        "keep_releases": settings["keep_releases"],
+    }
+    if dry_run:
+        return result
+    with tempfile.TemporaryDirectory(prefix="krw-ontology-prod-") as tmp_dir:
+        bundle_path = Path(tmp_dir) / f"{release_id}.tar.gz"
+        _build_prod_release_bundle(resolved_root, bundle_path, release_id)
+        remote_bundle = f"{settings['remote_root']}/incoming/{release_id}.tar.gz"
+        _run_checked(
+            [
+                "ssh",
+                str(settings["host"]),
+                "mkdir",
+                "-p",
+                f"{settings['remote_root']}/incoming",
+                f"{settings['remote_root']}/releases",
+            ]
+        )
+        _run_checked(["scp", str(bundle_path), f"{settings['host']}:{remote_bundle}"])
+        _run_checked(
+            ["ssh", str(settings["host"]), "sh", "-s"],
+            input_text=_prod_activation_script(
+                remote_root=str(settings["remote_root"]),
+                release_id=release_id,
+                reload_command=str(settings["reload_command"]) if settings["reload_command"] else None,
+                health_url=str(settings["health_url"]) if settings["health_url"] else None,
+                keep_releases=int(settings["keep_releases"]),
+            ),
+        )
+    return result
+
+
+def _rollback_prod_release(
+    *,
+    release_id: str | None,
+    host: str | None = None,
+    remote_root: str | None = None,
+    reload_command: str | None = None,
+    health_url: str | None = None,
+) -> dict[str, str | None]:
+    settings = _resolve_prod_settings(
+        host=host,
+        remote_root=remote_root,
+        reload_command=reload_command,
+        health_url=health_url,
+        keep_releases=None,
+    )
+    completed = _run_checked(
+        ["ssh", str(settings["host"]), "sh", "-s"],
+        input_text=_prod_rollback_script(
+            remote_root=str(settings["remote_root"]),
+            release_id=release_id,
+            reload_command=str(settings["reload_command"]) if settings["reload_command"] else None,
+            health_url=str(settings["health_url"]) if settings["health_url"] else None,
+        ),
+    )
+    target = completed.stdout.strip().splitlines()[-1] if completed.stdout.strip() else ""
+    activated = target.removeprefix("releases/").rstrip("/")
+    return {"release_id": activated, "host": str(settings["host"]), "remote_root": str(settings["remote_root"])}
 
 
 def _publish_ticker_tree(source_root: Path, stable_root: Path, ticker: str) -> None:

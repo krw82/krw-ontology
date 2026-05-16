@@ -1,4 +1,4 @@
 interface:
   display_name: "KRW Ontology Research"
   short_description: "Query source-grounded 10-K and 10-Q ontology evidence"
-  default_prompt: "Use $krw-ontology-research to answer from retrieved ontology evidence with citations."
+  default_prompt: "Use $krw-ontology-research to build ResearchSynthesis with complete canonical_answer units from retrieved ontology evidence. The product runner should pass that synthesis to $krw-ontology-answer-composer for display_plan only."

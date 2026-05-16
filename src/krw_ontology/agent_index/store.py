@@ -28,6 +28,39 @@ _STRICT_TOPIC_WARNING_TERM_COUNT = 5
 _CHAIN_MAX_DEPTH = 4
 _CHAIN_MAX_PATHS = 40
 _CHAIN_MAX_TEMPORAL_CONTEXT = 12
+_QUERY_EXPANSION_RULES = (
+    ("유럽", "europe european"),
+    ("가스", "natural_gas_price natural gas feed gas lng"),
+    ("천연가스", "natural_gas_price natural gas feed gas lng"),
+    ("비축", "storage inventory"),
+    ("저장", "storage inventory"),
+    ("부족", "shortage deficit supply_disruption demand"),
+    ("수요", "demand customer_demand lng_demand"),
+    ("가격", "price commodity_price natural_gas_price"),
+    ("마진", "operating_margin cost_of_revenue margin"),
+    ("계약", "contract agreement spa customer"),
+    ("조건", "threshold covenant default termination"),
+    ("큰일", "risk covenant default impairment liquidity threshold"),
+    ("위험", "risk"),
+    ("ttf", "natural_gas_price international_lng_price global_lng_price europe"),
+    ("jkm", "international_lng_price global_lng_price lng"),
+    ("henry hub", "natural_gas_price feed_gas_cost"),
+    ("storage", "storage inventory supply_disruption"),
+    ("shortage", "shortage deficit supply_disruption demand"),
+    ("lng", "lng_sales lng_demand international_lng_price"),
+)
+_SPLIT_TOPIC_STOP_TERMS = {
+    "and",
+    "are",
+    "for",
+    "from",
+    "how",
+    "the",
+    "this",
+    "what",
+    "when",
+    "with",
+}
 _SEMANTIC_NEIGHBOR_TYPES = {
     "RiskFactor",
     "GrowthDriver",
@@ -113,9 +146,33 @@ class OntologyStore:
         limit: int = 20,
     ) -> list[dict[str, Any]]:
         """Return evidence bundles matching structured filters and optional FTS text."""
+        bundles, _diagnostics = self.query_with_diagnostics(
+            topic=topic,
+            tickers=tickers,
+            document_types=document_types,
+            periods=periods,
+            object_types=object_types,
+            include_rejected=include_rejected,
+            limit=limit,
+        )
+        return bundles
+
+    def query_with_diagnostics(
+        self,
+        *,
+        topic: str | None = None,
+        tickers: Iterable[str] | None = None,
+        document_types: Iterable[str] | None = None,
+        periods: Iterable[str] | None = None,
+        object_types: Iterable[str] | None = None,
+        include_rejected: bool = False,
+        limit: int = 20,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """Return evidence bundles plus deterministic search diagnostics."""
         selected_types = tuple(object_types or DEFAULT_QUERY_TYPES)
+        search_strategy: dict[str, Any] | None = None
         if topic:
-            rows = self._query_fts(
+            rows, search_strategy = self._query_fts_with_strategy(
                 topic,
                 tickers=tickers,
                 document_types=document_types,
@@ -133,7 +190,13 @@ class OntologyStore:
                 include_rejected=include_rejected,
                 limit=limit,
             )
-        return [self.bundle(row["id"]) for row in rows if row["id"]]
+        bundles = [self.bundle(row["id"]) for row in rows if row["id"]]
+        diagnostics = _search_diagnostics(
+            topic,
+            result_count=len(bundles),
+            search_strategy=search_strategy,
+        )
+        return bundles, diagnostics
 
     def search_diagnostics(
         self,
@@ -463,11 +526,8 @@ class OntologyStore:
         include_rejected: bool,
         limit: int,
     ) -> list[sqlite3.Row]:
-        fts_query = _fts_query(topic, operator="AND")
-        if not fts_query:
-            return []
-        return self._execute_fts(
-            fts_query,
+        rows, _strategy = self._query_fts_with_strategy(
+            topic,
             tickers=tickers,
             document_types=document_types,
             periods=periods,
@@ -475,6 +535,93 @@ class OntologyStore:
             include_rejected=include_rejected,
             limit=limit,
         )
+        return rows
+
+    def _query_fts_with_strategy(
+        self,
+        topic: str,
+        *,
+        tickers: Iterable[str] | None,
+        document_types: Iterable[str] | None,
+        periods: Iterable[str] | None,
+        object_types: Iterable[str],
+        include_rejected: bool,
+        limit: int,
+    ) -> tuple[list[sqlite3.Row], dict[str, Any]]:
+        attempts: list[dict[str, Any]] = []
+        selected_rows: dict[str, sqlite3.Row] = {}
+        expanded_topic = _expanded_topic(topic)
+        original_terms = _query_terms(topic)
+        should_relax = expanded_topic != topic or len(original_terms) >= 3
+
+        def run_attempt(mode: str, query_topic: str, *, operator: str) -> None:
+            if len(selected_rows) >= limit:
+                return
+            fts_query = _fts_query(query_topic, operator=operator)
+            if not fts_query:
+                attempts.append(
+                    {
+                        "mode": mode,
+                        "topic": query_topic,
+                        "operator": operator,
+                        "fts_query": "",
+                        "result_count": 0,
+                        "added_count": 0,
+                    }
+                )
+                return
+            rows = self._execute_fts(
+                fts_query,
+                tickers=tickers,
+                document_types=document_types,
+                periods=periods,
+                object_types=object_types,
+                include_rejected=include_rejected,
+                limit=limit,
+            )
+            added_count = 0
+            for row in rows:
+                row_id = row["id"]
+                if row_id in selected_rows:
+                    continue
+                selected_rows[row_id] = row
+                added_count += 1
+                if len(selected_rows) >= limit:
+                    break
+            attempts.append(
+                {
+                    "mode": mode,
+                    "topic": query_topic,
+                    "operator": operator,
+                    "fts_query": fts_query,
+                    "result_count": len(rows),
+                    "added_count": added_count,
+                }
+            )
+
+        run_attempt("strict_and", topic, operator="AND")
+        if len(selected_rows) < limit and expanded_topic != topic:
+            run_attempt("expanded_and", expanded_topic, operator="AND")
+        if should_relax and len(selected_rows) < limit:
+            for split_topic in _split_topic_queries(expanded_topic):
+                run_attempt("split_and", split_topic, operator="AND")
+                if len(selected_rows) >= limit:
+                    break
+        if should_relax and len(selected_rows) < limit:
+            run_attempt("relaxed_or", expanded_topic, operator="OR")
+
+        selected_mode = next(
+            (attempt["mode"] for attempt in attempts if attempt.get("added_count")),
+            None,
+        )
+        strategy = {
+            "original_topic": topic,
+            "expanded_topic": expanded_topic,
+            "expanded_terms": _query_terms(expanded_topic),
+            "selected_mode": selected_mode,
+            "attempts": attempts,
+        }
+        return list(selected_rows.values())[:limit], strategy
 
     def _execute_fts(
         self,
@@ -969,8 +1116,7 @@ def _add_in_filter(parts: list[str], params: list[Any], column: str, values: lis
 
 
 def _fts_query(topic: str, *, operator: str) -> str:
-    terms = [term.lower() for term in _TERM_RE.findall(topic) if len(term) > 1]
-    terms = _unique(terms)
+    terms = _query_terms(topic)
     if not terms:
         return ""
     if operator == "OR":
@@ -978,18 +1124,63 @@ def _fts_query(topic: str, *, operator: str) -> str:
     return " ".join(f"{term}*" for term in terms)
 
 
-def _search_diagnostics(topic: str | None, *, result_count: int | None) -> dict[str, Any]:
+def _query_terms(topic: str | None) -> list[str]:
+    return _unique(term.lower() for term in _TERM_RE.findall(topic or "") if len(term) > 1)
+
+
+def _expanded_topic(topic: str) -> str:
+    topic = " ".join(str(topic or "").split())
+    if not topic:
+        return ""
+    topic_lower = topic.lower()
+    expansions = [
+        expansion
+        for needle, expansion in _QUERY_EXPANSION_RULES
+        if needle in topic_lower
+    ]
+    if not expansions:
+        return topic
+    return " ".join(_unique([topic, *expansions]))
+
+
+def _split_topic_queries(topic: str, *, limit: int = 12) -> list[str]:
+    terms = [
+        term
+        for term in _query_terms(topic)
+        if term not in _SPLIT_TOPIC_STOP_TERMS and len(term) > 2
+    ]
+    chunks: list[str] = []
+    chunks.extend(term for term in terms if "_" in term)
+    chunks.extend(
+        f"{left} {right}"
+        for left, right in zip(terms, terms[1:])
+        if left != right
+    )
+    chunks.extend(terms)
+    return _unique(chunks)[:limit]
+
+
+def _search_diagnostics(
+    topic: str | None,
+    *,
+    result_count: int | None,
+    search_strategy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     original_topic = topic or None
-    terms = _unique(term.lower() for term in _TERM_RE.findall(topic or "") if len(term) > 1)
+    terms = _query_terms(topic)
     fts_query = _fts_query(topic or "", operator="AND") if topic else None
     warnings: list[str] = []
     suggestions: list[str] = []
+    expanded_terms = (search_strategy or {}).get("expanded_terms") or terms
 
     if topic and not terms:
-        warnings.append("empty_topic_after_tokenization")
-        suggestions.append(
-            "Use English/canonical company exposure terms or call krw_ontology_topic_map first."
-        )
+        if result_count:
+            warnings.append("topic_rewritten_for_search")
+        else:
+            warnings.append("empty_topic_after_tokenization")
+            suggestions.append(
+                "Use English/canonical company exposure terms or call krw_ontology_topic_map first."
+            )
     if topic and terms and result_count == 0 and len(terms) >= 3:
         warnings.append("strict_and_query_may_be_too_narrow")
         suggestions.append("Split the topic into shorter focused queries.")
@@ -1000,9 +1191,11 @@ def _search_diagnostics(topic: str | None, *, result_count: int | None) -> dict[
     return {
         "original_topic": original_topic,
         "normalized_terms": terms,
+        "expanded_terms": expanded_terms,
         "fts_query": fts_query,
         "operator": "AND" if topic else None,
         "result_count": result_count,
+        "search_strategy": search_strategy or {},
         "warnings": warnings,
         "suggestions": _unique(suggestions),
     }

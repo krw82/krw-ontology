@@ -300,6 +300,15 @@ class PipelineQueue:
         self.append_event("running", job)
         return job
 
+    def mark_pending(self, job: QueueJob, reason: str | None = None) -> QueueJob:
+        job.status = PENDING
+        job.started_at = None
+        job.finished_at = None
+        job.error = None
+        self.save_job(job)
+        self.append_event("requeued", job, {"reason": reason} if reason else None)
+        return job
+
     def mark_succeeded(self, job: QueueJob) -> QueueJob:
         job.status = SUCCEEDED
         job.finished_at = utc_now()

@@ -29,6 +29,16 @@ def test_krw_ontology_skill_documents_scenario_protocols():
     assert "canonical_answer.units" in skill_text
     assert "It should not choose visual blocks" in skill_text
     assert "do not force structured output" in skill_text
+    assert "Do not include a visible \"quality note\"" in skill_text
+    assert "Forbidden customer-facing terms" in skill_text
+    assert "Treat quality signals as internal controls" in skill_text
+    assert "Do not expose ontology object type names in normal answers" in skill_text
+    assert "Do not paste source labels followed by original quote text" in skill_text
+    assert "Do not add visible generic caveats" in skill_text
+    assert "retrieved evidence is weak" not in skill_text
+    assert "filing support is weak" not in skill_text
+    assert "공시 근거가 제한적입니다" not in skill_text
+    assert "회사가 이 항목을 명확히 수치화하지 않았습니다" not in skill_text
     assert "Do not assume one query is enough for scenario questions" in tools_text
     assert "coverage warnings" in tools_text
     assert "KRW Ontology Research Synthesis Contract" in synthesis_text
@@ -39,6 +49,13 @@ def test_krw_ontology_skill_documents_scenario_protocols():
     assert "Company overview" in synthesis_text
     assert "Do not emit `answer_blocks` from the research skill" in synthesis_text
     assert "Do not emit `display_plan` from the research skill" in synthesis_text
+    assert "Do not put internal quality, coverage, index" in synthesis_text
+    assert "Do not add customer-facing sections named" in synthesis_text
+    assert "Do not expose ontology object type names" in synthesis_text
+    assert "Do not paste original filing quote text" in synthesis_text
+    assert "Do not add visible generic caveats" in synthesis_text
+    assert "공시 근거가 제한적입니다" not in synthesis_text
+    assert "회사가 이 항목을 명확히 수치화하지 않았습니다" not in synthesis_text
     assert "krw-ontology-answer-composer" in composer_text
     assert "Use this skill after `krw-ontology-research` has produced" in composer_text
     assert "this skill is a display planner" in composer_text

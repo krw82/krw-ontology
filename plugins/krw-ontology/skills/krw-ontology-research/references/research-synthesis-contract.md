@@ -351,6 +351,9 @@ Canonical answer should cover:
 - Direct filing evidence outranks inferred bridges.
 - Do not promote rejected or unsupported objects into conclusions.
 - If a topic search fails, record the gap and the alternative search path only in internal notes or warnings.
+- Do not put internal quality, coverage, index, rejected-object, or pipeline diagnostics into `canonical_answer.units` with `display_policy="show"`.
+- If a quality issue materially weakens a candidate point, omit that point, lower confidence privately, or keep the uncertainty inside hidden/internal fields. Do not add visible generic caveats about evidence availability, missing quantification, extraction status, filing coverage, or quality unless the user explicitly asks for audit/debug/quality details.
+- Debuggable details such as object counts, section quality, batch failures, rejected objects, trace IDs, catalog output, and index inventory belong only in `evidence_refs`, `quality`, `internal_notes`, or hidden-by-default units unless the user explicitly requests audit/debug output.
 
 ## What Not To Do
 
@@ -358,5 +361,8 @@ Canonical answer should cover:
 - Do not emit `display_plan` from the research skill.
 - Do not decide frontend layout, HTML, React, CSS, or mobile rendering.
 - Do not paste raw ontology object text into canonical units.
+- Do not expose ontology object type names such as `ResearchClaim`, `EvidenceQuote`, `RiskFactor`, `GrowthDriver`, `Headwind`, `BusinessActivity`, `ExternalFactorExposure`, `NumericEvidence`, `XBRLFact`, `CompanyBusinessProfile`, `객체`, or `온톨로지 객체` in visible canonical units unless the user explicitly asks for audit/debug output.
+- Do not paste original filing quote text into visible canonical units. Use reader-facing source labels only, and keep quote text inside evidence refs or hidden/internal units by default.
+- Do not add customer-facing sections named "quality note", "품질 노트", "coverage note", "debug note", "데이터 커버리지", or similar operational footers unless the user explicitly asks for them.
 - Do not let numeric values pass through unless they are validated.
 - Do not leave the display planner to infer missing content.

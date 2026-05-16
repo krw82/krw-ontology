@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -1434,6 +1435,104 @@ class TestQueueCommands:
         assert not store.worker_pid_path.exists()
         assert "Force killing" in result.output
 
+    def test_queue_recover_stale_requeues_running_job_when_worker_stopped(self, tmp_path: Path):
+        store = pipeline_queue.PipelineQueue(tmp_path)
+        job = store.add_job(
+            "cvx",
+            years=1,
+            force=False,
+            publish_root=None,
+            publish_index_path=None,
+        )
+        store.mark_running(job)
+        store.write_worker_pid(999999)
+
+        result = runner.invoke(
+            app,
+            ["queue-recover-stale", "--root", str(tmp_path), "--reason", "worker killed"],
+        )
+
+        recovered = store.load_job(job.job_id)
+        assert result.exit_code == 0
+        assert recovered.status == pipeline_queue.PENDING
+        assert recovered.attempts == 1
+        assert recovered.started_at is None
+        assert recovered.finished_at is None
+        assert recovered.error is None
+        assert not store.worker_pid_path.exists()
+        assert "Requeued 1 stale job(s)" in result.output
+
+    def test_queue_recover_stale_mark_failed(self, tmp_path: Path):
+        store = pipeline_queue.PipelineQueue(tmp_path)
+        job = store.add_job(
+            "cvx",
+            years=1,
+            force=False,
+            publish_root=None,
+            publish_index_path=None,
+        )
+        store.mark_running(job)
+
+        result = runner.invoke(
+            app,
+            [
+                "queue-recover-stale",
+                "--root",
+                str(tmp_path),
+                "--mark-failed",
+                "--reason",
+                "worker killed",
+            ],
+        )
+
+        recovered = store.load_job(job.job_id)
+        assert result.exit_code == 0
+        assert recovered.status == pipeline_queue.FAILED
+        assert recovered.error == "worker killed"
+        assert recovered.finished_at is not None
+        assert "Marked 1 stale job(s) failed" in result.output
+
+    def test_queue_recover_stale_refuses_live_worker(self, tmp_path: Path):
+        store = pipeline_queue.PipelineQueue(tmp_path)
+        job = store.add_job(
+            "cvx",
+            years=1,
+            force=False,
+            publish_root=None,
+            publish_index_path=None,
+        )
+        store.mark_running(job)
+        store.write_worker_pid(os.getpid())
+
+        result = runner.invoke(
+            app,
+            ["queue-recover-stale", "--root", str(tmp_path)],
+        )
+
+        assert result.exit_code == 1
+        assert store.load_job(job.job_id).status == pipeline_queue.RUNNING
+        assert "Queue worker appears to be running" in result.output
+
+    def test_queue_recover_stale_dry_run_does_not_change_jobs(self, tmp_path: Path):
+        store = pipeline_queue.PipelineQueue(tmp_path)
+        job = store.add_job(
+            "cvx",
+            years=1,
+            force=False,
+            publish_root=None,
+            publish_index_path=None,
+        )
+        store.mark_running(job)
+
+        result = runner.invoke(
+            app,
+            ["queue-recover-stale", "--root", str(tmp_path), "--dry-run"],
+        )
+
+        assert result.exit_code == 0
+        assert store.load_job(job.job_id).status == pipeline_queue.RUNNING
+        assert "Dry run complete" in result.output
+
     def test_queue_group_status_shows_stop_requested(self, tmp_path: Path):
         store = pipeline_queue.PipelineQueue(tmp_path)
         store.request_stop()
@@ -1442,6 +1541,64 @@ class TestQueueCommands:
 
         assert result.exit_code == 0
         assert "Stop requested: yes" in result.output
+
+    def test_queue_group_status_compact_groups_operator_summary(self, tmp_path: Path):
+        store = pipeline_queue.PipelineQueue(tmp_path)
+        running = store.add_job(
+            "cost",
+            years=3,
+            force=False,
+            publish_root=None,
+            publish_index_path=None,
+        )
+        store.mark_running(running)
+        store.add_job(
+            "nflx",
+            years=3,
+            force=False,
+            publish_root=None,
+            publish_index_path=None,
+        )
+        succeeded = store.add_job(
+            "ge",
+            years=3,
+            force=False,
+            publish_root=None,
+            publish_index_path=None,
+        )
+        store.mark_succeeded(succeeded)
+        comma_failed = store.add_job(
+            "aapl,",
+            years=3,
+            force=False,
+            publish_root=None,
+            publish_index_path=None,
+        )
+        store.mark_failed(comma_failed, "resolve_ticker: ticker 'AAPL,' not found")
+        typo_failed = store.add_job(
+            "appl",
+            years=3,
+            force=False,
+            publish_root=None,
+            publish_index_path=None,
+        )
+        store.mark_failed(
+            typo_failed,
+            "resolve_ticker: ticker 'APPL' not found in SEC company_tickers.json",
+        )
+
+        result = runner.invoke(app, ["queue", "status", "--root", str(tmp_path), "--compact"])
+
+        assert result.exit_code == 0
+        assert "Jobs: pending=1 running=1 succeeded=1 failed=2 cancelled=0" in result.output
+        assert "Running:" in result.output
+        assert "COST full_refresh years=3 attempts=1" in result.output
+        assert "Pending:" in result.output
+        assert "NFLX" in result.output
+        assert "Recent succeeded:" in result.output
+        assert "GE" in result.output
+        assert "1 invalid ticker(s) with trailing comma: `AAPL,`" in result.output
+        assert "1 ticker not found in SEC company_tickers.json: `APPL`" in result.output
 
     def test_queue_cancel_marks_pending_job_cancelled(self, tmp_path: Path):
         store = pipeline_queue.PipelineQueue(tmp_path)
@@ -1660,4 +1817,14 @@ class TestHelpOutput:
         assert "watch" in result.output
         assert "stop" in result.output
         assert "kill" in result.output
+        assert "recover-stale" in result.output
         assert "cancel" in result.output
+        assert "Common flow: full refresh" in result.output
+        assert "Safe shutdown" in result.output
+        assert "Immediate interrupt" in result.output
+
+    def test_queue_status_help_shows_compact_mode(self):
+        result = runner.invoke(app, ["queue", "status", "--help"])
+        assert result.exit_code == 0
+        assert "--compact" in result.output
+        assert "operator summary" in result.output

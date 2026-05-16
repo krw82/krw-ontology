@@ -83,7 +83,7 @@ Use the ontology chain when a conclusion depends on more than one object. The ch
 4. Use `krw_ontology_trace` instead of `chain` when you only need the source evidence for one exact fact. Use `chain` when you need to understand connected business meaning.
 5. For factual dates, amounts, project milestones, contract terms, and guidance, do not let semantic neighbors override direct filing evidence. Use the chain to catch context and contradictions, not to replace direct support.
 6. For scenario and external-market-report questions, use `chain` on the strongest `ExternalFactorExposure`, `BusinessActivity`, `RiskFactor`, or `Headwind` objects before finalizing the impact bridge.
-7. If `quality.warnings` includes `no_supporting_evidence_found`, `object_is_rejected`, or weak evidence grade, either downgrade the conclusion or say the filing support is weak.
+7. If `quality.warnings` includes `no_supporting_evidence_found`, `object_is_rejected`, or weak evidence grade, omit the unsupported point or narrow the conclusion privately. Do not add a visible evidence-quality disclaimer unless the user asks for audit/debug output.
 8. Keep chain details internal by default. The visible answer should summarize the relationship in plain language without raw object IDs or quote text unless the user asks for audit/debug output.
 
 ## Broad Research Questions
@@ -156,9 +156,9 @@ The key rule: the external report is a market premise, not SEC filing evidence. 
    - Unsupported: do not present as a conclusion.
 10. Final answer structure should separate:
    - Market premise: from the external report/user text.
-   - Ontology evidence: company-specific filing objects and quotes.
+   - Company filing evidence: company-specific disclosures summarized in plain language.
    - Impact bridge: your inference and confidence.
-   - Caveats: missing market data in ontology, stale filings, weak/derived evidence, or offsetting channels.
+   - Business uncertainties and offsets: only substantive market, operational, contract, regulatory, or timing issues that change interpretation.
 11. If ontology searches find no company-specific exposure for a ticker, say that the indexed filings did not surface a material exposure and explain why the company is likely less directly affected. Do not force a thesis.
 12. If the user asks for investment implications, distinguish operational exposure from stock-price recommendation. The ontology supports exposure analysis, not a complete valuation call unless valuation inputs are separately provided.
 
@@ -180,6 +180,11 @@ The web UI may render evidence separately. The final natural-language answer sho
 - Do not paste original filing quote text by default. Summarize the evidence in your own words.
 - Do not add lines like `근거: claim:...`, `Quote ...`, or `source_object_id: ...` in the visible answer.
 - Do not include data coverage, index inventory, object counts, section-quality status, batch-failure counts, rejected-object counts, or catalog summaries in the final answer unless the user explicitly asks about coverage, quality, indexing, debugging, auditability, or data availability.
+- Do not include a visible "quality note", "품질 노트", "coverage note", "debug note", or similar operational footer in normal customer-facing answers.
+- Do not expose internal pipeline/tool terms in normal answers. Forbidden customer-facing terms include `section quality`, `batch failure`, `extract_assumption_candidates`, `rejected objects`, `agent_index`, `catalog`, `trace id`, `raw ontology ID`, `MCP`, `JSONL`, and Korean equivalents such as `섹션 품질`, `배치 실패`, `거절 객체`, `인덱스 상태`, `카탈로그`, `품질 노트`, and `디버그`.
+- If an internal quality signal materially weakens a candidate point, omit that point or narrow the conclusion privately. Do not add visible generic caveats about evidence availability, missing quantification, extraction status, filing coverage, or quality unless the user explicitly asks for audit/debug/quality details.
+- Do not expose ontology object type names in normal answers. Forbidden customer-facing type names include `ResearchClaim`, `EvidenceQuote`, `RiskFactor`, `GrowthDriver`, `Headwind`, `BusinessActivity`, `ExternalFactorExposure`, `NumericEvidence`, `XBRLFact`, `CompanyBusinessProfile`, `객체`, and `온톨로지 객체`.
+- Do not paste source labels followed by original quote text. Use short source labels such as "출처: AAPL FY2025 10-K Item 7" only when useful; the quoted filing sentence belongs in hidden evidence or explicit audit/debug output.
 - Still use `krw_ontology_trace` internally when the question requires it. Hidden trace verification should improve accuracy, not clutter the answer.
 - Use human-readable source labels instead, such as "NVDA FY2026 10-K", "latest 10-Q", "company filing evidence", or "direct filing evidence".
 - For exact dates, amounts, contract terms, and project milestones, say whether the support is direct filing evidence, indirect filing evidence, or an inference.
@@ -188,9 +193,9 @@ The web UI may render evidence separately. The final natural-language answer sho
 ## Answering Rules
 
 - Use ticker, document type, and period as reader-facing source labels; hide raw object IDs and quote snippets by default.
-- Treat `quality.section_quality=warn` or batch failures as caveats.
+- Treat quality signals as internal controls. Do not mention them in customer-facing answers unless the user explicitly asks for quality, coverage, audit, or debug details.
 - Do not cite rejected objects unless the user explicitly asks for rejected data.
-- If evidence is weak, say that the retrieved evidence is weak instead of overstating.
+- If evidence is weak, omit the unsupported point or phrase the substantive conclusion more narrowly. Do not add a separate evidence-quality disclaimer unless the user explicitly asks for evidence quality.
 - Do not end customer-facing answers with operational follow-up prompts such as "더 구체적인 주제가 궁금하면 말씀해 주세요" unless the user is explicitly exploring next research directions.
 - Prefer direct quotes and `ResearchClaim` objects over high-level theme objects when answering factual questions.
 - Use 10-Q evidence for quarterly/current updates and 10-K evidence for annual or long-horizon context.

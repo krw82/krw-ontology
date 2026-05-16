@@ -71,19 +71,17 @@ app = typer.Typer(
 queue_app = typer.Typer(
     name="queue",
     help=(
-        "Append, run, monitor, and stop ticker-level research jobs. Jobs are stored "
-        "under <running-root>/.krw_pipeline and processed one ticker at a time."
+        "Manage ticker-level research jobs. Jobs live under "
+        "<running-root>/.krw_pipeline and the worker processes one ticker at a time."
     ),
     epilog=(
-        "Typical flow:\n"
-        "  krw-ontology queue add CVX XOM --years 3\n"
-        "  krw-ontology queue update VG --document-type 10-Q --period FY2026Q1\n"
-        "  krw-ontology queue start\n"
-        "  krw-ontology queue status\n"
-        "  krw-ontology queue watch\n\n"
-        "Shutdown flow:\n"
-        "  krw-ontology queue stop        # finish current job, then stop\n"
-        "  krw-ontology queue kill        # terminate the worker process\n\n"
+        "[bold]Common flow: full refresh[/bold] `queue add CVX XOM --years 3`, "
+        "then `queue start`, `queue status`, and `queue watch`.\n\n"
+        "[bold]Common flow: one new filing[/bold] `queue update VG --document-type 10-Q "
+        "--period FY2026Q1`, then `queue start`.\n\n"
+        "[bold]Safe shutdown[/bold] `queue stop` finishes the current ticker before exit.\n\n"
+        "[bold]Immediate interrupt[/bold] `queue kill` terminates now; run "
+        "`queue recover-stale` afterwards to requeue jobs left in running status.\n\n"
         "Use `krw-ontology config set running-root ...` and `publish-root ...` to avoid "
         "passing long paths on every command."
     ),
@@ -1316,7 +1314,7 @@ def queue_stop_cmd(
         help="Seconds to wait when --wait is set.",
     ),
 ) -> None:
-    """Request a graceful queue worker stop after the current job finishes."""
+    """Safely stop the worker after the current ticker job finishes."""
     output_root = resolve_running_root(root, fallback_to_cwd=False)
     store = PipelineQueue(output_root)
     store.request_stop()
@@ -1376,7 +1374,7 @@ def queue_kill_cmd(
         help="Seconds to wait for SIGTERM shutdown before optional --force escalation.",
     ),
 ) -> None:
-    """Terminate the background queue worker process."""
+    """Immediately terminate the background worker process."""
     output_root = resolve_running_root(root, fallback_to_cwd=False)
     store = PipelineQueue(output_root)
     pid = store.worker_pid()
@@ -1408,6 +1406,90 @@ def queue_kill_cmd(
     store.clear_worker_pid(pid)
     store.clear_stop_request()
     typer.echo("Queue worker kill signal sent.")
+
+
+@queue_app.command(
+    "recover-stale",
+    epilog=(
+        "Examples:\n"
+        "  krw-ontology queue recover-stale\n"
+        "  krw-ontology queue recover-stale --dry-run\n"
+        "  krw-ontology queue recover-stale --mark-failed --reason \"worker killed\"\n\n"
+        "Use this after `queue kill`, a machine reboot, or a crashed worker leaves jobs "
+        "stuck in running status. By default it requeues stale running jobs so the next "
+        "`queue start` can retry them. It refuses to run while a queue worker appears live "
+        "unless --force is passed."
+    ),
+)
+@app.command("queue-recover-stale", hidden=True)
+def queue_recover_stale_cmd(
+    root: Optional[Path] = typer.Option(
+        None,
+        "--root",
+        "--output-dir",
+        help="Staging/running ontology data root.",
+    ),
+    mark_failed: bool = typer.Option(
+        False,
+        "--mark-failed/--requeue",
+        help="Mark stale running jobs failed instead of requeueing them as pending.",
+    ),
+    reason: str = typer.Option(
+        "stale running job recovered after worker exit",
+        "--reason",
+        help="Reason recorded in the queue event or failed job error.",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run/--no-dry-run",
+        help="Show stale running jobs without changing job files.",
+    ),
+    force: bool = typer.Option(
+        False,
+        "--force/--no-force",
+        help="Recover even if a worker appears to be running.",
+    ),
+) -> None:
+    """Requeue or fail jobs left running after kill, crash, or reboot."""
+    output_root = resolve_running_root(root, fallback_to_cwd=False)
+    store = PipelineQueue(output_root)
+    store.ensure_dirs()
+
+    worker_running = store.worker_is_running()
+    if worker_running and not force:
+        typer.echo(
+            "Queue worker appears to be running; refusing to recover running jobs. "
+            "Use `queue stop`, `queue kill`, or pass --force if this is a stale PID/lock."
+        )
+        raise typer.Exit(1)
+
+    if not worker_running:
+        stale_pid = store.worker_pid()
+        if stale_pid is not None:
+            store.clear_worker_pid(stale_pid)
+
+    running_jobs = store.list_jobs(statuses=[RUNNING])
+    if not running_jobs:
+        typer.echo("No stale running jobs found.")
+        return
+
+    action = "mark failed" if mark_failed else "requeue"
+    typer.echo(f"Found {len(running_jobs)} stale running job(s); action={action}")
+    for job in running_jobs:
+        typer.echo(f"- {job.ticker} job={job.job_id} attempts={job.attempts}")
+        if dry_run:
+            continue
+        if mark_failed:
+            store.mark_failed(job, reason)
+        else:
+            store.mark_pending(job, reason)
+
+    if dry_run:
+        typer.echo("Dry run complete; no jobs changed.")
+    elif mark_failed:
+        typer.echo(f"Marked {len(running_jobs)} stale job(s) failed.")
+    else:
+        typer.echo(f"Requeued {len(running_jobs)} stale job(s).")
 
 
 @queue_app.command(
@@ -1463,13 +1545,89 @@ def _queue_job_description(job: QueueJob) -> str:
     return f"{job.ticker} full_refresh years={job.years}"
 
 
+def _queue_job_summary(job: QueueJob) -> str:
+    return f"{_queue_job_description(job)} attempts={job.attempts} job={job.job_id}"
+
+
+def _format_ticker_list(jobs: list[QueueJob], *, limit: int) -> str:
+    tickers = [job.ticker for job in jobs]
+    shown = tickers[:limit]
+    suffix = f" (+{len(tickers) - limit} more)" if len(tickers) > limit else ""
+    return ", ".join(f"`{ticker}`" for ticker in shown) + suffix if shown else "(none)"
+
+
+def _queue_failure_group(job: QueueJob) -> str:
+    error = job.error or ""
+    if job.ticker.endswith(","):
+        return "invalid ticker(s) with trailing comma"
+    if "not found in SEC company_tickers.json" in error:
+        return "ticker not found in SEC company_tickers.json"
+    if error:
+        return error.splitlines()[0][:120]
+    return "unknown failure"
+
+
+def _show_queue_status_compact(
+    *,
+    store: PipelineQueue,
+    jobs: list[QueueJob],
+    counts: dict[str, int],
+    worker_state: str,
+    pid: int | None,
+    limit: int,
+) -> None:
+    typer.echo(f"QUEUE_ROOT={store.queue_dir}")
+    typer.echo(f"Worker: {worker_state}" + (f" pid={pid}" if pid is not None else ""))
+    typer.echo(f"Stop requested: {'yes' if store.stop_requested() else 'no'}")
+    typer.echo(
+        "Jobs: "
+        f"pending={counts.get(PENDING, 0)} "
+        f"running={counts.get(RUNNING, 0)} "
+        f"succeeded={counts.get(SUCCEEDED, 0)} "
+        f"failed={counts.get(FAILED, 0)} "
+        f"cancelled={counts.get(CANCELLED, 0)}"
+    )
+
+    running_jobs = [job for job in jobs if job.status == RUNNING]
+    pending_jobs = [job for job in jobs if job.status == PENDING]
+    succeeded_jobs = [job for job in jobs if job.status == SUCCEEDED]
+    failed_jobs = [job for job in jobs if job.status == FAILED]
+
+    typer.echo("")
+    typer.echo("Running:")
+    if running_jobs:
+        for job in running_jobs:
+            typer.echo(f"  {_queue_job_summary(job)}")
+    else:
+        typer.echo("  (none)")
+
+    typer.echo("Pending:")
+    typer.echo(f"  {_format_ticker_list(pending_jobs, limit=limit)}")
+
+    typer.echo("Recent succeeded:")
+    typer.echo(f"  {_format_ticker_list(succeeded_jobs[-limit:], limit=limit)}")
+
+    typer.echo("Failed groups:")
+    if not failed_jobs:
+        typer.echo("  (none)")
+        return
+
+    groups: dict[str, list[QueueJob]] = {}
+    for job in failed_jobs:
+        groups.setdefault(_queue_failure_group(job), []).append(job)
+    for label, group_jobs in groups.items():
+        typer.echo(f"  {len(group_jobs)} {label}: {_format_ticker_list(group_jobs, limit=limit)}")
+
+
 @queue_app.command(
     "status",
     epilog=(
         "Examples:\n"
         "  krw-ontology queue status\n"
+        "  krw-ontology queue status --compact\n"
         "  krw-ontology queue status --limit 50\n\n"
-        "Shows worker state, stop-request state, status counts, and recent jobs."
+        "Default mode shows recent jobs in detail. Compact mode groups running, pending, "
+        "recent succeeded, and repeated failure causes."
     ),
 )
 @app.command("queue-status", hidden=True)
@@ -1481,6 +1639,11 @@ def queue_status_cmd(
         help="Staging/running ontology data root.",
     ),
     limit: int = typer.Option(20, "--limit", min=1, help="Number of recent jobs to show."),
+    compact: bool = typer.Option(
+        False,
+        "--compact/--details",
+        help="Show a compact operator summary instead of detailed recent jobs.",
+    ),
 ) -> None:
     """Show queue worker and job status."""
     output_root = resolve_running_root(root, fallback_to_cwd=False)
@@ -1488,14 +1651,26 @@ def queue_status_cmd(
     store.ensure_dirs()
     worker_state = "running" if store.worker_is_running() else "stopped"
     pid = store.worker_pid()
-    typer.echo(f"QUEUE_ROOT={store.queue_dir}")
-    typer.echo(f"Worker: {worker_state}" + (f" pid={pid}" if pid is not None else ""))
-    typer.echo(f"Stop requested: {'yes' if store.stop_requested() else 'no'}")
 
     jobs = store.list_jobs()
     counts = {PENDING: 0, RUNNING: 0, SUCCEEDED: 0, FAILED: 0, CANCELLED: 0}
     for job in jobs:
         counts[job.status] = counts.get(job.status, 0) + 1
+
+    if compact:
+        _show_queue_status_compact(
+            store=store,
+            jobs=jobs,
+            counts=counts,
+            worker_state=worker_state,
+            pid=pid,
+            limit=limit,
+        )
+        return
+
+    typer.echo(f"QUEUE_ROOT={store.queue_dir}")
+    typer.echo(f"Worker: {worker_state}" + (f" pid={pid}" if pid is not None else ""))
+    typer.echo(f"Stop requested: {'yes' if store.stop_requested() else 'no'}")
     typer.echo(
         "Jobs: "
         f"pending={counts.get(PENDING, 0)} "

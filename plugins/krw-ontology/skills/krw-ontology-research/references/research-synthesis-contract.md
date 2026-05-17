@@ -6,13 +6,62 @@ This contract defines pass 1 of the product workflow.
 MCP tools -> ResearchSynthesis.canonical_answer -> display planner -> frontend renderer
 ```
 
-The research skill owns evidence retrieval, validation, chain inspection, analytical judgment, and the final canonical answer content. The display planner owns only grouping and rendering decisions.
+The research skill owns evidence retrieval, validation, trace/chain inspection, analytical judgment, answerability classification, and the final canonical answer content. The display planner owns only grouping and rendering decisions.
 
 ## Core Rule
 
 `canonical_answer.units` is the source of truth for what can be shown to the user. If a sentence, number, caveat, or conclusion should appear in the UI, it must exist as a canonical unit first.
 
 The answer-composer/display-planner is not allowed to invent content. It can only reference `canonical_answer.units` by `source_ids`.
+
+## Evidence And Answerability Rule
+
+Retrieval and answerability are different.
+
+```text
+Candidate retrieval may be broad.
+Direct answerability must be strict.
+```
+
+Do not use a returned object as a strong answer merely because it was retrieved. A conclusion is strong only when the result tier and evidence refs support it.
+
+When using `krw_ontology_retrieve`, map retrieval buckets directly into synthesis policy:
+
+```text
+direct_evidence -> candidate evidence refs for strong direct units, subject to trace/tier checks
+related_context -> contextual or bridge evidence only
+rejected_context -> internal diagnostics only; do not use for visible claims
+```
+
+Allowed strength levels:
+
+```text
+traceable_direct
+traceable_metric_lineage
+traceable_related
+untraced_direct_candidate
+broad_related_candidate
+no_direct_evidence
+not_answerable
+```
+
+Visible strong conclusions should use `traceable_direct` or `traceable_metric_lineage`. `traceable_related` can support context. `untraced_direct_candidate` and `broad_related_candidate` must not be phrased as direct evidence.
+
+## Canonical Object Boundary
+
+The research synthesis may use reader-friendly unit types such as risk, driver, headwind, timeline event, or metric. These are presentation-level categories, not necessarily canonical ontology object names.
+
+Internal canonical mapping:
+
+```text
+risk_item / driver_item / headwind_item -> BusinessFactor role views
+metric -> MetricObservation or Calculation-backed value
+impact_channel -> ExternalFactorExposure scenario_effects or traced analyst bridge
+timeline_event -> BusinessEvent or ChangeEvent depending on whether it is a business event or disclosure change
+contract / obligation / maturity / covenant content -> AgreementTerm
+period_delta -> TrendObservation, ChangeEvent, TemporalLink, MetricObservation, or Calculation support
+company_discovery -> CompanyTopicProfile / company_topic_index / ticker_summary, then traced source objects
+```
 
 ## Required Shape
 
@@ -29,6 +78,13 @@ Use this shape when the runtime asks for structured research handoff:
     "period_policy": "latest relevant filings",
     "external_premises": []
   },
+  "answerability": {
+    "direct_answerable": true,
+    "related_context_available": true,
+    "negative_answer_supported": false,
+    "needs_user_clarification": false,
+    "recommended_answer_mode": "direct_answer"
+  },
   "thesis": "One or two sentence analytical conclusion.",
   "canonical_answer": {
     "language": "ko",
@@ -40,6 +96,7 @@ Use this shape when the runtime asks for structured research handoff:
         "text": "VG는 LNG 가격 상승의 수혜 가능성이 있지만 feed gas cost와 프로젝트 일정 리스크가 같이 존재합니다.",
         "importance": "required",
         "confidence": "indirect",
+        "evidence_tier": "traceable_related",
         "display_policy": "show",
         "evidence_refs": ["ref_1"]
       }
@@ -53,6 +110,7 @@ Use this shape when the runtime asks for structured research handoff:
     "drivers": [],
     "watch_items": [],
     "timeline_events": [],
+    "agreement_terms": [],
     "caveats": []
   },
   "display_guidance": {
@@ -64,140 +122,214 @@ Use this shape when the runtime asks for structured research handoff:
   "quality": {
     "overall": "medium",
     "warnings": []
-  }
+  },
+  "internal_notes": []
 }
 ```
 
-Fields may be empty when not relevant, but `canonical_answer.units` should not be thin. A company overview usually needs business model, economics, drivers, risks, watch items, and caveats in canonical units before display planning.
+Fields may be empty when not relevant, but `canonical_answer.units` should not be thin. Company overview answers usually need business model, economics, drivers, risks, watch items, and caveats in canonical units before display planning.
+
+## Answerability Object
+
+Use this shape in research handoff whenever the query was direct, negative, scenario-based, or broad discovery:
+
+```json
+{
+  "direct_answerable": false,
+  "related_context_available": true,
+  "negative_answer_supported": true,
+  "needs_user_clarification": false,
+  "recommended_answer_mode": "no_direct_evidence_with_related_context",
+  "why": "No evidence mentions semiconductor, GPU, or HBM. Related evidence concerns construction commodities, feed gas, Henry Hub, and LNG price exposure."
+}
+```
+
+Recommended `recommended_answer_mode` values:
+
+```text
+direct_answer
+no_direct_evidence
+no_direct_evidence_with_related_context
+related_context_only
+not_answerable
+needs_clarification
+comparison_answer
+scenario_answer
+```
 
 ## Canonical Answer Units
 
-Every unit needs:
+Every visible unit needs:
 
-- `id`: stable within the synthesis, such as `p1`, `m1`, `r1`
-- `type`: one of the allowed canonical unit types
-- `importance`: `required`, `supporting`, or `optional`
-- `confidence`: `direct`, `indirect`, `inferred`, or `unsupported`
-- `display_policy`: `show` or `hidden_by_default`
-- `evidence_refs`: internal refs backing the unit
-
-Allowed unit types:
-
-| Unit type | Purpose |
-| --- | --- |
-| `heading` | Section label that carries no new factual claim |
-| `paragraph` | Final prose, interpretation, conclusion, nuance |
-| `metric` | Verified reported/derived number or exact date/value |
-| `period_delta` | Verified change between periods |
-| `business_segment` | Company activity, segment, or business line |
-| `premise` | User-provided or external market premise |
-| `impact_channel` | Factor -> financial channel -> mechanism |
-| `risk_item` | Risk factor or negative exposure |
-| `driver_item` | Growth driver or positive exposure |
-| `headwind_item` | Headwind or pressure point |
-| `watch_item` | Item to monitor |
-| `timeline_event` | Project/date/event/maturity milestone |
-| `comparison_row` | One row in a ticker/period/segment comparison |
-| `caveat` | Limitation or warning that changes interpretation |
-| `glossary_term` | Term definition |
-| `evidence_note` | Support path for audit/debug or user-requested evidence |
-
-## Unit Examples
-
-### Paragraph
-
-```json
-{
-  "id": "p1",
-  "type": "paragraph",
-  "text": "AMZN은 AWS 수익성, 북미 리테일 규모, AI 투자 부담을 함께 봐야 합니다.",
-  "importance": "required",
-  "confidence": "direct",
-  "display_policy": "show",
-  "evidence_refs": ["ref_aws_segment"]
-}
+```text
+id
+type
+text or structured content
+importance
+confidence
+evidence_tier
+display_policy
+evidence_refs
 ```
 
-### Metric
+Recommended `confidence` values:
 
-Use only for verified reported or derived values.
+```text
+direct
+metric_lineage
+derived
+related
+indirect
+uncertain
+unsupported
+```
+
+Recommended `evidence_tier` values:
+
+```text
+traceable_direct
+traceable_metric_lineage
+traceable_related
+untraced_direct_candidate
+broad_related_candidate
+no_direct_evidence
+not_answerable
+```
+
+Rules:
+
+- A unit with `evidence_tier="traceable_direct"` may support a strong direct claim.
+- A unit with `evidence_tier="traceable_metric_lineage"` may support a strong numeric claim.
+- A unit with `evidence_tier="traceable_related"` may provide context or caveat, not direct proof of a narrow premise.
+- Units with `untraced_direct_candidate` or `broad_related_candidate` should be hidden, internal, or explicitly caveated unless the user asked for exploration.
+- `no_direct_evidence` can be visible when the user asked a direct yes/no or negative-evidence question.
+
+## Evidence Refs
+
+Evidence refs connect canonical units to internal evidence without making raw ontology IDs visible by default.
+
+Recommended shape:
 
 ```json
 {
-  "id": "m1",
-  "type": "metric",
-  "label": "AWS operating income",
-  "value": "$45.6B",
-  "period": "FY2025",
-  "unit": "USD",
-  "status": "reported",
-  "source_label": "AMZN FY2025 10-K",
-  "importance": "supporting",
-  "confidence": "direct",
-  "display_policy": "show",
-  "evidence_refs": ["ref_metric_aws_op_income"]
+  "id": "ref_1",
+  "source_label": "VG FY2025 10-K",
+  "object_ids": ["claim:...", "quote:..."],
+  "support_path": ["EvidenceQuote", "ResearchClaim", "ExternalFactorExposure"],
+  "evidence_tier": "traceable_direct",
+  "trace_status": "traceable",
+  "evidence_chain_count": 2,
+  "matched_required_facets": ["SPA termination", "debt acceleration"],
+  "matched_related_facets": ["liquidity", "collateral"],
+  "missing_required_facets": [],
+  "why_tier": "Matched SPA termination and debt acceleration with explicit quote support."
 }
 ```
 
 Rules:
 
-- Prefer `FinancialMetricValue`, `DerivedMetricValue`, `NumericEvidence`, or `XBRLFact`.
-- Use traced `ResearchClaim` or `EvidenceQuote` only if the value is explicit.
-- Do not compute a delta unless both endpoints, units, periods, and sign are clear.
-- Omit suspicious values instead of passing them to canonical content.
+- Do not put raw filing quote text in visible canonical units by default. Keep raw quote text inside `evidence_refs` or hidden/internal units unless the user explicitly asks for raw source text.
+- Include trace/tier metadata when it materially affects answerability.
+- Use reader-facing `source_label` for visible citation labels.
 
-### Business Segment
+## Unit Types
+
+### Paragraph
+
+Use for synthesized conclusions supported by one or more evidence refs.
 
 ```json
 {
-  "id": "s1",
-  "type": "business_segment",
-  "name": "AWS",
-  "role": "Cloud infrastructure and AI/ML services",
-  "economics": "Disproportionate operating income contributor",
-  "why_it_matters": "AWS profitability can offset retail and AI infrastructure investment pressure.",
+  "id": "p1",
+  "type": "paragraph",
+  "text": "VG의 FY2025 10-K에서는 HBM 또는 GPU 가격 변동에 대한 직접 노출 근거는 확인되지 않습니다.",
   "importance": "required",
   "confidence": "direct",
+  "evidence_tier": "no_direct_evidence",
   "display_policy": "show",
-  "evidence_refs": ["ref_aws_segment"]
+  "evidence_refs": ["ref_hbm_negative"]
 }
 ```
 
-### Impact Channel
+### Risk / Driver / Headwind Item
 
-```json
-{
-  "id": "ic1",
-  "type": "impact_channel",
-  "factor": "global LNG price",
-  "channel": "revenue",
-  "direction": "positive",
-  "mechanism": "Higher international LNG prices can improve realized sales economics on exposed volumes.",
-  "offsets": ["feed gas cost", "project timing", "contract mix"],
-  "importance": "required",
-  "confidence": "indirect",
-  "display_policy": "show",
-  "evidence_refs": ["ref_lng_price_exposure"]
-}
-```
-
-### Risk, Driver, Headwind, Watch Item
+Use for `BusinessFactor` role views only when supported by traceable claim/quote or metric lineage.
 
 ```json
 {
   "id": "r1",
   "type": "risk_item",
-  "label": "AI infrastructure investment burden",
-  "analysis": "Demand growth is positive, but capex and depreciation can pressure margins if monetization lags.",
-  "severity": "medium",
+  "label": "Feed gas cost exposure",
+  "analysis": "Feed gas costs can affect cost of revenue and margin.",
+  "impact_channels": ["cost_of_revenue", "gross_margin"],
   "importance": "required",
   "confidence": "direct",
+  "evidence_tier": "traceable_direct",
   "display_policy": "show",
-  "evidence_refs": ["ref_ai_capex"]
+  "evidence_refs": ["ref_feed_gas"]
 }
 ```
 
+Rules:
+
+- Do not show role-view labels such as `BusinessFactor` or `ExternalFactorExposure` in user-facing text unless the user asks for audit/debug details.
+- If a factor is retrieved but untraced, keep it internal or label it as exploratory only.
+
+### Metric
+
+Use for `MetricObservation` and `Calculation` backed values.
+
+```json
+{
+  "id": "m1",
+  "type": "metric",
+  "label": "Revenue",
+  "value": "$215.9B",
+  "period": "FY2026",
+  "analysis": "Reported revenue for the period.",
+  "importance": "required",
+  "confidence": "metric_lineage",
+  "evidence_tier": "traceable_metric_lineage",
+  "display_policy": "show",
+  "evidence_refs": ["ref_revenue"]
+}
+```
+
+Rules:
+
+- A metric does not need quote support if XBRL/table/calculation lineage resolves.
+- Do not allow raw unformatted numeric values into visible units unless they have validated unit/scale/period.
+
+### Impact Channel / Scenario
+
+Use for scenario or sensitivity answers.
+
+```json
+{
+  "id": "s1",
+  "type": "impact_channel",
+  "external_factor": "Natural gas price",
+  "scenario": "factor increases",
+  "company_effect": "negative",
+  "financial_channel": "cost_of_revenue / gross_margin",
+  "analysis": "Higher feed gas costs can pressure margins if not fully passed through.",
+  "importance": "required",
+  "confidence": "direct",
+  "evidence_tier": "traceable_direct",
+  "display_policy": "show",
+  "evidence_refs": ["ref_natural_gas"]
+}
+```
+
+Rules:
+
+- Use `ExternalFactorExposure.scenario_effects` when available.
+- If scenario effects are inferred rather than directly disclosed, label confidence as `indirect` or `related` and keep the bridge explicit.
+- Do not claim metric direction unless the trace supports it or the bridge is clearly labeled.
+
 ### Timeline Event
+
+Use for `BusinessEvent`-backed project, regulatory, litigation, financing, guidance, or product events.
 
 ```json
 {
@@ -210,12 +342,44 @@ Rules:
   "source_label": "VG FY2025 10-K",
   "importance": "required",
   "confidence": "direct",
+  "evidence_tier": "traceable_direct",
   "display_policy": "show",
   "evidence_refs": ["ref_cp2_phase1_cod"]
 }
 ```
 
+Rules:
+
+- Use `ChangeEvent`-backed units only when discussing disclosure change across periods.
+- Label targeted, expected, completed, delayed, pending, approved, denied, withdrawn, or updated status precisely.
+
+### Agreement Term
+
+Use for contract, debt, lease, covenant, purchase commitment, take-or-pay, pricing formula, termination, renewal, and counterparty terms.
+
+```json
+{
+  "id": "a1",
+  "type": "agreement_term",
+  "label": "SPA termination and debt acceleration exposure",
+  "term": "Termination or suspension of long-term post-COD SPAs",
+  "analysis": "The term is linked to potential acceleration of obligations and collateral consequences.",
+  "source_label": "VG FY2025 10-K",
+  "importance": "required",
+  "confidence": "direct",
+  "evidence_tier": "traceable_direct",
+  "display_policy": "show",
+  "evidence_refs": ["ref_spa_termination"]
+}
+```
+
+Rules:
+
+- Do not create visible agreement-term units from generic contract language without specific economic, timing, party, or obligation details.
+
 ### Caveat
+
+Use caveats only when they materially change interpretation.
 
 ```json
 {
@@ -225,10 +389,64 @@ Rules:
   "severity": "warning",
   "importance": "required",
   "confidence": "direct",
+  "evidence_tier": "traceable_direct",
   "display_policy": "show",
   "evidence_refs": ["ref_cp2_phase1_cod"]
 }
 ```
+
+## Direct / Negative Answer Policy
+
+For direct exposure questions, do not answer yes from broad related evidence.
+
+Example:
+
+```text
+Question: VG는 semiconductor memory price cycle 또는 GPU HBM 가격 변동에 직접 노출되어 있나?
+```
+
+Correct visible answer:
+
+```text
+VG의 FY2025 10-K 기반 근거에서는 semiconductor memory, GPU, HBM 가격 변동에 대한 직접 노출은 확인되지 않습니다. 다만 VG는 construction commodity, feed gas, Henry Hub, LNG 가격 등 broad commodity/energy 가격 리스크에는 노출되어 있습니다.
+```
+
+Incorrect:
+
+```text
+VG는 commodity price exposure가 있으므로 HBM/GPU 가격에 직접 노출되어 있습니다.
+```
+
+## External Market Report Impact
+
+Canonical answer should separate:
+
+```text
+1. external market premise
+2. company-specific ontology exposure
+3. explicit analyst bridge
+4. benefit/risk channels
+5. caveats about market data not being native ontology evidence
+```
+
+Do not use external premise as if it were filing evidence. Do not claim a company-specific direct exposure unless the ontology evidence is `traceable_direct`.
+
+## Company Discovery / Large Universe
+
+For many tickers, do not brute-force every ticker with full queries.
+
+Use:
+
+```text
+question context / QueryFrame
+-> company_topic_index or global compact discovery
+-> candidate ticker narrowing
+-> focused query for shortlisted tickers
+-> trace selected objects
+-> synthesis
+```
+
+Discovery output can be used to choose tickers, but final visible conclusions should be based on traced source objects.
 
 ## Research Facts
 
@@ -250,7 +468,8 @@ If a fact should be visible, put it into `canonical_answer.units`. Do not assume
     }
   ],
   "do_not_claim": [
-    "Do not call a targeted COD an achieved COD."
+    "Do not call a targeted COD an achieved COD.",
+    "Do not treat traceable_related evidence as direct exposure."
   ],
   "required_source_ids": ["p1", "c1"]
 }
@@ -258,102 +477,19 @@ If a fact should be visible, put it into `canonical_answer.units`. Do not assume
 
 The display planner may ignore `recommended_blocks` when a simpler markdown layout is clearer, but it must include all required visible units unless the user explicitly requested a narrower answer.
 
-## Evidence Refs
-
-Evidence refs connect canonical units to internal evidence without making raw ontology IDs visible by default.
-
-```json
-{
-  "id": "ref_cp2_phase1_cod",
-  "source_label": "VG FY2025 10-K",
-  "object_type": "ResearchClaim",
-  "evidence_grade": "direct",
-  "trace_id": "internal-only",
-  "chain_summary": {
-    "has_quote": true,
-    "has_claim": true,
-    "has_semantic_object": true,
-    "has_temporal_context": false
-  },
-  "quote_text": null
-}
-```
-
-Rules:
-
-- `id` should be stable within the synthesis payload.
-- `trace_id` or raw object IDs are internal-only.
-- `quote_text` should be `null` unless the user explicitly asked for raw evidence, audit output, or export citations.
-- Use `evidence_grade`: `direct`, `indirect`, `derived`, or `unsupported`.
-
-## Minimum Coverage By Question Type
-
-### Company overview
-
-Canonical answer should cover:
-
-- what the company does
-- business segments or activities
-- economics and key metrics when verified
-- growth drivers
-- risks/headwinds
-- watch items
-- material caveats
-
-Do not reduce a company overview to a few cards or a metric table. The prose must exist as canonical units.
-
-### Exact factual lookup
-
-Canonical answer should cover:
-
-- direct answer first
-- source label
-- whether it is reported, targeted, expected, estimated, guided, or inferred
-- caveat if forward-looking or unsupported
-- contradiction check result when relevant
-
-### Scenario or sensitivity
-
-Canonical answer should cover:
-
-- external factor
-- company exposure
-- financial channels
-- offsets
-- confidence level
-- what evidence is direct versus inferred
-
-### External market report impact
-
-Canonical answer should cover:
-
-- market premise
-- company-specific ontology exposure
-- explicit analyst bridge
-- benefit channels
-- risk or offset channels
-- caveats about market data not being native ontology evidence
-
-### Comparison
-
-Canonical answer should cover:
-
-- common comparison axis
-- each ticker's differentiated exposure
-- confidence and evidence depth
-- caveats for missing coverage or non-comparable periods
-
 ## Quality Rules
 
-- Use `krw_ontology_trace` for exact values, dates, project milestones, contract terms, and guidance.
-- Use `krw_ontology_chain` for conclusions that depend on how evidence, claims, semantic objects, and temporal context connect.
+- Use `krw_ontology_trace` for exact values, dates, project milestones, contract terms, debt maturities, covenant terms, and guidance.
+- Use `krw_ontology_chain` for conclusions that depend on how evidence, claims, metrics, semantic objects, agreement terms, business events, and temporal context connect.
 - Use `krw_ontology_quality` when completeness or reliability matters.
 - Direct filing evidence outranks inferred bridges.
+- Traceable direct evidence outranks traceable related evidence.
 - Do not promote rejected or unsupported objects into conclusions.
+- Do not promote `answerable=true` into a direct answer unless `direct_answerable=true` or `tier=traceable_direct`.
 - If a topic search fails, record the gap and the alternative search path only in internal notes or warnings.
-- Do not put internal quality, coverage, index, rejected-object, or pipeline diagnostics into `canonical_answer.units` with `display_policy="show"`.
+- Do not put internal quality, coverage, index, rejected-object, validation, registry, or pipeline diagnostics into `canonical_answer.units` with `display_policy="show"`.
 - If a quality issue materially weakens a candidate point, omit that point, lower confidence privately, or keep the uncertainty inside hidden/internal fields. Do not add visible generic caveats about evidence availability, missing quantification, extraction status, filing coverage, or quality unless the user explicitly asks for audit/debug/quality details.
-- Debuggable details such as object counts, section quality, batch failures, rejected objects, trace IDs, catalog output, and index inventory belong only in `evidence_refs`, `quality`, `internal_notes`, or hidden-by-default units unless the user explicitly requests audit/debug output.
+- Debuggable details such as object counts, section quality, batch failures, rejected objects, trace IDs, catalog output, registry versions, validation reports, stale artifact flags, and index inventory belong only in `evidence_refs`, `quality`, `internal_notes`, or hidden-by-default units unless the user explicitly requests audit/debug output.
 
 ## What Not To Do
 
@@ -361,8 +497,10 @@ Canonical answer should cover:
 - Do not emit `display_plan` from the research skill.
 - Do not decide frontend layout, HTML, React, CSS, or mobile rendering.
 - Do not paste raw ontology object text into canonical units.
-- Do not expose ontology object type names such as `ResearchClaim`, `EvidenceQuote`, `RiskFactor`, `GrowthDriver`, `Headwind`, `BusinessActivity`, `ExternalFactorExposure`, `NumericEvidence`, `XBRLFact`, `CompanyBusinessProfile`, `객체`, or `온톨로지 객체` in visible canonical units unless the user explicitly asks for audit/debug output.
+- Do not expose ontology object type names such as `ResearchClaim`, `EvidenceQuote`, `BusinessFactor`, `BusinessActivity`, `ExternalFactorExposure`, `MetricObservation`, `Calculation`, `XBRLFact`, `AgreementTerm`, `BusinessEvent`, `SupportLink`, `Edge`, `CompanyBusinessProfile`, `RiskFactor`, `GrowthDriver`, `Headwind`, `FinancialMetricValue`, `DerivedMetricValue`, `NumericEvidence`, `객체`, or `온톨로지 객체` in visible canonical units unless the user explicitly asks for audit/debug output.
 - Do not paste original filing quote text into visible canonical units. Use reader-facing source labels only, and keep quote text inside evidence refs or hidden/internal units by default.
 - Do not add customer-facing sections named "quality note", "품질 노트", "coverage note", "debug note", "데이터 커버리지", or similar operational footers unless the user explicitly asks for them.
 - Do not let numeric values pass through unless they are validated.
 - Do not leave the display planner to infer missing content.
+- Do not answer a direct exposure question with broad related evidence as if it were direct.
+- Do not hide `no_direct_evidence` when the user asked a yes/no directness question.

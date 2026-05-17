@@ -29,7 +29,7 @@ def validate_metric_fields(
     Returns (True, None) always since unknown metrics don't cause rejection,
     but modifies the object in place to move unknown metrics.
     """
-    for field in ("related_metrics", "affects"):
+    for field in ("related_metrics", "affects", "affected_channels"):
         values = obj.get(field)
         if not values:
             continue

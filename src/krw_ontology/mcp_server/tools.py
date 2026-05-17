@@ -5,9 +5,10 @@ from __future__ import annotations
 from enum import Enum
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping, Sequence
 
 from krw_ontology.agent_index import AgentRetriever, OntologyStore, QueryPlan
+from krw_ontology.agent_index.retrieval_text import format_metric_compact
 from krw_ontology.agent_index.store import DEFAULT_QUERY_TYPES
 from krw_ontology.config.paths import ONTOLOGY_ROOT_ENV, resolve_agent_index_path, resolve_ontology_root
 
@@ -22,25 +23,89 @@ class ResponseFormat(str, Enum):
 class ResponseDetail(str, Enum):
     """How much object/evidence detail to return from search-style tools."""
 
+    IDS_ONLY = "ids_only"
     COMPACT = "compact"
+    TICKER_SUMMARY = "ticker_summary"
     FULL = "full"
 
 
 DEFAULT_LIMIT = 10
 MAX_LIMIT = 50
+MAX_DISCOVERY_LIMIT = 200
 MAX_OFFSET = 10_000
+MAX_LIMIT_GROUPS = 50
+MAX_LIMIT_PER_GROUP = 10
 MAX_COMPARE_TICKERS = 20
 MAX_COMPACT_CLAIMS = 3
 MAX_COMPACT_QUOTES = 3
 MAX_COMPACT_SPANS = 1
 MAX_COMPACT_RELATED_OBJECTS = 5
 
+TRACE_ONLY_OBJECT_TYPES = frozenset(
+    {
+        "SupportLink",
+        "Edge",
+        "CanonicalEntity",
+        "EntityMention",
+        "SourceDocument",
+        "SourceLocation",
+        "SourceSpan",
+        "SourceTable",
+        "SourceTableCell",
+        "XBRLFact",
+    }
+)
+DISCOVERY_OBJECT_TYPES = (
+    "ResearchClaim",
+    "EvidenceQuote",
+    "BusinessFactor",
+    "ExternalFactorExposure",
+    "BusinessActivity",
+    "BusinessEvent",
+    "AgreementTerm",
+    "MetricObservation",
+    "Calculation",
+    "CompanyBusinessProfile",
+    "ChangeEvent",
+    "TrendObservation",
+    "TemporalLink",
+    "AssumptionCandidate",
+)
+DISCOVERY_TYPE_SCORES = {
+    "ExternalFactorExposure": 12.0,
+    "EvidenceQuote": 10.0,
+    "ResearchClaim": 9.0,
+    "BusinessFactor": 8.0,
+    "BusinessActivity": 5.0,
+    "BusinessEvent": 5.0,
+    "AgreementTerm": 5.0,
+    "MetricObservation": 4.0,
+    "ChangeEvent": 4.0,
+    "TrendObservation": 4.0,
+    "Calculation": 3.0,
+    "CompanyBusinessProfile": 2.0,
+    "TemporalLink": 2.0,
+    "AssumptionCandidate": 2.0,
+}
+
 _ALLOWED_OBJECT_TYPES = set(DEFAULT_QUERY_TYPES) | {
-    "FinancialMetricValue",
-    "DerivedMetricValue",
-    "NumericEvidence",
-    "CalculatedNumericSupport",
     "XBRLFact",
+    "SupportLink",
+    "RunManifest",
+    "OntologyRegistrySnapshot",
+    "ValidationReport",
+    "TaxonomyTerm",
+    "SourceDocument",
+    "SourceLocation",
+    "SourceTable",
+    "SourceTableCell",
+    "CanonicalEntity",
+    "EntityMention",
+    "MetricObservation",
+    "Calculation",
+    "BusinessFactor",
+    "AgreementTerm",
+    "BusinessEvent",
     "BusinessActivity",
     "ExternalFactorExposure",
     "CompanyBusinessProfile",
@@ -53,21 +118,38 @@ _OBJECT_TYPE_ALIASES = {
     "quotes": ("EvidenceQuote",),
     "evidencequote": ("EvidenceQuote",),
     "evidence_quote": ("EvidenceQuote",),
+    "support": ("SupportLink",),
+    "supportlink": ("SupportLink",),
+    "support_link": ("SupportLink",),
+    "support_links": ("SupportLink",),
+    "entity": ("CanonicalEntity",),
+    "canonical_entity": ("CanonicalEntity",),
+    "entity_mention": ("EntityMention",),
     "claim": ("ResearchClaim",),
     "claims": ("ResearchClaim",),
     "researchclaim": ("ResearchClaim",),
     "research_claim": ("ResearchClaim",),
-    "risk": ("RiskFactor",),
-    "risks": ("RiskFactor",),
-    "riskfactor": ("RiskFactor",),
-    "risk_factor": ("RiskFactor",),
-    "growth": ("GrowthDriver",),
-    "driver": ("GrowthDriver",),
-    "drivers": ("GrowthDriver",),
-    "growthdriver": ("GrowthDriver",),
-    "growth_driver": ("GrowthDriver",),
-    "headwind": ("Headwind",),
-    "headwinds": ("Headwind",),
+    "risk": ("BusinessFactor",),
+    "risks": ("BusinessFactor",),
+    "riskfactor": ("BusinessFactor",),
+    "risk_factor": ("BusinessFactor",),
+    "growth": ("BusinessFactor",),
+    "driver": ("BusinessFactor",),
+    "drivers": ("BusinessFactor",),
+    "growthdriver": ("BusinessFactor",),
+    "growth_driver": ("BusinessFactor",),
+    "headwind": ("BusinessFactor",),
+    "headwinds": ("BusinessFactor",),
+    "business_factor": ("BusinessFactor",),
+    "business_factors": ("BusinessFactor",),
+    "agreement": ("AgreementTerm",),
+    "agreement_term": ("AgreementTerm",),
+    "event": ("BusinessEvent", "ChangeEvent"),
+    "events": ("BusinessEvent", "ChangeEvent"),
+    "business_event": ("BusinessEvent",),
+    "business_events": ("BusinessEvent",),
+    "metric_observation": ("MetricObservation",),
+    "metric_observations": ("MetricObservation",),
     "assumption": ("AssumptionCandidate",),
     "assumptions": ("AssumptionCandidate",),
     "assumptioncandidate": ("AssumptionCandidate",),
@@ -92,19 +174,22 @@ _OBJECT_TYPE_ALIASES = {
     "trendobservation": ("TrendObservation",),
     "trend_observation": ("TrendObservation",),
     "change": ("ChangeEvent",),
-    "event": ("ChangeEvent",),
+    "changes": ("ChangeEvent",),
+    "disclosure_change": ("ChangeEvent",),
+    "disclosure_changes": ("ChangeEvent",),
     "changeevent": ("ChangeEvent",),
     "change_event": ("ChangeEvent",),
-    "metric": ("FinancialMetricValue", "DerivedMetricValue"),
-    "metrics": ("FinancialMetricValue", "DerivedMetricValue"),
-    "financialmetric": ("FinancialMetricValue", "DerivedMetricValue"),
-    "financial_metric": ("FinancialMetricValue", "DerivedMetricValue"),
-    "financialmetrics": ("FinancialMetricValue", "DerivedMetricValue"),
-    "financial_metrics": ("FinancialMetricValue", "DerivedMetricValue"),
-    "financialmetricvalue": ("FinancialMetricValue",),
-    "financial_metric_value": ("FinancialMetricValue",),
-    "derivedmetricvalue": ("DerivedMetricValue",),
-    "derived_metric_value": ("DerivedMetricValue",),
+    "change_events": ("ChangeEvent",),
+    "metric": ("MetricObservation",),
+    "metrics": ("MetricObservation",),
+    "financialmetric": ("MetricObservation",),
+    "financial_metric": ("MetricObservation",),
+    "financialmetrics": ("MetricObservation",),
+    "financial_metrics": ("MetricObservation",),
+    "financialmetricvalue": ("MetricObservation",),
+    "financial_metric_value": ("MetricObservation",),
+    "derivedmetricvalue": ("MetricObservation",),
+    "derived_metric_value": ("MetricObservation",),
     "xbrl": ("XBRLFact",),
     "xbrlfact": ("XBRLFact",),
     "xbrl_fact": ("XBRLFact",),
@@ -157,6 +242,10 @@ def query_tool(
     include_rejected: bool = False,
     limit: int = DEFAULT_LIMIT,
     offset: int = 0,
+    group_by: str | None = None,
+    limit_groups: int = DEFAULT_LIMIT,
+    limit_per_group: int = 3,
+    answer_candidate_only: bool = False,
     response_format: ResponseFormat = ResponseFormat.JSON,
     response_detail: ResponseDetail = ResponseDetail.COMPACT,
 ) -> str:
@@ -164,7 +253,12 @@ def query_tool(
     index = _index(root, index_path)
     limit = _bounded_limit(limit)
     offset = _bounded_offset(offset)
-    fetch_limit = min(MAX_LIMIT + offset + 1, offset + limit + 1)
+    detail = _coerce_response_detail(response_detail)
+    normalized_group_by = _coerce_group_by(group_by)
+    limit_groups = _bounded_limit_groups(limit_groups)
+    limit_per_group = _bounded_limit_per_group(limit_per_group)
+    summary_mode = detail == ResponseDetail.TICKER_SUMMARY or normalized_group_by == "ticker"
+    fetch_limit = MAX_DISCOVERY_LIMIT if summary_mode else min(MAX_LIMIT + offset + 1, offset + limit + 1)
     normalized_object_types, invalid_object_types = _normalize_object_types(object_types)
     if invalid_object_types:
         payload = _error_payload(
@@ -174,6 +268,44 @@ def query_tool(
             + ", ".join(sorted(_ALLOWED_OBJECT_TYPES)),
         )
         return _format_response(payload, response_format, _markdown_error)
+    if answer_candidate_only:
+        normalized_object_types = _answer_candidate_object_types(normalized_object_types)
+
+    if summary_mode and topic:
+        with _store(index) as store:
+            discovery = store.discover_company_topics(
+                question=topic,
+                tickers=tickers,
+                document_types=document_types,
+                periods=periods,
+                limit_groups=limit_groups,
+                limit_per_group=limit_per_group,
+                limit=fetch_limit,
+            )
+        payload = {
+            "query": {
+                "topic": topic,
+                "tickers": _upper_list(tickers),
+                "document_types": document_types or [],
+                "periods": _upper_list(periods),
+                "object_types": normalized_object_types or [],
+                "object_types_requested": object_types or [],
+                "include_rejected": include_rejected,
+                "group_by": normalized_group_by,
+                "limit_groups": limit_groups,
+                "limit_per_group": limit_per_group,
+                "answer_candidate_only": answer_candidate_only,
+            },
+            "response_detail": detail.value,
+            **discovery,
+        }
+        payload["pagination"] = _pagination(
+            len(payload.get("ticker_candidates") or []),
+            0,
+            len(payload.get("ticker_candidates") or []),
+            limit_groups,
+        )
+        return _format_response(payload, response_format, _markdown_bundles)
 
     with _store(index) as store:
         bundles, search_diagnostics = store.query_with_diagnostics(
@@ -187,8 +319,12 @@ def query_tool(
         )
 
     page = bundles[offset : offset + limit]
-    detail = _coerce_response_detail(response_detail)
-    results = page if detail == ResponseDetail.FULL else [_compact_bundle(bundle) for bundle in page]
+    if detail == ResponseDetail.FULL:
+        results = page
+    elif detail == ResponseDetail.IDS_ONLY:
+        results = [_ids_only_bundle(bundle) for bundle in page]
+    else:
+        results = [_compact_bundle(bundle) for bundle in page]
     payload = {
         "query": {
             "topic": topic,
@@ -198,12 +334,31 @@ def query_tool(
             "object_types": normalized_object_types or [],
             "object_types_requested": object_types or [],
             "include_rejected": include_rejected,
+            "group_by": normalized_group_by,
+            "limit_groups": limit_groups,
+            "limit_per_group": limit_per_group,
+            "answer_candidate_only": answer_candidate_only,
         },
         "response_detail": detail.value,
         "search_diagnostics": search_diagnostics,
         "results": results,
         "pagination": _pagination(len(bundles), offset, len(page), limit),
     }
+    if summary_mode:
+        payload.pop("results", None)
+        payload.update(
+            _ticker_summary_payload(
+                bundles,
+                limit_groups=limit_groups,
+                limit_per_group=limit_per_group,
+            )
+        )
+        payload["pagination"] = _pagination(
+            len(payload.get("ticker_candidates") or []),
+            0,
+            len(payload.get("ticker_candidates") or []),
+            limit_groups,
+        )
     return _format_response(payload, response_format, _markdown_bundles)
 
 
@@ -240,12 +395,64 @@ def retrieve_tool(
     periods: list[str] | None = None,
     include_rejected: bool | None = None,
     limit: int = DEFAULT_LIMIT,
+    group_by: str | None = None,
+    limit_groups: int = DEFAULT_LIMIT,
+    limit_per_group: int = 3,
+    answer_candidate_only: bool = False,
     response_format: ResponseFormat = ResponseFormat.JSON,
     response_detail: ResponseDetail = ResponseDetail.COMPACT,
 ) -> str:
     """Use the deterministic local planner, then retrieve evidence bundles."""
     index = _index(root, index_path)
     limit = _bounded_limit(limit)
+    detail = _coerce_response_detail(response_detail)
+    normalized_group_by = _coerce_group_by(group_by)
+    limit_groups = _bounded_limit_groups(limit_groups)
+    limit_per_group = _bounded_limit_per_group(limit_per_group)
+    summary_mode = detail == ResponseDetail.TICKER_SUMMARY or normalized_group_by == "ticker"
+    fetch_limit = MAX_DISCOVERY_LIMIT if summary_mode else limit
+    if summary_mode:
+        with _store(index) as store:
+            discovery = store.discover_company_topics(
+                question=question,
+                tickers=tickers,
+                document_types=document_types,
+                periods=periods,
+                limit_groups=limit_groups,
+                limit_per_group=limit_per_group,
+                limit=fetch_limit,
+            )
+        payload = {
+            "answerability": {
+                "direct_answerable": bool(discovery.get("ticker_candidates")),
+                "related_context_available": False,
+                "negative_answer_supported": False,
+                "needs_user_clarification": False,
+                "recommended_answer_mode": "ticker_discovery",
+            },
+            "recommended_answer_mode": "ticker_discovery",
+            "question": question,
+            "query": {
+                "question": question,
+                "tickers": _upper_list(tickers),
+                "document_types": document_types or [],
+                "periods": _upper_list(periods),
+                "group_by": normalized_group_by,
+                "limit_groups": limit_groups,
+                "limit_per_group": limit_per_group,
+                "answer_candidate_only": answer_candidate_only,
+            },
+            "response_detail": detail.value,
+            **discovery,
+        }
+        payload["pagination"] = _pagination(
+            len(payload.get("ticker_candidates") or []),
+            0,
+            len(payload.get("ticker_candidates") or []),
+            limit_groups,
+        )
+        return _format_response(payload, response_format, _markdown_retrieve)
+
     with _store(index) as store:
         result = AgentRetriever(store).retrieve(
             question,
@@ -253,10 +460,46 @@ def retrieve_tool(
             document_types=document_types,
             periods=periods,
             include_rejected=include_rejected,
-            limit=limit,
+            limit=fetch_limit,
         )
-    detail = _coerce_response_detail(response_detail)
-    payload = result if detail == ResponseDetail.FULL else _compact_retrieval(result)
+    if answer_candidate_only:
+        result = _map_retrieval_context(result, _answer_candidate_bundles)
+    if summary_mode:
+        bundles = _retrieval_context_bundles(result)
+        payload = {
+            **{
+                key: value
+                for key, value in result.items()
+                if key not in {"direct_evidence", "related_context", "rejected_context"}
+            },
+            **_ticker_summary_payload(
+                bundles,
+                limit_groups=limit_groups,
+                limit_per_group=limit_per_group,
+            ),
+        }
+    elif detail == ResponseDetail.IDS_ONLY:
+        payload = {
+            **{
+                key: value
+                for key, value in result.items()
+                if key not in {"direct_evidence", "related_context", "rejected_context"}
+            },
+            "direct_evidence": [_ids_only_bundle(bundle) for bundle in result.get("direct_evidence", [])],
+            "related_context": [_ids_only_bundle(bundle) for bundle in result.get("related_context", [])],
+            "rejected_context": [_ids_only_bundle(bundle) for bundle in result.get("rejected_context", [])],
+        }
+    else:
+        payload = result if detail == ResponseDetail.FULL else _compact_retrieval(result)
+    payload.setdefault("query", {})
+    payload["query"].update(
+        {
+            "group_by": normalized_group_by,
+            "limit_groups": limit_groups,
+            "limit_per_group": limit_per_group,
+            "answer_candidate_only": answer_candidate_only,
+        }
+    )
     payload["response_detail"] = detail.value
     return _format_response(payload, response_format, _markdown_retrieve)
 
@@ -523,6 +766,15 @@ def _coerce_response_detail(response_detail: ResponseDetail | str) -> ResponseDe
         return ResponseDetail.COMPACT
 
 
+def _coerce_group_by(group_by: str | None) -> str | None:
+    if not group_by:
+        return None
+    normalized = str(group_by).strip().lower()
+    if normalized in {"ticker", "tickers"}:
+        return "ticker"
+    return None
+
+
 def _normalize_object_types(
     object_types: list[str] | None,
 ) -> tuple[list[str] | None, list[str]]:
@@ -546,22 +798,163 @@ def _normalize_object_types(
     return _unique(normalized), invalid
 
 
+def _answer_candidate_object_types(object_types: list[str] | None) -> list[str]:
+    if object_types is None:
+        return list(DISCOVERY_OBJECT_TYPES)
+    filtered = [object_type for object_type in object_types if object_type not in TRACE_ONLY_OBJECT_TYPES]
+    return filtered or list(DISCOVERY_OBJECT_TYPES)
+
+
+def _is_answer_candidate_bundle(bundle: Mapping[str, Any]) -> bool:
+    return str(bundle.get("type") or "") not in TRACE_ONLY_OBJECT_TYPES
+
+
+def _answer_candidate_bundles(bundles: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+    return [bundle for bundle in bundles if _is_answer_candidate_bundle(bundle)]
+
+
+def _ids_only_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
+    obj = bundle.get("object")
+    return {
+        "id": bundle.get("id"),
+        "type": bundle.get("type"),
+        "ticker": _object_value(obj, "ticker") or bundle.get("ticker"),
+        "document_id": bundle.get("document_id"),
+    }
+
+
+def _ticker_summary_payload(
+    bundles: Sequence[Mapping[str, Any]],
+    *,
+    limit_groups: int,
+    limit_per_group: int,
+) -> dict[str, Any]:
+    grouped: dict[str, list[Mapping[str, Any]]] = {}
+    for bundle in bundles:
+        if not _is_answer_candidate_bundle(bundle):
+            continue
+        grouped.setdefault(_ticker_from_bundle(bundle), []).append(bundle)
+
+    candidates: list[dict[str, Any]] = []
+    results_by_ticker: dict[str, list[dict[str, Any]]] = {}
+    for ticker, ticker_bundles in grouped.items():
+        ranked = sorted(ticker_bundles, key=_bundle_score, reverse=True)
+        selected = ranked[:limit_per_group]
+        compact_objects = [_compact_bundle(bundle) for bundle in selected]
+        results_by_ticker[ticker] = compact_objects
+        candidates.append(
+            {
+                "ticker": ticker,
+                "score": round(sum(max(_bundle_score(bundle), 0.0) for bundle in selected), 3),
+                "tier": _ticker_tier(ticker_bundles),
+                "matched_object_counts": _object_type_counts(ticker_bundles),
+                "evidence_counts": _evidence_counts(ticker_bundles),
+                "top_reasons": [_bundle_reason(bundle) for bundle in selected],
+                "top_object_ids": [str(bundle.get("id")) for bundle in selected if bundle.get("id")],
+                "top_objects": compact_objects,
+            }
+        )
+
+    candidates.sort(key=lambda item: float(item.get("score") or 0.0), reverse=True)
+    candidates = candidates[:limit_groups]
+    allowed = {candidate["ticker"] for candidate in candidates}
+    return {
+        "ticker_candidates": candidates,
+        "results_by_ticker": {
+            ticker: results_by_ticker[ticker]
+            for ticker in sorted(allowed)
+            if ticker in results_by_ticker
+        },
+    }
+
+
+def _ticker_from_bundle(bundle: Mapping[str, Any]) -> str:
+    obj = bundle.get("object")
+    ticker = _object_value(obj, "ticker") or bundle.get("ticker")
+    return str(ticker or "UNKNOWN")
+
+
+def _bundle_score(bundle: Mapping[str, Any]) -> float:
+    object_type = str(bundle.get("type") or "")
+    if object_type in TRACE_ONLY_OBJECT_TYPES:
+        return -100.0
+    score = DISCOVERY_TYPE_SCORES.get(object_type, 1.0)
+    evidence = bundle.get("evidence") or {}
+    score += min(len(evidence.get("quotes") or []), 3) * 2.0
+    score += min(len(evidence.get("claims") or []), 3) * 1.5
+    score += min(len(evidence.get("metrics") or []), 2) * 0.75
+    obj = bundle.get("object")
+    grade = str(_object_value(obj, "evidence_grade") or "").lower() if obj is not None else ""
+    if grade == "direct":
+        score += 3.0
+    elif grade == "indirect":
+        score += 1.0
+    return score
+
+
+def _ticker_tier(bundles: Sequence[Mapping[str, Any]]) -> str:
+    object_types = {str(bundle.get("type") or "") for bundle in bundles}
+    if object_types & {"ExternalFactorExposure", "EvidenceQuote", "ResearchClaim"}:
+        return "direct"
+    if object_types & {"BusinessFactor", "BusinessActivity", "BusinessEvent", "AgreementTerm", "MetricObservation"}:
+        return "related"
+    if object_types:
+        return "inferred"
+    return "insufficient"
+
+
+def _object_type_counts(bundles: Sequence[Mapping[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for bundle in bundles:
+        object_type = str(bundle.get("type") or "Unknown")
+        counts[object_type] = counts.get(object_type, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def _evidence_counts(bundles: Sequence[Mapping[str, Any]]) -> dict[str, int]:
+    counts = {"quotes": 0, "claims": 0, "metrics": 0}
+    for bundle in bundles:
+        evidence = bundle.get("evidence") or {}
+        counts["quotes"] += len(evidence.get("quotes") or [])
+        counts["claims"] += len(evidence.get("claims") or [])
+        counts["metrics"] += len(evidence.get("metrics") or [])
+    return counts
+
+
+def _bundle_reason(bundle: Mapping[str, Any]) -> str:
+    object_type = str(bundle.get("type") or "")
+    obj = bundle.get("object")
+    title = None
+    for attr in ("label", "title", "factor_name", "claim_text", "quote_text", "activity_name", "event_name"):
+        value = _object_value(obj, attr) if obj is not None else None
+        if value:
+            title = str(value)
+            break
+    if not title:
+        title = str(bundle.get("text") or bundle.get("id") or "")
+    title = title.replace("\n", " ").strip()
+    if len(title) > 140:
+        title = title[:137].rstrip() + "..."
+    return f"{object_type}: {title}" if object_type else title
+
+
+def _object_value(obj: Any, key: str) -> Any:
+    if obj is None:
+        return None
+    if isinstance(obj, Mapping):
+        return obj.get(key)
+    return getattr(obj, key, None)
+
+
 def _compact_retrieval(result: dict[str, Any]) -> dict[str, Any]:
     payload = {
         key: value
         for key, value in result.items()
-        if key not in {"results", "compare", "quality"}
+        if key not in {"direct_evidence", "related_context", "rejected_context", "results", "compare", "quality"}
     }
-    results = result.get("results")
-    if isinstance(results, list):
-        payload["results"] = [_compact_bundle(item) for item in results]
-    elif isinstance(results, dict):
-        payload["results"] = {
-            ticker: [_compact_bundle(item) for item in items]
-            for ticker, items in results.items()
-        }
-    else:
-        payload["results"] = results
+    for field_name in ("direct_evidence", "related_context", "rejected_context"):
+        values = result.get(field_name)
+        payload[field_name] = [_compact_bundle(item) for item in values] if isinstance(values, list) else []
     if "compare" in result:
         payload["compare"] = _compact_compare(result["compare"])
     if "quality" in result:
@@ -691,11 +1084,10 @@ def _comparison_item_score(item: dict[str, Any]) -> tuple[int, int, int, str]:
         "ResearchClaim": 4,
         "ExternalFactorExposure": 3,
         "BusinessActivity": 3,
-        "FinancialMetricValue": 3,
-        "DerivedMetricValue": 3,
-        "RiskFactor": 2,
-        "GrowthDriver": 2,
-        "Headwind": 2,
+        "MetricObservation": 3,
+        "BusinessFactor": 2,
+        "BusinessEvent": 2,
+        "AgreementTerm": 2,
     }.get(str(item.get("type") or ""), 1)
     support_count = len(evidence.get("claims") or []) + len(evidence.get("quotes") or [])
     return (grade_score, type_score, support_count, str(item.get("id") or ""))
@@ -742,6 +1134,16 @@ def _compact_bundle(item: dict[str, Any]) -> dict[str, Any]:
         "section": item.get("section"),
         "text": _short_text(item.get("text"), 700),
         "trace_id": item.get("id"),
+        "semantic_relevance": item.get("semantic_relevance"),
+        "trace_status": item.get("trace_status"),
+        "tier": item.get("tier"),
+        "evidence_chain_count": item.get("evidence_chain_count"),
+        "support_depth": item.get("support_depth"),
+        "support_quote_count": item.get("support_quote_count"),
+        "support_claim_count": item.get("support_claim_count"),
+        "matched_required_facets": item.get("matched_required_facets"),
+        "missing_required_facets": item.get("missing_required_facets"),
+        "why_tier": item.get("why_tier"),
         "evidence": {
             "claims": [
                 _compact_evidence_object(claim, max_chars=320)
@@ -759,6 +1161,7 @@ def _compact_bundle(item: dict[str, Any]) -> dict[str, Any]:
                 _compact_evidence_object(related, max_chars=320)
                 for related in evidence.get("related_objects", [])[:MAX_COMPACT_RELATED_OBJECTS]
             ],
+            "metric_lineage": _compact_metric_lineage(evidence.get("metric_lineage")),
         },
         "quality": {
             "object_status": quality.get("object_status"),
@@ -799,6 +1202,27 @@ def _compact_document(doc: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _compact_metric_lineage(lineage: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not lineage:
+        return None
+    return {
+        "trace_type": lineage.get("trace_type"),
+        "formatted_value": lineage.get("formatted_value"),
+        "calculation": _compact_evidence_object(lineage["calculation"], max_chars=240)
+        if lineage.get("calculation")
+        else None,
+        "input_metrics": [
+            _compact_evidence_object(metric, max_chars=240)
+            for metric in (lineage.get("input_metrics") or [])[:5]
+        ],
+        "xbrl_facts": [
+            _compact_evidence_object(fact, max_chars=240)
+            for fact in (lineage.get("xbrl_facts") or [])[:5]
+        ],
+        "source_document_ids": lineage.get("source_document_ids") or [],
+    }
+
+
 def _compact_quality_event(event: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": event.get("id"),
@@ -811,6 +1235,14 @@ def _compact_quality_event(event: dict[str, Any]) -> dict[str, Any]:
 
 def _bounded_limit(limit: int) -> int:
     return max(1, min(int(limit), MAX_LIMIT))
+
+
+def _bounded_limit_groups(limit: int) -> int:
+    return max(1, min(int(limit), MAX_LIMIT_GROUPS))
+
+
+def _bounded_limit_per_group(limit: int) -> int:
+    return max(1, min(int(limit), MAX_LIMIT_PER_GROUP))
 
 
 def _bounded_offset(offset: int) -> int:
@@ -870,6 +1302,8 @@ def _markdown_catalog(payload: dict[str, Any]) -> str:
 
 
 def _markdown_bundles(payload: dict[str, Any]) -> str:
+    if payload.get("response_detail") == ResponseDetail.TICKER_SUMMARY.value:
+        return _markdown_ticker_summary(payload)
     lines = ["# Ontology Query Results", f"- Results: {payload['pagination']['count']}"]
     diagnostics = payload.get("search_diagnostics") or {}
     warnings = diagnostics.get("warnings") or []
@@ -909,18 +1343,76 @@ def _markdown_topic_map(payload: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _retrieval_context_bundles(result: Mapping[str, Any]) -> list[dict[str, Any]]:
+    bundles: list[dict[str, Any]] = []
+    for field_name in ("direct_evidence", "related_context", "rejected_context"):
+        values = result.get(field_name)
+        if isinstance(values, list):
+            bundles.extend(item for item in values if isinstance(item, dict))
+    return bundles
+
+
+def _map_retrieval_context(result: dict[str, Any], mapper: Any) -> dict[str, Any]:
+    mapped = dict(result)
+    for field_name in ("direct_evidence", "related_context", "rejected_context"):
+        values = result.get(field_name)
+        mapped[field_name] = mapper(values) if isinstance(values, list) else []
+    return mapped
+
+
 def _markdown_retrieve(payload: dict[str, Any]) -> str:
+    if payload.get("response_detail") == ResponseDetail.TICKER_SUMMARY.value:
+        return _markdown_ticker_summary(payload)
+    answerability = payload.get("answerability") or {}
     lines = [
         "# Ontology Retrieval",
-        f"- Answerable: {payload.get('answerable')}",
+        f"- Direct answerable: {answerability.get('direct_answerable')}",
+        f"- Related context available: {answerability.get('related_context_available')}",
+        f"- Recommended answer mode: {payload.get('recommended_answer_mode') or answerability.get('recommended_answer_mode')}",
         f"- Plan: `{json.dumps(payload.get('plan', {}), ensure_ascii=False)}`",
     ]
-    results = payload.get("results")
-    if isinstance(results, list):
-        for item in results:
-            lines.extend(_bundle_lines(item))
-    elif results:
-        lines.append(json.dumps(results, ensure_ascii=False, indent=2, default=str))
+    for title, field_name in (
+        ("Direct Evidence", "direct_evidence"),
+        ("Related Context", "related_context"),
+        ("Rejected Context", "rejected_context"),
+    ):
+        results = payload.get(field_name)
+        if isinstance(results, list) and results:
+            lines.append(f"## {title}")
+            for item in results:
+                lines.extend(_bundle_lines(item, prefix="### "))
+    return "\n".join(lines)
+
+
+def _markdown_ticker_summary(payload: dict[str, Any]) -> str:
+    candidates = payload.get("ticker_candidates") or []
+    if not candidates:
+        return "No ticker candidates found."
+    lines = ["# Ticker Discovery Summary", ""]
+    for index, candidate in enumerate(candidates, 1):
+        lines.append(
+            f"{index}. `{candidate.get('ticker')}` "
+            f"tier={candidate.get('tier')} score={candidate.get('score')}"
+        )
+        counts = candidate.get("matched_object_counts") or {}
+        if counts:
+            lines.append(f"- Object counts: {counts}")
+        for reason in (candidate.get("top_reasons") or [])[:3]:
+            if isinstance(reason, Mapping):
+                why = reason.get("why_direct") or reason.get("why_not_direct") or reason.get("topic_label") or reason.get("object_id")
+                lines.append(f"- {why}")
+                core = reason.get("matched_core_terms") or []
+                mechanisms = reason.get("matched_mechanisms") or []
+                channels = reason.get("matched_impact_channels") or []
+                if core or mechanisms or channels:
+                    lines.append(
+                        f"- Matched facets: core={core} mechanisms={mechanisms} channels={channels}"
+                    )
+                missing = reason.get("missing_required_facets") or []
+                if missing:
+                    lines.append(f"- Missing for direct: {missing}")
+            else:
+                lines.append(f"- {reason}")
     return "\n".join(lines)
 
 
@@ -938,6 +1430,13 @@ def _markdown_trace(payload: dict[str, Any]) -> str:
         lines.append(f"- Quote `{quote.get('id')}`: {_short_text(quote.get('text'))}")
     for span in payload.get("evidence", {}).get("spans", [])[:3]:
         lines.append(f"- Span `{span.get('id')}`: {_short_text(span.get('text'))}")
+    metric_lineage = payload.get("evidence", {}).get("metric_lineage")
+    if metric_lineage:
+        lines.append(f"- Metric lineage: {metric_lineage.get('formatted_value')}")
+        if metric_lineage.get("calculation"):
+            lines.append(f"- Calculation: `{metric_lineage['calculation'].get('id')}`")
+        for fact in (metric_lineage.get("xbrl_facts") or [])[:3]:
+            lines.append(f"- XBRLFact `{fact.get('id')}`: {_short_text(fact.get('text'))}")
     return "\n".join(lines)
 
 
@@ -1048,6 +1547,8 @@ def _bundle_lines(item: dict[str, Any], *, prefix: str = "## ") -> list[str]:
 
 
 def _display_text(obj: dict[str, Any]) -> str:
+    if obj.get("type") == "MetricObservation" or obj.get("metric_name"):
+        return format_metric_compact(obj)
     for key in (
         "claim_text",
         "quote_text",

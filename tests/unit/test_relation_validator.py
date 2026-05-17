@@ -147,14 +147,14 @@ class TestInvalidRelations:
 
     def test_same_type_required_fails_for_mixed_temporal_link(self, relations_whitelist: list):
         all_objects = {
-            "risk:1": {"id": "risk:1", "type": "RiskFactor"},
-            "headwind:1": {"id": "headwind:1", "type": "Headwind"},
+            "business_factor:1": {"id": "business_factor:1", "type": "BusinessFactor"},
+            "external_factor_exposure:1": {"id": "external_factor_exposure:1", "type": "ExternalFactorExposure"},
         }
         edge = _edge(
             edge_class="temporal",
             evidence_level="inferred",
-            from_id="risk:1",
-            to_id="headwind:1",
+            from_id="business_factor:1",
+            to_id="external_factor_exposure:1",
             relation_name="continues_as",
             relation_id="continues_as",
         )

@@ -103,32 +103,11 @@ def extract_xbrl(
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     write_jsonl(output_path, facts)
-    metric_values = _build_financial_metric_values(
-        facts=facts,
-        raw_html_path=raw_html_path,
-        ticker=ticker,
-        period=period,
-        doc_type_key=doc_type_key,
-        document_type=document_type,
-        source_document_id=source_document_id,
-    )
-    derived_values = _build_derived_metric_values(
-        metric_values=metric_values,
-        ticker=ticker,
-        period=period,
-        doc_type_key=doc_type_key,
-        document_type=document_type,
-        source_document_id=source_document_id,
-    )
-    write_jsonl(output_path.parent / "financial_metric_values.jsonl", metric_values)
-    write_jsonl(output_path.parent / "derived_metric_values.jsonl", derived_values)
 
     status = "ok" if facts else "missing_or_failed"
     logger.info(
-        "extract_xbrl: extracted %d facts, %d metric values, %d derived values, status=%s",
+        "extract_xbrl: extracted %d facts, status=%s",
         len(facts),
-        len(metric_values),
-        len(derived_values),
         status,
         extra={"stage": "extract_xbrl_facts"},
     )
@@ -184,8 +163,6 @@ def _inline_xbrl_tags(soup: BeautifulSoup) -> list[Any]:
 
 def _write_empty_xbrl_outputs(output_path: Path) -> None:
     write_jsonl(output_path, [])
-    write_jsonl(output_path.parent / "financial_metric_values.jsonl", [])
-    write_jsonl(output_path.parent / "derived_metric_values.jsonl", [])
 
 
 def _extract_contexts(soup: BeautifulSoup) -> dict[str, dict]:

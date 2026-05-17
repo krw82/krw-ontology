@@ -31,8 +31,10 @@ logger = logging.getLogger("krw_ontology")
 BATCH_SIZE = 5
 SPAN_PRUNING_OFF = "off"
 SPAN_PRUNING_CONSERVATIVE = "conservative"
-SPAN_PRUNING_MODES = {SPAN_PRUNING_OFF, SPAN_PRUNING_CONSERVATIVE}
-CACHE_VERSION = 2
+SPAN_PRUNING_PILOT = "pilot"
+SPAN_PRUNING_MODES = {SPAN_PRUNING_OFF, SPAN_PRUNING_CONSERVATIVE, SPAN_PRUNING_PILOT}
+PILOT_MAX_QUOTE_SPANS = 120
+CACHE_VERSION = 3
 
 _SCHEMA = {
     "type": "object",
@@ -88,6 +90,32 @@ _TARGET_SECTIONS = {
     "part2_item1",
     "part2_item1a",
 }
+_PILOT_SECTION_PRIORITY = {
+    "item1": 0,
+    "part1_item1": 0,
+    "item1a": 1,
+    "part2_item1a": 1,
+    "item7": 2,
+    "item7a": 3,
+    "item1c": 4,
+    "item8": 5,
+}
+_PILOT_SECTION_QUOTAS = {
+    "item1": 24,
+    "part1_item1": 24,
+    "item1a": 36,
+    "part2_item1a": 36,
+    "item7": 36,
+    "item7a": 8,
+    "item1c": 8,
+    "item8": 8,
+}
+_PILOT_FALLBACK_KEYWORDS = (
+    "revenue", "net sales", "gross margin", "operating margin", "data center",
+    "artificial intelligence", "ai", "export control", "china", "supply",
+    "supplier", "customer", "competition", "regulation", "liquidity",
+    "capital expenditure", "cash flow", "risk", "adverse",
+)
 _QUOTE_KEYWORDS = (
     "adverse", "affect", "risk", "uncertain", "competition", "competitive",
     "regulatory", "litigation", "supply", "supplier", "manufacturing",
@@ -185,6 +213,7 @@ def _filter_spans_for_quote_extraction(
     spans: list[dict],
     *,
     span_pruning: str,
+    pilot_max_quote_spans: int = PILOT_MAX_QUOTE_SPANS,
 ) -> tuple[list[dict], list[dict]]:
     """Return spans eligible for quote extraction and an auditable decision row per span."""
     mode = _normalize_span_pruning_mode(span_pruning)
@@ -207,7 +236,64 @@ def _filter_spans_for_quote_extraction(
         if decision == "keep":
             eligible.append(span)
 
+    if mode == SPAN_PRUNING_PILOT:
+        selected = _select_pilot_spans(eligible, pilot_max_quote_spans)
+        selected_ids = {span.get("id", "") for span in selected}
+        for row in audit_rows:
+            if row["decision"] != "keep":
+                row["pilot_selected"] = False
+                continue
+            row["pilot_selected"] = row["span_id"] in selected_ids
+            if row["span_id"] not in selected_ids:
+                row["decision"] = "skip"
+                row["reason"] = "pilot_span_cap_or_non_core_section"
+        eligible = selected
+
     return eligible, audit_rows
+
+
+def _select_pilot_spans(spans: list[dict], max_spans: int) -> list[dict]:
+    """Keep a small, deterministic set of high-value spans for development runs."""
+    limit = max(1, int(max_spans or PILOT_MAX_QUOTE_SPANS))
+
+    def score(span: dict) -> tuple[int, int, int]:
+        section_name = span.get("section_name", "")
+        normalized = _normalize_text(span.get("text", ""))
+        lowered = normalized.lower()
+        section_priority = _PILOT_SECTION_PRIORITY.get(section_name, 20)
+        keyword_hit = 0 if any(keyword in lowered for keyword in _PILOT_FALLBACK_KEYWORDS) else 1
+        span_index = int(span.get("span_index") or 0)
+        return section_priority, keyword_hit, span_index
+
+    selected: list[dict] = []
+    selected_ids: set[str] = set()
+    for section_name, _priority in sorted(_PILOT_SECTION_PRIORITY.items(), key=lambda item: item[1]):
+        quota = _PILOT_SECTION_QUOTAS.get(section_name, 0)
+        if quota <= 0 or len(selected) >= limit:
+            continue
+        section_spans = [
+            span for span in spans
+            if span.get("section_name", "") == section_name and span.get("id", "") not in selected_ids
+        ]
+        for span in sorted(section_spans, key=score)[: min(quota, limit - len(selected))]:
+            selected.append(span)
+            selected_ids.add(span.get("id", ""))
+
+    if len(selected) < limit:
+        fallback_spans = [
+            span for span in spans
+            if span.get("id", "") not in selected_ids
+            and (
+                span.get("section_name", "") in _PILOT_SECTION_PRIORITY
+                or any(keyword in _normalize_text(span.get("text", "")).lower() for keyword in _PILOT_FALLBACK_KEYWORDS)
+            )
+        ]
+        for span in sorted(fallback_spans, key=score)[: limit - len(selected)]:
+            selected.append(span)
+            selected_ids.add(span.get("id", ""))
+
+    selected_ids = {span.get("id", "") for span in selected}
+    return [span for span in spans if span.get("id", "") in selected_ids]
 
 
 def _classify_span_eligibility(span: dict, mode: str) -> tuple[str, str, int]:
@@ -346,6 +432,7 @@ async def extract_evidence_quotes(
     concurrency: int = 1,
     force: bool = False,
     span_pruning: str = SPAN_PRUNING_CONSERVATIVE,
+    pilot_max_quote_spans: int = PILOT_MAX_QUOTE_SPANS,
     batch_size: int = BATCH_SIZE,
 ) -> list[dict]:
     """Extract evidence quotes from spans in batches with split retry."""
@@ -370,6 +457,7 @@ async def extract_evidence_quotes(
     eligible_spans, span_eligibility_audit = _filter_spans_for_quote_extraction(
         spans,
         span_pruning=span_pruning,
+        pilot_max_quote_spans=pilot_max_quote_spans,
     )
     write_jsonl(span_eligibility_path, span_eligibility_audit)
     skipped_count = len(spans) - len(eligible_spans)
@@ -623,6 +711,22 @@ async def _extract_batch_with_split_retry(
         )
         return [], len(batch)
     except Exception as e:
+        if _is_transient_service_error(e):
+            batch_span_ids = [s["id"] for s in batch]
+            logger.error(
+                "%s batch %s failed with transient service error; recording %s failed spans without split retry: %s",
+                stage_name,
+                batch_index,
+                len(batch),
+                e,
+                extra={"stage": stage_name},
+            )
+            _record_batch_failure(
+                failures_path, ticker, doc_type, period, source_document_id,
+                doc_type_key, stage_name, batch_index, batch_span_ids, str(e),
+                error_type="TransientServiceError",
+            )
+            return [], len(batch)
         if len(batch) <= 1:
             batch_span_ids = [s["id"] for s in batch]
             logger.error(
@@ -670,6 +774,16 @@ async def _extract_batch_with_split_retry(
             stage_name=stage_name,
         )
         return [*left_items, *right_items], left_failed + right_failed
+
+
+def _is_transient_service_error(error: Exception) -> bool:
+    message = str(error).lower()
+    return (
+        "api_error_status\":500" in message
+        or "api error: 500" in message
+        or "network error" in message
+        or "server-side issue" in message
+    )
 
 
 async def _extract_candidate_batch(

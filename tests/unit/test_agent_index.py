@@ -68,7 +68,7 @@ def test_build_agent_index_and_query_trace_quality(tmp_path: Path):
         assert docs[0]["section_quality_status"] == "pass"
 
         bundles = store.query(topic="margin pressure", tickers=["VG"])
-        assert len(bundles) == 2
+        assert len(bundles) >= 2
         claim_bundle = next(bundle for bundle in bundles if bundle["type"] == "ResearchClaim")
         assert claim_bundle["ticker"] == "VG"
         assert claim_bundle["quality"]["object_status"] == "accepted"
@@ -195,6 +195,86 @@ def test_no_force_build_replaces_existing_fts_entries(tmp_path: Path):
     assert fts_rows == objects_with_text
 
 
+def test_business_factor_retrieval_text_inherits_supported_claim_keywords(tmp_path: Path):
+    ontology_dir = tmp_path / "companies" / "NVDA" / "ontology" / "10K" / "FY2026"
+    ontology_dir.mkdir(parents=True)
+    claim_id = "claim:NVDA:FY2026:10K:export-controls"
+    factor_id = "business_factor:NVDA:FY2026:10K:generic-risk"
+    quote_id = "quote:NVDA:FY2026:10K:0001"
+    write_jsonl(
+        ontology_dir / "claims.jsonl",
+        [
+            {
+                "id": claim_id,
+                "type": "ResearchClaim",
+                "ticker": "NVDA",
+                "document_type": "10-K",
+                "period": "FY2026",
+                "claim_text": "Export restrictions targeted A100, H100, and DGX exports to China.",
+                "supported_by_quotes": [quote_id],
+                "review_status": "accepted",
+            }
+        ],
+    )
+    write_jsonl(
+        ontology_dir / "evidence_quotes.jsonl",
+        [
+            {
+                "id": quote_id,
+                "type": "EvidenceQuote",
+                "ticker": "NVDA",
+                "document_type": "10-K",
+                "period": "FY2026",
+                "quote_text": "The U.S. government restricted exports of A100 and H100 products to China.",
+                "review_status": "accepted",
+            }
+        ],
+    )
+    write_jsonl(
+        ontology_dir / "business_factors.jsonl",
+        [
+            {
+                "id": factor_id,
+                "type": "BusinessFactor",
+                "ticker": "NVDA",
+                "document_type": "10-K",
+                "period": "FY2026",
+                "name": "Geopolitical event",
+                "factor_roles": ["risk"],
+                "description": "Generic geopolitical risk.",
+                "supported_by_claims": [claim_id],
+                "review_status": "accepted",
+            }
+        ],
+    )
+    atomic_write_json(
+        ontology_dir / "artifact_index.json",
+        {
+            "ticker": "NVDA",
+            "document_type": "10-K",
+            "doc_type_key": "10K",
+            "period": "FY2026",
+            "files": {
+                "claims": "companies/NVDA/ontology/10K/FY2026/claims.jsonl",
+                "evidence_quotes": "companies/NVDA/ontology/10K/FY2026/evidence_quotes.jsonl",
+                "business_factors": "companies/NVDA/ontology/10K/FY2026/business_factors.jsonl",
+            },
+            "counts": {"claims": 1, "evidence_quotes": 1, "business_factors": 1},
+        },
+    )
+
+    index = build_agent_index(tmp_path)
+
+    with OntologyStore(index["index_path"]) as store:
+        results = store.query(
+            topic="export controls China H100",
+            tickers=["NVDA"],
+            object_types=["BusinessFactor"],
+        )
+
+    assert [result["id"] for result in results] == [factor_id]
+
+
 def test_agent_retriever_plans_and_retrieves_latest_10q(tmp_path: Path):
     _write_document_fixture(
         tmp_path,
@@ -224,12 +304,15 @@ def test_agent_retriever_plans_and_retrieves_latest_10q(tmp_path: Path):
         retriever = AgentRetriever(store)
         result = retriever.retrieve("VG 최근 10-Q에서 마진 압박 근거 찾아줘")
 
-    assert result["answerable"] is True
+    assert "answerable" not in result
+    assert "results" not in result
+    assert result["answerability"]["recommended_answer_mode"] in {"direct_evidence", "related_context"}
     assert result["plan"]["tickers"] == ["VG"]
     assert result["plan"]["document_types"] == ["10-Q"]
     assert result["resolved_periods"] == ["FY2025Q3"]
-    assert {bundle["period"] for bundle in result["results"]} == {"FY2025Q3"}
-    assert any(bundle["evidence"]["quotes"] for bundle in result["results"])
+    bundles = result["direct_evidence"] + result["related_context"]
+    assert {bundle["period"] for bundle in bundles} == {"FY2025Q3"}
+    assert any(bundle["evidence"]["quotes"] for bundle in bundles)
     assert result["audit"]["executed_queries"][0]["topic"] == "margin pressure"
 
 
@@ -262,14 +345,57 @@ def test_agent_retriever_key_risk_question_uses_latest_10k_and_broad_risk_topic(
         retriever = AgentRetriever(store)
         result = retriever.retrieve("What are the key risks for VG?", limit=5)
 
-    assert result["answerable"] is True
+    assert "answerable" not in result
+    assert "results" not in result
+    assert result["answerability"]["recommended_answer_mode"] in {"direct_evidence", "related_context"}
     assert result["plan"]["tickers"] == ["VG"]
     assert result["plan"]["document_types"] == ["10-K"]
     assert result["plan"]["period_policy"] == "latest"
     assert result["plan"]["topics"] == ["risk"]
-    assert result["plan"]["object_types"] == ["RiskFactor", "Headwind", "ResearchClaim"]
+    assert result["plan"]["object_types"] == ["BusinessFactor", "ExternalFactorExposure", "ResearchClaim"]
     assert result["resolved_periods"] == ["FY2025"]
-    assert {bundle["period"] for bundle in result["results"]} == {"FY2025"}
+    bundles = result["direct_evidence"] + result["related_context"]
+    assert {bundle["period"] for bundle in bundles} == {"FY2025"}
+
+
+def test_agent_retriever_korean_intent_narrows_default_object_types():
+    catalog = {"companies": ["NVDA"], "document_types": ["10-K"], "documents": []}
+    planner = agent_index_builder  # keep module import used in this file
+    del planner
+    from krw_ontology.agent_index.retriever import DefaultQueryPlanner
+
+    event_plan = DefaultQueryPlanner().plan("NVDA 최근 중요한 이벤트는?", catalog)
+    assert event_plan.object_types == ["BusinessEvent", "ChangeEvent", "ResearchClaim", "EvidenceQuote"]
+
+    metric_plan = DefaultQueryPlanner().plan("NVDA의 주요 지표는?", catalog)
+    assert "MetricObservation" in metric_plan.object_types
+    assert "SupportLink" not in metric_plan.object_types
+    assert "CanonicalEntity" not in metric_plan.object_types
+    assert "XBRLFact" not in metric_plan.object_types
+
+
+def test_metric_observation_trace_includes_xbrl_lineage(tmp_path: Path):
+    _write_document_fixture(
+        tmp_path,
+        ticker="VG",
+        document_type="10-K",
+        doc_type_key="10K",
+        period="FY2025",
+        section_quality={"status": "pass", "missing_core_sections": [], "fail_reasons": []},
+        topic_text="Capital expenditures increased for upstream projects.",
+        metric_name="capex",
+        metric_value=900.0,
+    )
+    index = build_agent_index(tmp_path)
+
+    with OntologyStore(index["index_path"]) as store:
+        trace = store.trace("metric_observation:VG:FY2025:10K:capex")
+
+    assert trace is not None
+    lineage = trace["evidence"]["metric_lineage"]
+    assert lineage["trace_type"] == "metric_lineage"
+    assert lineage["formatted_value"].startswith("FY2025 capex: $900")
+    assert lineage["xbrl_facts"][0]["id"] == "xbrl:VG:FY2025:10K:capex"
 
 
 def test_agent_retriever_compare_and_quality_paths(tmp_path: Path):
@@ -345,7 +471,8 @@ def test_agent_retriever_accepts_injected_planner_and_reranker(tmp_path: Path):
         result = retriever.retrieve("ignored")
 
     assert result["plan"]["question"] == "custom"
-    assert result["results"][0]["type"] == "ResearchClaim"
+    bundles = result["direct_evidence"] + result["related_context"]
+    assert bundles[0]["type"] == "ResearchClaim"
 
 
 def test_claude_sdk_planner_coerces_output_to_catalog():
@@ -426,11 +553,14 @@ def test_live_claude_sdk_planner_retrieves_fixture(tmp_path: Path):
         )
         result = retriever.retrieve("VG 최근 10-Q에서 마진 압박 근거 찾아줘", limit=5)
 
-    assert result["answerable"] is True
+    assert "answerable" not in result
+    assert "results" not in result
+    assert result["answerability"]["recommended_answer_mode"] in {"direct_evidence", "related_context"}
     assert result["plan"]["tickers"] == ["VG"]
     assert result["plan"]["document_types"] == ["10-Q"]
-    assert result["results"]
-    assert all(bundle["ticker"] == "VG" for bundle in result["results"])
+    bundles = result["direct_evidence"] + result["related_context"]
+    assert bundles
+    assert all(bundle["ticker"] == "VG" for bundle in bundles)
 
 
 def _write_document_fixture(
@@ -508,8 +638,8 @@ def _write_document_fixture(
         "schema_version": "0.1.0",
     }
     metric = {
-        "id": f"metric-value:{ticker}:{period}:{doc_type_key}:{metric_name}",
-        "type": "FinancialMetricValue",
+        "id": f"metric_observation:{ticker}:{period}:{doc_type_key}:{metric_name}",
+        "type": "MetricObservation",
         "ticker": ticker,
         "source_document_id": source_document_id,
         "document_type": document_type,
@@ -519,9 +649,26 @@ def _write_document_fixture(
         "unit": "USD",
         "fiscal_year": 2025,
         "fiscal_period": period,
-        "period_type": "quarter" if document_type == "10-Q" else "year",
-        "source_xbrl_fact_id": f"xbrl:{ticker}:{period}:{doc_type_key}:capex",
-        "source": "filing_inline_xbrl",
+        "period_type": "quarter" if document_type == "10-Q" else "annual",
+        "source_fact_ids": [f"xbrl:{ticker}:{period}:{doc_type_key}:capex"],
+        "source_type": "reported",
+        "schema_version": "0.1.0",
+    }
+    xbrl_fact = {
+        "id": f"xbrl:{ticker}:{period}:{doc_type_key}:capex",
+        "type": "XBRLFact",
+        "ticker": ticker,
+        "source_document_id": source_document_id,
+        "document_type": document_type,
+        "period": period,
+        "taxonomy_tag": "us-gaap:CapitalExpenditures",
+        "safe_taxonomy_tag": "us_gaap_CapitalExpenditures",
+        "concept": "us-gaap:CapitalExpenditures",
+        "value": metric_value,
+        "unit": "USD",
+        "period_end": "2025-12-31",
+        "context_ref": "duration_2025",
+        "review_status": "accepted",
         "schema_version": "0.1.0",
     }
     activity = {
@@ -578,7 +725,8 @@ def _write_document_fixture(
     write_jsonl(ontology_dir / "evidence_quotes.jsonl", [quote])
     write_jsonl(ontology_dir / "claims.jsonl", [claim])
     write_jsonl(ontology_dir / "business_activities.jsonl", [activity])
-    write_jsonl(ontology_dir / "financial_metric_values.jsonl", [metric])
+    write_jsonl(ontology_dir / "metric_observations.jsonl", [metric])
+    write_jsonl(ontology_dir / "xbrl_facts.jsonl", [xbrl_fact])
     write_jsonl(ontology_dir / "edges.jsonl", edges)
     if include_rejected:
         write_jsonl(

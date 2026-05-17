@@ -9,34 +9,34 @@ class TestCanonicalMetrics:
     def test_canonical_metric_passes(self, metric_dictionary: dict):
         canonical = set(metric_dictionary["canonical_metrics"].keys())
         obj = {
-            "type": "RiskFactor",
-            "affects": ["revenue", "gross_margin"],
+            "type": "BusinessFactor",
+            "affected_channels": ["revenue", "gross_margin"],
             "related_metrics": ["revenue_growth"],
         }
         ok, reason = validate_metric_fields(obj, canonical)
         assert ok
-        assert obj["affects"] == ["revenue", "gross_margin"]
+        assert obj["affected_channels"] == ["revenue", "gross_margin"]
         assert obj["related_metrics"] == ["revenue_growth"]
 
     def test_unknown_metric_moved_to_unmapped(self, metric_dictionary: dict):
         canonical = set(metric_dictionary["canonical_metrics"].keys())
         obj = {
-            "type": "RiskFactor",
-            "affects": ["revenue", "debt_to_equity"],
+            "type": "BusinessFactor",
+            "affected_channels": ["revenue", "debt_to_equity"],
             "related_metrics": None,
         }
         ok, reason = validate_metric_fields(obj, canonical)
         assert ok  # Never rejects, only flags
         assert "debt_to_equity" in obj.get("unmapped_metrics", [])
-        assert "revenue" in obj["affects"]
-        assert "debt_to_equity" not in obj["affects"]
+        assert "revenue" in obj["affected_channels"]
+        assert "debt_to_equity" not in obj["affected_channels"]
         assert obj["review_status"] == "needs_review"
 
     def test_multiple_unknown_metrics(self, metric_dictionary: dict):
         canonical = set(metric_dictionary["canonical_metrics"].keys())
         obj = {
-            "type": "GrowthDriver",
-            "affects": ["current_ratio", "net_debt", "debt_to_equity"],
+            "type": "BusinessFactor",
+            "affected_channels": ["current_ratio", "net_debt", "debt_to_equity"],
             "related_metrics": ["enterprise_value"],
         }
         ok, reason = validate_metric_fields(obj, canonical)
@@ -47,8 +47,8 @@ class TestCanonicalMetrics:
     def test_empty_metrics_fields(self, metric_dictionary: dict):
         canonical = set(metric_dictionary["canonical_metrics"].keys())
         obj = {
-            "type": "RiskFactor",
-            "affects": None,
+            "type": "BusinessFactor",
+            "affected_channels": None,
             "related_metrics": None,
         }
         ok, reason = validate_metric_fields(obj, canonical)

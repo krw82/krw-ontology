@@ -13,8 +13,8 @@ from krw_ontology.config.settings import PipelineConfig
 from krw_ontology.errors import PipelineStageError
 from krw_ontology.extraction.worker import ExtractionWorker
 from krw_ontology.pipeline.checkpoint import CheckpointManager
+from krw_ontology.pipeline.stages.build_governance import build_governance_artifacts
 from krw_ontology.pipeline.stages.build_indexes import build_indexes
-from krw_ontology.pipeline.stages.build_numeric_evidence import build_numeric_evidence
 from krw_ontology.pipeline.stages.build_reports import build_reports
 from krw_ontology.pipeline.stages.build_spans import build_spans
 from krw_ontology.pipeline.stages.clean_to_markdown import clean_to_markdown
@@ -25,10 +25,11 @@ from krw_ontology.pipeline.stages.extract_business_activities import extract_bus
 from krw_ontology.pipeline.stages.extract_evidence_quotes import extract_evidence_quotes
 from krw_ontology.pipeline.stages.extract_external_factor_exposures import extract_external_factor_exposures
 from krw_ontology.pipeline.stages.extract_research_claims import extract_research_claims
-from krw_ontology.pipeline.stages.extract_risks_drivers_headwinds import extract_risks_drivers_headwinds
 from krw_ontology.pipeline.stages.extract_sections import extract_sections
 from krw_ontology.pipeline.stages.extract_xbrl import extract_xbrl
+from krw_ontology.pipeline.stages.generate_canonical_artifacts import generate_canonical_artifacts
 from krw_ontology.pipeline.stages.generate_edges import generate_edges
+from krw_ontology.pipeline.stages.generate_support_links import generate_support_links
 from krw_ontology.pipeline.stages.resolve_ticker import resolve_ticker
 from krw_ontology.pipeline.stages.validate_ontology import run_validate_ontology
 from krw_ontology.schema.id_utils import generate_source_document_id
@@ -47,15 +48,16 @@ PIPELINE_STAGES = [
     "build_source_spans",
     "extract_xbrl_facts",
     "extract_evidence_quotes",
-    "build_numeric_evidence",
     "extract_research_claims",
-    "extract_risks_drivers_headwinds",
     "extract_business_activities",
     "extract_external_factor_exposures",
     "extract_assumption_candidates",
+    "generate_canonical_artifacts",
     "validate_ontology",
+    "generate_support_links",
     "generate_edges",
     "validate_edges",
+    "build_governance_artifacts",
     "build_indexes",
     "build_graph_report",
 ]
@@ -72,20 +74,22 @@ def _derive_period_from_dates(
     document_type: str,
     report_date: str | None,
     filing_date: str | None,
+    *,
+    fiscal_year: object = None,
+    fiscal_period: object = None,
+    fiscal_year_end: object = None,
 ) -> str:
-    """Derive a stable period key before source contents are parsed.
+    """Derive a stable period key before source contents are parsed."""
+    from krw_ontology.pipeline.stages.discover_source import derive_period_key
 
-    SEC submissions expose reportDate before download. For 10-Q, this is a
-    fallback calendar-quarter key; callers can pass --period when they need an
-    issuer-specific fiscal-quarter override.
-    """
-    date_value = report_date or filing_date or ""
-    year = date_value[:4] if len(date_value) >= 4 and date_value[:4].isdigit() else "unknown"
-    if document_type == "10-Q":
-        month = _month_from_date(date_value)
-        quarter = ((month - 1) // 3 + 1) if month else 0
-        return f"FY{year}Q{quarter}" if quarter else f"FY{year}Q?"
-    return f"FY{year}"
+    return derive_period_key(
+        document_type,
+        report_date,
+        filing_date,
+        fiscal_year=fiscal_year,
+        fiscal_period=fiscal_period,
+        fiscal_year_end=fiscal_year_end,
+    )
 
 
 def _month_from_date(value: str | None) -> int | None:
@@ -105,10 +109,13 @@ def run_pipeline(
     period: str | None = None,
     force: bool = False,
     output_dir: Path | None = None,
+    pilot: bool = False,
 ) -> None:
     """Run the full evidence ontology pipeline for a given ticker."""
     setup_logging()
     config = PipelineConfig.load()
+    if pilot:
+        config.apply_pilot_mode()
 
     ticker = ticker.upper()
     doc_type_key = normalize_doc_type(document_type)
@@ -156,12 +163,13 @@ def _is_code_stage(stage: str) -> bool:
     return stage in {
         "resolve_ticker", "discover_source_document", "download_source_document",
         "clean_to_markdown", "extract_sections", "build_source_spans",
-        "extract_xbrl_facts", "extract_evidence_quotes", "build_numeric_evidence",
+        "extract_xbrl_facts", "extract_evidence_quotes",
         "extract_research_claims",
-        "extract_risks_drivers_headwinds", "extract_business_activities",
+        "extract_business_activities",
         "extract_external_factor_exposures", "extract_assumption_candidates",
-        "validate_ontology", "generate_edges", "validate_edges",
-        "build_indexes", "build_graph_report",
+        "generate_canonical_artifacts",
+        "validate_ontology", "generate_support_links", "generate_edges", "validate_edges",
+        "build_governance_artifacts", "build_indexes", "build_graph_report",
     }
 
 
@@ -189,7 +197,10 @@ def _execute_stage(stage: str, ctx: dict) -> None:
         ctx["filing_date"] = result["filing_date"]
         ctx["source_url"] = result["source_url"]
         ctx["report_date"] = result["report_date"]
-        # Derive period: prefer explicit override, then report_date, then filing_date
+        ctx["fiscal_year"] = result.get("fiscal_year")
+        ctx["fiscal_period"] = result.get("fiscal_period")
+        ctx["fiscal_year_end"] = result.get("fiscal_year_end")
+        # Derive period: prefer explicit override, then report_date/filing_date calendar key
         if ctx.get("period"):
             pass  # Use explicit period from CLI
         elif ctx.get("report_date"):
@@ -197,12 +208,18 @@ def _execute_stage(stage: str, ctx: dict) -> None:
                 ctx["document_type"],
                 ctx.get("report_date"),
                 ctx.get("filing_date"),
+                fiscal_year=ctx.get("fiscal_year"),
+                fiscal_period=ctx.get("fiscal_period"),
+                fiscal_year_end=ctx.get("fiscal_year_end"),
             )
         elif ctx.get("filing_date"):
             ctx["period"] = _derive_period_from_dates(
                 ctx["document_type"],
                 None,
                 ctx.get("filing_date"),
+                fiscal_year=ctx.get("fiscal_year"),
+                fiscal_period=ctx.get("fiscal_period"),
+                fiscal_year_end=ctx.get("fiscal_year_end"),
             )
 
         # Now we know period, set up paths
@@ -292,20 +309,10 @@ def _execute_stage(stage: str, ctx: dict) -> None:
             concurrency=config.concurrency_for_stage(stage),
             force=ctx["force"],
             span_pruning=config.span_pruning,
+            pilot_max_quote_spans=config.pilot_max_quote_spans,
             batch_size=config.batch_size_for_stage(stage, default=10),
         ))
         ctx["quotes"] = quotes
-
-    elif stage == "build_numeric_evidence":
-        result = build_numeric_evidence(
-            ontology_dir=ctx["ontology_dir"],
-            ticker=ticker,
-            period=ctx["period"],
-            doc_type_key=doc_type_key,
-            document_type=ctx["document_type"],
-            source_document_id=ctx["source_document_id"],
-        )
-        ctx["numeric_evidence"] = result["numeric_evidence"]
 
     elif stage == "extract_research_claims":
         worker = _make_extraction_worker(config, base_dir, stage)
@@ -321,21 +328,6 @@ def _execute_stage(stage: str, ctx: dict) -> None:
             batch_size=config.batch_size_for_stage(stage, default=12),
         ))
         ctx["claims"] = claims
-
-    elif stage == "extract_risks_drivers_headwinds":
-        worker = _make_extraction_worker(config, base_dir, stage)
-        result = asyncio.run(extract_risks_drivers_headwinds(
-            worker=worker,
-            ontology_dir=ctx["ontology_dir"],
-            ticker=ticker,
-            period=ctx["period"],
-            doc_type=ctx["document_type"],
-            claims=ctx.get("claims"),
-            quotes=ctx.get("quotes"),
-        ))
-        ctx["risks"] = result.get("risks", [])
-        ctx["growth_drivers"] = result.get("growth_drivers", [])
-        ctx["headwinds"] = result.get("headwinds", [])
 
     elif stage == "extract_business_activities":
         worker = _make_extraction_worker(config, base_dir, stage)
@@ -377,6 +369,18 @@ def _execute_stage(stage: str, ctx: dict) -> None:
         ))
         ctx["assumptions"] = assumptions
 
+    elif stage == "generate_canonical_artifacts":
+        canonical_artifacts = generate_canonical_artifacts(
+            ontology_dir=ctx["ontology_dir"],
+            ticker=ticker,
+            period=ctx["period"],
+            document_type=ctx["document_type"],
+            source_document_id=ctx["source_document_id"],
+            clean_text_hash=ctx.get("clean_md_sha256"),
+            raw_text_hash=ctx.get("raw_html_sha256"),
+        )
+        ctx["canonical_artifacts"] = canonical_artifacts
+
     elif stage == "generate_edges":
         worker = _make_extraction_worker(config, base_dir, stage)
         edges = asyncio.run(generate_edges(
@@ -388,6 +392,16 @@ def _execute_stage(stage: str, ctx: dict) -> None:
         ))
         ctx["edges"] = edges
 
+    elif stage == "generate_support_links":
+        support_links = generate_support_links(
+            ontology_dir=ctx["ontology_dir"],
+            ticker=ticker,
+            period=ctx["period"],
+            document_type=ctx["document_type"],
+            source_document_id=ctx["source_document_id"],
+        )
+        ctx["support_links"] = support_links
+
     elif stage == "validate_ontology":
         result = run_validate_ontology(ctx["ontology_dir"], include_edges=False)
         ctx["validation_result"] = result
@@ -395,6 +409,19 @@ def _execute_stage(stage: str, ctx: dict) -> None:
     elif stage == "validate_edges":
         result = run_validate_ontology(ctx["ontology_dir"], include_edges=True)
         ctx["edge_validation_result"] = result
+
+    elif stage == "build_governance_artifacts":
+        governance = build_governance_artifacts(
+            ontology_dir=ctx["ontology_dir"],
+            ticker=ticker,
+            period=ctx["period"],
+            document_type=ctx["document_type"],
+            source_document_id=ctx["source_document_id"],
+            config=config,
+            raw_html_sha256=ctx.get("raw_html_sha256"),
+            clean_md_sha256=ctx.get("clean_md_sha256"),
+        )
+        ctx["governance_artifacts"] = governance
 
     elif stage == "build_indexes":
         build_indexes(
@@ -435,6 +462,7 @@ def _write_pipeline_config(ctx: dict, ontology_dir: Path) -> None:
     config_data = {
         "cli_version": "0.1.0",
         "model": ctx["config"].model,
+        "execution_mode": ctx["config"].execution_mode,
         "stage_models": ctx["config"].stage_models,
         "ai_concurrency": ctx["config"].ai_concurrency,
         "stage_concurrency": ctx["config"].stage_concurrency,
@@ -442,11 +470,13 @@ def _write_pipeline_config(ctx: dict, ontology_dir: Path) -> None:
         "call_timeout_seconds": ctx["config"].call_timeout_seconds,
         "fail_on_section_quality": ctx["config"].fail_on_section_quality,
         "span_pruning": ctx["config"].span_pruning,
+        "pilot_max_quote_spans": ctx["config"].pilot_max_quote_spans,
         "schema_version": SCHEMA_VERSION,
         "cli_flags": {
             "document_type": ctx["document_type"],
             "latest": ctx["latest"],
             "force": ctx["force"],
+            "pilot": ctx["config"].execution_mode == "pilot",
         },
         "started_at": datetime.now(timezone.utc).isoformat(),
         "python_version": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",

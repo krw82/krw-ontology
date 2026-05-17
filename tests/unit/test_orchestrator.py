@@ -242,21 +242,28 @@ class TestPipelineStages:
         for stage in PIPELINE_STAGES:
             assert _is_code_stage(stage), f"{stage} not in _is_code_stage"
 
-    def test_nineteen_stages(self):
-        assert len(PIPELINE_STAGES) == 19
+    def test_twenty_canonical_stages(self):
+        assert len(PIPELINE_STAGES) == 20
 
-    def test_numeric_evidence_runs_after_quotes_before_claims(self):
-        assert PIPELINE_STAGES.index("extract_evidence_quotes") < PIPELINE_STAGES.index("build_numeric_evidence")
-        assert PIPELINE_STAGES.index("build_numeric_evidence") < PIPELINE_STAGES.index("extract_research_claims")
+    def test_claims_run_after_quotes_before_canonical_projection(self):
+        assert PIPELINE_STAGES.index("extract_evidence_quotes") < PIPELINE_STAGES.index("extract_research_claims")
+        assert PIPELINE_STAGES.index("extract_research_claims") < PIPELINE_STAGES.index("generate_canonical_artifacts")
 
     def test_validation_runs_before_and_after_edge_generation(self):
         assert PIPELINE_STAGES.index("validate_ontology") < PIPELINE_STAGES.index("generate_edges")
         assert PIPELINE_STAGES.index("generate_edges") < PIPELINE_STAGES.index("validate_edges")
 
-    def test_business_context_stages_run_after_research_objects_before_assumptions(self):
-        assert PIPELINE_STAGES.index("extract_risks_drivers_headwinds") < PIPELINE_STAGES.index(
-            "extract_business_activities"
+    def test_support_links_and_governance_run_after_validation(self):
+        assert PIPELINE_STAGES.index("extract_assumption_candidates") < PIPELINE_STAGES.index(
+            "generate_canonical_artifacts"
         )
+        assert PIPELINE_STAGES.index("generate_canonical_artifacts") < PIPELINE_STAGES.index("validate_ontology")
+        assert PIPELINE_STAGES.index("validate_ontology") < PIPELINE_STAGES.index("generate_support_links")
+        assert PIPELINE_STAGES.index("generate_support_links") < PIPELINE_STAGES.index("generate_edges")
+        assert PIPELINE_STAGES.index("validate_edges") < PIPELINE_STAGES.index("build_governance_artifacts")
+
+    def test_business_context_stages_run_after_claims_before_assumptions(self):
+        assert PIPELINE_STAGES.index("extract_research_claims") < PIPELINE_STAGES.index("extract_business_activities")
         assert PIPELINE_STAGES.index("extract_business_activities") < PIPELINE_STAGES.index(
             "extract_external_factor_exposures"
         )

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date
 from typing import Iterable
 
 from krw_ontology.config.settings import PipelineConfig
@@ -29,7 +30,7 @@ def discover_research_filing_targets(
     years: int,
     config: PipelineConfig,
 ) -> list[ResearchFilingTarget]:
-    """Discover latest annual filings and quarterly filings for those report years."""
+    """Discover latest annual filings and current calendar year quarterly filings."""
     if years < 1:
         raise ValueError("years must be at least 1")
 
@@ -45,7 +46,7 @@ def select_research_filing_targets(
     *,
     years: int,
 ) -> list[ResearchFilingTarget]:
-    """Select latest N 10-K periods plus all 10-Q periods in those report years."""
+    """Select latest N 10-K periods plus 10-Q periods in the current calendar year."""
     if years < 1:
         raise ValueError("years must be at least 1")
 
@@ -58,18 +59,20 @@ def select_research_filing_targets(
     if not annuals:
         raise PipelineStageError(f"research_plan: no 10-K filings found for {ticker}")
 
-    annual_years = {_period_year(filing["period"]) for filing in annuals}
-    annual_years.discard(None)
-
-    quarterlies = _latest_unique_periods(
+    all_quarterlies = _latest_unique_periods(
         (
             filing
             for filing in normalized_filings
             if filing.get("document_type") == "10-Q"
-            and _period_year(filing.get("period")) in annual_years
         ),
         limit=None,
     )
+    current_calendar_year = date.today().year
+    quarterlies = [
+        filing
+        for filing in all_quarterlies
+        if _period_year(filing.get("period")) == current_calendar_year
+    ]
 
     targets = [
         _to_target(ticker, filing)
@@ -116,9 +119,14 @@ def _target_sort_key(target: ResearchFilingTarget) -> tuple[int, int, str]:
 
 
 def _period_year(period: str | None) -> int | None:
-    if not period or not period.upper().startswith("FY") or len(period) < 6:
+    if not period:
         return None
-    year_text = period[2:6]
+    normalized = period.upper()
+    if normalized.startswith(("FY", "CY")):
+        normalized = normalized[2:]
+    if len(normalized) < 4:
+        return None
+    year_text = normalized[:4]
     return int(year_text) if year_text.isdigit() else None
 
 

@@ -119,6 +119,10 @@ async def krw_ontology_query(
     include_rejected: bool = False,
     limit: int = 10,
     offset: int = 0,
+    group_by: str | None = None,
+    limit_groups: int = 10,
+    limit_per_group: int = 3,
+    answer_candidate_only: bool = False,
     response_format: ResponseFormat = ResponseFormat.JSON,
     response_detail: ResponseDetail = ResponseDetail.COMPACT,
 ) -> str:
@@ -134,6 +138,10 @@ async def krw_ontology_query(
         include_rejected=include_rejected,
         limit=limit,
         offset=offset,
+        group_by=group_by,
+        limit_groups=limit_groups,
+        limit_per_group=limit_per_group,
+        answer_candidate_only=answer_candidate_only,
         response_format=response_format,
         response_detail=response_detail,
     )
@@ -179,6 +187,10 @@ async def krw_ontology_retrieve(
     periods: list[str] | None = None,
     include_rejected: bool | None = None,
     limit: int = 10,
+    group_by: str | None = None,
+    limit_groups: int = 10,
+    limit_per_group: int = 3,
+    answer_candidate_only: bool = False,
     response_format: ResponseFormat = ResponseFormat.JSON,
     response_detail: ResponseDetail = ResponseDetail.COMPACT,
 ) -> str:
@@ -192,6 +204,10 @@ async def krw_ontology_retrieve(
         periods=periods,
         include_rejected=include_rejected,
         limit=limit,
+        group_by=group_by,
+        limit_groups=limit_groups,
+        limit_per_group=limit_per_group,
+        answer_candidate_only=answer_candidate_only,
         response_format=response_format,
         response_detail=response_detail,
     )

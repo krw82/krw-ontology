@@ -29,27 +29,6 @@ relations:
     edge_class: evidence
     evidence_level: direct
 
-  - id: describes_risk
-    name: describes_risk
-    from: ResearchClaim
-    to: RiskFactor
-    edge_class: interpretation
-    evidence_level: derived
-
-  - id: describes_driver
-    name: describes_driver
-    from: ResearchClaim
-    to: GrowthDriver
-    edge_class: interpretation
-    evidence_level: derived
-
-  - id: describes_headwind
-    name: describes_headwind
-    from: ResearchClaim
-    to: Headwind
-    edge_class: interpretation
-    evidence_level: derived
-
   - id: describes_activity
     name: describes_activity
     from: ResearchClaim
@@ -64,13 +43,37 @@ relations:
     edge_class: interpretation
     evidence_level: derived
 
+  - id: describes_business_factor
+    name: describes_business_factor
+    from:
+      - ResearchClaim
+      - EvidenceQuote
+    to: BusinessFactor
+    edge_class: interpretation
+    evidence_level: derived
+
+  - id: describes_agreement_term
+    name: describes_agreement_term
+    from:
+      - ResearchClaim
+      - EvidenceQuote
+    to: AgreementTerm
+    edge_class: interpretation
+    evidence_level: derived
+
+  - id: describes_business_event
+    name: describes_business_event
+    from:
+      - ResearchClaim
+      - EvidenceQuote
+    to: BusinessEvent
+    edge_class: interpretation
+    evidence_level: derived
+
   - id: manifests_as
     name: manifests_as
     from: ExternalFactorExposure
-    to:
-      - RiskFactor
-      - GrowthDriver
-      - Headwind
+    to: BusinessFactor
     edge_class: exposure_link
     evidence_level: derived
 
@@ -83,9 +86,23 @@ relations:
 
   - id: derived_from
     name: derived_from
-    from: AssumptionCandidate
-    to: ResearchClaim
+    from:
+      - AssumptionCandidate
+      - XBRLFact
+      - Calculation
+    to:
+      - ResearchClaim
+      - MetricObservation
     edge_class: interpretation
+    evidence_level: derived
+
+  - id: calculated_from
+    name: calculated_from
+    from: MetricObservation
+    to:
+      - MetricObservation
+      - Calculation
+    edge_class: calculation
     evidence_level: derived
 
   - id: continues_as
@@ -93,15 +110,15 @@ relations:
     from:
       - BusinessActivity
       - ExternalFactorExposure
-      - RiskFactor
-      - GrowthDriver
-      - Headwind
+      - BusinessFactor
+      - AgreementTerm
+      - BusinessEvent
     to:
       - BusinessActivity
       - ExternalFactorExposure
-      - RiskFactor
-      - GrowthDriver
-      - Headwind
+      - BusinessFactor
+      - AgreementTerm
+      - BusinessEvent
     same_type_required: true
     edge_class: temporal
     evidence_level: inferred
@@ -119,8 +136,8 @@ relations:
     to:
       - BusinessActivity
       - ExternalFactorExposure
-      - RiskFactor
-      - GrowthDriver
-      - Headwind
+      - BusinessFactor
+      - AgreementTerm
+      - BusinessEvent
     edge_class: event
     evidence_level: derived

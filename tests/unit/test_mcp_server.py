@@ -8,6 +8,7 @@ from pathlib import Path
 from krw_ontology.agent_index import build_agent_index
 from krw_ontology.mcp_server.server import health_payload, mcp
 from krw_ontology.mcp_server.tools import (
+    _normalize_object_types,
     catalog_tool,
     chain_tool,
     compare_tool,
@@ -35,7 +36,7 @@ def test_mcp_tools_query_trace_quality_and_compare(tmp_path: Path, monkeypatch):
             topic="revenue growth",
             tickers=["VG"],
             document_types=["10-K"],
-            object_types=["ResearchClaim", "GrowthDriver"],
+            object_types=["ResearchClaim", "BusinessFactor"],
             limit=5,
         )
     )
@@ -54,8 +55,8 @@ def test_mcp_tools_query_trace_quality_and_compare(tmp_path: Path, monkeypatch):
     assert trace["object"]["type"] == "ResearchClaim"
     assert trace["evidence"]["quotes"][0]["id"] == "quote:VG:FY2025:10K:0001"
 
-    chain = json.loads(chain_tool(object_id="growth_driver:VG:FY2025:10K:revenue-growth"))
-    assert chain["object"]["type"] == "GrowthDriver"
+    chain = json.loads(chain_tool(object_id="business_factor:VG:FY2025:10K:revenue-growth"))
+    assert chain["object"]["type"] == "BusinessFactor"
     assert chain["chain"]["evidence_chain"]["claims"][0]["id"] == "claim:VG:FY2025:10K:revenue-growth"
     assert chain["chain"]["evidence_chain"]["quotes"][0]["id"] == "quote:VG:FY2025:10K:0001"
     assert "text" not in chain["chain"]["evidence_chain"]["quotes"][0]
@@ -110,8 +111,8 @@ def test_mcp_query_normalizes_object_type_aliases(tmp_path: Path, monkeypatch):
     )
 
     assert query["query"]["object_types_requested"] == ["Risk"]
-    assert query["query"]["object_types"] == ["RiskFactor"]
-    assert query["results"][0]["type"] == "RiskFactor"
+    assert query["query"]["object_types"] == ["BusinessFactor"]
+    assert query["results"][0]["type"] == "BusinessFactor"
     assert query["results"][0]["evidence"]["quotes"]
 
     metric_query = json.loads(
@@ -122,7 +123,21 @@ def test_mcp_query_normalizes_object_type_aliases(tmp_path: Path, monkeypatch):
         )
     )
     assert metric_query["query"]["object_types_requested"] == ["FinancialMetric"]
-    assert metric_query["query"]["object_types"] == ["FinancialMetricValue", "DerivedMetricValue"]
+    assert metric_query["query"]["object_types"] == ["MetricObservation"]
+
+
+def test_mcp_event_aliases_are_not_overwritten():
+    event_types, invalid = _normalize_object_types(["event"])
+    assert invalid == []
+    assert event_types == ["BusinessEvent", "ChangeEvent"]
+
+    business_event_types, invalid = _normalize_object_types(["business_event"])
+    assert invalid == []
+    assert business_event_types == ["BusinessEvent"]
+
+    change_event_types, invalid = _normalize_object_types(["change_event", "disclosure_change"])
+    assert invalid == []
+    assert change_event_types == ["ChangeEvent"]
 
 
 def test_mcp_query_falls_back_for_korean_topic(tmp_path: Path, monkeypatch):
@@ -218,7 +233,7 @@ def test_mcp_chain_respects_depth_and_quote_text_option(tmp_path: Path, monkeypa
 
     shallow = json.loads(
         chain_tool(
-            object_id="growth_driver:VG:FY2025:10K:revenue-growth",
+            object_id="business_factor:VG:FY2025:10K:revenue-growth",
             max_depth=1,
             direction="incoming",
         )
@@ -233,7 +248,7 @@ def test_mcp_chain_respects_depth_and_quote_text_option(tmp_path: Path, monkeypa
 
     deeper = json.loads(
         chain_tool(
-            object_id="growth_driver:VG:FY2025:10K:revenue-growth",
+            object_id="business_factor:VG:FY2025:10K:revenue-growth",
             max_depth=2,
             direction="incoming",
             include_quote_text=True,
@@ -256,13 +271,13 @@ def test_mcp_chain_reports_missing_ambiguous_and_unsupported_objects(
     build_agent_index(tmp_path)
     monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
 
-    missing = json.loads(chain_tool(object_id="risk:VG:missing"))
+    missing = json.loads(chain_tool(object_id="business_factor:VG:missing"))
     assert missing["error"]["code"] == "not_found"
 
     ambiguous = json.loads(chain_tool(object_id="claim:VG"))
     assert ambiguous["error"]["code"] == "ambiguous_object_id"
 
-    unsupported = json.loads(chain_tool(object_id="risk:VG:FY2025:10K:unsupported-risk"))
+    unsupported = json.loads(chain_tool(object_id="business_factor:VG:FY2025:10K:unsupported-risk"))
     assert "no_supporting_evidence_found" in unsupported["quality"]["warnings"]
 
 
@@ -370,9 +385,9 @@ def _write_fixture(
     quote_id = f"quote:VG:{period}:10K:0001"
     claim_id = f"claim:VG:{period}:10K:revenue-growth"
     risk_claim_id = f"claim:VG:{period}:10K:regulatory-risk"
-    driver_id = f"growth_driver:VG:{period}:10K:revenue-growth"
-    risk_id = f"risk:VG:{period}:10K:regulatory-risk"
-    unsupported_risk_id = f"risk:VG:{period}:10K:unsupported-risk"
+    driver_id = f"business_factor:VG:{period}:10K:revenue-growth"
+    risk_id = f"business_factor:VG:{period}:10K:regulatory-risk"
+    unsupported_risk_id = f"business_factor:VG:{period}:10K:unsupported-risk"
     activity_id = f"business_activity:VG:{period}:10K:lng-sales"
     exposure_id = f"external_factor_exposure:VG:{period}:10K:natural-gas-price-operating-margin"
     span = {
@@ -429,12 +444,13 @@ def _write_fixture(
     }
     driver = {
         "id": driver_id,
-        "type": "GrowthDriver",
+        "type": "BusinessFactor",
         "ticker": "VG",
         "source_document_id": source_document_id,
         "document_type": "10-K",
         "period": period,
         "name": "Revenue growth",
+        "factor_roles": ["growth_driver"],
         "description": "Customer demand increased and supported revenue growth.",
         "category": "demand",
         "supported_by_claims": [claim_id],
@@ -442,12 +458,13 @@ def _write_fixture(
     }
     risk = {
         "id": risk_id,
-        "type": "RiskFactor",
+        "type": "BusinessFactor",
         "ticker": "VG",
         "source_document_id": source_document_id,
         "document_type": "10-K",
         "period": period,
         "name": "Regulatory risk",
+        "factor_roles": ["risk"],
         "description": "Regulatory risk could delay approvals and pressure revenue growth.",
         "category": "regulatory",
         "supported_by_claims": [risk_claim_id],
@@ -455,12 +472,13 @@ def _write_fixture(
     }
     unsupported_risk = {
         "id": unsupported_risk_id,
-        "type": "RiskFactor",
+        "type": "BusinessFactor",
         "ticker": "VG",
         "source_document_id": source_document_id,
         "document_type": "10-K",
         "period": period,
         "name": "Unsupported risk",
+        "factor_roles": ["risk"],
         "description": "Unsupported risk has no supporting claim.",
         "category": "operational",
         "supported_by_claims": [],
@@ -542,8 +560,7 @@ def _write_fixture(
     write_jsonl(ontology_dir / "spans.jsonl", [span])
     write_jsonl(ontology_dir / "evidence_quotes.jsonl", [quote])
     write_jsonl(ontology_dir / "claims.jsonl", [claim, risk_claim])
-    write_jsonl(ontology_dir / "risks.jsonl", [risk, unsupported_risk])
-    write_jsonl(ontology_dir / "growth_drivers.jsonl", [driver])
+    write_jsonl(ontology_dir / "business_factors.jsonl", [risk, unsupported_risk, driver])
     write_jsonl(ontology_dir / "business_activities.jsonl", [activity])
     write_jsonl(ontology_dir / "external_factor_exposures.jsonl", [exposure])
     write_jsonl(ontology_dir / "edges.jsonl", edges)
@@ -562,8 +579,7 @@ def _write_fixture(
                 "spans": f"companies/VG/ontology/10K/{period}/spans.jsonl",
                 "evidence_quotes": f"companies/VG/ontology/10K/{period}/evidence_quotes.jsonl",
                 "claims": f"companies/VG/ontology/10K/{period}/claims.jsonl",
-                "risks": f"companies/VG/ontology/10K/{period}/risks.jsonl",
-                "growth_drivers": f"companies/VG/ontology/10K/{period}/growth_drivers.jsonl",
+                "business_factors": f"companies/VG/ontology/10K/{period}/business_factors.jsonl",
                 "business_activities": f"companies/VG/ontology/10K/{period}/business_activities.jsonl",
                 "external_factor_exposures": f"companies/VG/ontology/10K/{period}/external_factor_exposures.jsonl",
                 "edges": f"companies/VG/ontology/10K/{period}/edges.jsonl",
@@ -572,8 +588,7 @@ def _write_fixture(
                 "spans": 1,
                 "evidence_quotes": 1,
                 "claims": 2,
-                "risks": 2,
-                "growth_drivers": 1,
+                "business_factors": 3,
                 "business_activities": 1,
                 "external_factor_exposures": 1,
                 "edges": 3,
@@ -718,3 +733,133 @@ def _write_context_fixture(
             "source_period": period,
         },
     )
+
+
+def test_query_ticker_summary_discovery_contract(tmp_path: Path) -> None:
+    _write_fixture(tmp_path)
+    build_agent_index(tmp_path)
+
+    payload = json.loads(
+        query_tool(
+            root=str(tmp_path),
+            topic="commodity volatility natural gas price revenue exposure",
+            object_types=["ExternalFactorExposure", "ResearchClaim", "EvidenceQuote", "SupportLink"],
+            response_detail="ticker_summary",
+            group_by="ticker",
+            limit=20,
+            limit_groups=5,
+            limit_per_group=2,
+            answer_candidate_only=True,
+        )
+    )
+
+    assert payload["response_detail"] == "ticker_summary"
+    assert payload["query"]["group_by"] == "ticker"
+    assert payload["query"]["answer_candidate_only"] is True
+    assert payload["query_frame"]["core_domain_terms"]
+    assert payload["ticker_candidates"]
+    assert payload["ticker_candidates"][0]["ticker"] == "VG"
+    assert payload["ticker_candidates"][0]["tier"] == "traceable_direct"
+    assert payload["ticker_candidates"][0]["trace_status"] == "traceable"
+    assert payload["ticker_candidates"][0]["trace_counts"]["evidence_chains"] > 0
+    assert payload["ticker_candidates"][0]["top_object_ids"]
+    assert payload["ticker_candidates"][0]["matched_topics"]
+    reason = payload["ticker_candidates"][0]["top_reasons"][0]
+    assert isinstance(reason, dict)
+    assert reason["semantic_relevance"] == "direct"
+    assert reason["trace_status"] == "traceable"
+    assert reason["matched_core_terms"]
+    assert "missing_required_facets" in reason
+    assert "SupportLink" not in payload["ticker_candidates"][0]["matched_object_counts"]
+    assert "VG" in payload["results_by_ticker"]
+    assert len(payload["results_by_ticker"]["VG"]) <= 2
+
+
+def test_query_ids_only_response_detail_contract(tmp_path: Path) -> None:
+    _write_fixture(tmp_path)
+    build_agent_index(tmp_path)
+
+    payload = json.loads(
+        query_tool(
+            root=str(tmp_path),
+            topic="revenue growth",
+            response_detail="ids_only",
+            limit=3,
+        )
+    )
+
+    assert payload["response_detail"] == "ids_only"
+    assert payload["results"]
+    assert set(payload["results"][0]) == {"id", "type", "ticker", "document_id"}
+
+
+def test_retrieve_ticker_summary_discovery_contract(tmp_path: Path) -> None:
+    from krw_ontology.mcp_server.tools import retrieve_tool
+
+    _write_fixture(tmp_path)
+    build_agent_index(tmp_path)
+
+    payload = json.loads(
+        retrieve_tool(
+            root=str(tmp_path),
+            question="commodity volatility and natural gas price exposure",
+            response_detail="ticker_summary",
+            group_by="ticker",
+            limit=20,
+            limit_groups=5,
+            limit_per_group=2,
+            answer_candidate_only=True,
+        )
+    )
+
+    assert payload["response_detail"] == "ticker_summary"
+    assert payload["query"]["group_by"] == "ticker"
+    assert payload["query"]["answer_candidate_only"] is True
+    assert payload["query_frame"]["core_domain_terms"]
+    assert payload["ticker_candidates"]
+    assert payload["ticker_candidates"][0]["ticker"] == "VG"
+    assert payload["ticker_candidates"][0]["tier"] in {
+        "traceable_direct",
+        "untraced_direct_candidate",
+        "traceable_related",
+        "untraced_related",
+    }
+    assert payload["ticker_candidates"][0]["top_reasons"][0]["matched_core_terms"]
+    assert len(payload["results_by_ticker"]["VG"]) <= 2
+
+
+def test_ticker_summary_demotes_untraced_direct_candidate(tmp_path: Path) -> None:
+    _write_fixture(tmp_path)
+    exposure_path = (
+        tmp_path
+        / "companies"
+        / "VG"
+        / "ontology"
+        / "10K"
+        / "FY2025"
+        / "external_factor_exposures.jsonl"
+    )
+    exposures = json.loads(f"[{exposure_path.read_text().strip().replace(chr(10), ',')}]")
+    exposures[0]["supported_by_claims"] = []
+    exposures[0]["supported_by_quotes"] = []
+    write_jsonl(exposure_path, exposures)
+    build_agent_index(tmp_path)
+
+    payload = json.loads(
+        query_tool(
+            root=str(tmp_path),
+            topic="feed gas costs Henry Hub operating margin",
+            response_detail="ticker_summary",
+            group_by="ticker",
+            tickers=["VG"],
+            limit=20,
+            limit_groups=5,
+            limit_per_group=2,
+        )
+    )
+
+    candidate = payload["ticker_candidates"][0]
+    assert candidate["tier"] == "untraced_direct_candidate"
+    assert candidate["top_reasons"][0]["semantic_relevance"] == "direct"
+    assert candidate["top_reasons"][0]["trace_status"] == "orphan"
+    assert candidate["untraced_object_ids"]

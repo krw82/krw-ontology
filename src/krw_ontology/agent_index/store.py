@@ -7,17 +7,29 @@ import json
 import re
 import sqlite3
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
+
+from krw_ontology.agent_index.retrieval_text import format_metric_compact
+from krw_ontology.agent_index.discovery import (
+    build_evidence_frame,
+    build_query_frame,
+    classify_topic_match,
+    tier_rank,
+    topic_from_row,
+)
 
 DEFAULT_QUERY_TYPES = (
     "EvidenceQuote",
     "ResearchClaim",
-    "RiskFactor",
-    "GrowthDriver",
-    "Headwind",
+    "MetricObservation",
+    "Calculation",
+    "BusinessFactor",
+    "AgreementTerm",
+    "BusinessEvent",
     "BusinessActivity",
     "ExternalFactorExposure",
     "CompanyBusinessProfile",
+    "TemporalLink",
     "TrendObservation",
     "ChangeEvent",
     "AssumptionCandidate",
@@ -42,6 +54,21 @@ _QUERY_EXPANSION_RULES = (
     ("조건", "threshold covenant default termination"),
     ("큰일", "risk covenant default impairment liquidity threshold"),
     ("위험", "risk"),
+    ("중국", "china"),
+    ("수출", "export exports export_controls restrictions"),
+    ("규제", "regulatory regulation controls restrictions"),
+    ("제한", "restriction restrictions controls"),
+    ("허가", "license licensing approval"),
+    ("라이선스", "license licensing"),
+    ("고객", "customer customers"),
+    ("집중", "concentration concentrated"),
+    ("주요", "key primary major"),
+    ("이벤트", "event business_event change_event"),
+    ("일정", "event milestone date"),
+    ("변화", "change trend temporal"),
+    ("바뀐", "change changed trend"),
+    ("부채", "debt maturity obligation"),
+    ("만기", "maturity"),
     ("ttf", "natural_gas_price international_lng_price global_lng_price europe"),
     ("jkm", "international_lng_price global_lng_price lng"),
     ("henry hub", "natural_gas_price feed_gas_cost"),
@@ -62,9 +89,9 @@ _SPLIT_TOPIC_STOP_TERMS = {
     "with",
 }
 _SEMANTIC_NEIGHBOR_TYPES = {
-    "RiskFactor",
-    "GrowthDriver",
-    "Headwind",
+    "BusinessFactor",
+    "AgreementTerm",
+    "BusinessEvent",
     "BusinessActivity",
     "ExternalFactorExposure",
     "AssumptionCandidate",
@@ -207,6 +234,153 @@ class OntologyStore:
         """Return deterministic diagnostics for the FTS topic query."""
         return _search_diagnostics(topic, result_count=result_count)
 
+    def discover_company_topics(
+        self,
+        *,
+        question: str,
+        tickers: Iterable[str] | None = None,
+        document_types: Iterable[str] | None = None,
+        periods: Iterable[str] | None = None,
+        limit_groups: int = 20,
+        limit_per_group: int = 3,
+        limit: int = 200,
+    ) -> dict[str, Any]:
+        """Discover ticker candidates by matching QueryFrame to evidence-derived topics."""
+        query_frame = build_query_frame(question)
+        fts_query = _fts_query(_expanded_topic(question), operator="OR")
+        try:
+            rows = self._query_company_topics(
+                fts_query,
+                tickers=tickers,
+                document_types=document_types,
+                periods=periods,
+                limit=limit,
+            ) if fts_query else []
+        except sqlite3.OperationalError as exc:
+            return {
+                "query_frame": query_frame.as_dict(),
+                "ticker_candidates": [],
+                "results_by_ticker": {},
+                "search_diagnostics": {
+                    "topic": question,
+                    "fts_query": fts_query,
+                    "searched_company_topics": 0,
+                    "matched_tickers": 0,
+                    "warnings": ["company_topic_index_unavailable"],
+                    "error": str(exc),
+                },
+            }
+
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            topic = topic_from_row(dict(row))
+            evidence_frame = build_evidence_frame(topic)
+            match = classify_topic_match(query_frame, evidence_frame)
+            if match["tier"] == "insufficient":
+                continue
+            semantic_relevance = str(match.get("tier") or "insufficient")
+            trace_status = str(topic.get("trace_status") or "unknown")
+            final_tier = _combined_discovery_tier(semantic_relevance, trace_status)
+            match = {
+                **match,
+                "semantic_relevance": semantic_relevance,
+                "trace_status": trace_status,
+                "tier": final_tier,
+                "why_tier": _why_discovery_tier(semantic_relevance, trace_status, final_tier),
+            }
+            topic_payload = {
+                "topic_id": topic.get("topic_id"),
+                "ticker": topic.get("ticker"),
+                "period": topic.get("period"),
+                "document_type": topic.get("document_type"),
+                "topic_label": topic.get("topic_label"),
+                "topic_summary": topic.get("topic_summary"),
+                "primary_object_id": topic.get("primary_object_id"),
+                "primary_object_type": topic.get("primary_object_type"),
+                "source_object_ids": topic.get("source_object_ids") or [],
+                "dominant_object_types": topic.get("dominant_object_types") or [],
+                "impact_channels": topic.get("impact_channels") or [],
+                "evidence_strength": topic.get("evidence_strength"),
+                "support_quote_count": topic.get("support_quote_count") or 0,
+                "support_claim_count": topic.get("support_claim_count") or 0,
+                "trace_status": trace_status,
+                "evidence_chain_count": topic.get("evidence_chain_count") or 0,
+                "support_depth": topic.get("support_depth"),
+                "support_link_count": topic.get("support_link_count") or 0,
+                "trace_method": topic.get("trace_method"),
+                "metric_lineage_status": topic.get("metric_lineage_status"),
+                "answer_candidate": bool(topic.get("answer_candidate")),
+                "specificity_score": topic.get("specificity_score"),
+                "materiality_hint": topic.get("materiality_hint"),
+                "match": match,
+            }
+            grouped.setdefault(str(topic.get("ticker") or "UNKNOWN"), []).append(topic_payload)
+
+        candidates: list[dict[str, Any]] = []
+        results_by_ticker: dict[str, list[dict[str, Any]]] = {}
+        for ticker, topics in grouped.items():
+            topics.sort(
+                key=lambda item: (
+                    tier_rank(str((item.get("match") or {}).get("tier") or "")),
+                    float((item.get("match") or {}).get("score") or 0.0),
+                    int(item.get("support_quote_count") or 0) + int(item.get("support_claim_count") or 0),
+                ),
+                reverse=True,
+            )
+            selected = topics[:limit_per_group]
+            if not selected:
+                continue
+            results_by_ticker[ticker] = selected
+            best_tier = str((selected[0].get("match") or {}).get("tier") or "insufficient")
+            top_object_ids: list[str] = []
+            for topic in selected:
+                for object_id in topic.get("source_object_ids") or []:
+                    if object_id not in top_object_ids:
+                        top_object_ids.append(object_id)
+            candidates.append(
+                {
+                    "ticker": ticker,
+                    "score": round(sum(float((topic.get("match") or {}).get("score") or 0.0) for topic in selected), 4),
+                    "tier": best_tier,
+                    "matched_topic_count": len(topics),
+                    "matched_object_counts": _topic_object_counts(topics),
+                    "evidence_counts": _topic_evidence_counts(topics),
+                    "trace_status": _ticker_trace_status(selected),
+                    "trace_counts": _topic_trace_counts(selected),
+                    "top_traceable_object_ids": _traceable_object_ids(selected)[:10],
+                    "untraced_object_ids": _untraced_object_ids(selected)[:10],
+                    "top_reasons": [_topic_reason(topic) for topic in selected],
+                    "top_object_ids": top_object_ids[:10],
+                    "matched_topics": selected,
+                }
+            )
+
+        candidates.sort(
+            key=lambda item: (
+                tier_rank(str(item.get("tier") or "")),
+                float(item.get("score") or 0.0),
+                int(item.get("matched_topic_count") or 0),
+            ),
+            reverse=True,
+        )
+        candidates = candidates[:limit_groups]
+        allowed = {str(candidate.get("ticker")) for candidate in candidates}
+        return {
+            "query_frame": query_frame.as_dict(),
+            "ticker_candidates": candidates,
+            "results_by_ticker": {
+                ticker: results_by_ticker[ticker]
+                for ticker in sorted(allowed)
+                if ticker in results_by_ticker
+            },
+            "search_diagnostics": {
+                "topic": question,
+                "fts_query": fts_query,
+                "searched_company_topics": len(rows),
+                "matched_tickers": len(candidates),
+            },
+        }
+
     def topic_map(
         self,
         *,
@@ -246,7 +420,7 @@ class OntologyStore:
         )
         metric_objects = self._topic_map_objects(
             ticker=ticker,
-            object_types=("FinancialMetricValue", "DerivedMetricValue"),
+            object_types=("MetricObservation",),
             document_types=document_types,
             periods=periods,
             limit=limit * 2,
@@ -653,6 +827,33 @@ class OntologyStore:
             [*params, fts_query, limit],
         ).fetchall()
 
+    def _query_company_topics(
+        self,
+        fts_query: str,
+        *,
+        tickers: Iterable[str] | None,
+        document_types: Iterable[str] | None,
+        periods: Iterable[str] | None,
+        limit: int,
+    ) -> list[sqlite3.Row]:
+        where, params = _company_topic_filters(
+            tickers=tickers,
+            document_types=document_types,
+            periods=periods,
+        )
+        return self.conn.execute(
+            f"""
+            SELECT company_topic_index.*
+            FROM company_topic_fts
+            JOIN company_topic_index
+              ON company_topic_index.topic_id = company_topic_fts.topic_id
+            {where} AND company_topic_fts MATCH ?
+            ORDER BY rank
+            LIMIT ?
+            """,
+            [*params, fts_query, limit],
+        ).fetchall()
+
     def _query_objects(
         self,
         *,
@@ -688,7 +889,7 @@ class OntologyStore:
             tickers=[ticker],
             document_types=document_types,
             periods=periods,
-            object_types=("FinancialMetricValue", "DerivedMetricValue"),
+            object_types=("MetricObservation",),
             include_rejected=False,
         )
         return self.conn.execute(
@@ -895,25 +1096,46 @@ class OntologyStore:
         obj_type = obj.get("type")
         if obj_type == "ResearchClaim":
             claims = [obj]
-            quotes = self._objects_by_ids(obj.get("supported_by_quotes") or [])
+            quotes = _dedupe_objects([
+                *self._objects_by_ids(obj.get("supported_by_quotes") or []),
+                *self._support_objects_for(obj["id"], support_types={"EvidenceQuote"}),
+            ])
         elif obj_type == "EvidenceQuote":
             quotes = [obj]
             claims = self._claims_supported_by_quote(obj["id"])
-        elif obj_type in {"RiskFactor", "GrowthDriver", "Headwind", "BusinessActivity", "ExternalFactorExposure"}:
-            claims = self._objects_by_ids(obj.get("supported_by_claims") or [])
+        elif obj_type in {"BusinessFactor", "AgreementTerm", "BusinessEvent", "BusinessActivity", "ExternalFactorExposure"}:
+            claims = _dedupe_objects([
+                *self._objects_by_ids(obj.get("supported_by_claims") or []),
+                *self._support_objects_for(obj["id"], support_types={"ResearchClaim"}),
+            ])
             quote_ids = _unique(
                 quote_id
                 for claim in claims
                 for quote_id in claim.get("supported_by_quotes") or []
             )
             quote_ids = _unique([*quote_ids, *(obj.get("supported_by_quotes") or [])])
-            quotes = self._objects_by_ids(quote_ids)
+            quotes = _dedupe_objects([
+                *self._objects_by_ids(quote_ids),
+                *self._support_objects_for(obj["id"], support_types={"EvidenceQuote"}),
+            ])
         elif obj_type == "AssumptionCandidate":
-            quotes = self._objects_by_ids(obj.get("supported_by_quotes") or [])
-            claims = self._objects_by_ids(obj.get("supported_by_claims") or [])
+            quotes = _dedupe_objects([
+                *self._objects_by_ids(obj.get("supported_by_quotes") or []),
+                *self._support_objects_for(obj["id"], support_types={"EvidenceQuote"}),
+            ])
+            claims = _dedupe_objects([
+                *self._objects_by_ids(obj.get("supported_by_claims") or []),
+                *self._support_objects_for(obj["id"], support_types={"ResearchClaim"}),
+            ])
         elif obj_type == "ChangeEvent":
-            quotes = self._objects_by_ids(obj.get("supported_by_quotes") or [])
-            claims = self._objects_by_ids(obj.get("supported_by_claims") or [])
+            quotes = _dedupe_objects([
+                *self._objects_by_ids(obj.get("supported_by_quotes") or []),
+                *self._support_objects_for(obj["id"], support_types={"EvidenceQuote"}),
+            ])
+            claims = _dedupe_objects([
+                *self._objects_by_ids(obj.get("supported_by_claims") or []),
+                *self._support_objects_for(obj["id"], support_types={"ResearchClaim"}),
+            ])
         elif obj_type == "CompanyBusinessProfile":
             source_objects = self._objects_by_ids(obj.get("source_object_ids") or [])
             claims = self._claims_from_source_objects(source_objects)
@@ -945,12 +1167,68 @@ class OntologyStore:
         span_ids = _unique(quote.get("source_span_id") for quote in quotes if quote.get("source_span_id"))
         spans = self._objects_by_ids(span_ids)
         related_objects = self._objects_sharing_claims(obj, claims)
-        return {
+        evidence: dict[str, Any] = {
             "claims": [_compact_object(claim) for claim in claims],
             "quotes": [_compact_object(quote) for quote in quotes],
             "spans": [_compact_object(span) for span in spans],
             "related_objects": [_compact_object(related) for related in related_objects],
         }
+        if obj_type == "MetricObservation":
+            evidence["metric_lineage"] = self._metric_lineage_for(obj)
+        return evidence
+
+    def _metric_lineage_for(self, metric: dict[str, Any]) -> dict[str, Any]:
+        calculation = self._metric_calculation(metric)
+        input_metrics: list[dict[str, Any]] = []
+        if calculation:
+            input_metrics.extend(
+                self._objects_by_ids(
+                    [
+                        *list(calculation.get("input_metric_ids") or []),
+                        *list(calculation.get("source_metric_ids") or []),
+                    ]
+                )
+            )
+        input_metrics.extend(self._objects_by_ids(metric.get("source_metric_ids") or []))
+        input_metrics = _dedupe_objects(input_metrics)
+
+        fact_ids = list(metric.get("source_fact_ids") or [])
+        for input_metric in input_metrics:
+            fact_ids.extend(input_metric.get("source_fact_ids") or [])
+        xbrl_facts = self._objects_by_ids(_unique(fact_ids))
+        source_document_ids = _unique(
+            fact.get("source_document_id")
+            for fact in xbrl_facts
+            if fact.get("source_document_id")
+        )
+        return {
+            "trace_type": "metric_lineage",
+            "formatted_value": format_metric_compact(metric),
+            "calculation": _compact_object(calculation) if calculation else None,
+            "input_metrics": [_compact_object(input_metric) for input_metric in input_metrics],
+            "xbrl_facts": [_compact_object(fact) for fact in xbrl_facts],
+            "source_document_ids": source_document_ids,
+        }
+
+    def _metric_calculation(self, metric: dict[str, Any]) -> dict[str, Any] | None:
+        calculation_id = metric.get("calculation_id")
+        if calculation_id:
+            calculations = self._objects_by_ids([calculation_id])
+            if calculations:
+                return calculations[0]
+        rows = self.conn.execute(
+            """
+            SELECT *
+            FROM objects
+            WHERE type = 'Calculation'
+              AND json_extract(json, '$.output_metric_id') = ?
+              AND (review_status IS NULL OR review_status != 'rejected')
+            ORDER BY id
+            LIMIT 1
+            """,
+            (metric.get("id"),),
+        ).fetchall()
+        return _object_from_row(rows[0]) if rows else None
 
     def _objects_by_ids(self, object_ids: Iterable[str]) -> list[dict[str, Any]]:
         ids = [object_id for object_id in object_ids if object_id]
@@ -975,7 +1253,72 @@ class OntologyStore:
             """,
             (quote_id,),
         ).fetchall()
-        return [_object_from_row(row) for row in rows]
+        return _dedupe_objects([
+            *[_object_from_row(row) for row in rows],
+            *self._support_targets_for(quote_id, target_types={"ResearchClaim"}),
+        ])
+
+    def _support_objects_for(
+        self,
+        object_id: str,
+        *,
+        support_types: set[str],
+    ) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            """
+            SELECT support.*
+            FROM objects AS links
+            JOIN objects AS support
+              ON support.id = COALESCE(
+                    json_extract(links.json, '$.support_object_id'),
+                    json_extract(links.json, '$.from_id')
+                 )
+            WHERE links.type = 'SupportLink'
+              AND (
+                    json_extract(links.json, '$.target_object_id') = ?
+                 OR json_extract(links.json, '$.to_id') = ?
+              )
+              AND (support.review_status IS NULL OR support.review_status != 'rejected')
+            ORDER BY support.type, support.id
+            """,
+            (object_id, object_id),
+        ).fetchall()
+        return [
+            obj
+            for obj in (_object_from_row(row) for row in rows)
+            if obj.get("type") in support_types
+        ]
+
+    def _support_targets_for(
+        self,
+        support_id: str,
+        *,
+        target_types: set[str],
+    ) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            """
+            SELECT target.*
+            FROM objects AS links
+            JOIN objects AS target
+              ON target.id = COALESCE(
+                    json_extract(links.json, '$.target_object_id'),
+                    json_extract(links.json, '$.to_id')
+                 )
+            WHERE links.type = 'SupportLink'
+              AND (
+                    json_extract(links.json, '$.support_object_id') = ?
+                 OR json_extract(links.json, '$.from_id') = ?
+              )
+              AND (target.review_status IS NULL OR target.review_status != 'rejected')
+            ORDER BY target.type, target.id
+            """,
+            (support_id, support_id),
+        ).fetchall()
+        return [
+            obj
+            for obj in (_object_from_row(row) for row in rows)
+            if obj.get("type") in target_types
+        ]
 
     def _claims_from_source_objects(self, source_objects: list[dict[str, Any]]) -> list[dict[str, Any]]:
         claim_ids = _unique(
@@ -1015,9 +1358,9 @@ class OntologyStore:
               AND document_type = ?
               AND period = ?
               AND type IN (
-                'RiskFactor',
-                'GrowthDriver',
-                'Headwind',
+                'BusinessFactor',
+                'AgreementTerm',
+                'BusinessEvent',
                 'BusinessActivity',
                 'ExternalFactorExposure',
                 'ChangeEvent'
@@ -1087,6 +1430,143 @@ def _object_filters(
     if not include_rejected:
         parts.append("(objects.review_status IS NULL OR objects.review_status != 'rejected')")
     return f"WHERE {' AND '.join(parts)}", params
+
+
+def _company_topic_filters(
+    *,
+    tickers: Iterable[str] | None,
+    document_types: Iterable[str] | None,
+    periods: Iterable[str] | None,
+) -> tuple[str, list[Any]]:
+    parts = ["1 = 1"]
+    params: list[Any] = []
+    _add_in_filter(parts, params, "company_topic_index.ticker", [t.upper() for t in tickers or []])
+    _add_in_filter(parts, params, "company_topic_index.document_type", list(document_types or []))
+    _add_in_filter(parts, params, "company_topic_index.period", list(periods or []))
+    return f"WHERE {' AND '.join(parts)}", params
+
+
+def _combined_discovery_tier(semantic_relevance: str, trace_status: str) -> str:
+    if semantic_relevance == "insufficient":
+        return "insufficient"
+    if trace_status in {"traceable", "traceable_metric_lineage"}:
+        return "traceable_direct" if semantic_relevance == "direct" else "traceable_related"
+    if semantic_relevance == "direct":
+        return "untraced_direct_candidate"
+    if trace_status in {"orphan", "untraced", "untraced_metric_candidate", "unknown"}:
+        return "untraced_related"
+    return "untraced_related"
+
+
+def _why_discovery_tier(semantic_relevance: str, trace_status: str, tier: str) -> str:
+    if tier == "traceable_direct":
+        return "Matched query core premise and has an explicit evidence or metric trace."
+    if tier == "untraced_direct_candidate":
+        return "Matched query core premise, but no explicit evidence trace was available in the serving index."
+    if tier == "traceable_related":
+        return "Related to the query and has an explicit evidence or metric trace."
+    if tier == "untraced_related":
+        return "Related to the query, but evidence traceability is missing or weak."
+    return f"semantic_relevance={semantic_relevance}, trace_status={trace_status}"
+
+
+def _is_traceable_status(trace_status: Any) -> bool:
+    return str(trace_status or "") in {"traceable", "traceable_metric_lineage"}
+
+
+def _ticker_trace_status(topics: Iterable[Mapping[str, Any]]) -> str:
+    statuses = [str(topic.get("trace_status") or "unknown") for topic in topics]
+    if any(_is_traceable_status(status) for status in statuses):
+        return "traceable"
+    if any(status == "orphan" for status in statuses):
+        return "orphan"
+    return statuses[0] if statuses else "unknown"
+
+
+def _topic_trace_counts(topics: Iterable[Mapping[str, Any]]) -> dict[str, int]:
+    counts = {"traceable": 0, "untraced": 0, "orphan": 0, "evidence_chains": 0}
+    for topic in topics:
+        status = str(topic.get("trace_status") or "unknown")
+        if _is_traceable_status(status):
+            counts["traceable"] += 1
+        elif status == "orphan":
+            counts["orphan"] += 1
+        else:
+            counts["untraced"] += 1
+        counts["evidence_chains"] += int(topic.get("evidence_chain_count") or 0)
+    return counts
+
+
+def _traceable_object_ids(topics: Iterable[Mapping[str, Any]]) -> list[str]:
+    ids: list[str] = []
+    for topic in topics:
+        if not _is_traceable_status(topic.get("trace_status")):
+            continue
+        object_id = topic.get("primary_object_id")
+        if object_id and object_id not in ids:
+            ids.append(str(object_id))
+    return ids
+
+
+def _untraced_object_ids(topics: Iterable[Mapping[str, Any]]) -> list[str]:
+    ids: list[str] = []
+    for topic in topics:
+        if _is_traceable_status(topic.get("trace_status")):
+            continue
+        object_id = topic.get("primary_object_id")
+        if object_id and object_id not in ids:
+            ids.append(str(object_id))
+    return ids
+
+
+def _topic_object_counts(topics: Iterable[Mapping[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for topic in topics:
+        object_types = topic.get("dominant_object_types") or [topic.get("primary_object_type")]
+        for object_type in object_types:
+            key = str(object_type or "Unknown")
+            counts[key] = counts.get(key, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def _topic_evidence_counts(topics: Iterable[Mapping[str, Any]]) -> dict[str, int]:
+    counts = {"quotes": 0, "claims": 0, "topics": 0}
+    for topic in topics:
+        counts["topics"] += 1
+        counts["quotes"] += int(topic.get("support_quote_count") or 0)
+        counts["claims"] += int(topic.get("support_claim_count") or 0)
+    return counts
+
+
+def _topic_reason(topic: Mapping[str, Any]) -> dict[str, Any]:
+    match = topic.get("match") or {}
+    reason: dict[str, Any] = {
+        "topic_id": topic.get("topic_id"),
+        "topic_label": topic.get("topic_label"),
+        "object_id": topic.get("primary_object_id"),
+        "object_type": topic.get("primary_object_type"),
+        "tier": match.get("tier"),
+        "semantic_relevance": match.get("semantic_relevance"),
+        "trace_status": topic.get("trace_status"),
+        "trace_method": topic.get("trace_method"),
+        "evidence_chain_count": topic.get("evidence_chain_count") or 0,
+        "support_depth": topic.get("support_depth"),
+        "score": match.get("score"),
+        "matched_core_terms": match.get("matched_core_terms") or [],
+        "matched_mechanisms": match.get("matched_mechanisms") or [],
+        "matched_impact_channels": match.get("matched_impact_channels") or [],
+        "matched_generic_terms": match.get("matched_generic_terms") or [],
+        "missing_required_facets": match.get("missing_required_facets") or [],
+        "evidence_strength": topic.get("evidence_strength"),
+        "source_object_ids": topic.get("source_object_ids") or [],
+    }
+    if match.get("why_direct"):
+        reason["why_direct"] = match.get("why_direct")
+    if match.get("why_not_direct"):
+        reason["why_not_direct"] = match.get("why_not_direct")
+    if match.get("why_tier"):
+        reason["why_tier"] = match.get("why_tier")
+    return reason
 
 
 def _scope_where(
@@ -1208,6 +1688,18 @@ def _object_from_row(row: sqlite3.Row) -> dict[str, Any]:
     return obj
 
 
+def _dedupe_objects(objects: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    output: list[dict[str, Any]] = []
+    for obj in objects:
+        object_id = obj.get("id")
+        if not object_id or object_id in seen:
+            continue
+        seen.add(object_id)
+        output.append(obj)
+    return output
+
+
 def _document_from_row(row: sqlite3.Row) -> dict[str, Any]:
     return {
         "ticker": row["ticker"],
@@ -1320,9 +1812,8 @@ def _chain_warnings(
         "EvidenceQuote",
         "ResearchClaim",
         "SourceSpan",
-        "FinancialMetricValue",
-        "DerivedMetricValue",
-        "NumericEvidence",
+        "MetricObservation",
+        "Calculation",
         "XBRLFact",
     }:
         warnings.append("no_supporting_evidence_found")
@@ -1337,6 +1828,8 @@ def _chain_warnings(
 
 
 def _display_text(obj: dict[str, Any]) -> str:
+    if obj.get("type") == "MetricObservation" or obj.get("metric_name"):
+        return format_metric_compact(obj)
     for key in (
         "claim_text",
         "quote_text",
@@ -1496,7 +1989,7 @@ def _suggest_topic_queries(
         suggestions.append(
             {
                 "topic": topic,
-                "object_types": ["ExternalFactorExposure", "RiskFactor", "ResearchClaim"],
+                "object_types": ["ExternalFactorExposure", "BusinessFactor", "ResearchClaim"],
                 "source_object_ids": entry.get("source_object_ids", [])[:3],
             }
         )

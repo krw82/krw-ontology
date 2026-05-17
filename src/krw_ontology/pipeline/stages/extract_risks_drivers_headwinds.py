@@ -129,6 +129,7 @@ async def extract_risks_drivers_headwinds(
                              "unmapped_impacts", "unmapped_metrics"):
             if item.get(optional_key):
                 obj[optional_key] = _dedupe_list(item[optional_key])
+        obj.update(_quality_scores_for_research_object(obj))
 
         by_key[key] = obj
         if obj_type == "RiskFactor":
@@ -327,3 +328,51 @@ def _merge_research_object(existing: dict, item: dict) -> None:
             existing[key] = _dedupe_list(merged)
     if existing.get("confidence") != "high" and item.get("confidence") == "high":
         existing["confidence"] = "high"
+    existing.update(_quality_scores_for_research_object(existing))
+
+
+def _quality_scores_for_research_object(obj: dict) -> dict:
+    text = " ".join(str(obj.get(key, "")) for key in ("name", "description", "category")).lower()
+    supported_quote_count = len(obj.get("supported_by_quotes") or [])
+    supported_claim_count = len(obj.get("supported_by_claims") or [])
+    specificity = 0.35
+    if supported_quote_count:
+        specificity += 0.2
+    if supported_claim_count:
+        specificity += 0.15
+    if obj.get("affects"):
+        specificity += 0.15
+    if any(token in text for token in ("project", "facility", "segment", "margin", "revenue", "cost", "cash", "liquidity")):
+        specificity += 0.15
+    boilerplate = 0.25
+    if any(token in text for token in ("may", "could", "adverse", "uncertain", "subject to")):
+        boilerplate += 0.25
+    if any(token in text for token in ("project", "contract", "customer", "regulatory approval", "specific")):
+        boilerplate -= 0.15
+    specificity = max(0.0, min(1.0, specificity))
+    boilerplate = max(0.0, min(1.0, boilerplate))
+    ranking = max(0.0, min(1.0, specificity + 0.15 * supported_quote_count + 0.1 * supported_claim_count - 0.25 * boilerplate))
+    basis: list[str] = []
+    if supported_quote_count:
+        basis.append("direct_quote_support")
+    if supported_claim_count:
+        basis.append("claim_support")
+    if obj.get("affects"):
+        basis.append("business_or_metric_link")
+    if boilerplate >= 0.5:
+        basis.append("boilerplate_penalty_applied")
+    return {
+        "materiality_hint": obj.get("materiality_hint") or obj.get("materiality") or _materiality_from_score(ranking),
+        "materiality_basis": basis,
+        "specificity_score": round(specificity, 3),
+        "boilerplate_score": round(boilerplate, 3),
+        "ranking_score": round(ranking, 3),
+    }
+
+
+def _materiality_from_score(score: float) -> str:
+    if score >= 0.75:
+        return "high"
+    if score >= 0.45:
+        return "medium"
+    return "low"

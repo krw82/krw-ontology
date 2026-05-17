@@ -19,8 +19,8 @@ def test_metric_edge_is_rejected_by_minimal_graph_whitelist(tmp_path: Path):
     }
     span_id = "span:AAPL:FY2025:10K:item1a:0000"
     quote_id = "quote:AAPL:FY2025:10K:item1a:0000:001"
-    risk_id = "risk:AAPL:FY2025:10K:test-risk"
-    edge_id = "edge:AAPL:FY2025:10K:affects_risk:abc1234567"
+    factor_id = "business_factor:AAPL:FY2025:10K:test-risk"
+    edge_id = "edge:AAPL:FY2025:10K:affects_business_factor:abc1234567"
 
     write_jsonl(tmp_path / "spans.jsonl", [{
         "id": span_id,
@@ -48,15 +48,16 @@ def test_metric_edge_is_rejected_by_minimal_graph_whitelist(tmp_path: Path):
         "confidence": "high",
         "review_status": "accepted",
     }])
-    write_jsonl(tmp_path / "risks.jsonl", [{
-        "id": risk_id,
-        "type": "RiskFactor",
+    write_jsonl(tmp_path / "business_factors.jsonl", [{
+        "id": factor_id,
+        "type": "BusinessFactor",
         **base,
         "name": "Revenue Risk",
+        "factor_roles": ["risk"],
         "category": "competitive",
         "description": "Revenue risk could affect performance.",
         "supported_by_quotes": [quote_id],
-        "affects": ["revenue"],
+        "affected_channels": ["revenue"],
         "qualitative_impact": "negative",
         "confidence": "high",
         "review_status": "accepted",
@@ -65,14 +66,14 @@ def test_metric_edge_is_rejected_by_minimal_graph_whitelist(tmp_path: Path):
         "id": edge_id,
         "type": "Edge",
         **base,
-        "from_id": risk_id,
+        "from_id": factor_id,
         "to_id": "metric:revenue",
         "relation_name": "affects",
-        "relation_id": "affects_risk",
+        "relation_id": "affects_business_factor",
         "edge_class": "metric_impact",
         "evidence_level": "derived",
         "generation_method": "deterministic_reference",
-        "rationale": "RiskFactor declares impact on revenue.",
+        "rationale": "BusinessFactor declares impact on revenue.",
         "confidence": "high",
         "review_status": "accepted",
     }])

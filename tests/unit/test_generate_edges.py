@@ -22,7 +22,7 @@ def test_generate_edges_uses_existing_references_without_sdk(tmp_path: Path):
     quote_id = "quote:AAPL:FY2025:10K:item1a:0000:001"
     signal_id = "signal:AAPL:FY2025:10K:item1a:0000:001"
     claim_id = "claim:AAPL:FY2025:10K:test-claim"
-    risk_id = "risk:AAPL:FY2025:10K:test-risk"
+    factor_id = "business_factor:AAPL:FY2025:10K:test-risk"
     assumption_id = "assumption:AAPL:FY2025:10K:test-cue"
 
     write_jsonl(tmp_path / "spans.jsonl", [{"id": span_id, "type": "SourceSpan", **base}])
@@ -44,13 +44,14 @@ def test_generate_edges_uses_existing_references_without_sdk(tmp_path: Path):
         **base,
         "supported_by_quotes": [quote_id, span_id],
     }])
-    write_jsonl(tmp_path / "risks.jsonl", [{
-        "id": risk_id,
-        "type": "RiskFactor",
+    write_jsonl(tmp_path / "business_factors.jsonl", [{
+        "id": factor_id,
+        "type": "BusinessFactor",
         **base,
         "supported_by_claims": [claim_id],
         "supported_by_quotes": [quote_id],
-        "affects": ["revenue"],
+        "factor_roles": ["risk"],
+        "affected_channels": ["revenue"],
     }])
     write_jsonl(tmp_path / "assumption_candidates.jsonl", [{
         "id": assumption_id,
@@ -77,7 +78,7 @@ def test_generate_edges_uses_existing_references_without_sdk(tmp_path: Path):
         "contains_quote": 1,
         "has_signal": 1,
         "supports": 1,
-        "describes_risk": 1,
+        "describes_business_factor": 2,
         "supports_assumption": 1,
         "derived_from": 1,
     }
@@ -108,9 +109,7 @@ def test_generate_edges_respects_10q_document_type_key(tmp_path: Path):
     }])
     write_jsonl(tmp_path / "language_signals.jsonl", [])
     write_jsonl(tmp_path / "claims.jsonl", [])
-    write_jsonl(tmp_path / "risks.jsonl", [])
-    write_jsonl(tmp_path / "growth_drivers.jsonl", [])
-    write_jsonl(tmp_path / "headwinds.jsonl", [])
+    write_jsonl(tmp_path / "business_factors.jsonl", [])
     write_jsonl(tmp_path / "assumption_candidates.jsonl", [])
 
     class FakeWorker:

@@ -494,6 +494,11 @@ def build_evidence_ontology(
     period: Optional[str] = typer.Option(None, "--period", help="Explicit period override (e.g., FY2025)"),
     force: bool = typer.Option(False, "--force", help="Re-process even if content hash matches"),
     output_dir: Optional[Path] = typer.Option(None, "--output-dir", help="Override default output directory"),
+    pilot: bool = typer.Option(
+        False,
+        "--pilot",
+        help="Run a fast development profile: core sections only, capped quote spans, same artifact contract.",
+    ),
 ) -> None:
     """Build evidence ontology from SEC filing for a given ticker."""
     validate_document_type(document_type)
@@ -507,6 +512,7 @@ def build_evidence_ontology(
         period=period,
         force=force,
         output_dir=output_root,
+        pilot=pilot,
     )
     typer.echo(f"Pipeline complete for {ticker}")
 
@@ -530,6 +536,11 @@ def e2e_matrix_cmd(
         "--continue-on-error",
         help="Continue remaining tickers if one pipeline run fails.",
     ),
+    pilot: bool = typer.Option(
+        False,
+        "--pilot",
+        help="Run a fast development profile: core sections only, capped quote spans, same artifact contract.",
+    ),
 ) -> None:
     """Run full e2e pipeline for a ticker matrix."""
     validate_document_type(document_type)
@@ -546,6 +557,8 @@ def e2e_matrix_cmd(
     root.mkdir(parents=True, exist_ok=True)
 
     typer.echo(f"OUTPUT_ROOT={root}")
+    if pilot:
+        typer.echo("EXECUTION_MODE=pilot")
     failures: list[tuple[str, str]] = []
 
     for ticker in run_tickers:
@@ -559,6 +572,7 @@ def e2e_matrix_cmd(
                 period=None,
                 force=force,
                 output_dir=root,
+                pilot=pilot,
             )
         except Exception as exc:
             failures.append((ticker, str(exc)))
@@ -591,7 +605,7 @@ def build_research_pipeline_cmd(
         3,
         "--years",
         min=1,
-        help="Number of latest 10-K report years to include.",
+        help="Number of latest 10-K filings to include; 10-Qs are limited to the current calendar year.",
     ),
     force: bool = typer.Option(
         False,
@@ -630,8 +644,13 @@ def build_research_pipeline_cmd(
         "--continue-on-error",
         help="Continue remaining filings if one pipeline run fails.",
     ),
+    pilot: bool = typer.Option(
+        False,
+        "--pilot",
+        help="Run a fast development profile for each filing; do not use for final publish quality.",
+    ),
 ) -> None:
-    """Build the default research set: latest 3 years of 10-K plus 10-Qs."""
+    """Build the default research set: latest 10-Ks plus current calendar year 10-Qs."""
     from krw_ontology.agent_index import build_agent_index
     from krw_ontology.config.settings import PipelineConfig
     from krw_ontology.pipeline.stages.build_company_context import build_company_context
@@ -642,6 +661,9 @@ def build_research_pipeline_cmd(
     output_root = resolve_running_root(root, fallback_to_cwd=False)
     stable_root = resolve_publish_root(publish_root)
     resolved_publish_index_path = resolve_publish_index_path(publish_index_path)
+    if pilot and stable_root is not None:
+        typer.echo("Refusing --pilot with --publish-root. Pilot artifacts are for development only.")
+        raise typer.Exit(1)
     output_root.mkdir(parents=True, exist_ok=True)
     if stable_root is not None:
         stable_root.mkdir(parents=True, exist_ok=True)
@@ -653,7 +675,9 @@ def build_research_pipeline_cmd(
     typer.echo(f"OUTPUT_ROOT={output_root}")
     if stable_root is not None:
         typer.echo(f"PUBLISH_ROOT={stable_root}")
-    typer.echo(f"Research scope: {years} latest 10-K report years + matching 10-Q periods")
+    if pilot:
+        typer.echo("EXECUTION_MODE=pilot")
+    typer.echo(f"Research scope: {years} latest 10-K filings + current calendar year 10-Q periods")
 
     try:
         for ticker in run_tickers:
@@ -687,6 +711,7 @@ def build_research_pipeline_cmd(
                         period=target.period,
                         force=force,
                         output_dir=output_root,
+                        pilot=pilot,
                     )
                 except Exception as exc:
                     ticker_failed = True
@@ -970,7 +995,7 @@ def queue_add_cmd(
         3,
         "--years",
         min=1,
-        help="Number of latest 10-K report years to include.",
+        help="Number of latest 10-K filings to include; 10-Qs are limited to the current calendar year.",
     ),
     force: bool = typer.Option(
         False,

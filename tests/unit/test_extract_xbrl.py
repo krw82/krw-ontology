@@ -8,7 +8,7 @@ from krw_ontology.pipeline.stages.extract_xbrl import extract_xbrl
 from krw_ontology.utils.io import read_jsonl
 
 
-def test_extract_xbrl_builds_financial_and_derived_values(tmp_path: Path):
+def test_extract_xbrl_builds_xbrl_facts_only(tmp_path: Path):
     raw_html = tmp_path / "raw.html"
     raw_html.write_text(
         """
@@ -44,16 +44,15 @@ def test_extract_xbrl_builds_financial_and_derived_values(tmp_path: Path):
 
     assert result["status"] == "ok"
     facts = read_jsonl(output_path)
-    metric_values = read_jsonl(tmp_path / "financial_metric_values.jsonl")
-    derived_values = read_jsonl(tmp_path / "derived_metric_values.jsonl")
 
     assert len(facts) == 3
-    assert any(row["metric_name"] == "revenue" and row["value"] == 416_161_000_000 for row in metric_values)
-    assert not any(row["metric_name"] == "gross_margin" for row in metric_values)
-    revenue_growth = next(row for row in derived_values if row["metric_name"] == "revenue_growth")
-    gross_margin = next(row for row in derived_values if row["metric_name"] == "gross_margin")
-    assert round(revenue_growth["value"], 1) == 6.4
-    assert round(gross_margin["value"], 1) == 46.9
+    assert any(
+        row["taxonomy_tag"] == "us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax"
+        and row["value"] == 416_161_000_000
+        for row in facts
+    )
+    assert read_jsonl(tmp_path / "financial_metric_values.jsonl") == []
+    assert read_jsonl(tmp_path / "derived_metric_values.jsonl") == []
 
 
 def test_extract_xbrl_preserves_10q_document_and_period_context(tmp_path: Path):
@@ -86,12 +85,9 @@ def test_extract_xbrl_preserves_10q_document_and_period_context(tmp_path: Path):
     )
 
     fact = read_jsonl(output_path)[0]
-    metric = next(row for row in read_jsonl(tmp_path / "financial_metric_values.jsonl") if row["metric_name"] == "revenue")
     assert fact["id"].startswith("xbrl:AAPL:FY2025Q2:10Q:")
     assert fact["document_type"] == "10-Q"
-    assert metric["document_type"] == "10-Q"
-    assert metric["fiscal_period"] == "Q2"
-    assert metric["period_type"] == "quarter"
+    assert fact["period"] == "FY2025Q2"
 
 
 def test_extract_xbrl_uses_sibling_inline_document_when_primary_has_no_ix_tags(tmp_path: Path):

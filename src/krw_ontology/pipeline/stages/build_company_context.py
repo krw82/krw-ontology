@@ -118,11 +118,10 @@ def _load_document_artifacts(root: Path, ticker: str) -> list[dict[str, Any]]:
             "quotes": _read_artifact(root, files.get("evidence_quotes")),
             "business_activities": _read_artifact(root, files.get("business_activities")),
             "external_factor_exposures": _read_artifact(root, files.get("external_factor_exposures")),
-            "financial_metric_values": _read_artifact(root, files.get("financial_metric_values")),
-            "derived_metric_values": _read_artifact(root, files.get("derived_metric_values")),
-            "risks": _read_artifact(root, files.get("risks")),
-            "growth_drivers": _read_artifact(root, files.get("growth_drivers")),
-            "headwinds": _read_artifact(root, files.get("headwinds")),
+            "metric_observations": _read_artifact(root, files.get("metric_observations")),
+            "business_factors": _read_artifact(root, files.get("business_factors")),
+            "agreement_terms": _read_artifact(root, files.get("agreement_terms")),
+            "business_events": _read_artifact(root, files.get("business_events")),
         }
         docs.append(doc)
     return docs
@@ -286,9 +285,9 @@ def _build_temporal_links(ticker: str, docs: list[dict[str, Any]]) -> list[dict[
         for obj in [
             *doc["business_activities"],
             *doc["external_factor_exposures"],
-            *doc["risks"],
-            *doc["growth_drivers"],
-            *doc["headwinds"],
+            *doc["business_factors"],
+            *doc["agreement_terms"],
+            *doc["business_events"],
         ]:
             key = _temporal_key(obj)
             if key:
@@ -325,7 +324,7 @@ def _build_temporal_links(ticker: str, docs: list[dict[str, Any]]) -> list[dict[
 def _build_trend_observations(ticker: str, docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     metric_groups: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
     for doc in docs:
-        for metric in [*doc["financial_metric_values"], *doc["derived_metric_values"]]:
+        for metric in doc["metric_observations"]:
             group_key = _trend_group_key(metric)
             if group_key and metric.get("value") is not None:
                 metric_groups[group_key].append(metric)
@@ -474,9 +473,9 @@ def _claim_object_index(docs: list[dict[str, Any]]) -> dict[str, list[str]]:
         for obj in [
             *doc["business_activities"],
             *doc["external_factor_exposures"],
-            *doc["risks"],
-            *doc["growth_drivers"],
-            *doc["headwinds"],
+            *doc["business_factors"],
+            *doc["agreement_terms"],
+            *doc["business_events"],
         ]:
             obj_id = obj.get("id")
             if not obj_id:
@@ -515,9 +514,12 @@ def _temporal_key(obj: dict[str, Any]) -> tuple[str, str] | None:
             str(obj.get("impact_channel") or ""),
             str(obj.get("benchmark") or ""),
         ])
-    if obj_type in {"RiskFactor", "GrowthDriver", "Headwind"}:
-        affects = ",".join(obj.get("affects") or [])
-        return obj_type, "|".join([str(obj.get("category") or ""), affects or _slug(obj.get("name") or "")])
+    if obj_type == "BusinessFactor":
+        channels = ",".join(obj.get("affected_channels") or [])
+        roles = ",".join(obj.get("factor_roles") or [])
+        return obj_type, "|".join([str(obj.get("category") or ""), roles, channels or _slug(obj.get("name") or "")])
+    if obj_type in {"AgreementTerm", "BusinessEvent"}:
+        return obj_type, _slug(obj.get("name") or obj.get("description") or obj.get("event_type") or "")
     return None
 
 

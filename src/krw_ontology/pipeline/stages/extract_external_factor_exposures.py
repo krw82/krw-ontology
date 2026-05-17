@@ -119,6 +119,8 @@ async def extract_external_factor_exposures(
                 )
 
     exposures = list(by_key.values())
+    for exposure in exposures:
+        _attach_scenario_and_quality(exposure)
     write_jsonl(ontology_dir / "external_factor_exposures.jsonl", exposures)
     logger.info(
         "%s: extracted %d external factor exposures using global_factor_taxonomy=%s",
@@ -343,3 +345,138 @@ def _dedupe(values) -> list:
         seen.add(value)
         result.append(value)
     return result
+
+
+def _attach_scenario_and_quality(exposure: dict[str, Any]) -> None:
+    channel = str(exposure.get("impact_channel") or "business_performance")
+    factor = str(exposure.get("factor") or "")
+    category = str(exposure.get("factor_category") or "")
+    exposure["scenario_effects"] = _scenario_effects(channel=channel, factor=factor, category=category)
+    exposure.setdefault("pass_through_mechanism", "unknown")
+    exposure.setdefault("offsetting_factors", [])
+
+    basis: list[str] = []
+    if exposure.get("supported_by_claims"):
+        basis.append("supported_by_claims")
+    if exposure.get("supported_by_quotes"):
+        basis.append("supported_by_quotes")
+    if exposure.get("related_business_activities"):
+        basis.append("linked_to_business_activity")
+    if exposure.get("related_metrics"):
+        basis.append("linked_to_metric_or_channel")
+    if exposure.get("benchmark"):
+        basis.append("benchmark_specific")
+    exposure["materiality_basis"] = basis
+
+    specificity = 0.15
+    specificity += 0.20 if exposure.get("supported_by_claims") else 0
+    specificity += 0.20 if exposure.get("supported_by_quotes") else 0
+    specificity += 0.20 if exposure.get("related_business_activities") else 0
+    specificity += 0.15 if exposure.get("related_metrics") else 0
+    specificity += 0.10 if exposure.get("benchmark") else 0
+    specificity = min(1.0, specificity)
+
+    boilerplate = 0.65
+    boilerplate -= 0.20 if exposure.get("related_business_activities") else 0
+    boilerplate -= 0.15 if exposure.get("benchmark") else 0
+    boilerplate -= 0.15 if category not in {"unknown", ""} else 0
+    boilerplate = max(0.0, min(1.0, boilerplate))
+
+    grade_bonus = {"direct": 0.20, "indirect": 0.12, "derived": 0.05}.get(
+        str(exposure.get("evidence_grade") or "").lower(),
+        0.0,
+    )
+    ranking = max(0.0, min(1.0, specificity + grade_bonus - boilerplate * 0.25))
+    exposure["specificity_score"] = round(specificity, 3)
+    exposure["boilerplate_score"] = round(boilerplate, 3)
+    exposure["ranking_score"] = round(ranking, 3)
+    if not exposure.get("materiality") or exposure.get("materiality") == "unknown":
+        exposure["materiality"] = _materiality_from_score(ranking)
+
+
+def _scenario_effects(*, channel: str, factor: str, category: str) -> list[dict[str, Any]]:
+    channel_l = channel.lower()
+    factor_l = factor.lower()
+    category_l = category.lower()
+    if "approval" in factor_l or category_l == "regulatory":
+        return [
+            {
+                "factor_change": "approval_delayed",
+                "affected_channel": channel,
+                "metric_direction": "delayed_or_pressured",
+                "company_effect": "negative",
+                "effect_certainty": "conditional",
+                "lag": "medium_to_long",
+                "conditions": ["depends_on_project_or_compliance_exposure"],
+            },
+            {
+                "factor_change": "approval_granted",
+                "affected_channel": channel,
+                "metric_direction": "enabled_or_improved",
+                "company_effect": "positive",
+                "effect_certainty": "conditional",
+                "lag": "medium_to_long",
+                "conditions": ["depends_on_execution_and_market_conditions"],
+            },
+        ]
+    if channel_l in {"cost_of_revenue", "operating_expense", "interest_expense", "capital_expenditures"}:
+        return [
+            {
+                "factor_change": "increase",
+                "affected_channel": channel,
+                "metric_direction": "increase",
+                "company_effect": "negative",
+                "effect_certainty": "likely",
+                "lag": "short_to_medium",
+                "conditions": ["assuming_no_full_pass_through_or_offset"],
+            },
+            {
+                "factor_change": "decrease",
+                "affected_channel": channel,
+                "metric_direction": "decrease",
+                "company_effect": "positive",
+                "effect_certainty": "likely",
+                "lag": "short_to_medium",
+                "conditions": ["assuming_no_full_pass_through_or_offset"],
+            },
+        ]
+    if channel_l in {"revenue", "gross_margin", "operating_margin", "cash_flow", "liquidity"}:
+        return [
+            {
+                "factor_change": "increase",
+                "affected_channel": channel,
+                "metric_direction": "increase_or_improve",
+                "company_effect": "positive",
+                "effect_certainty": "conditional",
+                "lag": "short_to_medium",
+                "conditions": ["depends_on_contract_mix_and_volume_exposure"],
+            },
+            {
+                "factor_change": "decrease",
+                "affected_channel": channel,
+                "metric_direction": "decrease_or_pressure",
+                "company_effect": "negative",
+                "effect_certainty": "conditional",
+                "lag": "short_to_medium",
+                "conditions": ["depends_on_contract_mix_and_volume_exposure"],
+            },
+        ]
+    return [
+        {
+            "factor_change": "increase",
+            "affected_channel": channel,
+            "metric_direction": "unknown",
+            "company_effect": "uncertain",
+            "effect_certainty": "unknown",
+            "lag": None,
+            "conditions": ["filing_evidence_does_not_define_direction"],
+        }
+    ]
+
+
+def _materiality_from_score(score: float) -> str:
+    if score >= 0.70:
+        return "high"
+    if score >= 0.40:
+        return "medium"
+    return "low"

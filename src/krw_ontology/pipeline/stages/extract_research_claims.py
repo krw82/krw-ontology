@@ -66,12 +66,12 @@ _CLAIM_HINT_STRING_FIELDS = (
     "sector_hint",
 )
 _OBJECT_TYPE_HINTS = {
-    "riskfactor": "RiskFactor",
-    "risk": "RiskFactor",
-    "growthdriver": "GrowthDriver",
-    "growth_driver": "GrowthDriver",
-    "driver": "GrowthDriver",
-    "headwind": "Headwind",
+    "riskfactor": "BusinessFactor",
+    "risk": "BusinessFactor",
+    "growthdriver": "BusinessFactor",
+    "growth_driver": "BusinessFactor",
+    "driver": "BusinessFactor",
+    "headwind": "BusinessFactor",
     "businessactivity": "BusinessActivity",
     "business_activity": "BusinessActivity",
     "activity": "BusinessActivity",

@@ -161,19 +161,20 @@ def test_business_and_exposure_stages_validate_and_generate_edges(tmp_path: Path
     )
     assert any(exposure["factor"] == "regulatory_approval" for exposure in exposures)
 
-    write_jsonl(tmp_path / "risks.jsonl", [{
-        "id": "risk:VG:FY2025:10K:feed-gas-basis-risk",
-        "type": "RiskFactor",
+    write_jsonl(tmp_path / "business_factors.jsonl", [{
+        "id": "business_factor:VG:FY2025:10K:feed-gas-basis-risk",
+        "type": "BusinessFactor",
         "ticker": "VG",
         "source_document_id": "source:VG:FY2025:10K",
         "document_type": "10-K",
         "period": "FY2025",
         "name": "Feed gas basis risk",
+        "factor_roles": ["risk"],
         "category": "financial",
         "description": "Feed gas basis differentials could compress operating margins.",
         "supported_by_claims": ["claim:VG:FY2025:10K:feed-gas-basis-risk"],
         "supported_by_quotes": ["quote:VG:FY2025:10K:item1a:0001:002"],
-        "affects": ["operating_margin"],
+        "affected_channels": ["operating_margin"],
         "qualitative_impact": "negative",
         "confidence": "high",
         "review_status": "accepted",
@@ -327,7 +328,7 @@ def test_company_context_does_not_compare_annual_metrics_to_quarterly_metrics(tm
         period="FY2025",
         doc_type="10-K",
         doc_type_key="10K",
-        financial_metrics=[
+        metric_observations=[
             _metric("VG", "FY2025", "10-K", "10K", "revenue", 100.0, fiscal_year=2025, period_type="annual")
         ],
     )
@@ -336,7 +337,7 @@ def test_company_context_does_not_compare_annual_metrics_to_quarterly_metrics(tm
         period="FY2025Q1",
         doc_type="10-Q",
         doc_type_key="10Q",
-        financial_metrics=[
+        metric_observations=[
             _metric("VG", "FY2025Q1", "10-Q", "10Q", "revenue", 20.0, fiscal_year=2025, fiscal_period="Q1", period_type="quarter")
         ],
     )
@@ -345,7 +346,7 @@ def test_company_context_does_not_compare_annual_metrics_to_quarterly_metrics(tm
         period="FY2025Q2",
         doc_type="10-Q",
         doc_type_key="10Q",
-        financial_metrics=[
+        metric_observations=[
             _metric("VG", "FY2025Q2", "10-Q", "10Q", "revenue", 30.0, fiscal_year=2025, fiscal_period="Q2", period_type="quarter")
         ],
     )
@@ -506,7 +507,7 @@ def _write_vg_doc_fixture(ontology_dir: Path, *, period: str) -> list[dict]:
             "claim_type": "risk_assessment",
             "supported_by_quotes": [quotes[1]["id"]],
             "related_metrics": ["cost_of_revenue", "operating_margin"],
-            "object_type_hints": ["RiskFactor", "ExternalFactorExposure", "BusinessActivity"],
+            "object_type_hints": ["BusinessFactor", "ExternalFactorExposure", "BusinessActivity"],
             "theme_hint": "feed_gas_cost_basis_exposure",
             "factor_hint": "basis_differential",
             "activity_hint": "feed_gas_procurement",
@@ -531,7 +532,7 @@ def _write_vg_doc_fixture(ontology_dir: Path, *, period: str) -> list[dict]:
             "claim_type": "risk_assessment",
             "supported_by_quotes": [quotes[2]["id"]],
             "related_metrics": ["capital_expenditures", "revenue"],
-            "object_type_hints": ["RiskFactor", "ExternalFactorExposure", "ChangeEvent"],
+            "object_type_hints": ["BusinessFactor", "ExternalFactorExposure", "ChangeEvent"],
             "theme_hint": "project_regulatory_approval_risk",
             "factor_hint": "regulatory_approval",
             "activity_hint": "liquefaction_projects",
@@ -599,11 +600,11 @@ def _write_indexed_company_doc(root: Path, *, period: str, revenue: float) -> No
     )
     source_document_id = f"source:{ticker}:{period}:{doc_type_key}"
     write_jsonl(
-        ontology_dir / "financial_metric_values.jsonl",
+        ontology_dir / "metric_observations.jsonl",
         [
             {
-                "id": f"financial_metric:{ticker}:{period}:{doc_type_key}:revenue",
-                "type": "FinancialMetricValue",
+                "id": f"metric_observation:{ticker}:{period}:{doc_type_key}:revenue",
+                "type": "MetricObservation",
                 "ticker": ticker,
                 "source_document_id": source_document_id,
                 "document_type": doc_type,
@@ -614,8 +615,8 @@ def _write_indexed_company_doc(root: Path, *, period: str, revenue: float) -> No
                 "fiscal_year": int(period.removeprefix("FY")),
                 "fiscal_period": period,
                 "period_type": "annual",
-                "source_xbrl_fact_id": f"xbrl:{ticker}:{period}:{doc_type_key}:revenue",
-                "source": "filing_inline_xbrl",
+                "source_fact_ids": [f"xbrl:{ticker}:{period}:{doc_type_key}:revenue"],
+                "source_type": "reported",
                 "schema_version": SCHEMA_VERSION,
             }
         ],
@@ -647,8 +648,7 @@ def _write_context_source_doc(
     claims: list[dict] | None = None,
     activities: list[dict] | None = None,
     exposures: list[dict] | None = None,
-    financial_metrics: list[dict] | None = None,
-    derived_metrics: list[dict] | None = None,
+    metric_observations: list[dict] | None = None,
 ) -> None:
     ticker = "VG"
     ontology_dir = root / "companies" / ticker / "ontology" / doc_type_key / period
@@ -660,11 +660,10 @@ def _write_context_source_doc(
         "evidence_quotes": [],
         "business_activities": activities or [],
         "external_factor_exposures": exposures or [],
-        "financial_metric_values": financial_metrics or [],
-        "derived_metric_values": derived_metrics or [],
-        "risks": [],
-        "growth_drivers": [],
-        "headwinds": [],
+        "metric_observations": metric_observations or [],
+        "business_factors": [],
+        "agreement_terms": [],
+        "business_events": [],
         "rejected_objects": [],
     }
     for key, rows in files.items():
@@ -703,8 +702,8 @@ def _metric(
     period_type: str,
 ) -> dict:
     return {
-        "id": f"financial_metric:{ticker}:{period}:{doc_type_key}:{metric_name}:{fiscal_year}:{fiscal_period or 'annual'}",
-        "type": "FinancialMetricValue",
+        "id": f"metric_observation:{ticker}:{period}:{doc_type_key}:{metric_name}:{fiscal_year}:{fiscal_period or 'annual'}",
+        "type": "MetricObservation",
         "ticker": ticker,
         "source_document_id": f"source:{ticker}:{period}:{doc_type_key}",
         "document_type": doc_type,
@@ -715,8 +714,8 @@ def _metric(
         "fiscal_year": fiscal_year,
         "fiscal_period": fiscal_period,
         "period_type": period_type,
-        "source_xbrl_fact_id": f"xbrl:{ticker}:{period}:{doc_type_key}:{metric_name}",
-        "source": "filing_inline_xbrl",
+        "source_fact_ids": [f"xbrl:{ticker}:{period}:{doc_type_key}:{metric_name}"],
+        "source_type": "reported",
         "schema_version": SCHEMA_VERSION,
     }
 

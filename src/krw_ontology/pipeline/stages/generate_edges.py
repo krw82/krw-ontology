@@ -17,25 +17,26 @@ from krw_ontology.utils.io import read_jsonl, write_jsonl
 logger = logging.getLogger("krw_ontology")
 
 _OBJECT_RELATIONS = {
-    "RiskFactor": ("describes_risk", "describes_risk"),
-    "GrowthDriver": ("describes_driver", "describes_driver"),
-    "Headwind": ("describes_headwind", "describes_headwind"),
     "BusinessActivity": ("describes_activity", "describes_activity"),
     "ExternalFactorExposure": ("describes_exposure", "describes_exposure"),
+    "BusinessFactor": ("describes_business_factor", "describes_business_factor"),
+    "AgreementTerm": ("describes_agreement_term", "describes_agreement_term"),
+    "BusinessEvent": ("describes_business_event", "describes_business_event"),
 }
 
 _RELATION_META = {
     "contains_quote": ("evidence", "direct", "deterministic_reference"),
     "has_signal": ("evidence", "derived", "deterministic_reference"),
     "supports": ("evidence", "direct", "deterministic_reference"),
-    "describes_risk": ("interpretation", "derived", "deterministic_reference"),
-    "describes_driver": ("interpretation", "derived", "deterministic_reference"),
-    "describes_headwind": ("interpretation", "derived", "deterministic_reference"),
     "describes_activity": ("interpretation", "derived", "deterministic_reference"),
     "describes_exposure": ("interpretation", "derived", "deterministic_reference"),
+    "describes_business_factor": ("interpretation", "derived", "deterministic_reference"),
+    "describes_agreement_term": ("interpretation", "derived", "deterministic_reference"),
+    "describes_business_event": ("interpretation", "derived", "deterministic_reference"),
     "manifests_as": ("exposure_link", "derived", "deterministic_shared_claim"),
     "supports_assumption": ("evidence", "direct", "deterministic_reference"),
     "derived_from": ("interpretation", "derived", "deterministic_reference"),
+    "calculated_from": ("calculation", "derived", "deterministic_reference"),
 }
 
 
@@ -45,9 +46,6 @@ async def generate_edges(
     ticker: str,
     period: str,
     doc_type: str,
-    risks: list[dict] | None = None,
-    growth_drivers: list[dict] | None = None,
-    headwinds: list[dict] | None = None,
     business_activities: list[dict] | None = None,
     external_factor_exposures: list[dict] | None = None,
     assumptions: list[dict] | None = None,
@@ -68,12 +66,6 @@ async def generate_edges(
 
     spans = read_jsonl(ontology_dir / "spans.jsonl")
     signals = read_jsonl(ontology_dir / "language_signals.jsonl")
-    if risks is None:
-        risks = read_jsonl(ontology_dir / "risks.jsonl")
-    if growth_drivers is None:
-        growth_drivers = read_jsonl(ontology_dir / "growth_drivers.jsonl")
-    if headwinds is None:
-        headwinds = read_jsonl(ontology_dir / "headwinds.jsonl")
     if business_activities is None:
         business_activities = read_jsonl(ontology_dir / "business_activities.jsonl")
     if external_factor_exposures is None:
@@ -84,6 +76,12 @@ async def generate_edges(
         claims = read_jsonl(ontology_dir / "claims.jsonl")
     if quotes is None:
         quotes = read_jsonl(ontology_dir / "evidence_quotes.jsonl")
+    business_factors = read_jsonl(ontology_dir / "business_factors.jsonl")
+    agreement_terms = read_jsonl(ontology_dir / "agreement_terms.jsonl")
+    business_events = read_jsonl(ontology_dir / "business_events.jsonl")
+    metric_observations = read_jsonl(ontology_dir / "metric_observations.jsonl")
+    calculations = read_jsonl(ontology_dir / "calculations.jsonl")
+    xbrl_facts = read_jsonl(ontology_dir / "xbrl_facts.jsonl")
 
     valid_ids = {
         obj["id"]
@@ -92,12 +90,15 @@ async def generate_edges(
             *quotes,
             *signals,
             *claims,
-            *risks,
-            *growth_drivers,
-            *headwinds,
             *business_activities,
             *external_factor_exposures,
             *assumptions,
+            *business_factors,
+            *agreement_terms,
+            *business_events,
+            *metric_observations,
+            *calculations,
+            *xbrl_facts,
         ]
         if obj.get("id")
     }
@@ -139,7 +140,13 @@ async def generate_edges(
                 rationale="ResearchClaim.supported_by_quotes includes this evidence quote.",
             )
 
-    for obj in [*risks, *growth_drivers, *headwinds, *business_activities, *external_factor_exposures]:
+    for obj in [
+        *business_activities,
+        *external_factor_exposures,
+        *business_factors,
+        *agreement_terms,
+        *business_events,
+    ]:
         obj_type = obj.get("type", "")
         relation = _OBJECT_RELATIONS.get(obj_type)
         if relation:
@@ -153,6 +160,55 @@ async def generate_edges(
                     relation_name=relation_name,
                     rationale=f"{obj_type}.supported_by_claims includes this research claim.",
                 )
+            if obj_type in {"BusinessFactor", "AgreementTerm", "BusinessEvent"}:
+                for quote_id in obj.get("supported_by_quotes") or []:
+                    _add_edge(
+                        edges, seen, valid_ids, ticker, period, doc_type, source_document_id,
+                        from_id=quote_id,
+                        to_id=obj.get("id"),
+                        relation_id=relation_id,
+                        relation_name=relation_name,
+                        rationale=f"{obj_type}.supported_by_quotes includes this evidence quote.",
+                    )
+
+    for metric in metric_observations:
+        for source_id in metric.get("source_fact_ids") or []:
+            _add_edge(
+                edges, seen, valid_ids, ticker, period, doc_type, source_document_id,
+                from_id=source_id,
+                to_id=metric.get("id"),
+                relation_id="derived_from",
+                relation_name="derived_from",
+                rationale="MetricObservation.source_fact_ids includes this XBRL fact.",
+            )
+        for source_id in metric.get("source_metric_ids") or []:
+            _add_edge(
+                edges, seen, valid_ids, ticker, period, doc_type, source_document_id,
+                from_id=source_id,
+                to_id=metric.get("id"),
+                relation_id="calculated_from",
+                relation_name="calculated_from",
+                rationale="MetricObservation.source_metric_ids includes this input observation.",
+            )
+
+    for calculation in calculations:
+        for input_id in calculation.get("input_metric_ids") or []:
+            _add_edge(
+                edges, seen, valid_ids, ticker, period, doc_type, source_document_id,
+                from_id=input_id,
+                to_id=calculation.get("id"),
+                relation_id="calculated_from",
+                relation_name="calculated_from",
+                rationale="Calculation.input_metric_ids includes this metric observation.",
+            )
+        _add_edge(
+            edges, seen, valid_ids, ticker, period, doc_type, source_document_id,
+            from_id=calculation.get("id"),
+            to_id=calculation.get("output_metric_id"),
+            relation_id="derived_from",
+            relation_name="derived_from",
+            rationale="Calculation.output_metric_id is the metric observation produced by the calculation.",
+        )
 
     for exposure in external_factor_exposures:
         _add_exposure_manifest_edges(
@@ -164,7 +220,7 @@ async def generate_edges(
             doc_type,
             source_document_id,
             exposure,
-            [*risks, *growth_drivers, *headwinds],
+            business_factors,
         )
 
     for assumption in assumptions:

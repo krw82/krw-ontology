@@ -13,7 +13,7 @@ from krw_ontology.errors import PipelineStageError
 logger = logging.getLogger("krw_ontology")
 
 SEC_SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik}.json"
-_PERIOD_RE = re.compile(r"^FY(?P<year>\d{4})(?:Q(?P<quarter>[1-4]))?$", re.IGNORECASE)
+_PERIOD_RE = re.compile(r"^(?:FY|CY)?(?P<year>\d{4})(?:Q(?P<quarter>[1-4]))?$", re.IGNORECASE)
 
 
 def discover_source(
@@ -36,11 +36,17 @@ def discover_source(
             period=period,
             report_date=filing.get("report_date"),
             filing_date=filing.get("filing_date"),
+            fiscal_year=filing.get("fiscal_year"),
+            fiscal_period=filing.get("fiscal_period"),
+            fiscal_year_end=filing.get("fiscal_year_end"),
         ):
             return {
                 "accession_number": filing["accession_number"],
                 "filing_date": filing["filing_date"],
                 "report_date": filing["report_date"],
+                "fiscal_year": filing.get("fiscal_year"),
+                "fiscal_period": filing.get("fiscal_period"),
+                "fiscal_year_end": filing.get("fiscal_year_end"),
                 "primary_document": filing["primary_document"],
                 "source_url": filing["source_url"],
             }
@@ -65,14 +71,49 @@ def derive_period_key(
     document_type: str,
     report_date: str | None,
     filing_date: str | None,
+    *,
+    fiscal_year: object = None,
+    fiscal_period: object = None,
+    fiscal_year_end: object = None,
 ) -> str:
-    """Derive the pipeline period key from SEC reportDate/filingDate."""
+    """Derive the pipeline period key from SEC reportDate/filingDate calendar dates."""
     date_value = report_date or filing_date or ""
     year = date_value[:4] if len(date_value) >= 4 and date_value[:4].isdigit() else "unknown"
     if document_type == "10-Q":
         quarter = _filing_quarter(report_date, filing_date)
-        return f"FY{year}Q{quarter}" if quarter else f"FY{year}Q?"
-    return f"FY{year}"
+        return f"CY{year}Q{quarter}" if quarter else f"CY{year}Q?"
+    return f"CY{year}"
+
+
+def _value_at(values: list[object], index: int) -> object:
+    return values[index] if index < len(values) else None
+
+
+def _normalize_fiscal_year(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    match = re.search(r"\d{4}", text)
+    return match.group(0) if match else None
+
+
+def _normalize_fiscal_period(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip().upper()
+    return text or None
+
+
+def _fiscal_period_quarter(value: object) -> int | None:
+    text = _normalize_fiscal_period(value)
+    if not text:
+        return None
+    if text in {"1", "2", "3", "4"}:
+        return int(text)
+    match = re.fullmatch(r"Q([1-4])", text)
+    return int(match.group(1)) if match else None
 
 
 def _fetch_submissions(cik: str, config: PipelineConfig) -> dict:
@@ -94,6 +135,8 @@ def _extract_source_filings(cik: str, data: dict, document_types: set[str]) -> l
     filing_dates = filings_data.get("filingDate", [])
     primary_documents = filings_data.get("primaryDocument", [])
     report_dates = filings_data.get("reportDate", [])
+    fiscal_years = filings_data.get("fy", []) or []
+    fiscal_periods = filings_data.get("fp", []) or []
 
     normalized: list[dict] = []
 
@@ -114,6 +157,8 @@ def _extract_source_filings(cik: str, data: dict, document_types: set[str]) -> l
         filing_date = filing_dates[i]
         report_date = report_dates[i] if i < len(report_dates) else ""
         primary_document = primary_documents[i] if i < len(primary_documents) else ""
+        fiscal_year = _value_at(fiscal_years, i)
+        fiscal_period = _value_at(fiscal_periods, i)
         accession_no_dashes = accession_number.replace("-", "")
         source_url = (
             f"https://www.sec.gov/Archives/edgar/data/"
@@ -122,10 +167,18 @@ def _extract_source_filings(cik: str, data: dict, document_types: set[str]) -> l
         normalized.append(
             {
                 "document_type": form,
-                "period": derive_period_key(form, report_date, filing_date),
+                "period": derive_period_key(
+                    form,
+                    report_date,
+                    filing_date,
+                    fiscal_year=fiscal_year,
+                    fiscal_period=fiscal_period,
+                ),
                 "accession_number": accession_number,
                 "filing_date": filing_date,
                 "report_date": report_date,
+                "fiscal_year": _normalize_fiscal_year(fiscal_year),
+                "fiscal_period": _normalize_fiscal_period(fiscal_period),
                 "primary_document": primary_document,
                 "source_url": source_url,
             }
@@ -138,13 +191,23 @@ def _filing_matches_period(
     period: str | None,
     report_date: str | None,
     filing_date: str | None,
+    fiscal_year: object = None,
+    fiscal_period: object = None,
+    fiscal_year_end: object = None,
 ) -> bool:
+    derived_period = derive_period_key(
+        document_type,
+        report_date,
+        filing_date,
+        fiscal_year=fiscal_year,
+        fiscal_period=fiscal_period,
+    )
     target_year = _period_year(period)
-    if target_year and _filing_year(report_date, filing_date) != target_year:
+    if target_year and _period_year(derived_period) != target_year:
         return False
     target_quarter = _period_quarter(period)
     if document_type == "10-Q" and target_quarter:
-        return _filing_quarter(report_date, filing_date) == target_quarter
+        return _period_quarter(derived_period) == target_quarter
     return True
 
 

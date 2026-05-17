@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
 
 from krw_ontology.schema.id_utils import generate_metric_id
+from krw_ontology.schema.objects import SCHEMA_VERSION
 from krw_ontology.utils.io import find_project_root, read_jsonl, write_jsonl
 from krw_ontology.validators.schema_validator import validate_schema
 from krw_ontology.validators.exact_match import validate_exact_match
@@ -29,50 +31,68 @@ LOG_EXTRA = {"stage": "validate_ontology"}
 
 # JSONL files to load (type -> filename)
 _JSONL_FILES: dict[str, str] = {
+    "TaxonomyTerm": "taxonomy_terms.jsonl",
+    "SourceDocument": "source_documents.jsonl",
+    "SourceLocation": "source_locations.jsonl",
+    "SourceTable": "source_tables.jsonl",
+    "SourceTableCell": "source_table_cells.jsonl",
     "SourceSpan": "spans.jsonl",
     "EvidenceQuote": "evidence_quotes.jsonl",
     "LanguageSignal": "language_signals.jsonl",
+    "SupportLink": "support_links.jsonl",
+    "CanonicalEntity": "canonical_entities.jsonl",
+    "EntityMention": "entity_mentions.jsonl",
     "ResearchClaim": "claims.jsonl",
-    "RiskFactor": "risks.jsonl",
-    "GrowthDriver": "growth_drivers.jsonl",
-    "Headwind": "headwinds.jsonl",
+    "MetricObservation": "metric_observations.jsonl",
+    "Calculation": "calculations.jsonl",
+    "BusinessFactor": "business_factors.jsonl",
+    "AgreementTerm": "agreement_terms.jsonl",
+    "BusinessEvent": "business_events.jsonl",
     "BusinessActivity": "business_activities.jsonl",
     "ExternalFactorExposure": "external_factor_exposures.jsonl",
     "AssumptionCandidate": "assumption_candidates.jsonl",
     "Edge": "edges.jsonl",
     "XBRLFact": "xbrl_facts.jsonl",
-    "FinancialMetricValue": "financial_metric_values.jsonl",
-    "DerivedMetricValue": "derived_metric_values.jsonl",
-    "NumericEvidence": "numeric_evidence.jsonl",
-    "CalculatedNumericSupport": "calculated_numeric_support.jsonl",
     "CompanyBusinessProfile": "company_business_profiles.jsonl",
     "TemporalLink": "temporal_links.jsonl",
     "TrendObservation": "trend_observations.jsonl",
     "ChangeEvent": "change_events.jsonl",
+    "RunManifest": "run_manifests.jsonl",
+    "OntologyRegistrySnapshot": "ontology_registry_snapshots.jsonl",
+    "ValidationReport": "validation_reports.jsonl",
 }
 
 # Filename mapping for writing accepted objects back
 _ACCEPTED_FILES: dict[str, str] = {
+    "TaxonomyTerm": "taxonomy_terms.jsonl",
+    "SourceDocument": "source_documents.jsonl",
+    "SourceLocation": "source_locations.jsonl",
+    "SourceTable": "source_tables.jsonl",
+    "SourceTableCell": "source_table_cells.jsonl",
     "SourceSpan": "spans.jsonl",
     "EvidenceQuote": "evidence_quotes.jsonl",
     "LanguageSignal": "language_signals.jsonl",
+    "SupportLink": "support_links.jsonl",
+    "CanonicalEntity": "canonical_entities.jsonl",
+    "EntityMention": "entity_mentions.jsonl",
     "ResearchClaim": "claims.jsonl",
-    "RiskFactor": "risks.jsonl",
-    "GrowthDriver": "growth_drivers.jsonl",
-    "Headwind": "headwinds.jsonl",
+    "MetricObservation": "metric_observations.jsonl",
+    "Calculation": "calculations.jsonl",
+    "BusinessFactor": "business_factors.jsonl",
+    "AgreementTerm": "agreement_terms.jsonl",
+    "BusinessEvent": "business_events.jsonl",
     "BusinessActivity": "business_activities.jsonl",
     "ExternalFactorExposure": "external_factor_exposures.jsonl",
     "AssumptionCandidate": "assumption_candidates.jsonl",
     "Edge": "edges.jsonl",
     "XBRLFact": "xbrl_facts.jsonl",
-    "FinancialMetricValue": "financial_metric_values.jsonl",
-    "DerivedMetricValue": "derived_metric_values.jsonl",
-    "NumericEvidence": "numeric_evidence.jsonl",
-    "CalculatedNumericSupport": "calculated_numeric_support.jsonl",
     "CompanyBusinessProfile": "company_business_profiles.jsonl",
     "TemporalLink": "temporal_links.jsonl",
     "TrendObservation": "trend_observations.jsonl",
     "ChangeEvent": "change_events.jsonl",
+    "RunManifest": "run_manifests.jsonl",
+    "OntologyRegistrySnapshot": "ontology_registry_snapshots.jsonl",
+    "ValidationReport": "validation_reports.jsonl",
 }
 
 
@@ -138,10 +158,7 @@ def _get_xbrl_facts(all_objects: dict[str, dict]) -> dict[str, dict]:
         for oid, obj in all_objects.items()
         if obj.get("type") in (
             "XBRLFact",
-            "FinancialMetricValue",
-            "DerivedMetricValue",
-            "NumericEvidence",
-            "CalculatedNumericSupport",
+            "MetricObservation",
         )
     }
 
@@ -158,13 +175,13 @@ def _prune_dangling_supports(accepted: dict[str, dict]) -> list[dict]:
                 obj["supported_by_quotes"] = quotes
                 pruned.append(obj)
         if obj_type in (
-            "RiskFactor",
-            "GrowthDriver",
-            "Headwind",
             "BusinessActivity",
             "ExternalFactorExposure",
             "AssumptionCandidate",
             "ChangeEvent",
+            "BusinessFactor",
+            "AgreementTerm",
+            "BusinessEvent",
         ):
             claims = [cid for cid in obj.get("supported_by_claims") or [] if cid in valid_ids]
             quotes = [qid for qid in obj.get("supported_by_quotes") or [] if qid in valid_ids]
@@ -369,7 +386,7 @@ def run_validate_ontology(ontology_dir: Path, *, include_edges: bool = True) -> 
         if obj_type == "Metric" and obj.get("_virtual"):
             continue
         # Normalize ResearchObject subtypes to their filenames
-        if obj_type in ("RiskFactor", "GrowthDriver", "Headwind"):
+        if obj_type == "BusinessFactor":
             pass  # they have their own files
         accepted_by_type.setdefault(obj_type, []).append(
             {k: v for k, v in obj.items() if k != "_virtual"}
@@ -387,6 +404,16 @@ def run_validate_ontology(ontology_dir: Path, *, include_edges: bool = True) -> 
     accepted_counts = {t: len(objs) for t, objs in accepted_by_type.items()}
     total_accepted = sum(accepted_counts.values())
     total_rejected = len(rejected)
+    scope = "with_edges" if include_edges else "without_edges"
+    report = _build_validation_report(
+        ontology_dir,
+        scope=scope,
+        total_input=total_input,
+        total_accepted=total_accepted,
+        total_rejected=total_rejected,
+        accepted_counts=accepted_counts,
+    )
+    write_jsonl(ontology_dir / "validation_reports.jsonl", [report])
 
     logger.info(
         "Validation complete: %d accepted, %d rejected",
@@ -403,4 +430,48 @@ def run_validate_ontology(ontology_dir: Path, *, include_edges: bool = True) -> 
             "total_accepted": total_accepted,
             "total_rejected": total_rejected,
         },
+    }
+
+
+def _build_validation_report(
+    ontology_dir: Path,
+    *,
+    scope: str,
+    total_input: int,
+    total_accepted: int,
+    total_rejected: int,
+    accepted_counts: dict[str, int],
+) -> dict:
+    """Build a governance validation report row for the current document."""
+    ticker = "UNKNOWN"
+    period = "UNKNOWN"
+    document_type = "UNKNOWN"
+    source_document_id = "source:UNKNOWN:UNKNOWN:UNKNOWN"
+    for filename in ("claims.jsonl", "evidence_quotes.jsonl", "spans.jsonl"):
+        for obj in read_jsonl(ontology_dir / filename):
+            ticker = obj.get("ticker") or ticker
+            period = obj.get("period") or period
+            document_type = obj.get("document_type") or document_type
+            source_document_id = obj.get("source_document_id") or source_document_id
+            break
+        if ticker != "UNKNOWN":
+            break
+    return {
+        "id": f"validation_report:{ticker}:{period}:{document_type.replace('-', '')}:{scope}",
+        "type": "ValidationReport",
+        "ticker": ticker,
+        "source_document_id": source_document_id,
+        "document_type": document_type,
+        "period": period,
+        "validation_scope": scope,
+        "total_input": total_input,
+        "total_accepted": total_accepted,
+        "total_rejected": total_rejected,
+        "summary": {
+            "accepted_counts": accepted_counts,
+            "quote_exact_match_required": True,
+            "invalid_reference_allowed": False,
+        },
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "schema_version": SCHEMA_VERSION,
     }

@@ -6,27 +6,27 @@ from krw_ontology.validators.support_validator import validate_has_support
 
 
 class TestSupportedObjects:
-    def test_risk_factor_with_claims(self):
+    def test_business_factor_with_claims(self):
         obj = {
-            "type": "RiskFactor",
+            "type": "BusinessFactor",
             "supported_by_claims": ["claim:1"],
             "supported_by_quotes": [],
         }
         ok, reason = validate_has_support(obj)
         assert ok
 
-    def test_growth_driver_with_quotes_only(self):
+    def test_business_activity_with_quotes_only(self):
         obj = {
-            "type": "GrowthDriver",
+            "type": "BusinessActivity",
             "supported_by_claims": [],
             "supported_by_quotes": ["quote:1"],
         }
         ok, reason = validate_has_support(obj)
         assert ok
 
-    def test_headwind_with_both(self):
+    def test_external_factor_with_both(self):
         obj = {
-            "type": "Headwind",
+            "type": "ExternalFactorExposure",
             "supported_by_claims": ["claim:1"],
             "supported_by_quotes": ["quote:1"],
         }
@@ -43,18 +43,18 @@ class TestSupportedObjects:
 
 
 class TestUnsupportedObjects:
-    def test_risk_no_support(self):
+    def test_business_factor_no_support(self):
         obj = {
-            "type": "RiskFactor",
+            "type": "BusinessFactor",
             "supported_by_claims": [],
             "supported_by_quotes": [],
         }
         ok, reason = validate_has_support(obj)
         assert not ok
 
-    def test_headwind_no_support(self):
+    def test_external_factor_no_support(self):
         obj = {
-            "type": "Headwind",
+            "type": "ExternalFactorExposure",
             "supported_by_claims": None,
             "supported_by_quotes": None,
         }

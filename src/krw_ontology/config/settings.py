@@ -14,6 +14,7 @@ _DEFAULT_MODEL = "claude-sonnet-4-20250514"
 
 @dataclass
 class PipelineConfig:
+    execution_mode: str = "full"
     model: str = _DEFAULT_MODEL
     stage_models: dict[str, str] = field(default_factory=dict)
     ai_concurrency: int = 10
@@ -34,6 +35,7 @@ class PipelineConfig:
     max_context_tokens: int = 180000
     fail_on_section_quality: bool = False
     span_pruning: str = "conservative"
+    pilot_max_quote_spans: int = 120
 
     @classmethod
     def load(cls) -> PipelineConfig:
@@ -42,6 +44,8 @@ class PipelineConfig:
         config = cls()
 
         # Environment variable overrides
+        if env_execution_mode := os.environ.get("KRW_EXECUTION_MODE"):
+            config.execution_mode = _parse_execution_mode(env_execution_mode, config.execution_mode)
         if env_model := os.environ.get("KRW_MODEL"):
             config.model = env_model
         if env_concurrency := os.environ.get("KRW_AI_CONCURRENCY"):
@@ -57,6 +61,11 @@ class PipelineConfig:
             )
         if env_span_pruning := os.environ.get("KRW_SPAN_PRUNING"):
             config.span_pruning = _parse_span_pruning_mode(env_span_pruning, config.span_pruning)
+        if env_pilot_max_spans := os.environ.get("KRW_PILOT_MAX_QUOTE_SPANS"):
+            config.pilot_max_quote_spans = _parse_positive_int(
+                env_pilot_max_spans,
+                config.pilot_max_quote_spans,
+            )
         _apply_stage_env(config)
         _apply_batch_size_env(config)
 
@@ -67,6 +76,11 @@ class PipelineConfig:
                 data = yaml.safe_load(f) or {}
             if "model" in data:
                 config.model = data["model"]
+            if "execution_mode" in data:
+                config.execution_mode = _parse_execution_mode(
+                    str(data["execution_mode"]),
+                    config.execution_mode,
+                )
             if "stage_models" in data:
                 config.stage_models.update(data["stage_models"] or {})
             if "ai_concurrency" in data:
@@ -97,8 +111,15 @@ class PipelineConfig:
                     str(data["span_pruning"]),
                     config.span_pruning,
                 )
+            if "pilot_max_quote_spans" in data:
+                config.pilot_max_quote_spans = _parse_positive_int(
+                    str(data["pilot_max_quote_spans"]),
+                    config.pilot_max_quote_spans,
+                )
 
         # Env var always wins over file
+        if env_execution_mode := os.environ.get("KRW_EXECUTION_MODE"):
+            config.execution_mode = _parse_execution_mode(env_execution_mode, config.execution_mode)
         if env_model := os.environ.get("KRW_MODEL"):
             config.model = env_model
         if env_concurrency := os.environ.get("KRW_AI_CONCURRENCY"):
@@ -114,10 +135,23 @@ class PipelineConfig:
             )
         if env_span_pruning := os.environ.get("KRW_SPAN_PRUNING"):
             config.span_pruning = _parse_span_pruning_mode(env_span_pruning, config.span_pruning)
+        if env_pilot_max_spans := os.environ.get("KRW_PILOT_MAX_QUOTE_SPANS"):
+            config.pilot_max_quote_spans = _parse_positive_int(
+                env_pilot_max_spans,
+                config.pilot_max_quote_spans,
+            )
         _apply_stage_env(config)
         _apply_batch_size_env(config)
+        if config.execution_mode == "pilot":
+            config.apply_pilot_mode()
 
         return config
+
+    def apply_pilot_mode(self) -> None:
+        """Switch to a small, development-friendly execution profile."""
+        self.execution_mode = "pilot"
+        self.span_pruning = "pilot"
+        self.pilot_max_quote_spans = max(1, int(self.pilot_max_quote_spans))
 
     def model_for_stage(self, stage_name: str) -> str:
         return self.stage_models.get(stage_name, self.model)
@@ -142,6 +176,13 @@ def _parse_positive_int(value: str, default: int) -> int:
     return max(1, parsed)
 
 
+def _parse_execution_mode(value: str, default: str) -> str:
+    normalized = value.strip().lower()
+    if normalized in {"full", "pilot"}:
+        return normalized
+    return default
+
+
 def _parse_bool(value: str, default: bool) -> bool:
     normalized = value.strip().lower()
     if normalized in {"1", "true", "yes", "y", "on"}:
@@ -163,7 +204,7 @@ def _coerce_bool(value: object, default: bool) -> bool:
 
 def _parse_span_pruning_mode(value: str, default: str) -> str:
     normalized = value.strip().lower()
-    if normalized in {"off", "conservative"}:
+    if normalized in {"off", "conservative", "pilot"}:
         return normalized
     return default
 

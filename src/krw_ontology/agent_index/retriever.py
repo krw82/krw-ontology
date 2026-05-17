@@ -9,8 +9,13 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 import re
-from typing import Any, Callable, Iterable, Protocol
+from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence
 
+from krw_ontology.agent_index.discovery import (
+    build_evidence_frame,
+    build_query_frame,
+    classify_topic_match,
+)
 from krw_ontology.agent_index.store import DEFAULT_QUERY_TYPES, OntologyStore
 
 PlannerFn = Callable[[str, dict[str, Any]], "QueryPlan"]
@@ -18,6 +23,42 @@ RerankerFn = Callable[[list[dict[str, Any]], "QueryPlan"], list[dict[str, Any]]]
 
 _TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9.:-]*")
 _PERIOD_RE = re.compile(r"\bFY\d{4}(?:Q[1-4?])?\b", re.IGNORECASE)
+
+QUESTION_TYPE_OBJECTS: dict[str, list[str]] = {
+    "risk": ["BusinessFactor", "ExternalFactorExposure", "ResearchClaim", "EvidenceQuote"],
+    "driver": [
+        "BusinessFactor",
+        "BusinessActivity",
+        "ExternalFactorExposure",
+        "ResearchClaim",
+        "EvidenceQuote",
+    ],
+    "scenario": [
+        "ExternalFactorExposure",
+        "BusinessFactor",
+        "ResearchClaim",
+        "EvidenceQuote",
+        "MetricObservation",
+    ],
+    "event": ["BusinessEvent", "ChangeEvent", "ResearchClaim", "EvidenceQuote"],
+    "change": [
+        "ChangeEvent",
+        "TrendObservation",
+        "TemporalLink",
+        "ResearchClaim",
+        "EvidenceQuote",
+        "MetricObservation",
+    ],
+    "metric": ["MetricObservation", "Calculation", "ResearchClaim"],
+    "agreement": ["AgreementTerm", "ResearchClaim", "EvidenceQuote"],
+    "business_model": [
+        "CompanyBusinessProfile",
+        "BusinessActivity",
+        "ExternalFactorExposure",
+        "BusinessFactor",
+        "ResearchClaim",
+    ],
+}
 
 
 @dataclass(frozen=True)
@@ -61,7 +102,11 @@ class DefaultQueryPlanner:
         metric = _extract_metric(question_lower)
         intent = _extract_intent(question_lower, tickers, metric)
         topics = _extract_topics(question, question_lower, metric, key_risk_question=key_risk_question)
-        object_types = _extract_object_types(question_lower, key_risk_question=key_risk_question)
+        object_types = _extract_object_types(
+            question_lower,
+            key_risk_question=key_risk_question,
+            metric=metric,
+        )
         include_rejected = _asks_include_rejected(question_lower)
 
         return QueryPlan(
@@ -150,10 +195,22 @@ class AgentRetriever:
         if plan.intent == "quality_check":
             quality = self._quality_for_plan(plan, resolved_periods)
             return {
-                "answerable": bool(quality["documents"]),
+                "answerability": {
+                    "direct_answerable": False,
+                    "related_context_available": bool(quality["documents"]),
+                    "negative_answer_supported": False,
+                    "needs_user_clarification": False,
+                    "recommended_answer_mode": "quality_report",
+                    "question_requires_direct_match": False,
+                    "query_frame": {},
+                },
+                "recommended_answer_mode": "quality_report",
+                "query_frame": {},
                 "plan": plan.to_dict(),
                 "resolved_periods": resolved_periods,
-                "results": [],
+                "direct_evidence": [],
+                "related_context": [],
+                "rejected_context": [],
                 "quality": quality,
                 "audit": {"executed_queries": executed_queries},
             }
@@ -161,24 +218,41 @@ class AgentRetriever:
         if plan.intent == "compare":
             result = self._execute_compare(plan, resolved_periods, executed_queries)
             return {
-                "answerable": any(result["results"].values()),
+                "answerability": {
+                    "direct_answerable": bool(any(result["results"].values())),
+                    "related_context_available": False,
+                    "negative_answer_supported": False,
+                    "needs_user_clarification": False,
+                    "recommended_answer_mode": "comparison",
+                    "question_requires_direct_match": False,
+                    "query_frame": {},
+                },
+                "recommended_answer_mode": "comparison",
+                "query_frame": {},
                 "plan": plan.to_dict(),
                 "resolved_periods": resolved_periods,
-                "results": result["results"],
+                "direct_evidence": [],
+                "related_context": [],
+                "rejected_context": [],
                 "compare": result,
                 "audit": {"executed_queries": executed_queries},
             }
 
         candidates = self._execute_search(plan, resolved_periods, executed_queries)
+        candidates = self._apply_graph_lift(candidates, plan)
         if self.reranker:
             candidates = self.reranker(candidates, plan)
         candidates = _dedupe_bundles(candidates)[: plan.limit]
+        candidates, answerability = _annotate_retrieval_answerability(plan, candidates)
+        retrieval_context = _split_retrieval_context(candidates)
 
         return {
-            "answerable": bool(candidates),
+            "answerability": answerability,
+            "recommended_answer_mode": answerability.get("recommended_answer_mode"),
+            "query_frame": answerability.get("query_frame", {}),
             "plan": plan.to_dict(),
             "resolved_periods": resolved_periods,
-            "results": candidates,
+            **retrieval_context,
             "audit": {"executed_queries": executed_queries},
         }
 
@@ -196,7 +270,7 @@ class AgentRetriever:
         resolved_periods: list[str],
         executed_queries: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
-        topics = plan.topics or [None]
+        topics = _expanded_retrieval_topics(plan)
         candidates: list[dict[str, Any]] = []
         per_topic_limit = max(plan.limit, 10)
         for topic in topics:
@@ -212,6 +286,68 @@ class AgentRetriever:
             executed_queries.append(query)
             candidates.extend(self.store.query(**query))
         return candidates
+
+    def _apply_graph_lift(
+        self,
+        candidates: list[dict[str, Any]],
+        plan: QueryPlan,
+    ) -> list[dict[str, Any]]:
+        """Promote semantic objects connected to top evidence results.
+
+        This is not a word dictionary. It uses the ontology evidence graph: if
+        an EvidenceQuote or ResearchClaim matches the query, connected semantic
+        objects become stronger answer candidates for risk, driver, and scenario
+        questions.
+        """
+        if not candidates:
+            return candidates
+
+        question_type = _infer_question_type(plan.question.lower()) or plan.intent
+        if question_type not in {"risk", "driver", "scenario"}:
+            return candidates
+        promotion_types = _promotion_types(question_type, plan.object_types)
+        if not promotion_types:
+            return candidates
+
+        promoted_ids: set[str] = set()
+        promoted: list[dict[str, Any]] = []
+        for bundle in candidates[:10]:
+            evidence = bundle.get("evidence") or {}
+            if bundle.get("type") in {"EvidenceQuote", "ResearchClaim"}:
+                for related in evidence.get("related_objects") or []:
+                    related_id = related.get("id")
+                    if not related_id or related.get("type") not in promotion_types:
+                        continue
+                    if related_id in promoted_ids:
+                        continue
+                    promoted_ids.add(related_id)
+                    promoted_bundle = self.store.bundle(related_id)
+                    if not promoted_bundle.get("missing"):
+                        promoted.append(promoted_bundle)
+            elif bundle.get("type") in promotion_types:
+                for evidence_obj in [
+                    *(evidence.get("claims") or []),
+                    *(evidence.get("quotes") or []),
+                ]:
+                    evidence_id = evidence_obj.get("id")
+                    if not evidence_id or evidence_obj.get("type") not in {"ResearchClaim", "EvidenceQuote"}:
+                        continue
+                    if evidence_id in promoted_ids:
+                        continue
+                    promoted_ids.add(evidence_id)
+                    promoted_bundle = self.store.bundle(evidence_id)
+                    if not promoted_bundle.get("missing"):
+                        promoted.append(promoted_bundle)
+
+        if not promoted:
+            return candidates
+
+        combined = [*candidates, *promoted]
+        return _rank_graph_lifted_bundles(
+            combined,
+            question_type=question_type,
+            promoted_ids=promoted_ids,
+        )
 
     def _execute_compare(
         self,
@@ -294,6 +430,31 @@ class AgentRetriever:
             if current is None or _period_sort_key(doc["period"]) > _period_sort_key(current["period"]):
                 latest_by_scope[key] = doc
         return sorted({doc["period"] for doc in latest_by_scope.values()})
+
+
+def _expanded_retrieval_topics(plan: QueryPlan) -> list[str | None]:
+    """Keep search recall broad while preserving the caller's first query."""
+    query_frame = build_query_frame(plan.question)
+    topics: list[str | None] = list(plan.topics) if plan.topics else []
+
+    anchors = _facet_terms_for_query(query_frame.must_for_direct)
+    should = _facet_terms_for_query(query_frame.should_for_direct)
+    predicates = _facet_terms_for_query(query_frame.predicate_terms)
+    context = _facet_terms_for_query(query_frame.context_facets)
+
+    if anchors:
+        topics.append(" ".join([*anchors, *should[:3]]) if should else " ".join(anchors))
+        if predicates:
+            topics.append(" ".join([*anchors, *predicates[:3]]))
+    if context or should:
+        topics.append(" ".join([*(context[:3]), *(should[:4])]))
+    if not topics:
+        topics.append(None)
+    return _unique_nullable([topic for topic in topics if topic is None or str(topic).strip()])[:6]
+
+
+def _facet_terms_for_query(facets: Iterable[str]) -> list[str]:
+    return [str(facet).replace("_", " ") for facet in sorted(set(facets)) if str(facet).strip()]
 
 
 def _extract_tickers(question: str, companies: Iterable[str]) -> list[str]:
@@ -409,15 +570,25 @@ def _extract_topics(
     return _unique(topics)
 
 
-def _extract_object_types(question_lower: str, *, key_risk_question: bool = False) -> list[str]:
+def _extract_object_types(
+    question_lower: str,
+    *,
+    key_risk_question: bool = False,
+    metric: str | None = None,
+) -> list[str]:
     if key_risk_question:
-        return ["RiskFactor", "Headwind", "ResearchClaim"]
+        return ["BusinessFactor", "ExternalFactorExposure", "ResearchClaim"]
+    if metric:
+        return QUESTION_TYPE_OBJECTS["metric"]
+    question_type = _infer_question_type(question_lower)
+    if question_type in {"risk", "driver", "scenario"}:
+        return QUESTION_TYPE_OBJECTS[question_type]
     mapping = {
         "EvidenceQuote": ("quote", "quotes", "근거", "인용"),
         "ResearchClaim": ("claim", "claims", "주장"),
-        "RiskFactor": ("risk", "리스크"),
-        "GrowthDriver": ("driver", "growth", "성장"),
-        "Headwind": ("headwind", "부담", "역풍"),
+        "BusinessFactor": ("risk", "리스크", "driver", "growth", "성장", "headwind", "부담", "역풍"),
+        "ExternalFactorExposure": ("exposure", "factor", "요인", "노출"),
+        "MetricObservation": ("metric", "metrics", "지표", "숫자"),
         "AssumptionCandidate": ("assumption", "가정"),
     }
     selected = [
@@ -425,7 +596,492 @@ def _extract_object_types(question_lower: str, *, key_risk_question: bool = Fals
         for object_type, aliases in mapping.items()
         if any(alias in question_lower for alias in aliases)
     ]
-    return selected or list(DEFAULT_QUERY_TYPES)
+    if selected:
+        return selected
+    if question_type:
+        return QUESTION_TYPE_OBJECTS[question_type]
+    return list(DEFAULT_QUERY_TYPES)
+
+
+def _infer_question_type(question_lower: str) -> str | None:
+    if any(
+        token in question_lower
+        for token in ("떨어지", "오르", "상승", "하락", "강화", "완화", "영향", "시나리오", "좋은가", "나쁜가")
+    ):
+        return "scenario"
+    if any(token in question_lower for token in ("리스크", "위험", "규제", "소송", "제재", "제한", "risk")):
+        return "risk"
+    if any(token in question_lower for token in ("성장", "수요", "동인", "수혜", "드라이버", "driver")):
+        return "driver"
+    if any(token in question_lower for token in ("이벤트", "일정", "마일스톤", "승인", "가이던스", "event")):
+        return "event"
+    if any(token in question_lower for token in ("바뀐", "변화", "전년", "작년", "비교", "추세", "change")):
+        return "change"
+    if any(token in question_lower for token in ("지표", "매출", "마진", "이익", "현금", "부채", "capex")):
+        return "metric"
+    if any(token in question_lower for token in ("계약", "만기", "covenant", "리스", "채무", "spa")):
+        return "agreement"
+    if any(token in question_lower for token in ("사업", "뭐하는", "비즈니스", "모델")):
+        return "business_model"
+    return None
+
+
+def _promotion_types(question_type: str, object_types: list[str]) -> set[str]:
+    if question_type == "risk":
+        return {"BusinessFactor", "ExternalFactorExposure"}
+    if question_type == "driver":
+        return {"BusinessFactor", "BusinessActivity", "ExternalFactorExposure"}
+    if question_type == "scenario":
+        return {"ExternalFactorExposure", "BusinessFactor", "MetricObservation"}
+    return set(object_types).intersection(
+        {
+            "BusinessFactor",
+            "ExternalFactorExposure",
+            "BusinessActivity",
+            "BusinessEvent",
+            "ChangeEvent",
+            "MetricObservation",
+        }
+    )
+
+
+def _rank_graph_lifted_bundles(
+    bundles: list[dict[str, Any]],
+    *,
+    question_type: str,
+    promoted_ids: set[str],
+) -> list[dict[str, Any]]:
+    if question_type in {"risk", "driver", "scenario"}:
+        return _interleave_evidence_and_semantic(bundles, question_type=question_type)
+
+    best_by_id: dict[str, tuple[float, int, dict[str, Any]]] = {}
+    for index, bundle in enumerate(bundles):
+        bundle_id = bundle.get("id")
+        if not bundle_id:
+            continue
+        score = _bundle_rank_score(
+            bundle,
+            base_rank=index + 1,
+            question_type=question_type,
+            promoted=bundle_id in promoted_ids,
+        )
+        current = best_by_id.get(bundle_id)
+        if current is None or score > current[0]:
+            best_by_id[bundle_id] = (score, index, bundle)
+    return [
+        item[2]
+        for item in sorted(
+            best_by_id.values(),
+            key=lambda entry: (-entry[0], entry[1]),
+        )
+    ]
+
+
+def _interleave_evidence_and_semantic(
+    bundles: list[dict[str, Any]],
+    *,
+    question_type: str,
+) -> list[dict[str, Any]]:
+    unique_bundles = _dedupe_bundles(bundles)
+    semantic_types = _promotion_types(question_type, QUESTION_TYPE_OBJECTS.get(question_type, []))
+    evidence = [bundle for bundle in unique_bundles if bundle.get("type") in {"EvidenceQuote", "ResearchClaim"}]
+    semantic = [
+        bundle
+        for bundle in unique_bundles
+        if bundle.get("type") in semantic_types and bundle.get("type") not in {"EvidenceQuote", "ResearchClaim"}
+    ]
+    other = [
+        bundle
+        for bundle in unique_bundles
+        if bundle not in evidence and bundle not in semantic
+    ]
+    semantic = sorted(
+        semantic,
+        key=lambda bundle: (
+            -_semantic_priority(question_type, bundle),
+            unique_bundles.index(bundle),
+        ),
+    )
+
+    if question_type == "scenario":
+        pattern = [semantic[:1], evidence[:1], semantic[1:3], evidence[1:3], semantic[3:], evidence[3:]]
+    elif question_type == "driver":
+        pattern = [semantic[:1], evidence[:1], semantic[1:3], evidence[1:3], semantic[3:], evidence[3:]]
+    else:
+        pattern = [evidence[:1], semantic[:2], evidence[1:3], semantic[2:], evidence[3:]]
+
+    output: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for group in [*pattern, other]:
+        for bundle in group:
+            bundle_id = bundle.get("id")
+            if not bundle_id or bundle_id in seen:
+                continue
+            seen.add(bundle_id)
+            output.append(bundle)
+    return output
+
+
+def _semantic_priority(question_type: str, bundle: dict[str, Any]) -> float:
+    bundle_type = bundle.get("type")
+    obj = bundle.get("object") or {}
+    if question_type == "scenario":
+        if bundle_type == "ExternalFactorExposure":
+            return 5.0 + (1.0 if obj.get("scenario_effects") else 0.0)
+        if bundle_type == "BusinessFactor":
+            return 3.0
+        if bundle_type == "MetricObservation":
+            return 2.0
+    if question_type == "driver":
+        return {
+            "BusinessActivity": 5.0,
+            "BusinessFactor": 4.0,
+            "ExternalFactorExposure": 2.0,
+        }.get(str(bundle_type), 0.0)
+    if question_type == "risk":
+        return {
+            "BusinessFactor": 5.0,
+            "ExternalFactorExposure": 4.0,
+        }.get(str(bundle_type), 0.0)
+    return 0.0
+
+
+def _bundle_rank_score(
+    bundle: dict[str, Any],
+    *,
+    base_rank: int,
+    question_type: str,
+    promoted: bool,
+) -> float:
+    bundle_type = bundle.get("type")
+    score = 1_000.0 - base_rank
+    if promoted:
+        score += 180.0
+    score += _intent_type_boost(question_type, bundle)
+    evidence = bundle.get("evidence") or {}
+    if evidence.get("quotes"):
+        score += 15.0
+    if evidence.get("claims"):
+        score += 10.0
+    return score
+
+
+def _intent_type_boost(question_type: str, bundle: dict[str, Any]) -> float:
+    bundle_type = bundle.get("type")
+    obj = bundle.get("object") or {}
+    if question_type == "risk":
+        return {
+            "BusinessFactor": 95.0,
+            "ExternalFactorExposure": 90.0,
+            "ResearchClaim": 55.0,
+            "EvidenceQuote": 50.0,
+        }.get(str(bundle_type), 0.0)
+    if question_type == "driver":
+        return {
+            "BusinessFactor": 90.0,
+            "BusinessActivity": 85.0,
+            "ExternalFactorExposure": 60.0,
+            "ResearchClaim": 65.0,
+            "EvidenceQuote": 60.0,
+        }.get(str(bundle_type), 0.0)
+    if question_type == "scenario":
+        boost = {
+            "ExternalFactorExposure": 120.0,
+            "BusinessFactor": 70.0,
+            "ResearchClaim": 55.0,
+            "EvidenceQuote": 50.0,
+            "MetricObservation": 35.0,
+        }.get(str(bundle_type), 0.0)
+        if bundle_type == "ExternalFactorExposure" and obj.get("scenario_effects"):
+            boost += 35.0
+        return boost
+    return 0.0
+
+
+def _annotate_retrieval_answerability(
+    plan: QueryPlan,
+    candidates: Sequence[Mapping[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    query_frame = build_query_frame(plan.question)
+    requires_direct = _question_requires_direct_match(plan.question)
+    annotated: list[dict[str, Any]] = []
+
+    for candidate in candidates:
+        bundle = dict(candidate)
+        match = classify_topic_match(query_frame, build_evidence_frame(_bundle_topic_like(bundle)))
+        trace_status, trace_counts = _bundle_trace_status(bundle)
+        tier = _retrieval_tier(match, trace_status)
+        missing_required = sorted(set(match.get("missing_required_facets", [])) | _missing_sector_facets(query_frame, match))
+        trace_score = 1.0 if trace_status in {"traceable", "traceable_metric_lineage"} else 0.0
+        directness_score = _final_directness_score(match, trace_score)
+        matched_required = sorted(
+            set(match.get("matched_required_facets", []))
+            | set(match.get("matched_core_terms", []))
+            | set(match.get("matched_mechanisms", []))
+            | set(match.get("matched_sectors", []))
+        )
+
+        bundle.update(
+            {
+                "semantic_relevance": match.get("tier", "insufficient"),
+                "trace_status": trace_status,
+                "tier": tier,
+                "evidence_chain_count": trace_counts["evidence_chain_count"],
+                "support_depth": trace_counts["support_depth"],
+                "support_quote_count": trace_counts["support_quote_count"],
+                "support_claim_count": trace_counts["support_claim_count"],
+                "directness_score": directness_score,
+                "anchor_score": match.get("anchor_score", 0.0),
+                "predicate_score": match.get("predicate_score", 0.0),
+                "channel_score": match.get("channel_score", 0.0),
+                "trace_score": trace_score,
+                "specificity_score": match.get("specificity_score", 0.0),
+                "generic_penalty": match.get("generic_penalty", 0.0),
+                "matched_required_facets": matched_required,
+                "matched_channel_facets": match.get("matched_channel_facets", []),
+                "matched_predicates": match.get("matched_predicates", []),
+                "missing_required_facets": missing_required,
+                "why_tier": _retrieval_why_tier(tier, match, missing_required, requires_direct),
+            }
+        )
+        annotated.append(bundle)
+
+    if requires_direct or query_frame.must_for_direct:
+        annotated.sort(key=_direct_answer_rank)
+
+    direct_answerable = any(item.get("tier") == "traceable_direct" for item in annotated)
+    related_context_available = any(
+        item.get("tier")
+        in {
+            "traceable_related",
+            "broad_related_candidate",
+            "untraced_related",
+            "untraced_direct_candidate",
+        }
+        for item in annotated
+    )
+
+    negative_answer_supported = bool(requires_direct and not direct_answerable and annotated)
+    answer_mode = _recommended_answer_mode(
+        direct_answerable=direct_answerable,
+        related_context_available=related_context_available,
+        negative_answer_supported=negative_answer_supported,
+        has_candidates=bool(annotated),
+    )
+
+    return annotated, {
+        "direct_answerable": bool(direct_answerable),
+        "related_context_available": bool(related_context_available),
+        "negative_answer_supported": bool(negative_answer_supported),
+        "needs_user_clarification": False,
+        "recommended_answer_mode": answer_mode,
+        "question_requires_direct_match": bool(requires_direct),
+        "query_frame": {
+            "query_type": query_frame.query_type,
+            "must_for_direct": sorted(query_frame.must_for_direct),
+            "should_for_direct": sorted(query_frame.should_for_direct),
+            "context_facets": sorted(query_frame.context_facets),
+            "predicate_terms": sorted(query_frame.predicate_terms),
+            "core_domain_terms": sorted(query_frame.core_domain_terms),
+            "sector_terms": sorted(query_frame.sector_terms),
+            "mechanism_terms": sorted(query_frame.mechanism_terms),
+            "impact_channels": sorted(query_frame.impact_channels),
+            "required_for_direct": sorted(query_frame.required_for_direct),
+        },
+    }
+
+
+def _split_retrieval_context(candidates: Sequence[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    direct_evidence: list[dict[str, Any]] = []
+    related_context: list[dict[str, Any]] = []
+    rejected_context: list[dict[str, Any]] = []
+
+    for candidate in candidates:
+        tier = candidate.get("tier")
+        if tier == "traceable_direct":
+            direct_evidence.append(candidate)
+        elif tier == "not_answerable":
+            rejected_context.append(candidate)
+        else:
+            related_context.append(candidate)
+
+    return {
+        "direct_evidence": direct_evidence,
+        "related_context": related_context,
+        "rejected_context": rejected_context,
+    }
+
+
+def _bundle_topic_like(bundle: Mapping[str, Any]) -> Mapping[str, Any]:
+    obj = bundle.get("object") if isinstance(bundle.get("object"), Mapping) else {}
+    evidence = bundle.get("evidence") if isinstance(bundle.get("evidence"), Mapping) else {}
+    quality = bundle.get("quality") if isinstance(bundle.get("quality"), Mapping) else {}
+    primary_parts = [str(bundle.get("text") or ""), str(obj.get("text") or ""), str(obj.get("topic") or "")]
+    evidence_parts: list[str] = []
+    impact_channels: list[str] = []
+
+    for key in ("external_factor", "factor", "metric", "metric_name", "impact", "impact_channel", "channel"):
+        value = obj.get(key)
+        if value:
+            primary_parts.append(str(value))
+            impact_channels.append(str(value))
+
+    for key in ("claims", "quotes", "spans"):
+        values = evidence.get(key)
+        if isinstance(values, Sequence) and not isinstance(values, (str, bytes)):
+            for value in values:
+                if isinstance(value, Mapping):
+                    evidence_parts.append(str(value.get("text") or value.get("claim_text") or value.get("quote") or ""))
+
+    primary_text = " ".join(part for part in primary_parts if part).strip()
+    evidence_text = " ".join(part for part in evidence_parts if part).strip()
+    topic_text = " ".join(part for part in (primary_text, evidence_text) if part).strip()
+    return {
+        "topic_id": f"retrieve:{bundle.get('id')}",
+        "topic_label": topic_text[:240],
+        "topic_summary": topic_text,
+        "topic_text": topic_text,
+        "facet_text": " ".join(impact_channels),
+        "impact_channels": impact_channels,
+        "primary_object_id": bundle.get("id"),
+        "primary_object_type": bundle.get("type"),
+        "ticker": bundle.get("ticker"),
+        "evidence_strength": quality.get("evidence_grade") or obj.get("evidence_strength") or obj.get("evidence_grade"),
+        "support_quote_count": len(evidence.get("quotes") or []),
+        "support_claim_count": len(evidence.get("claims") or []),
+        "specificity_score": obj.get("specificity_score") or 0.5,
+    }
+
+
+def _bundle_trace_status(bundle: Mapping[str, Any]) -> tuple[str, dict[str, int | None]]:
+    evidence = bundle.get("evidence") if isinstance(bundle.get("evidence"), Mapping) else {}
+    obj = bundle.get("object") if isinstance(bundle.get("object"), Mapping) else {}
+    quote_count = len(evidence.get("quotes") or [])
+    claim_count = len(evidence.get("claims") or [])
+    span_count = len(evidence.get("spans") or [])
+    chain_count = quote_count + claim_count + span_count
+    support_depth = 1 if chain_count else None
+    trace_status = "traceable" if chain_count else "untraced"
+
+    if bundle.get("type") == "MetricObservation" and not chain_count:
+        lineage_fields = ("source_fact_ids", "source_metric_ids", "calculation_id", "calculation_ids")
+        if any(obj.get(field) for field in lineage_fields):
+            trace_status = "traceable_metric_lineage"
+            chain_count = 1
+            support_depth = 1
+
+    return trace_status, {
+        "evidence_chain_count": chain_count,
+        "support_depth": support_depth,
+        "support_quote_count": quote_count,
+        "support_claim_count": claim_count,
+    }
+
+
+def _retrieval_tier(match: Mapping[str, Any], trace_status: str) -> str:
+    semantic = str(match.get("tier") or "insufficient")
+    traceable = trace_status in {"traceable", "traceable_metric_lineage"}
+    if semantic == "direct":
+        return "traceable_direct" if traceable else "untraced_direct_candidate"
+    if semantic in {"strong_related", "related"}:
+        return "traceable_related" if traceable else "untraced_related"
+    if traceable:
+        return "broad_related_candidate"
+    return "not_answerable"
+
+
+def _final_directness_score(match: Mapping[str, Any], trace_score: float) -> float:
+    score = (
+        0.35 * float(match.get("anchor_score") or 0.0)
+        + 0.20 * float(match.get("predicate_score") or 0.0)
+        + 0.15 * float(match.get("channel_score") or 0.0)
+        + 0.20 * trace_score
+        + 0.10 * float(match.get("specificity_score") or 0.0)
+        - float(match.get("generic_penalty") or 0.0)
+    )
+    return round(max(0.0, min(1.0, score)), 4)
+
+
+def _direct_answer_rank(bundle: Mapping[str, Any]) -> tuple[int, int, int]:
+    tier_order = {
+        "traceable_direct": 0,
+        "untraced_direct_candidate": 1,
+        "traceable_related": 2,
+        "broad_related_candidate": 3,
+        "untraced_related": 4,
+        "not_answerable": 5,
+    }
+    return (
+        tier_order.get(str(bundle.get("tier")), 9),
+        -int(float(bundle.get("directness_score") or 0.0) * 1000),
+        int(bundle.get("support_depth") or 99),
+    )
+
+
+def _retrieval_why_tier(
+    tier: str,
+    match: Mapping[str, Any],
+    missing_required: Sequence[str],
+    requires_direct: bool,
+) -> str:
+    if tier == "traceable_direct":
+        return "Question premise and evidence premise match directly, with traceable support."
+    if tier == "untraced_direct_candidate":
+        return "Question premise appears to match directly, but no explicit evidence chain was found."
+    if tier == "traceable_related":
+        return "Evidence is traceable and related, but it is broader or less specific than the question premise."
+    if tier == "broad_related_candidate":
+        if missing_required:
+            return (
+                "Retrieved evidence is traceable but does not match required direct facets: "
+                + ", ".join(missing_required)
+                + "."
+            )
+        if requires_direct:
+            return "Retrieved evidence is traceable, but it does not support a direct exposure answer."
+        return "Retrieved evidence is traceable but only broadly related."
+    if match.get("generic_only"):
+        return "Only generic retrieval terms matched; this is not sufficient evidence."
+    return "No sufficient direct or related evidence classification was found."
+
+
+def _missing_sector_facets(query_frame: Any, match: Mapping[str, Any]) -> set[str]:
+    sector_terms = set(getattr(query_frame, "sector_terms", set()) or set())
+    matched_sectors = set(match.get("matched_sectors", []) or [])
+    return sector_terms - matched_sectors
+
+
+def _question_requires_direct_match(question: str) -> bool:
+    lowered = question.lower()
+    direct_markers = (
+        "직접",
+        "direct",
+        "directly",
+        "노출",
+        "exposure",
+        "exposed",
+    )
+    return any(marker in lowered for marker in direct_markers)
+
+
+def _recommended_answer_mode(
+    *,
+    direct_answerable: bool,
+    related_context_available: bool,
+    negative_answer_supported: bool,
+    has_candidates: bool,
+) -> str:
+    if direct_answerable:
+        return "direct_evidence"
+    if negative_answer_supported and related_context_available:
+        return "no_direct_evidence_with_related_context"
+    if negative_answer_supported:
+        return "no_direct_evidence"
+    if related_context_available:
+        return "related_context"
+    if has_candidates:
+        return "retrieved_but_not_answerable"
+    return "not_answerable"
 
 
 def _clean_question_topic(question: str) -> str:
@@ -493,5 +1149,17 @@ def _unique(values: Iterable[str]) -> list[str]:
         if value in seen:
             continue
         seen.add(value)
+        output.append(value)
+    return output
+
+
+def _unique_nullable(values: Iterable[str | None]) -> list[str | None]:
+    seen = set()
+    output: list[str | None] = []
+    for value in values:
+        key = value if value is None else str(value)
+        if key in seen:
+            continue
+        seen.add(key)
         output.append(value)
     return output

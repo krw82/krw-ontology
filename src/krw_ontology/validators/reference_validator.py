@@ -64,6 +64,42 @@ def validate_references(
         if qid and qid not in all_objects:
             dangling.append(("source_quote_id", qid))
 
+    if obj_type == "SourceLocation":
+        for field in ("source_span_id", "source_table_id", "source_table_cell_id"):
+            ref_id = obj.get(field)
+            if ref_id and ref_id not in all_objects:
+                dangling.append((field, ref_id))
+
+    if obj_type == "SourceTableCell":
+        ref_id = obj.get("source_table_id")
+        if ref_id and ref_id not in all_objects:
+            dangling.append(("source_table_id", ref_id))
+
+    if obj_type == "EntityMention":
+        for field in ("canonical_entity_id", "source_object_id"):
+            ref_id = obj.get(field)
+            if ref_id and ref_id not in all_objects:
+                dangling.append((field, ref_id))
+
+    if obj_type == "MetricObservation":
+        for ref_id in obj.get("source_fact_ids") or []:
+            if ref_id not in all_objects:
+                dangling.append(("source_fact_ids", ref_id))
+        for ref_id in obj.get("source_metric_ids") or []:
+            if ref_id not in all_objects:
+                dangling.append(("source_metric_ids", ref_id))
+        calc_id = obj.get("calculation_id")
+        if calc_id and calc_id not in all_objects:
+            dangling.append(("calculation_id", calc_id))
+
+    if obj_type == "Calculation":
+        for ref_id in obj.get("input_metric_ids") or []:
+            if ref_id not in all_objects:
+                dangling.append(("input_metric_ids", ref_id))
+        output_id = obj.get("output_metric_id")
+        if output_id and output_id not in all_objects:
+            dangling.append(("output_metric_id", output_id))
+
     # CalculatedNumericSupport: every calculation input must exist
     if obj_type == "CalculatedNumericSupport":
         for input_id in obj.get("input_object_ids") or []:
@@ -91,6 +127,21 @@ def validate_references(
             if exposure_id not in all_objects:
                 dangling.append(("key_exposures", exposure_id))
 
+    if obj_type in ("BusinessFactor", "AgreementTerm", "BusinessEvent"):
+        for field in (
+            "related_activity_ids",
+            "related_entity_ids",
+            "party_entity_ids",
+            "supported_by_claims",
+            "supported_by_quotes",
+        ):
+            for ref_id in obj.get(field) or []:
+                if ref_id not in all_objects:
+                    dangling.append((field, ref_id))
+        authority_id = obj.get("authority_entity_id")
+        if authority_id and authority_id not in all_objects:
+            dangling.append(("authority_entity_id", authority_id))
+
     if obj_type == "TemporalLink":
         for field in ("from_object_id", "to_object_id"):
             ref_id = obj.get(field)
@@ -116,6 +167,15 @@ def validate_references(
 
     # Edge: from_id and to_id must exist
     if obj_type == "Edge":
+        fid = obj.get("from_id")
+        tid = obj.get("to_id")
+        if fid and fid not in all_objects:
+            dangling.append(("from_id", fid))
+        if tid and tid not in all_objects:
+            dangling.append(("to_id", tid))
+
+    # SupportLink: evidence source and supported target must exist
+    if obj_type == "SupportLink":
         fid = obj.get("from_id")
         tid = obj.get("to_id")
         if fid and fid not in all_objects:

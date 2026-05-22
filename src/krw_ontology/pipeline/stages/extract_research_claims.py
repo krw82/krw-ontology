@@ -25,6 +25,7 @@ from krw_ontology.pipeline.reference_aliases import alias_objects, resolve_refer
 from krw_ontology.schema.id_utils import generate_scoped_id
 from krw_ontology.schema.objects import SCHEMA_VERSION
 from krw_ontology.utils.io import find_project_root, read_jsonl, write_jsonl
+from krw_ontology.validators.metric_validator import _load_metric_dictionary
 
 logger = logging.getLogger("krw_ontology")
 
@@ -574,13 +575,11 @@ def _list_strings(value) -> list[str]:
 def _load_metrics_list(ontology_dir: Path) -> str:
     """Load canonical metric names from the YAML schema."""
     try:
-        import yaml
         project_root = find_project_root(ontology_dir)
         metric_path = project_root / "ontology" / "schema" / "metric_dictionary.yaml"
-        if metric_path.exists():
-            with open(metric_path) as f:
-                data = yaml.safe_load(f) or {}
-            metrics = list(data.get("canonical_metrics", {}).keys())
+        data = _load_metric_dictionary(metric_path)
+        metrics = list(data.get("canonical_metrics", {}).keys())
+        if metrics:
             return ", ".join(metrics)
     except Exception:
         pass

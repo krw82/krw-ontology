@@ -820,13 +820,12 @@ def _queue_emit(store: PipelineQueue, job: QueueJob, message: str) -> None:
     store.append_job_log(job.job_id, line)
 
 
-def _queue_publish_or_reindex(
+def _queue_publish_and_defer_index(
     *,
     store: PipelineQueue,
     job: QueueJob,
     output_root: Path,
-    build_agent_index,
-) -> Path | None:
+) -> tuple[Path, Path | None] | None:
     if job.publish_root:
         stable_root = resolve_ontology_root(Path(job.publish_root), fallback_to_cwd=False)
         stable_root.mkdir(parents=True, exist_ok=True)
@@ -834,38 +833,53 @@ def _queue_publish_or_reindex(
         _queue_emit(store, job, f"Publishing {job.ticker} to stable root {stable_root}")
         with FileProcessLock(PipelineQueue(stable_root).publish_lock_path):
             _publish_ticker_tree(output_root, stable_root, job.ticker)
-            index_result = build_agent_index(
-                stable_root,
-                index_path=publish_index_path,
-                force=True,
-            )
-        totals = index_result["totals"]
         _queue_emit(
             store,
             job,
-            "Stable index built: "
+            f"Published {job.ticker} to stable root; stable index rebuild deferred until batch completion",
+        )
+        return stable_root, publish_index_path
+
+    _queue_emit(
+        store,
+        job,
+        "No publish root configured; staging agent index rebuild deferred until batch completion",
+    )
+    return output_root, None
+
+
+def _queue_rebuild_pending_indexes(
+    *,
+    rebuild_targets: dict[str, tuple[Path, Path | None]],
+    publish_prod: bool,
+    build_agent_index,
+) -> None:
+    if not rebuild_targets:
+        return
+    typer.echo(f"[{_now_label()}] Rebuilding {len(rebuild_targets)} pending queue index root(s)")
+    for root, index_path in list(rebuild_targets.values()):
+        typer.echo(f"[{_now_label()}] Rebuilding agent index root={root}")
+        with FileProcessLock(PipelineQueue(root).publish_lock_path):
+            index_result = build_agent_index(root, index_path=index_path, force=True)
+        totals = index_result["totals"]
+        typer.echo(
+            f"[{_now_label()}] Agent index built: "
             f"{index_result['index_path']} "
             f"documents={totals['documents']} "
             f"objects={totals['objects']} "
             f"edges={totals['edges']} "
-            f"quality_events={totals['quality_events']}",
+            f"quality_events={totals['quality_events']}"
         )
-        return stable_root
-
-    _queue_emit(store, job, "No publish root configured; rebuilding staging agent index")
-    index_result = build_agent_index(output_root, force=True)
-    totals = index_result["totals"]
-    _queue_emit(
-        store,
-        job,
-        "Staging index built: "
-        f"{index_result['index_path']} "
-        f"documents={totals['documents']} "
-        f"objects={totals['objects']} "
-        f"edges={totals['edges']} "
-        f"quality_events={totals['quality_events']}",
-    )
-    return None
+        if publish_prod:
+            typer.echo(f"[{_now_label()}] Publishing stable root to prod from {root}")
+            prod_result = _publish_prod_root(stable_root=root)
+            typer.echo(
+                f"[{_now_label()}] Prod release activated: "
+                f"release={prod_result['release_id']} "
+                f"host={prod_result['host']} "
+                f"remote_root={prod_result['remote_root']}"
+            )
+    rebuild_targets.clear()
 
 
 def _queue_build_company_context(
@@ -891,8 +905,7 @@ def _process_queue_job(
     output_root: Path,
     *,
     publish_prod: bool = False,
-) -> None:
-    from krw_ontology.agent_index import build_agent_index
+) -> tuple[Path, Path | None] | None:
     from krw_ontology.config.settings import PipelineConfig
     from krw_ontology.pipeline.orchestrator import run_pipeline
     from krw_ontology.pipeline.research_plan import discover_research_filing_targets
@@ -900,6 +913,7 @@ def _process_queue_job(
 
     job = store.mark_running(job)
     _queue_emit(store, job, f"START job={job.job_id} type={job.job_type} ticker={job.ticker}")
+    rebuild_target: tuple[Path, Path | None] | None = None
     try:
         if publish_prod and not job.publish_root:
             raise ValueError(
@@ -949,32 +963,19 @@ def _process_queue_job(
             output_root=output_root,
             build_company_context=build_company_context,
         )
-        published_root = _queue_publish_or_reindex(
+        rebuild_target = _queue_publish_and_defer_index(
             store=store,
             job=job,
             output_root=output_root,
-            build_agent_index=build_agent_index,
         )
-        if publish_prod:
-            if published_root is None:
-                raise RuntimeError("Prod publish requires a stable publish root for the queue job.")
-            _queue_emit(store, job, f"Publishing stable root to prod from {published_root}")
-            prod_result = _publish_prod_root(stable_root=published_root)
-            _queue_emit(
-                store,
-                job,
-                "Prod release activated: "
-                f"release={prod_result['release_id']} "
-                f"host={prod_result['host']} "
-                f"remote_root={prod_result['remote_root']}",
-            )
     except Exception as exc:
         store.mark_failed(job, str(exc))
         _queue_emit(store, job, f"FAILED job={job.job_id} ticker={job.ticker}: {exc}")
-        return
+        return None
 
     store.mark_succeeded(job)
     _queue_emit(store, job, f"SUCCEEDED job={job.job_id} ticker={job.ticker}")
+    return rebuild_target
 
 
 @queue_app.command(
@@ -1198,8 +1199,8 @@ def queue_run_cmd(
         False,
         "--publish-prod/--no-publish-prod",
         help=(
-            "After each successful ticker publish/index, upload the stable root to prod "
-            "and atomically activate a release."
+            "After the queue batch publish and one agent-index rebuild, upload the stable root "
+            "to prod and atomically activate a release."
         ),
     ),
 ) -> None:
@@ -1208,6 +1209,7 @@ def queue_run_cmd(
     output_root.mkdir(parents=True, exist_ok=True)
     store = PipelineQueue(output_root)
     store.ensure_dirs()
+    from krw_ontology.agent_index import build_agent_index
 
     try:
         with FileProcessLock(store.worker_lock_path):
@@ -1215,21 +1217,39 @@ def queue_run_cmd(
             store.write_worker_pid(os.getpid())
             typer.echo(f"[{_now_label()}] Queue worker started root={output_root}")
             processed = 0
+            pending_rebuild_targets: dict[str, tuple[Path, Path | None]] = {}
             while True:
                 if store.stop_requested():
+                    _queue_rebuild_pending_indexes(
+                        rebuild_targets=pending_rebuild_targets,
+                        publish_prod=publish_prod,
+                        build_agent_index=build_agent_index,
+                    )
                     typer.echo(f"[{_now_label()}] Stop requested; worker exiting")
                     break
                 job = store.next_pending_job()
                 if job is None:
+                    _queue_rebuild_pending_indexes(
+                        rebuild_targets=pending_rebuild_targets,
+                        publish_prod=publish_prod,
+                        build_agent_index=build_agent_index,
+                    )
                     if not watch:
                         typer.echo(f"[{_now_label()}] Queue drained")
                         break
                     time.sleep(poll_interval)
                     continue
 
-                _process_queue_job(store, job, output_root, publish_prod=publish_prod)
+                rebuild_target = _process_queue_job(store, job, output_root, publish_prod=publish_prod)
+                if rebuild_target is not None:
+                    pending_rebuild_targets[str(rebuild_target[0])] = rebuild_target
                 processed += 1
                 if max_jobs is not None and processed >= max_jobs:
+                    _queue_rebuild_pending_indexes(
+                        rebuild_targets=pending_rebuild_targets,
+                        publish_prod=publish_prod,
+                        build_agent_index=build_agent_index,
+                    )
                     typer.echo(f"[{_now_label()}] Reached --max-jobs={max_jobs}")
                     break
     except LockHeldError as exc:
@@ -1268,8 +1288,7 @@ def queue_start_cmd(
         False,
         "--publish-prod/--no-publish-prod",
         help=(
-            "Start the worker in mode that publishes prod after each successful ticker "
-            "stable publish/index."
+            "Start the worker in mode that publishes prod after batch stable publish/index rebuild."
         ),
     ),
 ) -> None:
@@ -2642,7 +2661,42 @@ def _publish_ticker_tree(source_root: Path, stable_root: Path, ticker: str) -> N
     target_dir = stable_root / "companies" / ticker
     if not source_dir.exists() or not source_dir.is_dir():
         raise FileNotFoundError(f"Source ticker directory not found: {source_dir}")
+    _assert_company_context_publishable(source_root, ticker)
     _replace_tree(source_dir, target_dir)
+
+
+def _assert_company_context_publishable(source_root: Path, ticker: str) -> None:
+    context_index_path = source_root / "companies" / ticker / "context" / "artifact_index.json"
+    if not context_index_path.exists():
+        raise RuntimeError(f"Publish blocked for {ticker}: missing company context artifact index")
+
+    artifact_index = json.loads(context_index_path.read_text())
+    counts = artifact_index.get("counts") or {}
+    required_positive = {
+        "company_business_profiles": "company profile was not generated",
+        "temporal_links": "cross-period temporal links were not generated",
+        "trend_observations": "trend observations were not generated",
+        "change_events": "change events were not generated",
+        "edges": "company context graph edges were not generated",
+    }
+    required_zero = {
+        "quality_events": "company context quality warnings are present",
+        "rejected_objects": "company context rejected objects are present",
+    }
+
+    failures: list[str] = []
+    for key, reason in required_positive.items():
+        value = int(counts.get(key) or 0)
+        if value <= 0:
+            failures.append(f"{key}={value} ({reason})")
+    for key, reason in required_zero.items():
+        value = int(counts.get(key) or 0)
+        if value > 0:
+            failures.append(f"{key}={value} ({reason})")
+
+    if failures:
+        detail = "; ".join(failures)
+        raise RuntimeError(f"Publish blocked for {ticker}: unhealthy company context counts: {detail}")
 
 
 def _replace_tree(source_dir: Path, target_dir: Path) -> None:

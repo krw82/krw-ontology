@@ -179,8 +179,12 @@ class AgentRetriever:
         periods: Iterable[str] | None = None,
         include_rejected: bool | None = None,
         limit: int | None = None,
+        include_evidence_bundle: bool = True,
     ) -> dict[str, Any]:
         """Plan and execute an agent-safe retrieval request."""
+        import time
+
+        started_at = time.perf_counter()
         plan = self.plan(
             question,
             tickers=tickers,
@@ -213,6 +217,7 @@ class AgentRetriever:
                 "rejected_context": [],
                 "quality": quality,
                 "audit": {"executed_queries": executed_queries},
+                "timing_ms": {"total": round((time.perf_counter() - started_at) * 1000, 3)},
             }
 
         if plan.intent == "compare":
@@ -236,7 +241,11 @@ class AgentRetriever:
                 "rejected_context": [],
                 "compare": result,
                 "audit": {"executed_queries": executed_queries},
+                "timing_ms": {"total": round((time.perf_counter() - started_at) * 1000, 3)},
             }
+
+        if not include_evidence_bundle:
+            return self._retrieve_compact(plan, resolved_periods, executed_queries, started_at)
 
         candidates = self._execute_search(plan, resolved_periods, executed_queries)
         candidates = self._apply_graph_lift(candidates, plan)
@@ -254,6 +263,7 @@ class AgentRetriever:
             "resolved_periods": resolved_periods,
             **retrieval_context,
             "audit": {"executed_queries": executed_queries},
+            "timing_ms": {"total": round((time.perf_counter() - started_at) * 1000, 3)},
         }
 
     def catalog(self) -> dict[str, Any]:
@@ -286,6 +296,129 @@ class AgentRetriever:
             executed_queries.append(query)
             candidates.extend(self.store.query(**query))
         return candidates
+
+    def _retrieve_compact(
+        self,
+        plan: QueryPlan,
+        resolved_periods: list[str],
+        executed_queries: list[dict[str, Any]],
+        started_at: float,
+    ) -> dict[str, Any]:
+        """Return answerability and compact trace candidates without eager bundles."""
+        import time
+
+        query_context_started = time.perf_counter()
+        limit_results = max(1, min(plan.limit, 10))
+        context = self.store.query_context(
+            question=plan.question,
+            tickers=plan.tickers or None,
+            document_types=plan.document_types or None,
+            periods=resolved_periods or None,
+            limit_results=limit_results,
+            limit_tickers=max(len(plan.tickers), 1) if plan.tickers else min(limit_results, 10),
+            include_internal_ids=True,
+        )
+        query_context_ms = round((time.perf_counter() - query_context_started) * 1000, 3)
+        fallback_ms = 0.0
+        executed_queries.append(
+            {
+                "tool": "query_context",
+                "question": plan.question,
+                "tickers": plan.tickers or None,
+                "document_types": plan.document_types or None,
+                "periods": resolved_periods or None,
+                "object_types": plan.object_types or None,
+                "limit_results": limit_results,
+                "include_internal_ids": True,
+            }
+        )
+
+        raw_candidates = _compact_candidates_from_query_context(context, limit=plan.limit)
+        if raw_candidates:
+            candidates, answerability = _annotate_retrieval_answerability(plan, raw_candidates)
+            candidates = _restore_compact_trace_metadata(candidates, raw_candidates)
+        else:
+            fallback_started = time.perf_counter()
+            fallback_bundles = self._compact_bundle_fallback(plan, resolved_periods, executed_queries)
+            fallback_ms = round((time.perf_counter() - fallback_started) * 1000, 3)
+            if fallback_bundles:
+                candidates, answerability = _annotate_retrieval_answerability(plan, fallback_bundles[: plan.limit])
+            else:
+                candidates = []
+                answerability = dict(context.get("answerability") or {})
+        retrieval_context = _split_retrieval_context(candidates)
+        if not answerability:
+            has_candidates = bool(candidates)
+            answerability = {
+                "direct_answerable": any(item.get("tier") == "traceable_direct" for item in candidates),
+                "related_context_available": has_candidates,
+                "negative_answer_supported": False,
+                "needs_user_clarification": False,
+                "recommended_answer_mode": "direct_answer" if has_candidates else "not_answerable",
+            }
+
+        recommended_trace_object_ids = _recommended_trace_object_ids_from_context(context, candidates)
+        trace_required = _compact_retrieve_trace_required(plan, answerability)
+        elapsed_since_query_context_start = (time.perf_counter() - query_context_started) * 1000
+        timing_ms = {
+            "query_context": query_context_ms,
+            "bundle_fallback": fallback_ms,
+            "candidate_formatting": round(
+                max(0.0, elapsed_since_query_context_start - query_context_ms - fallback_ms),
+                3,
+            ),
+            "total": round((time.perf_counter() - started_at) * 1000, 3),
+        }
+
+        return {
+            "answerability": answerability,
+            "recommended_answer_mode": answerability.get("recommended_answer_mode"),
+            "query_frame": answerability.get("query_frame") or context.get("query_frame") or {},
+            "plan": plan.to_dict(),
+            "resolved_periods": resolved_periods,
+            **retrieval_context,
+            "recommended_trace_object_ids": recommended_trace_object_ids,
+            "trace_required": trace_required,
+            "trace_policy": {
+                "mode": "lazy",
+                "reason": "compact_retrieve_returns_trace_candidates_without_eager_evidence_bundles",
+                "max_recommended_trace_objects": 3,
+            },
+            "search_diagnostics": context.get("search_diagnostics"),
+            "audit": {
+                "executed_queries": executed_queries,
+                "compact_retrieve": True,
+                "evidence_bundle_included": False,
+            },
+            "timing_ms": timing_ms,
+        }
+
+    def _compact_bundle_fallback(
+        self,
+        plan: QueryPlan,
+        resolved_periods: list[str],
+        executed_queries: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Small capped bundle fallback when company-topic query_context is empty."""
+        topics = _compact_fallback_topics(plan)
+        candidates: list[dict[str, Any]] = []
+        per_topic_limit = max(1, min(plan.limit, 3))
+        for topic in topics[:2]:
+            query = {
+                "topic": topic,
+                "tickers": plan.tickers or None,
+                "document_types": plan.document_types or None,
+                "periods": resolved_periods or None,
+                "object_types": None,
+                "include_rejected": plan.include_rejected,
+                "limit": per_topic_limit,
+                "compact_fallback": True,
+            }
+            executed_queries.append(query)
+            candidates.extend(self.store.query(**{key: value for key, value in query.items() if key != "compact_fallback"}))
+            if len(candidates) >= plan.limit:
+                break
+        return _dedupe_bundles(candidates)[: plan.limit]
 
     def _apply_graph_lift(
         self,
@@ -910,6 +1043,260 @@ def _split_retrieval_context(candidates: Sequence[dict[str, Any]]) -> dict[str, 
         "related_context": related_context,
         "rejected_context": rejected_context,
     }
+
+
+def _compact_candidates_from_query_context(context: Mapping[str, Any], *, limit: int) -> list[dict[str, Any]]:
+    """Flatten query_context topic candidates into retrieve-compatible compact rows."""
+    candidates: list[dict[str, Any]] = []
+    for ticker_candidate in context.get("ticker_candidates") or []:
+        matched_topics = ticker_candidate.get("matched_topics") or []
+        if not matched_topics:
+            candidate = _compact_candidate_from_topic(ticker_candidate, ticker_candidate=ticker_candidate)
+            if candidate:
+                candidates.append(candidate)
+            continue
+        for topic in matched_topics:
+            candidate = _compact_candidate_from_topic(topic, ticker_candidate=ticker_candidate)
+            if candidate:
+                candidates.append(candidate)
+
+    if not candidates:
+        for ticker, items in (context.get("results_by_ticker") or {}).items():
+            for item in items or []:
+                enriched = dict(item)
+                enriched.setdefault("ticker", ticker)
+                candidate = _compact_candidate_from_topic(enriched, ticker_candidate=enriched)
+                if candidate:
+                    candidates.append(candidate)
+
+    return _dedupe_compact_candidates(candidates)[:limit]
+
+
+def _compact_fallback_topics(plan: QueryPlan) -> list[str]:
+    topics = [str(topic).strip() for topic in plan.topics if str(topic).strip()]
+    if topics:
+        return topics
+    return [plan.question]
+
+
+def _compact_candidate_from_topic(
+    topic: Mapping[str, Any],
+    *,
+    ticker_candidate: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    source_object_ids = _coerce_id_list(topic.get("source_object_ids"))
+    top_traceable_object_ids = _coerce_id_list(topic.get("top_traceable_object_ids"))
+    object_id = (
+        topic.get("primary_object_id")
+        or topic.get("object_id")
+        or (top_traceable_object_ids[0] if top_traceable_object_ids else None)
+        or (source_object_ids[0] if source_object_ids else None)
+        or topic.get("topic_id")
+        or ticker_candidate.get("object_id")
+    )
+    if not object_id:
+        return None
+
+    label = str(topic.get("topic_label") or topic.get("label") or topic.get("title") or "").strip()
+    summary = str(
+        topic.get("topic_summary")
+        or topic.get("summary")
+        or topic.get("compact_text")
+        or topic.get("text")
+        or label
+    ).strip()
+    if not summary:
+        summary = str(object_id)
+
+    trace_status = (
+        topic.get("trace_status")
+        or ticker_candidate.get("trace_status")
+        or ("traceable" if top_traceable_object_ids else "untraced")
+    )
+    tier = topic.get("tier") or ticker_candidate.get("tier")
+    if not tier:
+        tier = "traceable_related" if trace_status in {"traceable", "traceable_metric_lineage"} else "broad_related_candidate"
+
+    object_type = (
+        topic.get("primary_object_type")
+        or topic.get("object_type")
+        or topic.get("type")
+        or ticker_candidate.get("object_type")
+        or ticker_candidate.get("type")
+        or "CompanyTopic"
+    )
+    ticker = topic.get("ticker") or ticker_candidate.get("ticker")
+    candidate = {
+        "id": str(object_id),
+        "object_id": str(object_id),
+        "type": object_type,
+        "object_type": object_type,
+        "ticker": ticker,
+        "period": topic.get("period") or ticker_candidate.get("period"),
+        "document_type": topic.get("document_type") or topic.get("filing_type") or ticker_candidate.get("document_type"),
+        "title": label or summary,
+        "text": summary,
+        "summary": summary,
+        "topic_id": topic.get("topic_id"),
+        "topic_label": label,
+        "semantic_relevance": topic.get("semantic_relevance") or ticker_candidate.get("semantic_relevance"),
+        "trace_status": trace_status,
+        "tier": tier,
+        "why_tier": topic.get("why_tier") or ticker_candidate.get("why_tier"),
+        "evidence_chain_count": _coerce_int(
+            topic.get("evidence_chain_count") or ticker_candidate.get("evidence_chain_count")
+        ),
+        "support_depth": _coerce_int(topic.get("support_depth") or ticker_candidate.get("support_depth")),
+        "support_quote_count": _coerce_int(
+            topic.get("support_quote_count") or ticker_candidate.get("support_quote_count")
+        ),
+        "support_claim_count": _coerce_int(
+            topic.get("support_claim_count") or ticker_candidate.get("support_claim_count")
+        ),
+        "matched_required_facets": topic.get("matched_required_facets")
+        or ticker_candidate.get("matched_required_facets")
+        or [],
+        "missing_required_facets": topic.get("missing_required_facets")
+        or ticker_candidate.get("missing_required_facets")
+        or [],
+        "matched_related_facets": topic.get("matched_related_facets")
+        or ticker_candidate.get("matched_related_facets")
+        or [],
+        "source_object_ids": source_object_ids,
+        "top_traceable_object_ids": top_traceable_object_ids,
+        "internal_only_fields": ["object_id", "topic_id", "source_object_ids", "top_traceable_object_ids"],
+        "compact_only": True,
+    }
+    return candidate
+
+
+def _coerce_id_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return []
+        if stripped.startswith("["):
+            import json
+
+            try:
+                parsed = json.loads(stripped)
+            except json.JSONDecodeError:
+                return [stripped]
+            return [str(item) for item in parsed if item]
+        return [stripped]
+    if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
+        return [str(item) for item in value if item]
+    return [str(value)]
+
+
+def _coerce_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _dedupe_compact_candidates(candidates: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    deduped: list[dict[str, Any]] = []
+    for candidate in candidates:
+        candidate_id = str(candidate.get("id") or candidate.get("object_id") or "")
+        if not candidate_id or candidate_id in seen:
+            continue
+        seen.add(candidate_id)
+        deduped.append(candidate)
+    return deduped
+
+
+def _restore_compact_trace_metadata(
+    annotated: Sequence[dict[str, Any]],
+    raw_candidates: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    raw_by_id = {str(item.get("id") or item.get("object_id")): item for item in raw_candidates}
+    restored: list[dict[str, Any]] = []
+    for candidate in annotated:
+        item = dict(candidate)
+        raw = raw_by_id.get(str(item.get("id") or item.get("object_id"))) or {}
+        raw_trace_status = raw.get("trace_status")
+        if raw_trace_status in {"traceable", "traceable_metric_lineage"}:
+            item["trace_status"] = raw_trace_status
+            if item.get("tier") in {"untraced_related", "broad_related_candidate", "untraced_direct_candidate"}:
+                item["tier"] = "traceable_related"
+            for field_name in (
+                "evidence_chain_count",
+                "support_depth",
+                "support_quote_count",
+                "support_claim_count",
+            ):
+                raw_value = _coerce_int(raw.get(field_name))
+                if raw_value:
+                    item[field_name] = raw_value
+        restored.append(item)
+    return restored
+
+
+def _recommended_trace_object_ids_from_context(
+    context: Mapping[str, Any],
+    candidates: Sequence[Mapping[str, Any]],
+) -> list[str]:
+    trace_ids: list[str] = []
+    for item in context.get("recommended_tools") or []:
+        if not isinstance(item, Mapping):
+            continue
+        object_id = item.get("object_id") or item.get("target_object_id")
+        if object_id:
+            trace_ids.append(str(object_id))
+    for candidate in candidates:
+        trace_ids.extend(_coerce_id_list(candidate.get("top_traceable_object_ids")))
+        trace_ids.extend(_coerce_id_list(candidate.get("source_object_ids"))[:1])
+        object_id = candidate.get("object_id")
+        if object_id:
+            trace_ids.append(str(object_id))
+    return _unique_preserve_order(trace_ids)[:3]
+
+
+def _unique_preserve_order(values: Sequence[str]) -> list[str]:
+    seen: set[str] = set()
+    unique: list[str] = []
+    for value in values:
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        unique.append(value)
+    return unique
+
+
+def _compact_retrieve_trace_required(plan: QueryPlan, answerability: Mapping[str, Any]) -> bool:
+    if plan.require_trace or answerability.get("direct_answerable"):
+        return True
+    question = plan.question.lower()
+    exact_terms = {
+        "date",
+        "amount",
+        "maturity",
+        "covenant",
+        "contract",
+        "agreement",
+        "guidance",
+        "capacity",
+        "target",
+        "threshold",
+        "when",
+        "how much",
+        "언제",
+        "얼마",
+        "금액",
+        "만기",
+        "계약",
+        "약정",
+        "가이던스",
+        "용량",
+        "목표",
+        "기준",
+    }
+    return any(term in question for term in exact_terms)
 
 
 def _bundle_topic_like(bundle: Mapping[str, Any]) -> Mapping[str, Any]:

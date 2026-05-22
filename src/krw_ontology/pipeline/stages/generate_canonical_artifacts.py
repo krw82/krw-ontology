@@ -14,6 +14,7 @@ import yaml
 from krw_ontology.config.constants import normalize_doc_type
 from krw_ontology.schema.objects import SCHEMA_VERSION
 from krw_ontology.utils.io import find_project_root, read_jsonl, write_jsonl
+from krw_ontology.validators.metric_validator import _load_metric_dictionary
 
 logger = logging.getLogger("krw_ontology")
 
@@ -424,10 +425,7 @@ def _business_factors(
 
 def _load_metric_specs(ontology_dir: Path) -> dict[str, dict[str, Any]]:
     metric_path = find_project_root(ontology_dir) / "ontology" / "schema" / "metric_dictionary.yaml"
-    if not metric_path.exists():
-        return {}
-    with open(metric_path) as f:
-        data = yaml.safe_load(f) or {}
+    data = _load_metric_dictionary(metric_path)
     return data.get("canonical_metrics") or {}
 
 

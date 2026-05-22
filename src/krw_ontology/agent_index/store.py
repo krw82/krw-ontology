@@ -7,7 +7,7 @@ import json
 import re
 import sqlite3
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, Sequence
 
 from krw_ontology.agent_index.retrieval_text import format_metric_compact
 from krw_ontology.agent_index.discovery import (
@@ -52,6 +52,10 @@ _QUERY_EXPANSION_RULES = (
     ("마진", "operating_margin cost_of_revenue margin"),
     ("계약", "contract agreement spa customer"),
     ("조건", "threshold covenant default termination"),
+    ("종료", "termination terminate terminated cancellation cancel"),
+    ("해지", "termination terminate terminated cancellation cancel"),
+    ("가속화", "debt_acceleration accelerate accelerated acceleration"),
+    ("담보", "collateral collateral_enforcement security lien"),
     ("큰일", "risk covenant default impairment liquidity threshold"),
     ("위험", "risk"),
     ("중국", "china"),
@@ -140,6 +144,214 @@ class OntologyStore:
         ).fetchall()
         return [_document_from_row(row) for row in rows]
 
+    def index_context(
+        self,
+        *,
+        include_counts: bool = True,
+        include_capabilities: bool = True,
+        include_quality_summary: bool = True,
+    ) -> dict[str, Any]:
+        """Return a compact capability card for the current serving index."""
+        build_metadata = _metadata_json(self.conn, "build")
+        documents = self.list_documents()
+        periods_by_ticker: dict[str, list[str]] = {}
+        document_types: set[str] = set()
+        for document in documents:
+            ticker = str(document.get("ticker") or "")
+            period = str(document.get("period") or "")
+            if ticker and period:
+                periods_by_ticker.setdefault(ticker, [])
+                if period not in periods_by_ticker[ticker]:
+                    periods_by_ticker[ticker].append(period)
+            if document.get("document_type"):
+                document_types.add(str(document["document_type"]))
+
+        payload: dict[str, Any] = {
+            "index_status": "ready",
+            "index_path": str(self.index_path),
+            "schema_version": build_metadata.get("schema_version"),
+            "agent_index_schema_version": build_metadata.get("agent_index_schema_version")
+            or build_metadata.get("schema_version"),
+            "ontology_schema_version": build_metadata.get("ontology_schema_version"),
+            "ontology_registry_version": build_metadata.get("ontology_registry_version"),
+            "retrieval_text_builder_version": build_metadata.get("retrieval_text_builder_version"),
+            "company_topic_builder_version": build_metadata.get("company_topic_builder_version"),
+            "company_topic_profile_mode": build_metadata.get("company_topic_profile_mode"),
+            "available_tickers": self.list_companies(),
+            "available_document_types": sorted(document_types),
+            "available_periods_by_ticker": {ticker: sorted(periods) for ticker, periods in periods_by_ticker.items()},
+            "ticker_coverage": _ticker_coverage(self.conn),
+            "answer_candidate_object_types": list(DEFAULT_QUERY_TYPES),
+            "trace_only_object_types": [
+                "SupportLink",
+                "Edge",
+                "SourceDocument",
+                "SourceLocation",
+                "SourceSpan",
+                "SourceTable",
+                "SourceTableCell",
+                "XBRLFact",
+                "CanonicalEntity",
+                "EntityMention",
+            ],
+            "answerability_policy": {
+                "strong_claim_requires_traceable_direct": True,
+                "metric_claim_requires_metric_lineage": True,
+                "broad_related_must_not_be_presented_as_direct": True,
+                "internal_ids_hidden_in_final_answer": True,
+            },
+        }
+        if include_counts:
+            payload["object_counts"] = _count_by(self.conn, "objects", "type")
+            payload["serving_counts"] = {
+                "documents": _table_count(self.conn, "documents"),
+                "objects": _table_count(self.conn, "objects"),
+                "object_search_text": _table_count(self.conn, "object_search_text"),
+                "object_fts": _table_count(self.conn, "object_fts"),
+                "object_traceability": _table_count(self.conn, "object_traceability"),
+                "company_topic_index": _table_count(self.conn, "company_topic_index"),
+                "company_topic_fts": _table_count(self.conn, "company_topic_fts"),
+                "company_topic_source_objects": _table_count(self.conn, "company_topic_source_objects"),
+            }
+        if include_capabilities:
+            payload["capabilities"] = {
+                "query": True,
+                "retrieve": True,
+                "trace": True,
+                "chain": True,
+                "compare": True,
+                "quality": True,
+                "company_topic_index": _table_exists(self.conn, "company_topic_index"),
+                "object_search_text": _table_exists(self.conn, "object_search_text"),
+                "company_context": _table_exists(self.conn, "company_topic_index"),
+                "query_context": _table_exists(self.conn, "company_topic_index"),
+                "answerability_tiers": True,
+                "metric_lineage_trace": True,
+                "traceability_metadata": _table_exists(self.conn, "object_traceability"),
+            }
+        if include_quality_summary:
+            severity_counts = _count_by(self.conn, "quality_events", "severity")
+            payload["quality_summary"] = {
+                "severity_counts": severity_counts,
+                "critical_errors": int(severity_counts.get("critical") or severity_counts.get("error") or 0),
+                "batch_failures": self.conn.execute(
+                    "SELECT COUNT(*) FROM quality_events WHERE category = 'batch_failure'"
+                ).fetchone()[0],
+                "orphan_answer_object_count": self.conn.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM object_traceability
+                    WHERE answer_candidate = 1
+                      AND trace_status IN ('orphan', 'untraced', 'unknown')
+                    """
+                ).fetchone()[0],
+            }
+        return payload
+
+    def company_context(
+        self,
+        *,
+        ticker: str,
+        document_types: Iterable[str] | None = None,
+        periods: Iterable[str] | None = None,
+        limit_topics: int = 12,
+        include_internal_ids: bool = True,
+    ) -> dict[str, Any]:
+        """Return a compressed evidence-derived company topic profile."""
+        ticker = ticker.upper()
+        where, params = _company_topic_filters(
+            tickers=[ticker],
+            document_types=document_types,
+            periods=periods,
+        )
+        where = f"{where} AND COALESCE(company_topic_index.boilerplate_score, 0) < 1"
+        rows = self.conn.execute(
+            f"""
+            SELECT *
+            FROM company_topic_index
+            {where}
+            ORDER BY
+                CASE trace_status
+                    WHEN 'traceable' THEN 3
+                    WHEN 'traceable_metric_lineage' THEN 3
+                    WHEN 'related' THEN 2
+                    ELSE 1
+                END DESC,
+                COALESCE(specificity_score, 0) DESC,
+                COALESCE(generic_score, 0) ASC,
+                COALESCE(boilerplate_score, 0) ASC,
+                evidence_chain_count DESC,
+                support_quote_count + support_claim_count + support_metric_count DESC
+            LIMIT ?
+            """,
+            [*params, max(1, min(int(limit_topics), 50))],
+        ).fetchall()
+        topics = [_company_topic_payload(topic_from_row(dict(row)), include_internal_ids=include_internal_ids) for row in rows]
+        payload = {
+            "ticker": ticker,
+            "document_types": list(document_types or []),
+            "periods": list(periods or []),
+            "company_topics": topics,
+            "internal_only_fields": ["topic_id", "source_object_ids", "top_traceable_object_ids", "untraced_object_ids"],
+        }
+        if not topics:
+            payload["warnings"] = ["no_company_topics_found"]
+        return payload
+
+    def query_context(
+        self,
+        *,
+        question: str,
+        ticker: str | None = None,
+        tickers: Iterable[str] | None = None,
+        document_types: Iterable[str] | None = None,
+        periods: Iterable[str] | None = None,
+        universe: str | None = None,
+        limit_results: int = 10,
+        limit_tickers: int = 20,
+        include_internal_ids: bool = True,
+    ) -> dict[str, Any]:
+        """Return a deterministic answer-planning pack for one user question."""
+        requested_tickers: list[str] | None
+        if ticker:
+            requested_tickers = [ticker.upper()]
+        elif tickers:
+            requested_tickers = [str(value).upper() for value in tickers]
+        elif universe and universe != "all":
+            requested_tickers = [str(universe).upper()]
+        else:
+            requested_tickers = None
+
+        discovery = self.discover_company_topics(
+            question=question,
+            tickers=requested_tickers,
+            document_types=document_types,
+            periods=periods,
+            limit_groups=max(1, min(int(limit_tickers), 50)),
+            limit_per_group=3,
+            limit=max(int(limit_results) * 10, 50),
+        )
+        candidates = list(discovery.get("ticker_candidates") or [])
+        selected_candidates = candidates[: max(1, min(int(limit_tickers), 50))]
+        query_frame = dict(discovery.get("query_frame") or {})
+        if _question_requires_direct_match(question):
+            query_frame["question_requires_direct_match"] = True
+        answerability = _answerability_from_candidates(query_frame, selected_candidates)
+        recommended_tools = _recommended_trace_tools(selected_candidates, limit=max(1, min(int(limit_results), 10)))
+        payload = {
+            "question": question,
+            "query_frame": query_frame,
+            "answerability": answerability,
+            "ticker_candidates": selected_candidates,
+            "recommended_tools": recommended_tools,
+            "search_diagnostics": discovery.get("search_diagnostics"),
+            "final_answer_guidance": _final_answer_guidance(answerability, selected_candidates),
+            "internal_only_fields": ["topic_id", "primary_object_id", "source_object_ids", "top_traceable_object_ids", "recommended_tools.object_id"],
+        }
+        if include_internal_ids:
+            payload["results_by_ticker"] = discovery.get("results_by_ticker") or {}
+        return payload
+
     def get_object(self, object_id: str) -> dict[str, Any] | None:
         row = self.conn.execute(
             "SELECT * FROM objects WHERE id = ?",
@@ -223,6 +435,48 @@ class OntologyStore:
             result_count=len(bundles),
             search_strategy=search_strategy,
         )
+        return bundles, diagnostics
+
+    def query_compact_with_diagnostics(
+        self,
+        *,
+        topic: str | None = None,
+        tickers: Iterable[str] | None = None,
+        document_types: Iterable[str] | None = None,
+        periods: Iterable[str] | None = None,
+        object_types: Iterable[str] | None = None,
+        include_rejected: bool = False,
+        limit: int = 20,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """Return row-level compact query results without eager evidence expansion."""
+        selected_types = tuple(object_types or DEFAULT_QUERY_TYPES)
+        search_strategy: dict[str, Any] | None = None
+        if topic:
+            rows, search_strategy = self._query_fts_with_strategy(
+                topic,
+                tickers=tickers,
+                document_types=document_types,
+                periods=periods,
+                object_types=selected_types,
+                include_rejected=include_rejected,
+                limit=limit,
+            )
+        else:
+            rows = self._query_objects(
+                tickers=tickers,
+                document_types=document_types,
+                periods=periods,
+                object_types=selected_types,
+                include_rejected=include_rejected,
+                limit=limit,
+            )
+        bundles = self._compact_bundles_from_rows(rows)
+        diagnostics = _search_diagnostics(
+            topic,
+            result_count=len(bundles),
+            search_strategy=search_strategy,
+        )
+        diagnostics["compact_fast_path"] = True
         return bundles, diagnostics
 
     def search_diagnostics(
@@ -311,7 +565,19 @@ class OntologyStore:
                 "metric_lineage_status": topic.get("metric_lineage_status"),
                 "answer_candidate": bool(topic.get("answer_candidate")),
                 "specificity_score": topic.get("specificity_score"),
+                "generic_score": topic.get("generic_score"),
+                "boilerplate_score": topic.get("boilerplate_score"),
                 "materiality_hint": topic.get("materiality_hint"),
+                "materiality_score": topic.get("materiality_score"),
+                "topic_type": topic.get("topic_type"),
+                "topic_family": topic.get("topic_family"),
+                "factor_terms": topic.get("factor_terms") or [],
+                "metric_terms": topic.get("metric_terms") or [],
+                "entity_terms": topic.get("entity_terms") or [],
+                "mechanism_terms": topic.get("mechanism_terms") or [],
+                "scenario_terms": topic.get("scenario_terms") or [],
+                "top_traceable_object_ids": topic.get("top_traceable_object_ids") or [],
+                "untraced_object_ids": topic.get("untraced_object_ids") or [],
                 "match": match,
             }
             grouped.setdefault(str(topic.get("ticker") or "UNKNOWN"), []).append(topic_payload)
@@ -323,6 +589,9 @@ class OntologyStore:
                 key=lambda item: (
                     tier_rank(str((item.get("match") or {}).get("tier") or "")),
                     float((item.get("match") or {}).get("score") or 0.0),
+                    float(item.get("specificity_score") or 0.0),
+                    -float(item.get("generic_score") or 0.0),
+                    -float(item.get("boilerplate_score") or 0.0),
                     int(item.get("support_quote_count") or 0) + int(item.get("support_claim_count") or 0),
                 ),
                 reverse=True,
@@ -617,6 +886,8 @@ class OntologyStore:
         """Compare companies by topic or canonical metric at query time."""
         ticker_list = [ticker.upper() for ticker in tickers]
         results: dict[str, list[dict[str, Any]]] = {}
+        comparison_evaluations: dict[str, dict[str, Any]] = {}
+        comparison_contexts: dict[str, dict[str, Any]] = {}
         for ticker in ticker_list:
             if metric:
                 rows = self._query_metric(
@@ -627,20 +898,116 @@ class OntologyStore:
                     limit=limit_per_ticker,
                 )
                 results[ticker] = [self.bundle(row["id"]) for row in rows]
+                comparison_evaluations[ticker] = _comparison_evaluation_from_items(
+                    results[ticker],
+                    metric=metric,
+                )
             else:
-                results[ticker] = self.query(
+                context = self.query_context(
+                    question=topic or "",
+                    ticker=ticker,
+                    document_types=document_types,
+                    periods=periods,
+                    limit_results=limit_per_ticker,
+                    limit_tickers=1,
+                    include_internal_ids=True,
+                )
+                comparison_contexts[ticker] = _compact_comparison_context(context)
+                comparison_evaluations[ticker] = _comparison_evaluation_from_query_context(context)
+                context_bundles = self._bundles_from_object_ids(
+                    _object_ids_from_query_context(context),
+                    limit=limit_per_ticker,
+                )
+                query_bundles = self.query(
                     topic=topic,
                     tickers=[ticker],
                     document_types=document_types,
                     periods=periods,
                     limit=limit_per_ticker,
                 )
+                results[ticker] = _merge_bundle_lists(
+                    context_bundles,
+                    query_bundles,
+                    limit=max(limit_per_ticker * 2, limit_per_ticker + 2),
+                )
+                _apply_comparison_evaluation(results[ticker], comparison_evaluations[ticker])
         return {
             "mode": "metric" if metric else "topic",
             "topic": topic,
             "metric": metric,
             "tickers": ticker_list,
             "results": results,
+            "comparison_evaluations": comparison_evaluations,
+            "comparison_contexts": comparison_contexts,
+        }
+
+    def compare_compact(
+        self,
+        *,
+        tickers: Iterable[str],
+        topic: str | None = None,
+        metric: str | None = None,
+        document_types: Iterable[str] | None = None,
+        periods: Iterable[str] | None = None,
+        limit_per_ticker: int = 5,
+    ) -> dict[str, Any]:
+        """Compare companies using compact row-level candidates without eager traces."""
+        ticker_list = [ticker.upper() for ticker in tickers]
+        results: dict[str, list[dict[str, Any]]] = {}
+        comparison_evaluations: dict[str, dict[str, Any]] = {}
+        comparison_contexts: dict[str, dict[str, Any]] = {}
+        for ticker in ticker_list:
+            if metric:
+                rows = self._query_metric(
+                    metric,
+                    ticker=ticker,
+                    document_types=document_types,
+                    periods=periods,
+                    limit=limit_per_ticker,
+                )
+                results[ticker] = self._compact_bundles_from_rows(rows)
+                comparison_evaluations[ticker] = _comparison_evaluation_from_items(
+                    results[ticker],
+                    metric=metric,
+                )
+            else:
+                context = self.query_context(
+                    question=topic or "",
+                    ticker=ticker,
+                    document_types=document_types,
+                    periods=periods,
+                    limit_results=limit_per_ticker,
+                    limit_tickers=1,
+                    include_internal_ids=True,
+                )
+                comparison_contexts[ticker] = _compact_comparison_context(context)
+                comparison_evaluations[ticker] = _comparison_evaluation_from_query_context(context)
+                context_bundles = self._compact_bundles_from_object_ids(
+                    _object_ids_from_query_context(context),
+                    limit=limit_per_ticker,
+                )
+                query_bundles, _diagnostics = self.query_compact_with_diagnostics(
+                    topic=topic,
+                    tickers=[ticker],
+                    document_types=document_types,
+                    periods=periods,
+                    limit=limit_per_ticker,
+                )
+                results[ticker] = _merge_bundle_lists(
+                    context_bundles,
+                    query_bundles,
+                    limit=max(limit_per_ticker * 2, limit_per_ticker + 2),
+                )
+                _apply_comparison_evaluation(results[ticker], comparison_evaluations[ticker])
+        return {
+            "mode": "metric" if metric else "topic",
+            "topic": topic,
+            "metric": metric,
+            "tickers": ticker_list,
+            "results": results,
+            "comparison_evaluations": comparison_evaluations,
+            "comparison_contexts": comparison_contexts,
+            "compact_fast_path": True,
         }
 
     def quality(
@@ -848,11 +1215,59 @@ class OntologyStore:
             JOIN company_topic_index
               ON company_topic_index.topic_id = company_topic_fts.topic_id
             {where} AND company_topic_fts MATCH ?
-            ORDER BY rank
+            ORDER BY
+                rank,
+                CASE company_topic_index.trace_status
+                    WHEN 'traceable' THEN 3
+                    WHEN 'traceable_metric_lineage' THEN 3
+                    WHEN 'related' THEN 2
+                    ELSE 1
+                END DESC,
+                COALESCE(company_topic_index.specificity_score, 0) DESC,
+                COALESCE(company_topic_index.generic_score, 0) ASC,
+                COALESCE(company_topic_index.boilerplate_score, 0) ASC,
+                company_topic_index.evidence_chain_count DESC,
+                company_topic_index.support_quote_count + company_topic_index.support_claim_count + company_topic_index.support_metric_count DESC
             LIMIT ?
             """,
             [*params, fts_query, limit],
         ).fetchall()
+
+    def _bundles_from_object_ids(self, object_ids: Iterable[str], *, limit: int) -> list[dict[str, Any]]:
+        bundles: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for object_id in object_ids:
+            if not object_id or object_id in seen:
+                continue
+            seen.add(object_id)
+            bundle = self.bundle(object_id)
+            if bundle.get("missing"):
+                continue
+            bundles.append(bundle)
+            if len(bundles) >= max(1, int(limit)):
+                break
+        return bundles
+
+    def _compact_bundles_from_object_ids(self, object_ids: Iterable[str], *, limit: int) -> list[dict[str, Any]]:
+        ids: list[str] = []
+        seen: set[str] = set()
+        for object_id in object_ids:
+            if not object_id or object_id in seen:
+                continue
+            seen.add(object_id)
+            ids.append(object_id)
+            if len(ids) >= max(1, int(limit)):
+                break
+        if not ids:
+            return []
+        placeholders = ",".join("?" for _ in ids)
+        rows = self.conn.execute(
+            f"SELECT * FROM objects WHERE id IN ({placeholders})",
+            ids,
+        ).fetchall()
+        by_id = {row["id"]: row for row in rows}
+        ordered_rows = [by_id[object_id] for object_id in ids if object_id in by_id]
+        return self._compact_bundles_from_rows(ordered_rows)
 
     def _query_objects(
         self,
@@ -875,6 +1290,81 @@ class OntologyStore:
             f"SELECT * FROM objects {where} ORDER BY ticker, doc_type_key, period, type LIMIT ?",
             [*params, limit],
         ).fetchall()
+
+    def _compact_bundles_from_rows(self, rows: Sequence[sqlite3.Row]) -> list[dict[str, Any]]:
+        if not rows:
+            return []
+        object_ids = [row["id"] for row in rows if row["id"]]
+        trace_by_id = self._traceability_by_id(object_ids)
+        bundles: list[dict[str, Any]] = []
+        for row in rows:
+            obj = _object_from_row(row)
+            trace = trace_by_id.get(row["id"], {})
+            bundles.append(
+                {
+                    "id": row["id"],
+                    "type": row["type"],
+                    "ticker": row["ticker"],
+                    "document_type": row["document_type"],
+                    "period": row["period"],
+                    "section": row["section_name"],
+                    "text": row["text"] or _display_text(obj),
+                    "object": obj,
+                    "evidence": {
+                        "claims": [],
+                        "quotes": [],
+                        "spans": [],
+                        "related_objects": [],
+                        "metric_lineage": None,
+                    },
+                    "quality": {
+                        "object_status": obj.get("review_status"),
+                        "section_quality": None,
+                        "evidence_grade": obj.get("evidence_grade"),
+                        "events": [],
+                    },
+                    "document": {},
+                    "trace_status": trace.get("trace_status"),
+                    "evidence_chain_count": trace.get("evidence_chain_count"),
+                    "support_depth": trace.get("support_depth"),
+                    "support_quote_count": trace.get("support_quote_count"),
+                    "support_claim_count": trace.get("support_claim_count"),
+                    "support_link_count": trace.get("support_link_count"),
+                    "metric_lineage_status": trace.get("metric_lineage_status"),
+                    "answer_candidate": bool(trace.get("answer_candidate")),
+                    "compact_only": True,
+                    "trace_id": row["id"],
+                    "trace_required": False,
+                    "trace_policy": {
+                        "mode": "lazy",
+                        "reason": "query_compact_fast_path_skips_evidence_bundle_expansion",
+                    },
+                }
+            )
+        return bundles
+
+    def _traceability_by_id(self, object_ids: Sequence[str]) -> dict[str, dict[str, Any]]:
+        ids = [object_id for object_id in object_ids if object_id]
+        if not ids:
+            return {}
+        placeholders = ",".join("?" for _ in ids)
+        rows = self.conn.execute(
+            f"SELECT * FROM object_traceability WHERE object_id IN ({placeholders})",
+            ids,
+        ).fetchall()
+        return {
+            row["object_id"]: {
+                "trace_status": row["trace_status"],
+                "evidence_chain_count": row["evidence_chain_count"],
+                "support_depth": row["support_depth"],
+                "support_quote_count": row["support_quote_count"],
+                "support_claim_count": row["support_claim_count"],
+                "support_link_count": row["support_link_count"],
+                "metric_lineage_status": row["metric_lineage_status"],
+                "answer_candidate": row["answer_candidate"],
+            }
+            for row in rows
+        }
 
     def _query_metric(
         self,
@@ -1411,6 +1901,416 @@ class OntologyStore:
             "section_quality": document.get("section_quality_status"),
             "events": [_quality_from_row(row) for row in rows],
         }
+
+
+def _metadata_json(conn: sqlite3.Connection, key: str) -> dict[str, Any]:
+    if not _table_exists(conn, "metadata"):
+        return {}
+    row = conn.execute("SELECT value FROM metadata WHERE key = ?", (key,)).fetchone()
+    if not row:
+        return {}
+    try:
+        value = json.loads(row["value"])
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
+    row = conn.execute(
+        """
+        SELECT 1
+        FROM sqlite_master
+        WHERE type IN ('table', 'view')
+          AND name = ?
+        """,
+        (table_name,),
+    ).fetchone()
+    return row is not None
+
+
+def _table_count(conn: sqlite3.Connection, table_name: str) -> int:
+    if not _table_exists(conn, table_name):
+        return 0
+    return int(conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0])
+
+
+def _count_by(conn: sqlite3.Connection, table_name: str, column_name: str) -> dict[str, int]:
+    if not _table_exists(conn, table_name):
+        return {}
+    rows = conn.execute(
+        f"""
+        SELECT {column_name} AS key, COUNT(*) AS value
+        FROM {table_name}
+        GROUP BY {column_name}
+        ORDER BY value DESC, key
+        """
+    ).fetchall()
+    return {str(row["key"] or "unknown"): int(row["value"] or 0) for row in rows}
+
+
+def _company_topic_payload(topic: Mapping[str, Any], *, include_internal_ids: bool) -> dict[str, Any]:
+    payload = {
+        "ticker": topic.get("ticker"),
+        "period": topic.get("period"),
+        "document_type": topic.get("document_type"),
+        "topic_label": topic.get("topic_label"),
+        "topic_summary": topic.get("topic_summary"),
+        "topic_type": topic.get("topic_type"),
+        "topic_family": topic.get("topic_family"),
+        "evidence_strength": topic.get("evidence_strength"),
+        "trace_status": topic.get("trace_status"),
+        "evidence_chain_count": topic.get("evidence_chain_count") or 0,
+        "support_quote_count": topic.get("support_quote_count") or 0,
+        "support_claim_count": topic.get("support_claim_count") or 0,
+        "support_metric_count": topic.get("support_metric_count") or 0,
+        "impact_channels": topic.get("impact_channels") or [],
+        "factor_terms": topic.get("factor_terms") or [],
+        "metric_terms": topic.get("metric_terms") or [],
+        "entity_terms": topic.get("entity_terms") or [],
+        "mechanism_terms": topic.get("mechanism_terms") or [],
+        "scenario_terms": topic.get("scenario_terms") or [],
+        "specificity_score": topic.get("specificity_score"),
+        "generic_score": topic.get("generic_score"),
+        "boilerplate_score": topic.get("boilerplate_score"),
+        "materiality_hint": topic.get("materiality_hint"),
+        "materiality_score": topic.get("materiality_score"),
+    }
+    if include_internal_ids:
+        payload.update(
+            {
+                "topic_id": topic.get("topic_id"),
+                "primary_object_id": topic.get("primary_object_id"),
+                "primary_object_type": topic.get("primary_object_type"),
+                "source_object_ids": topic.get("source_object_ids") or [],
+                "top_traceable_object_ids": topic.get("top_traceable_object_ids") or [],
+                "untraced_object_ids": topic.get("untraced_object_ids") or [],
+                "internal_only": {
+                    "topic_id": True,
+                    "primary_object_id": True,
+                    "source_object_ids": True,
+                    "top_traceable_object_ids": True,
+                    "untraced_object_ids": True,
+                },
+            }
+        )
+    return payload
+
+
+def _answerability_from_candidates(query_frame: Mapping[str, Any], candidates: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    tiers = _collect_values(candidates, "tier")
+    has_direct = any(str(tier) in {"traceable_direct", "traceable_metric_lineage"} for tier in tiers)
+    has_related = any(
+        str(tier)
+        in {
+            "traceable_related",
+            "untraced_related",
+            "broad_related_candidate",
+            "untraced_direct_candidate",
+            "related",
+        }
+        for tier in tiers
+    )
+    requires_direct = bool(query_frame.get("question_requires_direct_match") or query_frame.get("requires_direct_match"))
+    needs_clarification = not candidates
+    return {
+        "direct_answerable": has_direct,
+        "related_context_available": has_related,
+        "negative_answer_supported": bool(requires_direct and not has_direct and has_related),
+        "needs_user_clarification": needs_clarification,
+        "recommended_answer_mode": (
+            "direct_answer"
+            if has_direct
+            else "no_direct_evidence_with_related_context"
+            if requires_direct and has_related
+            else "related_context_only"
+            if has_related
+            else "not_answerable"
+        ),
+    }
+
+
+def _compact_comparison_context(context: Mapping[str, Any]) -> dict[str, Any]:
+    candidates = list(context.get("ticker_candidates") or [])
+    return {
+        "answerability": context.get("answerability") or {},
+        "query_frame": context.get("query_frame") or {},
+        "top_candidate": _comparison_candidate_summary(candidates[0]) if candidates else None,
+        "recommended_tools": list(context.get("recommended_tools") or [])[:3],
+    }
+
+
+def _comparison_candidate_summary(candidate: Mapping[str, Any]) -> dict[str, Any]:
+    match = candidate.get("match") or {}
+    return {
+        "ticker": candidate.get("ticker"),
+        "topic_id": candidate.get("topic_id"),
+        "topic_label": candidate.get("topic_label"),
+        "primary_object_id": candidate.get("primary_object_id"),
+        "primary_object_type": candidate.get("primary_object_type"),
+        "tier": candidate.get("tier") or match.get("tier"),
+        "semantic_relevance": candidate.get("semantic_relevance") or match.get("semantic_relevance"),
+        "trace_status": candidate.get("trace_status") or match.get("trace_status"),
+        "matched_required_facets": candidate.get("matched_required_facets") or match.get("matched_required_facets") or [],
+        "missing_required_facets": candidate.get("missing_required_facets") or match.get("missing_required_facets") or [],
+        "why_tier": candidate.get("why_tier") or match.get("why_tier"),
+    }
+
+
+def _comparison_evaluation_from_query_context(context: Mapping[str, Any]) -> dict[str, Any]:
+    answerability = context.get("answerability") or {}
+    candidates = list(context.get("ticker_candidates") or [])
+    top = candidates[0] if candidates else {}
+    match = top.get("match") if isinstance(top, Mapping) else {}
+    if not isinstance(match, Mapping):
+        match = {}
+    tier = top.get("tier") or match.get("tier")
+    semantic_relevance = top.get("semantic_relevance") or match.get("semantic_relevance")
+    trace_status = top.get("trace_status") or match.get("trace_status")
+    matched_required = top.get("matched_required_facets") or match.get("matched_required_facets") or []
+    missing_required = top.get("missing_required_facets") or match.get("missing_required_facets") or []
+    why_tier = top.get("why_tier") or match.get("why_tier")
+    return {
+        "direct_answerable": bool(answerability.get("direct_answerable")),
+        "related_context_available": bool(answerability.get("related_context_available")),
+        "negative_answer_supported": bool(answerability.get("negative_answer_supported")),
+        "recommended_answer_mode": answerability.get("recommended_answer_mode"),
+        "semantic_relevance": semantic_relevance,
+        "trace_status": trace_status,
+        "tier": tier,
+        "matched_required_facets": list(matched_required),
+        "missing_required_facets": list(missing_required),
+        "why_tier": why_tier,
+        "evidence_chain_count": top.get("evidence_chain_count") or 0,
+        "support_depth": top.get("support_depth"),
+        "support_quote_count": top.get("support_quote_count") or 0,
+        "support_claim_count": top.get("support_claim_count") or 0,
+        "source_object_ids": _object_ids_from_query_context(context),
+        "top_traceable_object_ids": top.get("top_traceable_object_ids") or [],
+    }
+
+
+def _object_ids_from_query_context(context: Mapping[str, Any]) -> list[str]:
+    candidates = list(context.get("ticker_candidates") or [])
+    ids: list[str] = []
+    for candidate in candidates:
+        for key in ("top_traceable_object_ids", "top_object_ids", "source_object_ids", "primary_object_id"):
+            value = candidate.get(key)
+            if isinstance(value, list):
+                ids.extend(str(item) for item in value if item)
+            elif value:
+                ids.append(str(value))
+        for topic in candidate.get("matched_topics") or []:
+            for key in ("top_traceable_object_ids", "source_object_ids", "primary_object_id"):
+                value = topic.get(key)
+                if isinstance(value, list):
+                    ids.extend(str(item) for item in value if item)
+                elif value:
+                    ids.append(str(value))
+        for reason in candidate.get("top_reasons") or []:
+            for key in ("source_object_ids", "object_id"):
+                value = reason.get(key)
+                if isinstance(value, list):
+                    ids.extend(str(item) for item in value if item)
+                elif value:
+                    ids.append(str(value))
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for object_id in ids:
+        if object_id and object_id not in seen:
+            seen.add(object_id)
+            deduped.append(object_id)
+    return deduped
+
+
+def _merge_bundle_lists(*bundle_lists: Sequence[Mapping[str, Any]], limit: int) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for bundles in bundle_lists:
+        for bundle in bundles:
+            object_id = str(bundle.get("id") or "")
+            if not object_id or object_id in seen:
+                continue
+            seen.add(object_id)
+            merged.append(dict(bundle))
+            if len(merged) >= max(1, int(limit)):
+                return merged
+    return merged
+
+
+def _comparison_evaluation_from_items(items: Sequence[Mapping[str, Any]], *, metric: str | None) -> dict[str, Any]:
+    if not items:
+        return {
+            "direct_answerable": False,
+            "related_context_available": False,
+            "negative_answer_supported": False,
+            "recommended_answer_mode": "not_answerable",
+            "tier": "not_answerable",
+            "trace_status": "untraced",
+            "why_tier": "No matching ontology objects were returned for this comparison key.",
+        }
+    first = items[0]
+    tier = "traceable_metric_lineage" if metric else None
+    evidence = first.get("evidence") or {}
+    if tier is None:
+        if evidence.get("metric_lineage"):
+            tier = "traceable_metric_lineage"
+        elif first.get("type") in {"EvidenceQuote", "ResearchClaim"}:
+            tier = "traceable_direct"
+        elif evidence.get("claims") or evidence.get("quotes"):
+            tier = "traceable_related"
+        else:
+            tier = "untraced_direct_candidate"
+    trace_status = "traceable" if tier in {"traceable_direct", "traceable_metric_lineage", "traceable_related"} else "untraced"
+    return {
+        "direct_answerable": tier in {"traceable_direct", "traceable_metric_lineage"},
+        "related_context_available": tier == "traceable_related",
+        "negative_answer_supported": False,
+        "recommended_answer_mode": "direct_answer" if tier in {"traceable_direct", "traceable_metric_lineage"} else "related_context_only",
+        "semantic_relevance": "direct" if tier in {"traceable_direct", "traceable_metric_lineage"} else "related",
+        "trace_status": trace_status,
+        "tier": tier,
+        "matched_required_facets": [],
+        "missing_required_facets": [],
+        "why_tier": "Metric comparison uses traceable metric lineage." if tier == "traceable_metric_lineage" else "Comparison candidate inferred from returned evidence support.",
+        "evidence_chain_count": 1 if trace_status == "traceable" else 0,
+        "support_quote_count": len(evidence.get("quotes") or []),
+        "support_claim_count": len(evidence.get("claims") or []),
+    }
+
+
+def _apply_comparison_evaluation(items: Sequence[dict[str, Any]], evaluation: Mapping[str, Any]) -> None:
+    for item in items:
+        for key in (
+            "semantic_relevance",
+            "trace_status",
+            "tier",
+            "matched_required_facets",
+            "missing_required_facets",
+            "why_tier",
+            "evidence_chain_count",
+            "support_depth",
+            "support_quote_count",
+            "support_claim_count",
+        ):
+            if item.get(key) is None and evaluation.get(key) is not None:
+                item[key] = evaluation.get(key)
+
+
+def _question_requires_direct_match(question: str) -> bool:
+    normalized = str(question or "").lower()
+    return any(
+        term in normalized
+        for term in (
+            "direct exposure",
+            "directly exposed",
+            "directly affect",
+            "직접",
+            "직접 노출",
+            "직접 영향",
+            "직접적으로",
+        )
+    )
+
+
+def _recommended_trace_tools(candidates: Sequence[Mapping[str, Any]], *, limit: int) -> list[dict[str, Any]]:
+    object_ids: list[str] = []
+    for key in ("top_traceable_object_ids", "source_object_ids", "primary_object_id"):
+        for value in _collect_values(candidates, key):
+            if isinstance(value, list):
+                object_ids.extend(str(item) for item in value if item)
+            elif value:
+                object_ids.append(str(value))
+    selected: list[str] = []
+    for object_id in object_ids:
+        if object_id not in selected:
+            selected.append(object_id)
+        if len(selected) >= limit:
+            break
+    return [
+        {
+            "tool": "krw_ontology_trace",
+            "object_id": object_id,
+            "purpose": "verify_final_or_related_context",
+            "internal_only": True,
+        }
+        for object_id in selected
+    ]
+
+
+def _final_answer_guidance(answerability: Mapping[str, Any], candidates: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    missing: list[str] = []
+    for value in _collect_values(candidates, "missing_required_facets"):
+        if isinstance(value, list):
+            missing.extend(str(item) for item in value if item)
+        elif value:
+            missing.append(str(value))
+    guidance = {
+        "use_direct_evidence_only_when": "tier is traceable_direct or traceable_metric_lineage",
+        "do_not_expose_internal_ids": True,
+    }
+    if answerability.get("recommended_answer_mode") == "no_direct_evidence_with_related_context":
+        guidance["safe_answer_pattern"] = (
+            "공시자료에서 요청한 직접 노출은 확인되지 않습니다. "
+            "다만 관련 맥락은 별도로 구분해 설명할 수 있습니다."
+        )
+        guidance["missing_required_facets"] = sorted(set(missing))
+    elif answerability.get("direct_answerable"):
+        guidance["safe_answer_pattern"] = "공시자료에서 직접 확인되는 내용과 영향을 받는 사업/재무 채널을 함께 설명합니다."
+    else:
+        guidance["safe_answer_pattern"] = "현재 검색 맥락만으로는 단정하지 말고 확인되는 관련 맥락만 제한적으로 설명합니다."
+    return guidance
+
+
+def _collect_values(value: Any, key: str) -> list[Any]:
+    found: list[Any] = []
+    if isinstance(value, Mapping):
+        if key in value:
+            found.append(value[key])
+        for child in value.values():
+            found.extend(_collect_values(child, key))
+    elif isinstance(value, list):
+        for child in value:
+            found.extend(_collect_values(child, key))
+    return found
+
+
+def _ticker_coverage(conn: sqlite3.Connection) -> dict[str, dict[str, Any]]:
+    document_counts = {
+        str(row["ticker"]): int(row["count"])
+        for row in conn.execute(
+            "SELECT ticker, COUNT(*) AS count FROM documents GROUP BY ticker"
+        ).fetchall()
+    }
+    object_counts = {
+        str(row["ticker"]): int(row["count"])
+        for row in conn.execute(
+            "SELECT ticker, COUNT(*) AS count FROM objects GROUP BY ticker"
+        ).fetchall()
+    }
+    coverage: dict[str, dict[str, Any]] = {}
+    for ticker in sorted(set(document_counts) | set(object_counts)):
+        document_count = document_counts.get(ticker, 0)
+        object_count = object_counts.get(ticker, 0)
+        status = "ready"
+        warnings: list[str] = []
+        if object_count and not document_count:
+            status = "inconsistent"
+            warnings.append("objects_without_documents")
+        elif document_count and not object_count:
+            status = "inconsistent"
+            warnings.append("documents_without_objects")
+        elif not document_count and not object_count:
+            status = "not_indexed"
+        coverage[ticker] = {
+            "has_documents": bool(document_count),
+            "has_objects": bool(object_count),
+            "document_count": document_count,
+            "object_count": object_count,
+            "status": status,
+            "warnings": warnings,
+        }
+    return coverage
 
 
 def _object_filters(

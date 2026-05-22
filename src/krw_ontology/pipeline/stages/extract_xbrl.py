@@ -16,6 +16,7 @@ from krw_ontology.errors import PipelineStageError
 from krw_ontology.schema.id_utils import generate_scoped_id, generate_xbrl_local_id
 from krw_ontology.schema.objects import SCHEMA_VERSION
 from krw_ontology.utils.io import find_project_root, write_jsonl
+from krw_ontology.validators.metric_validator import _load_metric_dictionary
 
 logger = logging.getLogger("krw_ontology")
 
@@ -423,10 +424,7 @@ def _parse_ixbrl_number(raw: str, scale: int | None, sign: str | None) -> float 
 
 def _load_metric_specs(raw_html_path: Path) -> dict[str, dict]:
     metric_path = find_project_root(raw_html_path) / "ontology" / "schema" / "metric_dictionary.yaml"
-    if not metric_path.exists():
-        return {}
-    with open(metric_path) as f:
-        data = yaml.safe_load(f) or {}
+    data = _load_metric_dictionary(metric_path)
     return data.get("canonical_metrics") or {}
 
 

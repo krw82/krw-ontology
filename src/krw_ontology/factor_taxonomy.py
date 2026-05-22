@@ -47,6 +47,17 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
+def _taxonomy_path(filename: str, path: str | Path | None = None) -> Path:
+    if path:
+        return Path(path)
+
+    repo_path = _repo_root() / "ontology" / "taxonomy" / filename
+    if repo_path.exists():
+        return repo_path
+
+    return Path(__file__).resolve().parent / "resources" / "taxonomy" / filename
+
+
 def _normalize_key(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", str(value).lower()).strip("_")
 
@@ -54,7 +65,7 @@ def _normalize_key(value: str) -> str:
 @lru_cache(maxsize=8)
 def load_factor_taxonomy(path: str | Path | None = None) -> FactorTaxonomy:
     """Load the global factor taxonomy."""
-    taxonomy_path = Path(path) if path else _repo_root() / "ontology" / "taxonomy" / "factors.yaml"
+    taxonomy_path = _taxonomy_path("factors.yaml", path)
     data = yaml.safe_load(taxonomy_path.read_text()) or {}
     factors: dict[str, FactorSpec] = {}
     alias_to_key: dict[str, str] = {}
@@ -82,9 +93,7 @@ def load_factor_taxonomy(path: str | Path | None = None) -> FactorTaxonomy:
 @lru_cache(maxsize=8)
 def load_sector_expectations(path: str | Path | None = None) -> SectorExpectations:
     """Load sector coverage expectations."""
-    expectations_path = (
-        Path(path) if path else _repo_root() / "ontology" / "taxonomy" / "sector_expectations.yaml"
-    )
+    expectations_path = _taxonomy_path("sector_expectations.yaml", path)
     data = yaml.safe_load(expectations_path.read_text()) or {}
     sectors: dict[str, dict[str, Any]] = {}
     alias_to_sector: dict[str, str] = {}

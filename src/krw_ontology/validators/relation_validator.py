@@ -10,9 +10,25 @@ import yaml
 _RELATIONS_PATH = Path(__file__).resolve().parents[3] / "ontology" / "schema" / "relations.yaml"
 
 
+def _relations_schema_path(relations_path: Path | None = None) -> Path:
+    candidates = []
+    if relations_path is not None:
+        candidates.append(relations_path)
+    candidates.extend(
+        [
+            _RELATIONS_PATH,
+            Path(__file__).resolve().parents[1] / "resources" / "schema" / "relations.yaml",
+        ]
+    )
+    for path in candidates:
+        if path.exists():
+            return path
+    return candidates[0]
+
+
 def _load_relations(relations_path: Path | None = None) -> list[dict]:
     """Load relation whitelist from relations.yaml."""
-    path = relations_path or _RELATIONS_PATH
+    path = _relations_schema_path(relations_path)
     with open(path) as f:
         data = yaml.safe_load(f)
     return data["relations"]

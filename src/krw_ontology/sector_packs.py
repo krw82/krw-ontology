@@ -21,7 +21,7 @@ class SectorPack:
 
 def load_sector_packs(root: Path | None = None) -> list[SectorPack]:
     """Load all YAML sector packs bundled with the project."""
-    packs_dir = root or Path(__file__).resolve().parents[2] / "ontology" / "sector_packs"
+    packs_dir = root or _sector_packs_dir()
     packs: list[SectorPack] = []
     for path in sorted(packs_dir.glob("*.yaml")):
         data = yaml.safe_load(path.read_text()) or {}
@@ -36,13 +36,22 @@ def load_sector_packs(root: Path | None = None) -> list[SectorPack]:
     return packs
 
 
+def _sector_packs_dir() -> Path:
+    repo_dir = Path(__file__).resolve().parents[2] / "ontology" / "sector_packs"
+    if repo_dir.exists():
+        return repo_dir
+    return Path(__file__).resolve().parent / "resources" / "sector_packs"
+
+
 def choose_sector_pack(
     text: str,
     packs: list[SectorPack] | None = None,
     preferred_sector: str | None = None,
 ) -> SectorPack:
     """Choose the best sector pack by alias hits, falling back to generic."""
-    available = packs or load_sector_packs()
+    available = load_sector_packs() if packs is None else packs
+    if not available:
+        raise FileNotFoundError("No sector pack YAML files found")
     generic = next((pack for pack in available if pack.sector == "generic"), available[0])
     if preferred_sector:
         preferred = next((pack for pack in available if pack.sector == preferred_sector), None)
@@ -71,7 +80,7 @@ def merged_pack_for_text(
     preferred_sector: str | None = None,
 ) -> SectorPack:
     """Return generic pack merged with the best specialized pack for the text."""
-    available = packs or load_sector_packs()
+    available = load_sector_packs() if packs is None else packs
     generic = next((pack for pack in available if pack.sector == "generic"), None)
     chosen = choose_sector_pack(text, available, preferred_sector=preferred_sector)
     if generic is None or chosen.sector == "generic":

@@ -15,9 +15,12 @@ from krw_ontology.mcp_server.tools import (
     ResponseFormat,
     catalog_tool,
     chain_tool,
+    company_context_tool,
     compare_tool,
+    index_context_tool,
     plan_query_tool,
     quality_tool,
+    query_context_tool,
     query_tool,
     retrieve_tool,
     topic_map_tool,
@@ -104,6 +107,94 @@ async def krw_ontology_catalog(
 
 
 @mcp.tool(
+    name="krw_ontology_index_context",
+    title="Return KRW ontology index context",
+    annotations=READ_ONLY,
+)
+async def krw_ontology_index_context(
+    root: str | None = None,
+    index_path: str | None = None,
+    include_counts: bool = True,
+    include_capabilities: bool = True,
+    include_quality_summary: bool = True,
+    response_format: ResponseFormat = ResponseFormat.JSON,
+) -> str:
+    """Return index schema, capabilities, coverage, and answerability policy."""
+    return index_context_tool(
+        root=root,
+        index_path=index_path,
+        include_counts=include_counts,
+        include_capabilities=include_capabilities,
+        include_quality_summary=include_quality_summary,
+        response_format=response_format,
+    )
+
+
+@mcp.tool(
+    name="krw_ontology_company_context",
+    title="Return KRW ontology company topic context",
+    annotations=READ_ONLY,
+)
+async def krw_ontology_company_context(
+    ticker: str,
+    root: str | None = None,
+    index_path: str | None = None,
+    document_types: list[str] | None = None,
+    periods: list[str] | None = None,
+    limit_topics: int = 12,
+    include_internal_ids: bool = True,
+    response_format: ResponseFormat = ResponseFormat.JSON,
+) -> str:
+    """Return evidence-derived company topic profiles for search planning."""
+    return company_context_tool(
+        ticker=ticker,
+        root=root,
+        index_path=index_path,
+        document_types=document_types,
+        periods=periods,
+        limit_topics=limit_topics,
+        include_internal_ids=include_internal_ids,
+        response_format=response_format,
+    )
+
+
+@mcp.tool(
+    name="krw_ontology_query_context",
+    title="Plan KRW ontology answer context",
+    annotations=READ_ONLY,
+)
+async def krw_ontology_query_context(
+    question: str,
+    root: str | None = None,
+    index_path: str | None = None,
+    ticker: str | None = None,
+    tickers: list[str] | None = None,
+    document_types: list[str] | None = None,
+    periods: list[str] | None = None,
+    universe: str | None = None,
+    limit_results: int = 10,
+    limit_tickers: int = 20,
+    include_internal_ids: bool = True,
+    response_format: ResponseFormat = ResponseFormat.JSON,
+) -> str:
+    """Return a compact query-specific context pack with answerability guidance."""
+    return query_context_tool(
+        question=question,
+        root=root,
+        index_path=index_path,
+        ticker=ticker,
+        tickers=tickers,
+        document_types=document_types,
+        periods=periods,
+        universe=universe,
+        limit_results=limit_results,
+        limit_tickers=limit_tickers,
+        include_internal_ids=include_internal_ids,
+        response_format=response_format,
+    )
+
+
+@mcp.tool(
     name="krw_ontology_query",
     title="Search KRW ontology evidence",
     annotations=READ_ONLY,
@@ -112,9 +203,13 @@ async def krw_ontology_query(
     root: str | None = None,
     index_path: str | None = None,
     topic: str | None = None,
+    ticker: str | None = None,
     tickers: list[str] | None = None,
+    document_type: str | None = None,
     document_types: list[str] | None = None,
+    period: str | None = None,
     periods: list[str] | None = None,
+    object_type: str | None = None,
     object_types: list[str] | None = None,
     include_rejected: bool = False,
     limit: int = 10,
@@ -131,9 +226,13 @@ async def krw_ontology_query(
         root=root,
         index_path=index_path,
         topic=topic,
+        ticker=ticker,
         tickers=tickers,
+        document_type=document_type,
         document_types=document_types,
+        period=period,
         periods=periods,
+        object_type=object_type,
         object_types=object_types,
         include_rejected=include_rejected,
         limit=limit,
@@ -182,6 +281,7 @@ async def krw_ontology_retrieve(
     question: str,
     root: str | None = None,
     index_path: str | None = None,
+    ticker: str | None = None,
     tickers: list[str] | None = None,
     document_types: list[str] | None = None,
     periods: list[str] | None = None,
@@ -199,6 +299,7 @@ async def krw_ontology_retrieve(
         question=question,
         root=root,
         index_path=index_path,
+        ticker=ticker,
         tickers=tickers,
         document_types=document_types,
         periods=periods,
@@ -293,9 +394,12 @@ async def krw_ontology_quality(
     annotations=READ_ONLY,
 )
 async def krw_ontology_compare(
-    tickers: list[str],
+    tickers: list[str] | None = None,
     root: str | None = None,
     index_path: str | None = None,
+    ticker: str | None = None,
+    ticker_a: str | None = None,
+    ticker_b: str | None = None,
     topic: str | None = None,
     metric: str | None = None,
     document_types: list[str] | None = None,
@@ -309,6 +413,9 @@ async def krw_ontology_compare(
         tickers=tickers,
         root=root,
         index_path=index_path,
+        ticker=ticker,
+        ticker_a=ticker_a,
+        ticker_b=ticker_b,
         topic=topic,
         metric=metric,
         document_types=document_types,

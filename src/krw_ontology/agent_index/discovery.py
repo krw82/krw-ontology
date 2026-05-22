@@ -13,7 +13,6 @@ COMPANY_TOPIC_OBJECT_TYPES = {
     "BusinessActivity",
     "BusinessEvent",
     "AgreementTerm",
-    "MetricObservation",
     "CompanyBusinessProfile",
     "RiskFactor",
     "GrowthDriver",
@@ -446,13 +445,19 @@ def build_company_topic_profile(row: Mapping[str, Any], obj: Mapping[str, Any], 
     if not object_id or not ticker:
         return None
 
-    label = _topic_label(obj, object_type, object_id)
+    label = _display_topic_label(_topic_label(obj, object_type, object_id))
     topic_text = _compact_space(" ".join([label, _object_values_text(obj), retrieval_text]))[:12000]
     facets = _extract_facets(topic_text, is_query=False)
     impact_channels = sorted(facets["impact_channels"])
+    factor_terms = sorted(facets["core_domain_terms"] | facets["sector_terms"] | facets["anchor_terms"])
+    metric_terms = sorted(facets["impact_channels"])
+    entity_terms = sorted(facets["anchor_terms"] | facets["context_facets"])
+    mechanism_terms = sorted(facets["mechanism_terms"])
+    scenario_terms = sorted(facets["predicate_terms"])
     source_ids = _source_object_ids(obj, object_id)
     support_quote_count = _support_count(obj, ("supported_by_quotes", "supporting_quotes", "evidence_quotes", "quote_ids"))
     support_claim_count = _support_count(obj, ("supported_by_claims", "supporting_claims", "research_claim_ids", "claim_ids"))
+    support_metric_count = _support_count(obj, ("supported_by_metrics", "metric_ids", "related_metric_ids", "metric_observation_ids"))
     if object_type == "EvidenceQuote":
         support_quote_count = max(support_quote_count, 1)
     if object_type == "ResearchClaim":
@@ -460,6 +465,29 @@ def build_company_topic_profile(row: Mapping[str, Any], obj: Mapping[str, Any], 
 
     evidence_strength = _evidence_strength(obj, object_type, support_quote_count, support_claim_count)
     specificity_score = _specificity_score(obj, facets)
+    all_specific_terms = (
+        set(factor_terms)
+        | set(metric_terms)
+        | set(entity_terms)
+        | set(mechanism_terms)
+        | set(scenario_terms)
+    )
+    generic_score = min(1.0, len(facets["generic_terms"]) / max(1, len(all_specific_terms)))
+    label_normalized = _normalize(label).replace(" ", "_")
+    boilerplate_score = 1.0 if label_normalized in {
+        "business_activity",
+        "project",
+        "product_or_service_sales",
+        "product_sales",
+        "service_sales",
+        "revenue_source",
+        "risk",
+        "external_factor",
+        "metric",
+        "operation",
+    } else 0.0
+    if boilerplate_score and specificity_score < 0.5:
+        generic_score = max(generic_score, 0.8)
     topic_summary = _topic_summary(obj, topic_text)
     facet_text = " ".join(
         sorted(
@@ -482,6 +510,8 @@ def build_company_topic_profile(row: Mapping[str, Any], obj: Mapping[str, Any], 
         "doc_type_key": row.get("doc_type_key") or obj.get("doc_type_key"),
         "topic_label": label,
         "topic_summary": topic_summary,
+        "topic_type": _topic_type(object_type),
+        "topic_family": next(iter(sorted(facets["core_domain_terms"] or facets["sector_terms"] or facets["generic_terms"])), object_type),
         "topic_text": topic_text,
         "facet_text": facet_text,
         "primary_object_id": object_id,
@@ -489,17 +519,37 @@ def build_company_topic_profile(row: Mapping[str, Any], obj: Mapping[str, Any], 
         "source_object_ids": source_ids,
         "dominant_object_types": [object_type],
         "impact_channels": impact_channels,
+        "factor_terms": factor_terms,
+        "metric_terms": metric_terms,
+        "entity_terms": entity_terms,
+        "mechanism_terms": mechanism_terms,
+        "scenario_terms": scenario_terms,
         "evidence_strength": evidence_strength,
         "materiality_hint": _string_or_none(obj.get("materiality_hint") or obj.get("materiality") or obj.get("importance")),
+        "materiality_score": _materiality_score(obj),
         "specificity_score": specificity_score,
+        "generic_score": generic_score,
+        "boilerplate_score": boilerplate_score,
         "support_quote_count": support_quote_count,
         "support_claim_count": support_claim_count,
+        "support_metric_count": support_metric_count,
     }
 
 
 def topic_from_row(row: Mapping[str, Any]) -> dict[str, Any]:
     topic = dict(row)
-    for key in ("source_object_ids", "dominant_object_types", "impact_channels"):
+    for key in (
+        "source_object_ids",
+        "top_traceable_object_ids",
+        "untraced_object_ids",
+        "dominant_object_types",
+        "impact_channels",
+        "factor_terms",
+        "metric_terms",
+        "entity_terms",
+        "mechanism_terms",
+        "scenario_terms",
+    ):
         value = topic.get(key)
         if isinstance(value, str):
             try:
@@ -508,6 +558,52 @@ def topic_from_row(row: Mapping[str, Any]) -> dict[str, Any]:
                 decoded = []
             topic[key] = decoded if isinstance(decoded, list) else []
     return topic
+
+
+def _topic_type(object_type: str) -> str:
+    if object_type in {"ExternalFactorExposure", "BusinessFactor", "RiskFactor", "GrowthDriver"}:
+        return "risk_exposure"
+    if object_type in {"AgreementTerm"}:
+        return "agreement"
+    if object_type in {"BusinessEvent", "ChangeEvent", "TrendObservation"}:
+        return "event_or_change"
+    if object_type in {"MetricObservation", "Calculation"}:
+        return "metric"
+    if object_type in {"BusinessActivity", "CompanyBusinessProfile"}:
+        return "business_model"
+    return "topic"
+
+
+def _display_topic_label(label: str) -> str:
+    value = str(label or "").replace("_", " ").replace("-", " ")
+    value = _compact_space(value)
+    if not value:
+        return label
+    lower_words = {"and", "or", "of", "to", "for", "in", "on", "by"}
+    acronym_words = {"lng", "gpu", "hbm", "spa", "doe", "ferc", "cp2", "ttf", "jkm"}
+    words = []
+    for idx, word in enumerate(value.split()):
+        normalized = word.lower()
+        if normalized in acronym_words:
+            words.append(normalized.upper())
+        elif idx and normalized in lower_words:
+            words.append(normalized)
+        else:
+            words.append(word[:1].upper() + word[1:])
+    return " ".join(words)
+
+
+def _materiality_score(obj: Mapping[str, Any]) -> float | None:
+    raw = str(obj.get("materiality_hint") or obj.get("materiality") or obj.get("importance") or "").lower()
+    if not raw:
+        return None
+    if any(term in raw for term in ("high", "material", "significant", "primary", "major")):
+        return 1.0
+    if any(term in raw for term in ("medium", "moderate")):
+        return 0.6
+    if any(term in raw for term in ("low", "immaterial", "minor")):
+        return 0.2
+    return 0.4
 
 
 def tier_rank(tier: str) -> int:
@@ -740,7 +836,27 @@ def _source_object_ids(obj: Mapping[str, Any], object_id: str) -> list[str]:
     for key in ("source_object_ids", "supported_by_claims", "supported_by_quotes", "supporting_claims", "supporting_quotes", "claim_ids", "quote_ids"):
         value = obj.get(key)
         if isinstance(value, str):
-            if value.startswith(("claim:", "quote:", "risk:", "exposure:", "factor:")):
+            if value.startswith(
+                (
+                    "claim:",
+                    "research_claim:",
+                    "quote:",
+                    "evidence_quote:",
+                    "risk:",
+                    "exposure:",
+                    "external_factor_exposure:",
+                    "factor:",
+                    "business_factor:",
+                    "metric:",
+                    "metric_observation:",
+                    "calculation:",
+                    "agreement:",
+                    "agreement_term:",
+                    "business_event:",
+                    "event:",
+                    "business_activity:",
+                )
+            ):
                 ids.append(value)
         elif isinstance(value, list):
             ids.extend(str(item) for item in value if isinstance(item, str))

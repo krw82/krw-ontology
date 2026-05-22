@@ -10,11 +10,31 @@ import yaml
 _METRIC_DICT_PATH = Path(__file__).resolve().parents[3] / "ontology" / "schema" / "metric_dictionary.yaml"
 
 
+def _metric_dictionary_path(metric_dict_path: Path | None = None) -> Path:
+    candidates = []
+    if metric_dict_path is not None:
+        candidates.append(metric_dict_path)
+    candidates.extend(
+        [
+            _METRIC_DICT_PATH,
+            Path(__file__).resolve().parents[1] / "resources" / "schema" / "metric_dictionary.yaml",
+        ]
+    )
+    for path in candidates:
+        if path.exists():
+            return path
+    return candidates[0]
+
+
+def _load_metric_dictionary(metric_dict_path: Path | None = None) -> dict:
+    path = _metric_dictionary_path(metric_dict_path)
+    with open(path) as f:
+        return yaml.safe_load(f) or {}
+
+
 def _load_metric_names(metric_dict_path: Path | None = None) -> set[str]:
     """Load canonical metric names from metric_dictionary.yaml."""
-    path = metric_dict_path or _METRIC_DICT_PATH
-    with open(path) as f:
-        data = yaml.safe_load(f)
+    data = _load_metric_dictionary(metric_dict_path)
     return set(data["canonical_metrics"].keys())
 
 

@@ -35,7 +35,7 @@ from krw_ontology.utils.io import read_jsonl
 
 logger = logging.getLogger("krw_ontology")
 
-AGENT_INDEX_SCHEMA_VERSION = "1.0.0-alpha.2"
+AGENT_INDEX_SCHEMA_VERSION = "1.0.0-alpha.3"
 DEFAULT_INDEX_RELATIVE_PATH = Path("indexes") / "agent_index.sqlite"
 
 OBJECT_FILE_KEYS = {
@@ -198,8 +198,10 @@ BULK_INSERT_CHUNK_SIZE = 5_000
 COMPANY_TOPIC_BATCH_SIZE = 500
 SQLITE_CACHE_SIZE_KIB = 200_000
 SQLITE_MMAP_SIZE_BYTES = 256 * 1024 * 1024
-COMPANY_TOPIC_TEXT_CHAR_LIMIT = 4_000
-COMPANY_TOPIC_FIELD_CHAR_LIMIT = 1_000
+COMPANY_TOPIC_TEXT_CHAR_LIMIT = 2_500
+COMPANY_TOPIC_FIELD_CHAR_LIMIT = 700
+COMPANY_TOPIC_FTS_CHAR_LIMIT = 1_800
+COMPANY_TOPIC_BUILDER_VERSION = "0.3.0-rich-hardened"
 
 
 def _elapsed(started_at: float) -> float:
@@ -212,6 +214,10 @@ def _log_build_phase(phase: str, **fields: Any) -> None:
     if rendered:
         message = f"{message} {rendered}"
     logger.info(message, extra={"stage": "build_agent_index"})
+
+
+def _compact_space(value: str) -> str:
+    return _NON_WORD_RE.sub(" ", str(value or "")).strip()
 
 
 def build_agent_index(
@@ -334,6 +340,10 @@ def build_agent_index(
                             "artifact_manifest_hash": _artifact_manifest_hash(artifact_indexes),
                             "generated_at": datetime.now(timezone.utc).isoformat(),
                             "artifact_indexes": len(artifact_indexes),
+                            "company_topic_builder_version": COMPANY_TOPIC_BUILDER_VERSION,
+                            "company_topic_profile_mode": "rich_materialized",
+                            "object_search_text_enabled": True,
+                            "company_topic_fts_enabled": True,
                             "totals": totals,
                         },
                         ensure_ascii=False,
@@ -489,7 +499,9 @@ def _create_schema(conn: sqlite3.Connection) -> None:
 
         DROP TABLE IF EXISTS object_fts;
         DROP TABLE IF EXISTS object_text;
+        DROP TABLE IF EXISTS object_search_text;
         DROP TABLE IF EXISTS object_traceability;
+        DROP TABLE IF EXISTS company_topic_source_objects;
         DROP TABLE IF EXISTS company_topic_fts;
         DROP TABLE IF EXISTS company_topic_index;
 
@@ -506,6 +518,20 @@ def _create_schema(conn: sqlite3.Connection) -> None:
             text_aliases,
             compact_text,
             tokenize = 'unicode61'
+        );
+
+        CREATE TABLE IF NOT EXISTS object_search_text (
+            object_id TEXT PRIMARY KEY,
+            type TEXT NOT NULL,
+            ticker TEXT NOT NULL,
+            document_type TEXT NOT NULL,
+            period TEXT NOT NULL,
+            text_self TEXT,
+            text_support TEXT,
+            text_related TEXT,
+            text_entities TEXT,
+            text_aliases TEXT,
+            compact_text TEXT
         );
 
         CREATE TABLE IF NOT EXISTS object_text (
@@ -546,37 +572,67 @@ def _create_schema(conn: sqlite3.Connection) -> None:
             period TEXT,
             document_type TEXT,
             doc_type_key TEXT,
+            filing_type TEXT,
             topic_label TEXT,
             topic_summary TEXT,
+            topic_type TEXT,
+            topic_family TEXT,
             topic_text TEXT,
             facet_text TEXT,
             primary_object_id TEXT NOT NULL,
             primary_object_type TEXT NOT NULL,
             source_object_ids TEXT NOT NULL,
+            top_traceable_object_ids TEXT NOT NULL,
+            untraced_object_ids TEXT NOT NULL,
             dominant_object_types TEXT NOT NULL,
             impact_channels TEXT NOT NULL,
+            factor_terms TEXT NOT NULL,
+            metric_terms TEXT NOT NULL,
+            entity_terms TEXT NOT NULL,
+            mechanism_terms TEXT NOT NULL,
+            scenario_terms TEXT NOT NULL,
             evidence_strength TEXT,
             materiality_hint TEXT,
+            materiality_score REAL,
             specificity_score REAL,
+            generic_score REAL,
+            boilerplate_score REAL,
             support_quote_count INTEGER DEFAULT 0,
             support_claim_count INTEGER DEFAULT 0,
+            support_metric_count INTEGER DEFAULT 0,
             trace_status TEXT DEFAULT 'unknown',
             evidence_chain_count INTEGER DEFAULT 0,
             support_depth INTEGER,
             support_link_count INTEGER DEFAULT 0,
             trace_method TEXT,
             metric_lineage_status TEXT,
-            answer_candidate INTEGER DEFAULT 0
+            answer_candidate INTEGER DEFAULT 0,
+            created_from TEXT,
+            builder_version TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS company_topic_source_objects (
+            topic_id TEXT NOT NULL,
+            object_id TEXT NOT NULL,
+            object_type TEXT NOT NULL,
+            role TEXT,
+            rank INTEGER,
+            trace_status TEXT,
+            evidence_chain_count INTEGER DEFAULT 0,
+            PRIMARY KEY (topic_id, object_id)
         );
 
         CREATE VIRTUAL TABLE company_topic_fts USING fts5(
             topic_id UNINDEXED,
             ticker UNINDEXED,
             period UNINDEXED,
-            topic_label,
-            topic_summary,
-            topic_text,
-            facet_text,
+            text_label,
+            text_summary,
+            text_evidence,
+            text_entities,
+            text_channels,
+            text_aliases,
+            compact_text,
             tokenize = 'unicode61'
         );
         """
@@ -596,6 +652,12 @@ def _create_base_secondary_indexes(conn: sqlite3.Connection) -> None:
             ON edges(to_id, relation_id);
         CREATE INDEX IF NOT EXISTS idx_quality_scope
             ON quality_events(ticker, doc_type_key, period, category);
+        CREATE INDEX IF NOT EXISTS idx_object_search_text_ticker
+            ON object_search_text(ticker);
+        CREATE INDEX IF NOT EXISTS idx_object_search_text_type
+            ON object_search_text(type);
+        CREATE INDEX IF NOT EXISTS idx_object_search_text_ticker_type
+            ON object_search_text(ticker, type);
         """
     )
 
@@ -609,6 +671,10 @@ def _create_serving_secondary_indexes(conn: sqlite3.Connection) -> None:
             ON company_topic_index(ticker);
         CREATE INDEX IF NOT EXISTS idx_company_topic_scope
             ON company_topic_index(ticker, period, document_type, doc_type_key);
+        CREATE INDEX IF NOT EXISTS idx_company_topic_source_object
+            ON company_topic_source_objects(object_id);
+        CREATE INDEX IF NOT EXISTS idx_company_topic_source_topic
+            ON company_topic_source_objects(topic_id);
         """
     )
 
@@ -1275,10 +1341,22 @@ def _flush_object_insert_batch(
     if fts_rows:
         if replace_fts_entries:
             conn.executemany("DELETE FROM object_fts WHERE object_id = ?", ((row[0],) for row in fts_rows))
+            conn.executemany("DELETE FROM object_search_text WHERE object_id = ?", ((row[0],) for row in fts_rows))
             conn.executemany("DELETE FROM object_text WHERE object_id = ?", ((row[0],) for row in fts_rows))
         conn.executemany(
             """
             INSERT INTO object_fts(
+                object_id, type, ticker, document_type, period,
+                text_self, text_support, text_related, text_entities,
+                text_aliases, compact_text
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            fts_rows,
+        )
+        conn.executemany(
+            """
+            INSERT OR REPLACE INTO object_search_text(
                 object_id, type, ticker, document_type, period,
                 text_self, text_support, text_related, text_entities,
                 text_aliases, compact_text
@@ -1306,6 +1384,7 @@ def _rebuild_company_topic_index(conn: sqlite3.Connection) -> int:
     """Build serving-only company topic profiles from indexed evidence text."""
     conn.execute("DELETE FROM company_topic_index")
     conn.execute("DELETE FROM company_topic_fts")
+    conn.execute("DELETE FROM company_topic_source_objects")
     placeholders = ",".join("?" for _ in COMPANY_TOPIC_OBJECT_TYPES)
     params = tuple(sorted(COMPANY_TOPIC_OBJECT_TYPES))
     candidate_count = conn.execute(
@@ -1327,12 +1406,12 @@ def _rebuild_company_topic_index(conn: sqlite3.Connection) -> int:
             objects.document_type,
             objects.doc_type_key,
             objects.json,
-            object_text.text_self,
-            object_text.text_support,
-            object_text.text_related,
-            object_text.text_entities,
-            object_text.text_aliases,
-            object_text.compact_text,
+            object_search_text.text_self,
+            object_search_text.text_support,
+            object_search_text.text_related,
+            object_search_text.text_entities,
+            object_search_text.text_aliases,
+            object_search_text.compact_text,
             object_traceability.trace_status,
             object_traceability.evidence_chain_count,
             object_traceability.support_depth,
@@ -1343,7 +1422,7 @@ def _rebuild_company_topic_index(conn: sqlite3.Connection) -> int:
             object_traceability.metric_lineage_status,
             object_traceability.answer_candidate
         FROM objects
-        LEFT JOIN object_text ON object_text.object_id = objects.id
+        LEFT JOIN object_search_text ON object_search_text.object_id = objects.id
         LEFT JOIN object_traceability ON object_traceability.object_id = objects.id
         WHERE objects.type IN ({placeholders})
         ORDER BY objects.ticker, objects.id
@@ -1353,12 +1432,24 @@ def _rebuild_company_topic_index(conn: sqlite3.Connection) -> int:
     count = 0
     topic_rows: list[tuple[Any, ...]] = []
     topic_fts_rows: list[tuple[Any, ...]] = []
+    topic_source_rows: list[tuple[Any, ...]] = []
     for row in rows:
         obj = json.loads(row["json"])
         retrieval_text = _topic_retrieval_text(row)
         topic = build_company_topic_profile(dict(row), obj, retrieval_text)
         if topic is None:
             continue
+        source_object_ids = list(dict.fromkeys(topic.get("source_object_ids") or []))
+        trace_status = row["trace_status"] or "unknown"
+        if trace_status in {"traceable", "traceable_metric_lineage"}:
+            top_traceable_object_ids = source_object_ids[:5]
+            untraced_object_ids: list[str] = []
+        else:
+            top_traceable_object_ids = []
+            untraced_object_ids = source_object_ids[:5]
+        support_metric_count = int(topic.get("support_metric_count") or 0)
+        if topic.get("primary_object_type") in {"MetricObservation", "Calculation"}:
+            support_metric_count = max(support_metric_count, 1)
         topic_rows.append(
             (
                 topic["topic_id"],
@@ -1366,29 +1457,58 @@ def _rebuild_company_topic_index(conn: sqlite3.Connection) -> int:
                 topic.get("period"),
                 topic.get("document_type"),
                 topic.get("doc_type_key"),
+                topic.get("document_type"),
                 topic.get("topic_label"),
                 topic.get("topic_summary"),
+                topic.get("topic_type"),
+                topic.get("topic_family"),
                 topic.get("topic_text"),
                 topic.get("facet_text"),
                 topic.get("primary_object_id"),
                 topic.get("primary_object_type"),
-                json.dumps(topic.get("source_object_ids") or [], ensure_ascii=False),
+                json.dumps(source_object_ids, ensure_ascii=False),
+                json.dumps(top_traceable_object_ids, ensure_ascii=False),
+                json.dumps(untraced_object_ids, ensure_ascii=False),
                 json.dumps(topic.get("dominant_object_types") or [], ensure_ascii=False),
                 json.dumps(topic.get("impact_channels") or [], ensure_ascii=False),
+                json.dumps(topic.get("factor_terms") or [], ensure_ascii=False),
+                json.dumps(topic.get("metric_terms") or [], ensure_ascii=False),
+                json.dumps(topic.get("entity_terms") or [], ensure_ascii=False),
+                json.dumps(topic.get("mechanism_terms") or [], ensure_ascii=False),
+                json.dumps(topic.get("scenario_terms") or [], ensure_ascii=False),
                 topic.get("evidence_strength"),
                 topic.get("materiality_hint"),
+                topic.get("materiality_score"),
                 topic.get("specificity_score"),
+                topic.get("generic_score"),
+                topic.get("boilerplate_score"),
                 max(int(topic.get("support_quote_count") or 0), int(row["trace_support_quote_count"] or 0)),
                 max(int(topic.get("support_claim_count") or 0), int(row["trace_support_claim_count"] or 0)),
-                row["trace_status"] or "unknown",
+                support_metric_count,
+                trace_status,
                 int(row["evidence_chain_count"] or 0),
                 row["support_depth"],
                 int(row["support_link_count"] or 0),
                 row["trace_method"],
                 row["metric_lineage_status"],
                 int(row["answer_candidate"] or 0),
+                "object_search_text",
+                COMPANY_TOPIC_BUILDER_VERSION,
             )
         )
+        for rank, source_id in enumerate(source_object_ids):
+            role = _topic_source_role(source_id, topic.get("primary_object_id"))
+            topic_source_rows.append(
+                (
+                    topic["topic_id"],
+                    source_id,
+                    _topic_source_object_type(source_id, topic.get("primary_object_type") if role == "primary" else None),
+                    role,
+                    rank,
+                    trace_status if role == "primary" else None,
+                    int(row["evidence_chain_count"] or 0) if role == "primary" else 0,
+                )
+            )
         topic_fts_rows.append(
             (
                 topic["topic_id"],
@@ -1396,20 +1516,41 @@ def _rebuild_company_topic_index(conn: sqlite3.Connection) -> int:
                 topic.get("period"),
                 topic.get("topic_label"),
                 topic.get("topic_summary"),
-                topic.get("topic_text"),
+                _company_topic_evidence_text(topic, retrieval_text),
+                " ".join(topic.get("entity_terms") or []),
+                " ".join(
+                    list(topic.get("impact_channels") or [])
+                    + list(topic.get("factor_terms") or [])
+                    + list(topic.get("metric_terms") or [])
+                    + list(topic.get("mechanism_terms") or [])
+                    + list(topic.get("scenario_terms") or [])
+                ),
                 topic.get("facet_text"),
+                _compact_space(
+                    " ".join(
+                        str(value or "")
+                        for value in (
+                            topic.get("topic_label"),
+                            topic.get("topic_summary"),
+                            str(topic.get("topic_text") or "")[:COMPANY_TOPIC_FTS_CHAR_LIMIT],
+                            topic.get("facet_text"),
+                            topic.get("evidence_strength"),
+                            topic.get("trace_status"),
+                        )
+                    )
+                )[:COMPANY_TOPIC_FTS_CHAR_LIMIT],
             )
         )
         count += 1
         if len(topic_rows) >= COMPANY_TOPIC_BATCH_SIZE:
-            _flush_company_topic_batch(conn, topic_rows, topic_fts_rows)
+            _flush_company_topic_batch(conn, topic_rows, topic_fts_rows, topic_source_rows)
             conn.commit()
             _log_build_phase(
                 "company_topic_batch_done",
                 indexed=count,
                 candidates=candidate_count,
             )
-    _flush_company_topic_batch(conn, topic_rows, topic_fts_rows)
+    _flush_company_topic_batch(conn, topic_rows, topic_fts_rows, topic_source_rows)
     conn.commit()
     return count
 
@@ -1430,40 +1571,126 @@ def _topic_retrieval_text(row: sqlite3.Row) -> str:
     return "\n".join(parts)[:COMPANY_TOPIC_TEXT_CHAR_LIMIT]
 
 
+def _company_topic_evidence_text(topic: dict[str, Any], retrieval_text: str) -> str:
+    return _compact_space(
+        " ".join(
+            str(value or "")
+            for value in (
+                topic.get("topic_label"),
+                topic.get("topic_summary"),
+                topic.get("facet_text"),
+                retrieval_text,
+                topic.get("evidence_strength"),
+                topic.get("materiality_hint"),
+                " ".join(topic.get("impact_channels") or []),
+                " ".join(topic.get("factor_terms") or []),
+                " ".join(topic.get("metric_terms") or []),
+                " ".join(topic.get("entity_terms") or []),
+                " ".join(topic.get("mechanism_terms") or []),
+                " ".join(topic.get("scenario_terms") or []),
+            )
+        )
+    )[:COMPANY_TOPIC_FTS_CHAR_LIMIT]
+
+
+def _topic_source_role(source_id: str, primary_object_id: Any) -> str:
+    if source_id == primary_object_id:
+        return "primary"
+    normalized = str(source_id or "").lower()
+    if "quote" in normalized:
+        return "support"
+    if "claim" in normalized:
+        return "support"
+    if "metric" in normalized or "calculation" in normalized or "xbrl" in normalized:
+        return "metric"
+    if "agreement" in normalized or "contract" in normalized or "covenant" in normalized:
+        return "agreement"
+    if "event" in normalized or "milestone" in normalized:
+        return "event"
+    return "related"
+
+
+def _topic_source_object_type(source_id: str, fallback: Any = None) -> str:
+    if fallback:
+        return str(fallback)
+    normalized = str(source_id or "").lower()
+    prefix_map = (
+        ("evidence_quote", "EvidenceQuote"),
+        ("quote", "EvidenceQuote"),
+        ("research_claim", "ResearchClaim"),
+        ("claim", "ResearchClaim"),
+        ("metric_observation", "MetricObservation"),
+        ("metric", "MetricObservation"),
+        ("calculation", "Calculation"),
+        ("xbrl", "XBRLFact"),
+        ("agreement", "AgreementTerm"),
+        ("contract", "AgreementTerm"),
+        ("business_event", "BusinessEvent"),
+        ("event", "BusinessEvent"),
+        ("external_factor_exposure", "ExternalFactorExposure"),
+        ("exposure", "ExternalFactorExposure"),
+        ("business_factor", "BusinessFactor"),
+        ("factor", "BusinessFactor"),
+        ("business_activity", "BusinessActivity"),
+        ("activity", "BusinessActivity"),
+    )
+    for marker, object_type in prefix_map:
+        if marker in normalized:
+            return object_type
+    return "Unknown"
+
+
 def _flush_company_topic_batch(
     conn: sqlite3.Connection,
     topic_rows: list[tuple[Any, ...]],
     topic_fts_rows: list[tuple[Any, ...]],
+    topic_source_rows: list[tuple[Any, ...]],
 ) -> None:
     if topic_rows:
         conn.executemany(
             """
             INSERT OR REPLACE INTO company_topic_index(
                 topic_id, ticker, period, document_type, doc_type_key,
-                topic_label, topic_summary, topic_text, facet_text,
-                primary_object_id, primary_object_type, source_object_ids,
-                dominant_object_types, impact_channels, evidence_strength,
-                materiality_hint, specificity_score, support_quote_count,
-                support_claim_count, trace_status, evidence_chain_count,
-                support_depth, support_link_count, trace_method,
-                metric_lineage_status, answer_candidate
+                filing_type, topic_label, topic_summary, topic_type, topic_family,
+                topic_text, facet_text, primary_object_id, primary_object_type,
+                source_object_ids, top_traceable_object_ids, untraced_object_ids,
+                dominant_object_types, impact_channels, factor_terms, metric_terms,
+                entity_terms, mechanism_terms, scenario_terms, evidence_strength,
+                materiality_hint, materiality_score, specificity_score, generic_score,
+                boilerplate_score, support_quote_count, support_claim_count,
+                support_metric_count, trace_status, evidence_chain_count, support_depth,
+                support_link_count, trace_method, metric_lineage_status,
+                answer_candidate, created_from, builder_version
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             topic_rows,
+        )
+    if topic_source_rows:
+        conn.executemany(
+            """
+            INSERT OR REPLACE INTO company_topic_source_objects(
+                topic_id, object_id, object_type, role, rank,
+                trace_status, evidence_chain_count
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            topic_source_rows,
         )
     if topic_fts_rows:
         conn.executemany(
             """
             INSERT INTO company_topic_fts(
-                topic_id, ticker, period, topic_label, topic_summary, topic_text, facet_text
+                topic_id, ticker, period, text_label, text_summary, text_evidence,
+                text_entities, text_channels, text_aliases, compact_text
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             topic_fts_rows,
         )
     topic_rows.clear()
     topic_fts_rows.clear()
+    topic_source_rows.clear()
 
 
 def _index_edges(

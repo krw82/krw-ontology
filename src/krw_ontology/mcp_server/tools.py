@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from enum import Enum
 import json
+import re
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -235,9 +236,13 @@ def query_tool(
     root: str | None = None,
     index_path: str | None = None,
     topic: str | None = None,
+    ticker: str | None = None,
     tickers: list[str] | None = None,
+    document_type: str | None = None,
     document_types: list[str] | None = None,
+    period: str | None = None,
     periods: list[str] | None = None,
+    object_type: str | None = None,
     object_types: list[str] | None = None,
     include_rejected: bool = False,
     limit: int = DEFAULT_LIMIT,
@@ -248,6 +253,7 @@ def query_tool(
     answer_candidate_only: bool = False,
     response_format: ResponseFormat = ResponseFormat.JSON,
     response_detail: ResponseDetail = ResponseDetail.COMPACT,
+    **extra_args: Any,
 ) -> str:
     """Search accepted ontology objects and return evidence bundles."""
     index = _index(root, index_path)
@@ -257,9 +263,14 @@ def query_tool(
     normalized_group_by = _coerce_group_by(group_by)
     limit_groups = _bounded_limit_groups(limit_groups)
     limit_per_group = _bounded_limit_per_group(limit_per_group)
+    normalized_tickers = _merge_ticker_alias(ticker=ticker, tickers=tickers)
+    normalized_document_types = _merge_scalar_list_alias(document_type, document_types)
+    normalized_periods = _merge_scalar_list_alias(period, periods)
+    requested_object_types = _merge_scalar_list_alias(object_type, object_types)
+    input_warnings = _input_warnings(extra_args)
     summary_mode = detail == ResponseDetail.TICKER_SUMMARY or normalized_group_by == "ticker"
     fetch_limit = MAX_DISCOVERY_LIMIT if summary_mode else min(MAX_LIMIT + offset + 1, offset + limit + 1)
-    normalized_object_types, invalid_object_types = _normalize_object_types(object_types)
+    normalized_object_types, invalid_object_types = _normalize_object_types(requested_object_types)
     if invalid_object_types:
         payload = _error_payload(
             "invalid_object_type",
@@ -275,9 +286,9 @@ def query_tool(
         with _store(index) as store:
             discovery = store.discover_company_topics(
                 question=topic,
-                tickers=tickers,
-                document_types=document_types,
-                periods=periods,
+                tickers=normalized_tickers,
+                document_types=normalized_document_types,
+                periods=normalized_periods,
                 limit_groups=limit_groups,
                 limit_per_group=limit_per_group,
                 limit=fetch_limit,
@@ -285,11 +296,15 @@ def query_tool(
         payload = {
             "query": {
                 "topic": topic,
-                "tickers": _upper_list(tickers),
-                "document_types": document_types or [],
-                "periods": _upper_list(periods),
+                "tickers": _upper_list(normalized_tickers),
+                "ticker_alias": ticker,
+                "document_type_alias": document_type,
+                "period_alias": period,
+                "object_type_alias": object_type,
+                "document_types": normalized_document_types or [],
+                "periods": _upper_list(normalized_periods),
                 "object_types": normalized_object_types or [],
-                "object_types_requested": object_types or [],
+                "object_types_requested": requested_object_types or [],
                 "include_rejected": include_rejected,
                 "group_by": normalized_group_by,
                 "limit_groups": limit_groups,
@@ -299,6 +314,8 @@ def query_tool(
             "response_detail": detail.value,
             **discovery,
         }
+        if input_warnings:
+            payload["input_warnings"] = input_warnings
         payload["pagination"] = _pagination(
             len(payload.get("ticker_candidates") or []),
             0,
@@ -308,15 +325,26 @@ def query_tool(
         return _format_response(payload, response_format, _markdown_bundles)
 
     with _store(index) as store:
-        bundles, search_diagnostics = store.query_with_diagnostics(
-            topic=topic,
-            tickers=tickers,
-            document_types=document_types,
-            periods=periods,
-            object_types=normalized_object_types,
-            include_rejected=include_rejected,
-            limit=fetch_limit,
-        )
+        if detail == ResponseDetail.FULL:
+            bundles, search_diagnostics = store.query_with_diagnostics(
+                topic=topic,
+                tickers=normalized_tickers,
+                document_types=normalized_document_types,
+                periods=normalized_periods,
+                object_types=normalized_object_types,
+                include_rejected=include_rejected,
+                limit=fetch_limit,
+            )
+        else:
+            bundles, search_diagnostics = store.query_compact_with_diagnostics(
+                topic=topic,
+                tickers=normalized_tickers,
+                document_types=normalized_document_types,
+                periods=normalized_periods,
+                object_types=normalized_object_types,
+                include_rejected=include_rejected,
+                limit=fetch_limit,
+            )
 
     page = bundles[offset : offset + limit]
     if detail == ResponseDetail.FULL:
@@ -328,11 +356,15 @@ def query_tool(
     payload = {
         "query": {
             "topic": topic,
-            "tickers": _upper_list(tickers),
-            "document_types": document_types or [],
-            "periods": _upper_list(periods),
+            "tickers": _upper_list(normalized_tickers),
+            "ticker_alias": ticker,
+            "document_type_alias": document_type,
+            "period_alias": period,
+            "object_type_alias": object_type,
+            "document_types": normalized_document_types or [],
+            "periods": _upper_list(normalized_periods),
             "object_types": normalized_object_types or [],
-            "object_types_requested": object_types or [],
+            "object_types_requested": requested_object_types or [],
             "include_rejected": include_rejected,
             "group_by": normalized_group_by,
             "limit_groups": limit_groups,
@@ -344,6 +376,10 @@ def query_tool(
         "results": results,
         "pagination": _pagination(len(bundles), offset, len(page), limit),
     }
+    if input_warnings:
+        payload["input_warnings"] = input_warnings
+        search_diagnostics.setdefault("warnings", [])
+        search_diagnostics["warnings"].extend(warning["code"] for warning in input_warnings)
     if summary_mode:
         payload.pop("results", None)
         payload.update(
@@ -390,6 +426,7 @@ def retrieve_tool(
     question: str,
     root: str | None = None,
     index_path: str | None = None,
+    ticker: str | None = None,
     tickers: list[str] | None = None,
     document_types: list[str] | None = None,
     periods: list[str] | None = None,
@@ -401,6 +438,7 @@ def retrieve_tool(
     answer_candidate_only: bool = False,
     response_format: ResponseFormat = ResponseFormat.JSON,
     response_detail: ResponseDetail = ResponseDetail.COMPACT,
+    **extra_args: Any,
 ) -> str:
     """Use the deterministic local planner, then retrieve evidence bundles."""
     index = _index(root, index_path)
@@ -409,13 +447,15 @@ def retrieve_tool(
     normalized_group_by = _coerce_group_by(group_by)
     limit_groups = _bounded_limit_groups(limit_groups)
     limit_per_group = _bounded_limit_per_group(limit_per_group)
+    normalized_tickers = _merge_ticker_alias(ticker=ticker, tickers=tickers)
+    input_warnings = _input_warnings(extra_args)
     summary_mode = detail == ResponseDetail.TICKER_SUMMARY or normalized_group_by == "ticker"
     fetch_limit = MAX_DISCOVERY_LIMIT if summary_mode else limit
     if summary_mode:
         with _store(index) as store:
             discovery = store.discover_company_topics(
                 question=question,
-                tickers=tickers,
+                tickers=normalized_tickers,
                 document_types=document_types,
                 periods=periods,
                 limit_groups=limit_groups,
@@ -434,7 +474,8 @@ def retrieve_tool(
             "question": question,
             "query": {
                 "question": question,
-                "tickers": _upper_list(tickers),
+                "tickers": _upper_list(normalized_tickers),
+                "ticker_alias": ticker,
                 "document_types": document_types or [],
                 "periods": _upper_list(periods),
                 "group_by": normalized_group_by,
@@ -445,6 +486,8 @@ def retrieve_tool(
             "response_detail": detail.value,
             **discovery,
         }
+        if input_warnings:
+            payload["input_warnings"] = input_warnings
         payload["pagination"] = _pagination(
             len(payload.get("ticker_candidates") or []),
             0,
@@ -456,11 +499,12 @@ def retrieve_tool(
     with _store(index) as store:
         result = AgentRetriever(store).retrieve(
             question,
-            tickers=tickers,
+            tickers=normalized_tickers,
             document_types=document_types,
             periods=periods,
             include_rejected=include_rejected,
             limit=fetch_limit,
+            include_evidence_bundle=detail == ResponseDetail.FULL,
         )
     if answer_candidate_only:
         result = _map_retrieval_context(result, _answer_candidate_bundles)
@@ -494,12 +538,16 @@ def retrieve_tool(
     payload.setdefault("query", {})
     payload["query"].update(
         {
+            "tickers": _upper_list(normalized_tickers),
+            "ticker_alias": ticker,
             "group_by": normalized_group_by,
             "limit_groups": limit_groups,
             "limit_per_group": limit_per_group,
             "answer_candidate_only": answer_candidate_only,
         }
     )
+    if input_warnings:
+        payload["input_warnings"] = input_warnings
     payload["response_detail"] = detail.value
     return _format_response(payload, response_format, _markdown_retrieve)
 
@@ -629,9 +677,12 @@ def quality_tool(
 
 def compare_tool(
     *,
-    tickers: list[str],
+    tickers: list[str] | None = None,
     root: str | None = None,
     index_path: str | None = None,
+    ticker: str | None = None,
+    ticker_a: str | None = None,
+    ticker_b: str | None = None,
     topic: str | None = None,
     metric: str | None = None,
     document_types: list[str] | None = None,
@@ -639,40 +690,69 @@ def compare_tool(
     limit_per_ticker: int = 5,
     response_format: ResponseFormat = ResponseFormat.JSON,
     response_detail: ResponseDetail = ResponseDetail.COMPACT,
+    **extra_args: Any,
 ) -> str:
     """Compare companies by a topic search or canonical metric."""
-    period_compare = len(tickers) == 1 and len(periods or []) >= 2
-    if len(tickers) < 2 and not period_compare:
+    normalized_tickers = _merge_compare_ticker_aliases(
+        tickers=tickers,
+        ticker=ticker,
+        ticker_a=ticker_a,
+        ticker_b=ticker_b,
+    )
+    input_warnings = _input_warnings(extra_args)
+    period_compare = len(normalized_tickers) == 1 and len(periods or []) >= 2
+    if len(normalized_tickers) < 2 and not period_compare:
         payload = _error_payload(
             "invalid_request",
             "Compare requires at least two tickers or one ticker with at least two periods.",
             "Pass tickers like ['VG', 'XOM'], or tickers=['VG'] with periods like ['FY2024', 'FY2025'].",
         )
+        payload["query"] = {
+            "tickers": normalized_tickers,
+            "ticker_alias": ticker,
+            "ticker_a_alias": ticker_a,
+            "ticker_b_alias": ticker_b,
+        }
+        if input_warnings:
+            payload["input_warnings"] = input_warnings
         return _format_response(payload, response_format, _markdown_error)
-    if len(tickers) > MAX_COMPARE_TICKERS:
+    if len(normalized_tickers) > MAX_COMPARE_TICKERS:
         payload = _error_payload(
             "invalid_request",
             f"Compare supports at most {MAX_COMPARE_TICKERS} tickers per call.",
             "Split the comparison into smaller batches.",
         )
+        payload["query"] = {"tickers": normalized_tickers}
+        if input_warnings:
+            payload["input_warnings"] = input_warnings
         return _format_response(payload, response_format, _markdown_error)
 
     index = _index(root, index_path)
     limit_per_ticker = max(1, min(int(limit_per_ticker), 10))
+    detail = _coerce_response_detail(response_detail)
     with _store(index) as store:
         if period_compare:
             result = _compare_periods(
                 store,
-                ticker=tickers[0],
+                ticker=normalized_tickers[0],
                 topic=topic,
                 metric=metric,
                 document_types=document_types,
                 periods=periods or [],
                 limit_per_period=limit_per_ticker,
             )
-        else:
+        elif detail == ResponseDetail.FULL:
             result = store.compare(
-                tickers=tickers,
+                tickers=normalized_tickers,
+                topic=topic,
+                metric=metric,
+                document_types=document_types,
+                periods=periods,
+                limit_per_ticker=limit_per_ticker,
+            )
+        else:
+            result = store.compare_compact(
+                tickers=normalized_tickers,
                 topic=topic,
                 metric=metric,
                 document_types=document_types,
@@ -680,8 +760,20 @@ def compare_tool(
                 limit_per_ticker=limit_per_ticker,
             )
     result["comparison_rows"] = _comparison_rows(result)
-    detail = _coerce_response_detail(response_detail)
     payload = result if detail == ResponseDetail.FULL else _compact_compare(result)
+    payload["query"] = {
+        "tickers": normalized_tickers,
+        "ticker_alias": ticker,
+        "ticker_a_alias": ticker_a,
+        "ticker_b_alias": ticker_b,
+        "topic": topic,
+        "metric": metric,
+        "document_types": document_types or [],
+        "periods": _upper_list(periods),
+        "limit_per_ticker": limit_per_ticker,
+    }
+    if input_warnings:
+        payload["input_warnings"] = input_warnings
     payload["response_detail"] = detail.value
     return _format_response(payload, response_format, _markdown_compare)
 
@@ -699,6 +791,113 @@ def plan_query_tool(
         plan = AgentRetriever(store).plan(question)
     payload = {"plan": plan.to_dict()}
     return _format_response(payload, response_format, _markdown_plan)
+
+
+def index_context_tool(
+    *,
+    root: str | None = None,
+    index_path: str | None = None,
+    include_counts: bool = True,
+    include_capabilities: bool = True,
+    include_quality_summary: bool = True,
+    response_format: ResponseFormat = ResponseFormat.JSON,
+) -> str:
+    """Return a compact AI capability card for the current agent index."""
+    index = _index(root, index_path)
+    with _store(index) as store:
+        payload = store.index_context(
+            include_counts=include_counts,
+            include_capabilities=include_capabilities,
+            include_quality_summary=include_quality_summary,
+        )
+    return _format_response(payload, response_format, _markdown_index_context)
+
+
+def company_context_tool(
+    *,
+    ticker: str,
+    root: str | None = None,
+    index_path: str | None = None,
+    document_types: list[str] | None = None,
+    periods: list[str] | None = None,
+    limit_topics: int = 12,
+    include_internal_ids: bool = True,
+    response_format: ResponseFormat = ResponseFormat.JSON,
+) -> str:
+    """Return compressed evidence-derived topic context for one company."""
+    index = _index(root, index_path)
+    with _store(index) as store:
+        payload = store.company_context(
+            ticker=ticker,
+            document_types=document_types,
+            periods=periods,
+            limit_topics=limit_topics,
+            include_internal_ids=include_internal_ids,
+        )
+    return _format_response(payload, response_format, _markdown_company_context)
+
+
+def query_context_tool(
+    *,
+    question: str,
+    root: str | None = None,
+    index_path: str | None = None,
+    ticker: str | None = None,
+    tickers: list[str] | None = None,
+    document_types: list[str] | None = None,
+    periods: list[str] | None = None,
+    universe: str | None = None,
+    limit_results: int = 10,
+    limit_tickers: int = 20,
+    include_internal_ids: bool = True,
+    response_format: ResponseFormat = ResponseFormat.JSON,
+) -> str:
+    """Return a compact answer-planning pack with answerability guidance."""
+    index = _index(root, index_path)
+    with _store(index) as store:
+        payload = store.query_context(
+            question=question,
+            ticker=ticker,
+            tickers=tickers,
+            document_types=document_types,
+            periods=periods,
+            universe=universe,
+            limit_results=limit_results,
+            limit_tickers=limit_tickers,
+            include_internal_ids=include_internal_ids,
+        )
+    return _format_response(payload, response_format, _markdown_query_context)
+
+
+def _markdown_index_context(payload: Mapping[str, Any]) -> str:
+    return "\n".join(
+        [
+            "# KRW Ontology Index Context",
+            f"- status: {payload.get('index_status')}",
+            f"- schema: {payload.get('agent_index_schema_version')}",
+            f"- tickers: {', '.join(payload.get('available_tickers') or [])}",
+        ]
+    )
+
+
+def _markdown_company_context(payload: Mapping[str, Any]) -> str:
+    lines = [f"# {payload.get('ticker')} Company Context"]
+    for topic in payload.get("company_topics") or []:
+        lines.append(f"- {topic.get('topic_label')}: {topic.get('topic_summary')}")
+    return "\n".join(lines)
+
+
+def _markdown_query_context(payload: Mapping[str, Any]) -> str:
+    answerability = payload.get("answerability") or {}
+    lines = [
+        "# KRW Ontology Query Context",
+        f"- direct_answerable: {answerability.get('direct_answerable')}",
+        f"- related_context_available: {answerability.get('related_context_available')}",
+        f"- recommended_answer_mode: {answerability.get('recommended_answer_mode')}",
+    ]
+    for candidate in payload.get("ticker_candidates") or []:
+        lines.append(f"- {candidate.get('ticker')}: {candidate.get('tier') or candidate.get('top_tier')}")
+    return "\n".join(lines)
 
 
 def _compare_periods(
@@ -964,7 +1163,7 @@ def _compact_retrieval(result: dict[str, Any]) -> dict[str, Any]:
 
 def _compact_compare(result: dict[str, Any]) -> dict[str, Any]:
     return {
-        **{key: value for key, value in result.items() if key != "results"},
+        **{key: value for key, value in result.items() if key not in {"results", "comparison_contexts"}},
         "results": {
             ticker: [_compact_bundle(item) for item in items]
             for ticker, items in result.get("results", {}).items()
@@ -992,6 +1191,7 @@ def _comparison_rows(result: dict[str, Any]) -> list[dict[str, Any]]:
         return rows
 
     for ticker, items in results.items():
+        evaluation = (result.get("comparison_evaluations") or {}).get(ticker) or {}
         rows.append(
             _comparison_row(
                 comparison_key=str(ticker),
@@ -1000,6 +1200,7 @@ def _comparison_rows(result: dict[str, Any]) -> list[dict[str, Any]]:
                 items=items,
                 topic=result.get("topic"),
                 metric=result.get("metric"),
+                evaluation=evaluation,
             )
         )
     return rows
@@ -1013,7 +1214,9 @@ def _comparison_row(
     items: list[dict[str, Any]],
     topic: str | None,
     metric: str | None,
+    evaluation: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
+    evaluation = evaluation or {}
     if not items:
         return {
             "comparison_key": comparison_key,
@@ -1029,12 +1232,27 @@ def _comparison_row(
             "confidence": "unsupported",
             "evidence_grade": None,
             "evidence_counts": {"claims": 0, "quotes": 0, "spans": 0},
+            "direct_answerable": bool(evaluation.get("direct_answerable")),
+            "related_context_available": bool(evaluation.get("related_context_available")),
+            "negative_answer_supported": bool(evaluation.get("negative_answer_supported")),
+            "recommended_answer_mode": evaluation.get("recommended_answer_mode") or "not_answerable",
+            "semantic_relevance": evaluation.get("semantic_relevance"),
+            "trace_status": evaluation.get("trace_status"),
+            "tier": evaluation.get("tier") or "not_answerable",
+            "evidence_chain_count": evaluation.get("evidence_chain_count") or 0,
+            "support_depth": evaluation.get("support_depth"),
+            "support_quote_count": evaluation.get("support_quote_count") or 0,
+            "support_claim_count": evaluation.get("support_claim_count") or 0,
+            "matched_required_facets": evaluation.get("matched_required_facets") or [],
+            "missing_required_facets": evaluation.get("missing_required_facets") or [],
+            "why_tier": evaluation.get("why_tier") or "No matching ontology objects were returned for this comparison key.",
             "caveats": ["No matching ontology objects were returned for this comparison key."],
             "missing": True,
             "missing_reason": "no_matching_ontology_objects",
         }
 
-    item = _best_comparison_item(items)
+    item = _best_comparison_item(items, topic=topic)
+    answerability_fields = _comparison_answerability_fields(item, evaluation, topic=topic)
     obj = item.get("object") or {}
     evidence = item.get("evidence") or {}
     quality = item.get("quality") or {}
@@ -1059,17 +1277,18 @@ def _comparison_row(
             "quotes": len(evidence.get("quotes") or []),
             "spans": len(evidence.get("spans") or []),
         },
+        **answerability_fields,
         "caveats": _comparison_caveats(item),
         "missing": False,
         "missing_reason": None,
     }
 
 
-def _best_comparison_item(items: list[dict[str, Any]]) -> dict[str, Any]:
-    return max(items, key=_comparison_item_score)
+def _best_comparison_item(items: list[dict[str, Any]], *, topic: str | None = None) -> dict[str, Any]:
+    return max(items, key=lambda item: _comparison_item_score(item, topic=topic))
 
 
-def _comparison_item_score(item: dict[str, Any]) -> tuple[int, int, int, str]:
+def _comparison_item_score(item: dict[str, Any], *, topic: str | None = None) -> tuple[int, int, int, int, str]:
     obj = item.get("object") or {}
     evidence = item.get("evidence") or {}
     grade_score = {
@@ -1089,8 +1308,165 @@ def _comparison_item_score(item: dict[str, Any]) -> tuple[int, int, int, str]:
         "BusinessEvent": 2,
         "AgreementTerm": 2,
     }.get(str(item.get("type") or ""), 1)
+    tier_score = {
+        "traceable_direct": 5,
+        "traceable_metric_lineage": 5,
+        "traceable_related": 3,
+        "untraced_direct_candidate": 2,
+        "broad_related_candidate": 1,
+        "not_answerable": 0,
+    }.get(str(item.get("tier") or ""), 1)
     support_count = len(evidence.get("claims") or []) + len(evidence.get("quotes") or [])
-    return (grade_score, type_score, support_count, str(item.get("id") or ""))
+    if not support_count:
+        support_count = int(item.get("support_claim_count") or 0) + int(item.get("support_quote_count") or 0)
+    direct_topic_score = 1 if topic and _comparison_item_directly_matches_topic(item, topic) else 0
+    return (direct_topic_score, tier_score, grade_score + type_score, support_count, str(item.get("id") or ""))
+
+
+def _comparison_answerability_fields(
+    item: dict[str, Any],
+    evaluation: Mapping[str, Any],
+    *,
+    topic: str | None,
+) -> dict[str, Any]:
+    evidence = item.get("evidence") or {}
+    inferred_tier = _infer_comparison_item_tier(item)
+    tier = item.get("tier") or evaluation.get("tier") or inferred_tier
+    direct_topic_match = bool(topic and _comparison_item_directly_matches_topic(item, topic))
+    candidate_trace_status = item.get("trace_status") or evaluation.get("trace_status")
+    if (
+        topic
+        and direct_topic_match
+        and candidate_trace_status in {"traceable", "traceable_metric_lineage"}
+        and str(tier) in {"traceable_related", "untraced_direct_candidate", "broad_related_candidate"}
+    ):
+        tier = "traceable_direct"
+    if topic and str(tier) == "traceable_related" and direct_topic_match:
+        tier = "traceable_direct"
+    elif (
+        topic
+        and str(tier) == "traceable_direct"
+        and not direct_topic_match
+        and inferred_tier != "traceable_metric_lineage"
+    ):
+        tier = "traceable_related"
+    trace_status = item.get("trace_status") or evaluation.get("trace_status") or _infer_trace_status_from_tier(tier)
+    semantic_relevance = item.get("semantic_relevance") or evaluation.get("semantic_relevance")
+    support_quote_count = item.get("support_quote_count")
+    if support_quote_count is None:
+        support_quote_count = evaluation.get("support_quote_count")
+    if support_quote_count is None:
+        support_quote_count = len(evidence.get("quotes") or [])
+    support_claim_count = item.get("support_claim_count")
+    if support_claim_count is None:
+        support_claim_count = evaluation.get("support_claim_count")
+    if support_claim_count is None:
+        support_claim_count = len(evidence.get("claims") or [])
+    direct_answerable = tier in {"traceable_direct", "traceable_metric_lineage"}
+    return {
+        "direct_answerable": bool(direct_answerable),
+        "related_context_available": bool(evaluation.get("related_context_available") or tier == "traceable_related"),
+        "negative_answer_supported": bool(evaluation.get("negative_answer_supported")),
+        "recommended_answer_mode": evaluation.get("recommended_answer_mode"),
+        "semantic_relevance": semantic_relevance,
+        "trace_status": trace_status,
+        "tier": tier,
+        "evidence_chain_count": item.get("evidence_chain_count") or evaluation.get("evidence_chain_count"),
+        "support_depth": item.get("support_depth") or evaluation.get("support_depth"),
+        "support_quote_count": support_quote_count,
+        "support_claim_count": support_claim_count,
+        "matched_required_facets": item.get("matched_required_facets") or evaluation.get("matched_required_facets") or [],
+        "missing_required_facets": item.get("missing_required_facets") or evaluation.get("missing_required_facets") or [],
+        "why_tier": item.get("why_tier") or evaluation.get("why_tier") or _default_compare_why_tier(tier),
+    }
+
+
+def _infer_comparison_item_tier(item: Mapping[str, Any]) -> str:
+    evidence = item.get("evidence") or {}
+    if evidence.get("metric_lineage") or item.get("type") in {"MetricObservation", "Calculation"}:
+        return "traceable_metric_lineage"
+    if item.get("type") in {"EvidenceQuote", "ResearchClaim"}:
+        return "traceable_direct"
+    if evidence.get("claims") or evidence.get("quotes"):
+        return "traceable_related"
+    return "untraced_direct_candidate"
+
+
+def _comparison_item_directly_matches_topic(item: Mapping[str, Any], topic: str) -> bool:
+    terms = _meaningful_topic_terms(topic)
+    if not terms:
+        return False
+    evidence = item.get("evidence") or {}
+    text_parts = [str(item.get("text") or "")]
+    for key in ("claims", "quotes"):
+        for obj in evidence.get(key) or []:
+            if isinstance(obj, Mapping):
+                text_parts.append(str(obj.get("text") or ""))
+    haystack = " ".join(text_parts).lower()
+    matched = [term for term in terms if _topic_term_in_text(term, haystack)]
+    if len(terms) <= 4:
+        return len(matched) == len(terms)
+    return len(matched) >= len(terms) - 1
+
+
+def _meaningful_topic_terms(topic: str) -> list[str]:
+    stopwords = {
+        "and",
+        "or",
+        "the",
+        "a",
+        "an",
+        "of",
+        "to",
+        "by",
+        "for",
+        "with",
+        "risk",
+        "impact",
+        "effect",
+        "effects",
+        "exposure",
+        "compare",
+        "comparison",
+        "payment",
+        "payments",
+        "growth",
+        "revenue",
+        "cost",
+        "costs",
+    }
+    raw_terms = [
+        token.strip().lower()
+        for token in re.split(r"[^A-Za-z0-9]+", str(topic or ""))
+        if token.strip()
+    ]
+    terms: list[str] = []
+    for term in raw_terms:
+        if len(term) < 2 or term in stopwords:
+            continue
+        if term not in terms:
+            terms.append(term)
+    return terms[:8]
+
+
+def _topic_term_in_text(term: str, text: str) -> bool:
+    if term == "ai":
+        return bool(re.search(r"\bai\b", text)) or "artificial intelligence" in text
+    return bool(re.search(rf"\b{re.escape(term)}\b", text))
+
+
+def _infer_trace_status_from_tier(tier: Any) -> str:
+    return "traceable" if str(tier) in {"traceable_direct", "traceable_metric_lineage", "traceable_related"} else "untraced"
+
+
+def _default_compare_why_tier(tier: Any) -> str:
+    if tier == "traceable_direct":
+        return "Selected comparison evidence is directly traceable to filing claim or quote support."
+    if tier == "traceable_metric_lineage":
+        return "Selected comparison evidence is supported by metric lineage."
+    if tier == "traceable_related":
+        return "Selected comparison evidence is traceable but should be treated as related context unless it matches the exact comparison premise."
+    return "Selected comparison evidence needs follow-up trace or narrower search before being used as a strong conclusion."
 
 
 def _comparison_caveats(item: dict[str, Any]) -> list[str]:
@@ -1251,6 +1627,61 @@ def _bounded_offset(offset: int) -> int:
 
 def _upper_list(values: list[str] | None) -> list[str]:
     return [value.upper() for value in values or []]
+
+
+def _merge_ticker_alias(*, ticker: str | None, tickers: list[str] | None) -> list[str] | None:
+    return _merge_upper_scalar_list_alias(ticker, tickers)
+
+
+def _merge_compare_ticker_aliases(
+    *,
+    tickers: list[str] | None,
+    ticker: str | None,
+    ticker_a: str | None,
+    ticker_b: str | None,
+) -> list[str]:
+    return _merge_upper_scalar_list_alias(ticker_a, tickers, ticker_b, ticker) or []
+
+
+def _merge_scalar_list_alias(
+    scalar: str | None,
+    values: list[str] | None,
+) -> list[str] | None:
+    merged: list[str] = []
+    for value in [*(values or []), scalar]:
+        if not value:
+            continue
+        normalized = str(value).strip()
+        if normalized and normalized not in merged:
+            merged.append(normalized)
+    return merged or None
+
+
+def _merge_upper_scalar_list_alias(
+    scalar: str | None,
+    values: list[str] | None,
+    *extra_scalars: str | None,
+) -> list[str] | None:
+    merged: list[str] = []
+    for value in [*(values or []), scalar, *extra_scalars]:
+        if not value:
+            continue
+        normalized = str(value).strip().upper()
+        if normalized and normalized not in merged:
+            merged.append(normalized)
+    return merged or None
+
+
+def _input_warnings(extra_args: Mapping[str, Any] | None) -> list[dict[str, Any]]:
+    if not extra_args:
+        return []
+    return [
+        {
+            "code": "ignored_extra_args",
+            "message": "Unsupported extra MCP arguments were ignored.",
+            "args": sorted(str(key) for key in extra_args),
+        }
+    ]
 
 
 def _pagination(total_count: int, offset: int, count: int, limit: int) -> dict[str, Any]:

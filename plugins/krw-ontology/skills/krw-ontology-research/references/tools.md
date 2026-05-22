@@ -123,6 +123,60 @@ Useful parameters:
 
 Use catalog before broad research when coverage, document scope, periods, or index freshness are unclear.
 
+## `krw_ontology_index_context`
+
+Return the compact index capability card. Use this instead of trying to infer current schema, serving tables, available tickers, object counts, or answerability policy from raw SQLite rows.
+
+Useful parameters:
+
+- `include_counts`: include object and serving-table counts
+- `include_capabilities`: include available context/retrieval capabilities
+- `include_quality_summary`: include compact quality counters
+- `response_format`: `json` or `markdown`
+
+Use this early when the current index coverage, schema version, topic-index availability, or answerability behavior is unclear.
+
+## `krw_ontology_company_context`
+
+Return a compressed evidence-derived topic profile for one ticker from `company_topic_index`.
+
+Useful parameters:
+
+- `ticker`: required company ticker
+- `document_types`: optional scope
+- `periods`: optional scope
+- `limit_topics`: number of company topics to return
+- `include_internal_ids`: default `true`; use IDs only for follow-up trace calls
+- `response_format`: `json` or `markdown`
+
+This is a search map, not final evidence. Use `topic_label`, `topic_summary`, terms, impact channels, trace status, and source object IDs to plan focused queries and traces. Do not expose `topic_id` or `source_object_ids` in final answers.
+
+## `krw_ontology_query_context`
+
+Return a question-specific context pack with deterministic answerability guidance.
+
+Useful parameters:
+
+- `question`: user question
+- `ticker` or `tickers`: optional company scope
+- `universe`: use `all` for broad discovery
+- `document_types`, `periods`: optional scope
+- `limit_results`, `limit_tickers`
+- `include_internal_ids`: default `true`; IDs are internal trace inputs only
+- `response_format`: `json` or `markdown`
+
+Use this for broad, multi-ticker, direct-exposure, scenario, and ambiguous natural-language questions before writing the answer. Inspect:
+
+```text
+query_frame
+answerability
+ticker_candidates
+recommended_tools
+final_answer_guidance
+```
+
+If `answerability.direct_answerable=false` and `related_context_available=true`, do not promote related context into a direct answer. Trace only the recommended final or related-context objects.
+
 ## `krw_ontology_query`
 
 Search ontology objects by structured filters.

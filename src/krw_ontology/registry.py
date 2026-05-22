@@ -29,7 +29,23 @@ def repo_root() -> Path:
 
 
 def registry_path() -> Path:
-    return repo_root() / "ontology" / "registry.yaml"
+    return _registry_path()
+
+
+def _registry_path(path: Path | str | None = None) -> Path:
+    candidates: list[Path] = []
+    if path is not None:
+        candidates.append(Path(path))
+    candidates.extend(
+        [
+            repo_root() / "ontology" / "registry.yaml",
+            Path(__file__).resolve().parent / "resources" / "registry.yaml",
+        ]
+    )
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
 
 
 def load_ontology_registry(path: Path | str | None = None) -> OntologyRegistry:
@@ -39,7 +55,7 @@ def load_ontology_registry(path: Path | str | None = None) -> OntologyRegistry:
     filenames and searchable text fields so index/query code does not grow a
     second, drifting schema map.
     """
-    resolved = Path(path) if path is not None else registry_path()
+    resolved = _registry_path(path)
     data: dict[str, Any] = yaml.safe_load(resolved.read_text()) or {}
     objects = data.get("objects") or {}
     object_files: dict[str, str] = {}

@@ -7,8 +7,11 @@ through OntologyStore, and returns evidence bundles with an audit trail.
 
 from __future__ import annotations
 
+from collections import OrderedDict
+import copy
 from dataclasses import asdict, dataclass, field
 import re
+from threading import Lock
 from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence
 
 from krw_ontology.agent_index.discovery import (
@@ -23,6 +26,9 @@ RerankerFn = Callable[[list[dict[str, Any]], "QueryPlan"], list[dict[str, Any]]]
 
 _TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9.:-]*")
 _PERIOD_RE = re.compile(r"\bFY\d{4}(?:Q[1-4?])?\b", re.IGNORECASE)
+_RETRIEVE_COMPACT_CACHE_MAX = 256
+_RETRIEVE_COMPACT_CACHE: OrderedDict[tuple[Any, ...], dict[str, Any]] = OrderedDict()
+_RETRIEVE_COMPACT_CACHE_LOCK = Lock()
 
 QUESTION_TYPE_OBJECTS: dict[str, list[str]] = {
     "risk": ["BusinessFactor", "ExternalFactorExposure", "ResearchClaim", "EvidenceQuote"],
@@ -193,6 +199,21 @@ class AgentRetriever:
             include_rejected=include_rejected,
             limit=limit,
         )
+        unavailable_tickers: list[str] = []
+        if plan.tickers:
+            available_tickers = self.store._available_tickers(plan.tickers)
+            unavailable_tickers = [ticker for ticker in plan.tickers if ticker not in available_tickers]
+            if not available_tickers:
+                return _empty_retrieve_response(
+                    plan,
+                    started_at,
+                    unavailable_tickers=unavailable_tickers,
+                )
+            if unavailable_tickers:
+                plan = _replace_plan_tickers(
+                    plan,
+                    [ticker for ticker in plan.tickers if ticker in available_tickers],
+                )
         resolved_periods = self._resolve_periods(plan)
         executed_queries: list[dict[str, Any]] = []
 
@@ -245,7 +266,25 @@ class AgentRetriever:
             }
 
         if not include_evidence_bundle:
-            return self._retrieve_compact(plan, resolved_periods, executed_queries, started_at)
+            cache_key = _retrieve_compact_cache_key(self.store.index_path, plan, resolved_periods)
+            cached = _retrieve_compact_cache_get(cache_key)
+            if cached is not None:
+                result = copy.deepcopy(cached)
+                result.setdefault("audit", {})["cache_hit"] = True
+                result.setdefault("audit", {})["retrieve_compact_cache"] = True
+                if unavailable_tickers:
+                    result.setdefault("audit", {})["unavailable_tickers"] = unavailable_tickers
+                result.setdefault("timing_ms", {})["total"] = round(
+                    (time.perf_counter() - started_at) * 1000,
+                    3,
+                )
+                return result
+            result = self._retrieve_compact(plan, resolved_periods, executed_queries, started_at)
+            if unavailable_tickers:
+                result.setdefault("audit", {})["unavailable_tickers"] = unavailable_tickers
+                result.setdefault("audit", {})["ticker_guard"] = True
+            _retrieve_compact_cache_set(cache_key, result)
+            return result
 
         candidates = self._execute_search(plan, resolved_periods, executed_queries)
         candidates = self._apply_graph_lift(candidates, plan)
@@ -1550,3 +1589,108 @@ def _unique_nullable(values: Iterable[str | None]) -> list[str | None]:
         seen.add(key)
         output.append(value)
     return output
+
+
+def _replace_plan_tickers(plan: QueryPlan, tickers: list[str]) -> QueryPlan:
+    return QueryPlan(
+        question=plan.question,
+        intent=plan.intent,
+        tickers=tickers,
+        document_types=plan.document_types,
+        periods=plan.periods,
+        period_policy=plan.period_policy,
+        topics=plan.topics,
+        metric=plan.metric,
+        object_types=plan.object_types,
+        include_rejected=plan.include_rejected,
+        require_trace=plan.require_trace,
+        limit=plan.limit,
+    )
+
+
+def _empty_retrieve_response(
+    plan: QueryPlan,
+    started_at: float,
+    *,
+    unavailable_tickers: Sequence[str],
+) -> dict[str, Any]:
+    import time
+
+    answerability = {
+        "direct_answerable": False,
+        "related_context_available": False,
+        "negative_answer_supported": True,
+        "needs_user_clarification": False,
+        "recommended_answer_mode": "not_answerable",
+        "question_requires_direct_match": _question_requires_direct_match(plan.question),
+        "query_frame": {},
+    }
+    return {
+        "answerability": answerability,
+        "recommended_answer_mode": "not_answerable",
+        "query_frame": {},
+        "plan": plan.to_dict(),
+        "resolved_periods": [],
+        "direct_evidence": [],
+        "related_context": [],
+        "rejected_context": [],
+        "recommended_trace_object_ids": [],
+        "trace_required": False,
+        "trace_policy": {
+            "mode": "lazy",
+            "reason": "ticker_guard_no_index_rows",
+            "max_recommended_trace_objects": 0,
+        },
+        "search_diagnostics": {
+            "warnings": ["ticker_not_available"],
+            "unavailable_tickers": list(unavailable_tickers),
+        },
+        "audit": {
+            "executed_queries": [],
+            "compact_retrieve": True,
+            "evidence_bundle_included": False,
+            "ticker_guard": True,
+            "unavailable_tickers": list(unavailable_tickers),
+        },
+        "timing_ms": {"total": round((time.perf_counter() - started_at) * 1000, 3)},
+    }
+
+
+def _retrieve_compact_cache_key(
+    index_path: Any,
+    plan: QueryPlan,
+    resolved_periods: Sequence[str],
+) -> tuple[Any, ...]:
+    path_text = str(index_path)
+    try:
+        index_mtime_ns = index_path.stat().st_mtime_ns
+    except OSError:
+        index_mtime_ns = None
+    return (
+        path_text,
+        index_mtime_ns,
+        plan.question,
+        tuple(plan.tickers),
+        tuple(plan.document_types),
+        tuple(resolved_periods),
+        tuple(plan.object_types),
+        bool(plan.include_rejected),
+        int(plan.limit),
+    )
+
+
+def _retrieve_compact_cache_get(key: tuple[Any, ...]) -> dict[str, Any] | None:
+    with _RETRIEVE_COMPACT_CACHE_LOCK:
+        cached = _RETRIEVE_COMPACT_CACHE.get(key)
+        if cached is None:
+            return None
+        _RETRIEVE_COMPACT_CACHE.move_to_end(key)
+        return copy.deepcopy(cached)
+
+
+def _retrieve_compact_cache_set(key: tuple[Any, ...], value: dict[str, Any]) -> None:
+    with _RETRIEVE_COMPACT_CACHE_LOCK:
+        _RETRIEVE_COMPACT_CACHE[key] = copy.deepcopy(value)
+        _RETRIEVE_COMPACT_CACHE.move_to_end(key)
+        while len(_RETRIEVE_COMPACT_CACHE) > _RETRIEVE_COMPACT_CACHE_MAX:
+            _RETRIEVE_COMPACT_CACHE.popitem(last=False)

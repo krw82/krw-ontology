@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
-from collections import deque
+from collections import OrderedDict, deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import copy
 import json
 import re
 import sqlite3
+import time
+from threading import Lock
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -81,15 +85,54 @@ _QUERY_EXPANSION_RULES = (
     ("lng", "lng_sales lng_demand international_lng_price"),
 )
 _SPLIT_TOPIC_STOP_TERMS = {
+    "a",
+    "about",
+    "an",
     "and",
     "are",
+    "as",
+    "affected",
+    "be",
+    "been",
+    "being",
+    "check",
+    "companies",
+    "company",
+    "does",
+    "direct",
+    "directly",
+    "do",
+    "exposed",
+    "exposure",
+    "find",
+    "give",
+    "has",
+    "have",
+    "impact",
+    "impacted",
+    "is",
+    "of",
+    "or",
+    "prices",
+    "price",
     "for",
     "from",
     "how",
+    "if",
+    "in",
+    "into",
+    "on",
+    "risk",
+    "risks",
     "the",
     "this",
+    "tell",
+    "to",
+    "trends",
     "what",
     "when",
+    "whether",
+    "which",
     "with",
 }
 _SEMANTIC_NEIGHBOR_TYPES = {
@@ -101,14 +144,40 @@ _SEMANTIC_NEIGHBOR_TYPES = {
     "AssumptionCandidate",
 }
 
+_COMPARE_TICKER_CACHE_MAX = 256
+_COMPARE_TICKER_CACHE: OrderedDict[tuple[Any, ...], tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any]]] = OrderedDict()
+_COMPARE_TICKER_CACHE_LOCK = Lock()
+_DISCOVERY_CACHE_MAX = 128
+_DISCOVERY_CACHE: OrderedDict[tuple[Any, ...], dict[str, Any]] = OrderedDict()
+_DISCOVERY_CACHE_LOCK = Lock()
+_QUERY_COMPACT_CACHE_MAX = 512
+_QUERY_COMPACT_CACHE: OrderedDict[tuple[Any, ...], tuple[list[dict[str, Any]], dict[str, Any]]] = OrderedDict()
+_QUERY_COMPACT_CACHE_LOCK = Lock()
+_QUERY_CONTEXT_CACHE_MAX = 512
+_QUERY_CONTEXT_CACHE: OrderedDict[tuple[Any, ...], dict[str, Any]] = OrderedDict()
+_QUERY_CONTEXT_CACHE_LOCK = Lock()
+
 
 class OntologyStore:
     """Read-only SDK over an agent index SQLite database."""
 
     def __init__(self, index_path: Path | str):
         self.index_path = Path(index_path)
-        self.conn = sqlite3.connect(self.index_path)
+        self.conn = sqlite3.connect(self.index_path, cached_statements=512)
         self.conn.row_factory = sqlite3.Row
+        self._configure_read_connection()
+
+    def _configure_read_connection(self) -> None:
+        """Apply per-connection read-heavy SQLite settings."""
+        pragmas = (
+            "PRAGMA query_only = ON",
+            "PRAGMA temp_store = MEMORY",
+            "PRAGMA cache_size = -131072",
+            "PRAGMA mmap_size = 536870912",
+            "PRAGMA busy_timeout = 5000",
+        )
+        for statement in pragmas:
+            self.conn.execute(statement)
 
     def close(self) -> None:
         self.conn.close()
@@ -124,6 +193,21 @@ class OntologyStore:
             "SELECT DISTINCT ticker FROM documents ORDER BY ticker"
         ).fetchall()
         return [row["ticker"] for row in rows]
+
+    def _available_tickers(self, tickers: Sequence[str]) -> set[str]:
+        normalized = [ticker.upper() for ticker in tickers if ticker]
+        if not normalized:
+            return set()
+        placeholders = ", ".join("?" for _ in normalized)
+        rows = self.conn.execute(
+            f"""
+            SELECT DISTINCT ticker FROM documents WHERE ticker IN ({placeholders})
+            UNION
+            SELECT DISTINCT ticker FROM objects WHERE ticker IN ({placeholders})
+            """,
+            [*normalized, *normalized],
+        ).fetchall()
+        return {str(row["ticker"]).upper() for row in rows}
 
     def list_documents(
         self,
@@ -312,6 +396,9 @@ class OntologyStore:
         include_internal_ids: bool = True,
     ) -> dict[str, Any]:
         """Return a deterministic answer-planning pack for one user question."""
+        query_context_started_at = time.perf_counter()
+        document_types = list(document_types) if document_types is not None else None
+        periods = list(periods) if periods is not None else None
         requested_tickers: list[str] | None
         if ticker:
             requested_tickers = [ticker.upper()]
@@ -321,7 +408,23 @@ class OntologyStore:
             requested_tickers = [str(universe).upper()]
         else:
             requested_tickers = None
+        cache_key = _query_context_cache_key(
+            self.index_path,
+            question=question,
+            requested_tickers=requested_tickers,
+            document_types=document_types,
+            periods=periods,
+            universe=universe,
+            limit_results=limit_results,
+            limit_tickers=limit_tickers,
+            include_internal_ids=include_internal_ids,
+        )
+        cached = _query_context_cache_get(cache_key)
+        if cached is not None:
+            cached.setdefault("search_diagnostics", {})["cache_hit"] = True
+            return cached
 
+        discovery_started_at = time.perf_counter()
         discovery = self.discover_company_topics(
             question=question,
             tickers=requested_tickers,
@@ -329,8 +432,14 @@ class OntologyStore:
             periods=periods,
             limit_groups=max(1, min(int(limit_tickers), 50)),
             limit_per_group=3,
-            limit=max(int(limit_results) * 10, 50),
+            limit=_query_context_discovery_limit(
+                limit_results=limit_results,
+                limit_tickers=limit_tickers,
+                requested_tickers=requested_tickers,
+            ),
         )
+        discovery_elapsed_ms = int((time.perf_counter() - discovery_started_at) * 1000)
+        planning_started_at = time.perf_counter()
         candidates = list(discovery.get("ticker_candidates") or [])
         selected_candidates = candidates[: max(1, min(int(limit_tickers), 50))]
         query_frame = dict(discovery.get("query_frame") or {})
@@ -350,6 +459,14 @@ class OntologyStore:
         }
         if include_internal_ids:
             payload["results_by_ticker"] = discovery.get("results_by_ticker") or {}
+        search_diagnostics = payload.get("search_diagnostics")
+        if isinstance(search_diagnostics, dict):
+            timing = dict(search_diagnostics.get("timing_ms") or {})
+            timing["query_context_discovery"] = discovery_elapsed_ms
+            timing["query_context_planning"] = int((time.perf_counter() - planning_started_at) * 1000)
+            timing["query_context_total"] = int((time.perf_counter() - query_context_started_at) * 1000)
+            search_diagnostics["timing_ms"] = timing
+        _query_context_cache_set(cache_key, payload)
         return payload
 
     def get_object(self, object_id: str) -> dict[str, Any] | None:
@@ -408,6 +525,10 @@ class OntologyStore:
         limit: int = 20,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         """Return evidence bundles plus deterministic search diagnostics."""
+        original_tickers = list(tickers) if tickers is not None else None
+        tickers, unavailable_tickers = self._query_available_tickers(original_tickers)
+        if original_tickers is not None and not tickers:
+            return [], _ticker_guard_query_diagnostics(topic, unavailable_tickers)
         selected_types = tuple(object_types or DEFAULT_QUERY_TYPES)
         search_strategy: dict[str, Any] | None = None
         if topic:
@@ -435,6 +556,11 @@ class OntologyStore:
             result_count=len(bundles),
             search_strategy=search_strategy,
         )
+        if unavailable_tickers:
+            diagnostics.setdefault("warnings", [])
+            diagnostics["warnings"].append("ticker_not_available")
+            diagnostics["unavailable_tickers"] = unavailable_tickers
+            diagnostics["ticker_guard"] = True
         return bundles, diagnostics
 
     def query_compact_with_diagnostics(
@@ -449,7 +575,40 @@ class OntologyStore:
         limit: int = 20,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         """Return row-level compact query results without eager evidence expansion."""
+        original_tickers = list(tickers) if tickers is not None else None
+        tickers, unavailable_tickers = self._query_available_tickers(original_tickers)
+        if original_tickers is not None and not tickers:
+            return [], _ticker_guard_query_diagnostics(topic, unavailable_tickers, compact=True)
+        document_types = list(document_types) if document_types is not None else None
+        periods = list(periods) if periods is not None else None
+        object_types = list(object_types) if object_types is not None else None
         selected_types = tuple(object_types or DEFAULT_QUERY_TYPES)
+        if tickers and periods and not self._has_query_scope_objects(
+            tickers=tickers,
+            document_types=document_types,
+            periods=periods,
+            object_types=selected_types,
+            include_rejected=include_rejected,
+        ):
+            diagnostics = _search_diagnostics(topic, result_count=0)
+            diagnostics["compact_fast_path"] = True
+            diagnostics["scope_guard"] = "no_objects_for_ticker_period_scope"
+            return [], diagnostics
+        cache_key = _query_compact_cache_key(
+            self.index_path,
+            topic=topic,
+            tickers=original_tickers,
+            document_types=document_types,
+            periods=periods,
+            object_types=selected_types,
+            include_rejected=include_rejected,
+            limit=limit,
+        )
+        cached = _query_compact_cache_get(cache_key)
+        if cached is not None:
+            bundles, diagnostics = cached
+            diagnostics = {**diagnostics, "cache_hit": True}
+            return bundles, diagnostics
         search_strategy: dict[str, Any] | None = None
         if topic:
             rows, search_strategy = self._query_fts_with_strategy(
@@ -477,7 +636,28 @@ class OntologyStore:
             search_strategy=search_strategy,
         )
         diagnostics["compact_fast_path"] = True
-        return bundles, diagnostics
+        if unavailable_tickers:
+            diagnostics.setdefault("warnings", [])
+            diagnostics["warnings"].append("ticker_not_available")
+            diagnostics["unavailable_tickers"] = unavailable_tickers
+            diagnostics["ticker_guard"] = True
+        result = (bundles, diagnostics)
+        _query_compact_cache_set(cache_key, result)
+        return result
+
+    def _query_available_tickers(
+        self,
+        tickers: Sequence[str] | None,
+    ) -> tuple[list[str] | None, list[str]]:
+        if tickers is None:
+            return None, []
+        normalized = [str(ticker).upper() for ticker in tickers if ticker]
+        if not normalized:
+            return None, []
+        available = self._available_tickers(normalized)
+        filtered = [ticker for ticker in normalized if ticker in available]
+        unavailable = [ticker for ticker in normalized if ticker not in available]
+        return filtered, unavailable
 
     def search_diagnostics(
         self,
@@ -500,16 +680,172 @@ class OntologyStore:
         limit: int = 200,
     ) -> dict[str, Any]:
         """Discover ticker candidates by matching QueryFrame to evidence-derived topics."""
+        discovery_started_at = time.perf_counter()
+        cache_key = _discovery_cache_key(
+            self.index_path,
+            question=question,
+            tickers=tickers,
+            document_types=document_types,
+            periods=periods,
+            limit_groups=limit_groups,
+            limit_per_group=limit_per_group,
+            limit=limit,
+        )
+        cached = _discovery_cache_get(cache_key)
+        if cached is not None:
+            cached.setdefault("search_diagnostics", {})["cache_hit"] = True
+            return cached
+        query_frame_started_at = time.perf_counter()
         query_frame = build_query_frame(question)
-        fts_query = _fts_query(_expanded_topic(question), operator="OR")
+        search_topic = _discovery_search_topic(question)
+        expanded_search_topic = _expanded_topic(search_topic)
+        fts_query = _fts_query(expanded_search_topic, operator="OR")
+        fts_strategy = "or"
+        query_frame_elapsed_ms = int((time.perf_counter() - query_frame_started_at) * 1000)
         try:
-            rows = self._query_company_topics(
-                fts_query,
-                tickers=tickers,
-                document_types=document_types,
-                periods=periods,
-                limit=limit,
-            ) if fts_query else []
+            topic_query_started_at = time.perf_counter()
+            rows: list[sqlite3.Row] = []
+            ticker_scope = [str(ticker).upper() for ticker in tickers] if tickers else []
+            topic_query_attempts: list[dict[str, Any]] = []
+
+            def query_company_topics_attempt(
+                label: str,
+                query: str,
+                *,
+                attempt_limit: int,
+            ) -> list[sqlite3.Row]:
+                attempt_started_at = time.perf_counter()
+                attempt_rows = self._query_company_topics(
+                    query,
+                    tickers=tickers,
+                    document_types=document_types,
+                    periods=periods,
+                    limit=attempt_limit,
+                )
+                topic_query_attempts.append(
+                    {
+                        "label": label,
+                        "result_count": len(attempt_rows),
+                        "limit": attempt_limit,
+                        "elapsed_ms": int((time.perf_counter() - attempt_started_at) * 1000),
+                    }
+                )
+                return attempt_rows
+
+            if fts_query and len(ticker_scope) == 1 and len(_query_terms(expanded_search_topic)) >= 4:
+                and_fts_query = _fts_query(expanded_search_topic, operator="AND")
+                and_rows = query_company_topics_attempt(
+                    "ticker_full_and",
+                    and_fts_query,
+                    attempt_limit=limit,
+                ) if and_fts_query else []
+                if len(and_rows) >= max(1, int(limit_per_group)):
+                    rows = and_rows
+                    fts_query = and_fts_query
+                    fts_strategy = "and_first"
+                else:
+                    pair_rows: list[sqlite3.Row] = []
+                    seen_topic_ids: set[str] = set()
+                    pair_queries = [
+                        _fts_query(chunk, operator="AND")
+                        for chunk in _split_topic_queries(search_topic, limit=8)
+                        if len(_query_terms(chunk)) >= 2
+                    ]
+                    pair_limit = max(1, min(max(int(limit_per_group) * 2, 6), int(limit)))
+                    pair_stop = max(1, min(max(int(limit_per_group) * 2, 6), int(limit)))
+                    for pair_query in pair_queries:
+                        if not pair_query:
+                            continue
+                        for row in query_company_topics_attempt(
+                            "ticker_pair_and",
+                            pair_query,
+                            attempt_limit=pair_limit,
+                        ):
+                            topic_id = row["topic_id"]
+                            if topic_id in seen_topic_ids:
+                                continue
+                            seen_topic_ids.add(topic_id)
+                            pair_rows.append(row)
+                            if len(pair_rows) >= pair_stop:
+                                break
+                        if len(pair_rows) >= pair_stop:
+                            break
+                    if len(pair_rows) >= max(1, int(limit_per_group)):
+                        rows = pair_rows[:limit]
+                        fts_query = " OR ".join(pair_queries[:4])
+                        fts_strategy = "and_pair_fallback"
+                    else:
+                        rows = query_company_topics_attempt(
+                            "ticker_relaxed_or",
+                            fts_query,
+                            attempt_limit=limit,
+                        )
+                        fts_strategy = "and_fallback_or"
+            elif fts_query and not ticker_scope and len(_query_terms(expanded_search_topic)) >= 4:
+                and_fts_query = _fts_query(expanded_search_topic, operator="AND")
+                and_rows = query_company_topics_attempt(
+                    "global_full_and",
+                    and_fts_query,
+                    attempt_limit=limit,
+                ) if and_fts_query else []
+                and_ticker_count = len({row["ticker"] for row in and_rows if row["ticker"]})
+                required_tickers = min(max(2, int(limit_groups) // 2), 5)
+                if len(and_rows) >= max(1, int(limit_per_group)) and and_ticker_count >= required_tickers:
+                    rows = and_rows
+                    fts_query = and_fts_query
+                    fts_strategy = "global_and_first"
+                else:
+                    pair_rows = []
+                    seen_topic_ids: set[str] = set()
+                    pair_queries = [
+                        _fts_query(chunk, operator="AND")
+                        for chunk in _split_topic_queries(search_topic, limit=10)
+                        if len(_query_terms(chunk)) >= 2
+                    ]
+                    pair_limit = max(1, min(max(int(limit_per_group) * 2, 6), int(limit)))
+                    pair_stop = max(1, min(max(int(limit_groups) * int(limit_per_group), 16), int(limit)))
+                    for pair_query in pair_queries:
+                        if not pair_query:
+                            continue
+                        for row in query_company_topics_attempt(
+                            "global_pair_and",
+                            pair_query,
+                            attempt_limit=pair_limit,
+                        ):
+                            topic_id = row["topic_id"]
+                            if topic_id in seen_topic_ids:
+                                continue
+                            seen_topic_ids.add(topic_id)
+                            pair_rows.append(row)
+                            if (
+                                len(pair_rows) >= pair_stop
+                                and len({candidate["ticker"] for candidate in pair_rows if candidate["ticker"]}) >= required_tickers
+                            ):
+                                break
+                        if (
+                            len(pair_rows) >= pair_stop
+                            and len({candidate["ticker"] for candidate in pair_rows if candidate["ticker"]}) >= required_tickers
+                        ):
+                            break
+                    pair_ticker_count = len({row["ticker"] for row in pair_rows if row["ticker"]})
+                    if len(pair_rows) >= max(1, int(limit_per_group)) and pair_ticker_count >= required_tickers:
+                        rows = pair_rows[:limit]
+                        fts_query = " OR ".join(pair_queries[:4])
+                        fts_strategy = "global_and_pair_fallback"
+                    else:
+                        rows = query_company_topics_attempt(
+                            "global_relaxed_or",
+                            fts_query,
+                            attempt_limit=limit,
+                        )
+                        fts_strategy = "global_and_fallback_or"
+            elif fts_query:
+                rows = query_company_topics_attempt(
+                    "default_or",
+                    fts_query,
+                    attempt_limit=limit,
+                )
+            topic_query_elapsed_ms = int((time.perf_counter() - topic_query_started_at) * 1000)
         except sqlite3.OperationalError as exc:
             return {
                 "query_frame": query_frame.as_dict(),
@@ -526,6 +862,7 @@ class OntologyStore:
             }
 
         grouped: dict[str, list[dict[str, Any]]] = {}
+        classify_started_at = time.perf_counter()
         for row in rows:
             topic = topic_from_row(dict(row))
             evidence_frame = build_evidence_frame(topic)
@@ -581,9 +918,11 @@ class OntologyStore:
                 "match": match,
             }
             grouped.setdefault(str(topic.get("ticker") or "UNKNOWN"), []).append(topic_payload)
+        classify_elapsed_ms = int((time.perf_counter() - classify_started_at) * 1000)
 
         candidates: list[dict[str, Any]] = []
         results_by_ticker: dict[str, list[dict[str, Any]]] = {}
+        grouping_started_at = time.perf_counter()
         for ticker, topics in grouped.items():
             topics.sort(
                 key=lambda item: (
@@ -633,8 +972,30 @@ class OntologyStore:
             reverse=True,
         )
         candidates = candidates[:limit_groups]
+        grouping_elapsed_ms = int((time.perf_counter() - grouping_started_at) * 1000)
         allowed = {str(candidate.get("ticker")) for candidate in candidates}
-        return {
+        fallback_diagnostics: dict[str, Any] | None = None
+        fallback_elapsed_ms = 0
+        if not candidates and question:
+            fallback_started_at = time.perf_counter()
+            fallback_limit = min(max(limit, limit_groups * limit_per_group), 80)
+            if tickers:
+                fallback_limit = min(fallback_limit, 24)
+            fallback = self._discovery_object_fallback(
+                question=search_topic,
+                tickers=tickers,
+                document_types=document_types,
+                periods=periods,
+                limit_groups=limit_groups,
+                limit_per_group=limit_per_group,
+                limit=fallback_limit,
+            )
+            candidates = fallback["ticker_candidates"]
+            results_by_ticker = fallback["results_by_ticker"]
+            allowed = {str(candidate.get("ticker")) for candidate in candidates}
+            fallback_diagnostics = fallback["search_diagnostics"]
+            fallback_elapsed_ms = int((time.perf_counter() - fallback_started_at) * 1000)
+        result = {
             "query_frame": query_frame.as_dict(),
             "ticker_candidates": candidates,
             "results_by_ticker": {
@@ -644,9 +1005,149 @@ class OntologyStore:
             },
             "search_diagnostics": {
                 "topic": question,
+                "search_topic": search_topic,
                 "fts_query": fts_query,
+                "fts_strategy": fts_strategy,
+                "company_topic_attempts": topic_query_attempts,
                 "searched_company_topics": len(rows),
                 "matched_tickers": len(candidates),
+                "timing_ms": {
+                    "query_frame": query_frame_elapsed_ms,
+                    "company_topic_query": topic_query_elapsed_ms,
+                    "classify_topics": classify_elapsed_ms,
+                    "group_rank_candidates": grouping_elapsed_ms,
+                    "object_fallback": fallback_elapsed_ms,
+                    "discover_total": int((time.perf_counter() - discovery_started_at) * 1000),
+                },
+                **({"object_fallback": fallback_diagnostics} if fallback_diagnostics else {}),
+            },
+        }
+        _discovery_cache_set(cache_key, result)
+        return result
+
+    def _discovery_object_fallback(
+        self,
+        *,
+        question: str,
+        tickers: Iterable[str] | None,
+        document_types: Iterable[str] | None,
+        periods: Iterable[str] | None,
+        limit_groups: int,
+        limit_per_group: int,
+        limit: int,
+    ) -> dict[str, Any]:
+        """Fallback discovery from compact object hits when rich topic matching yields no candidates."""
+        bundles, diagnostics = self.query_compact_with_diagnostics(
+            topic=question,
+            tickers=tickers,
+            document_types=document_types,
+            periods=periods,
+            object_types=DEFAULT_QUERY_TYPES,
+            include_rejected=False,
+            limit=limit,
+        )
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for rank, bundle in enumerate(bundles, start=1):
+            ticker = str(bundle.get("ticker") or "UNKNOWN")
+            if ticker == "UNKNOWN":
+                continue
+            trace_status = str(bundle.get("trace_status") or "unknown")
+            traceable = _is_traceable_status(trace_status)
+            score = round((1.0 / rank) + (0.5 if traceable else 0.0), 4)
+            topic_payload = {
+                "topic_id": None,
+                "ticker": ticker,
+                "period": bundle.get("period"),
+                "document_type": bundle.get("document_type"),
+                "topic_label": str(bundle.get("type") or "Object evidence"),
+                "topic_summary": str(bundle.get("text") or "")[:500],
+                "primary_object_id": bundle.get("id"),
+                "primary_object_type": bundle.get("type"),
+                "source_object_ids": [bundle.get("id")] if bundle.get("id") else [],
+                "dominant_object_types": [bundle.get("type")] if bundle.get("type") else [],
+                "impact_channels": [],
+                "evidence_strength": "object_fallback",
+                "support_quote_count": bundle.get("support_quote_count") or 0,
+                "support_claim_count": bundle.get("support_claim_count") or 0,
+                "trace_status": trace_status,
+                "evidence_chain_count": bundle.get("evidence_chain_count") or 0,
+                "support_depth": bundle.get("support_depth"),
+                "support_link_count": bundle.get("support_link_count") or 0,
+                "trace_method": "object_compact_fallback",
+                "metric_lineage_status": bundle.get("metric_lineage_status"),
+                "answer_candidate": bool(bundle.get("answer_candidate")),
+                "specificity_score": None,
+                "generic_score": None,
+                "boilerplate_score": None,
+                "materiality_hint": None,
+                "materiality_score": None,
+                "topic_type": "object_fallback",
+                "topic_family": "object_fallback",
+                "factor_terms": [],
+                "metric_terms": [],
+                "entity_terms": [],
+                "mechanism_terms": [],
+                "scenario_terms": [],
+                "top_traceable_object_ids": [bundle.get("id")] if traceable and bundle.get("id") else [],
+                "untraced_object_ids": [] if traceable or not bundle.get("id") else [bundle.get("id")],
+                "match": {
+                    "tier": "traceable_related" if traceable else "untraced_related",
+                    "semantic_relevance": "object_fallback",
+                    "trace_status": trace_status,
+                    "score": score,
+                    "why_tier": "Rich company-topic matching returned no candidates; compact object search found related answer-candidate evidence.",
+                },
+            }
+            grouped.setdefault(ticker, []).append(topic_payload)
+
+        candidates: list[dict[str, Any]] = []
+        results_by_ticker: dict[str, list[dict[str, Any]]] = {}
+        for ticker, topics in grouped.items():
+            selected = topics[:limit_per_group]
+            results_by_ticker[ticker] = selected
+            candidates.append(
+                {
+                    "ticker": ticker,
+                    "score": round(sum(float((topic.get("match") or {}).get("score") or 0.0) for topic in selected), 4),
+                    "tier": str((selected[0].get("match") or {}).get("tier") or "untraced_related"),
+                    "matched_topic_count": len(topics),
+                    "matched_object_counts": _topic_object_counts(topics),
+                    "evidence_counts": _topic_evidence_counts(topics),
+                    "trace_status": _ticker_trace_status(selected),
+                    "trace_counts": _topic_trace_counts(selected),
+                    "top_traceable_object_ids": _traceable_object_ids(selected)[:10],
+                    "untraced_object_ids": _untraced_object_ids(selected)[:10],
+                    "top_reasons": [_topic_reason(topic) for topic in selected],
+                    "top_object_ids": [
+                        str(object_id)
+                        for topic in selected
+                        for object_id in (topic.get("source_object_ids") or [])
+                    ][:10],
+                    "matched_topics": selected,
+                }
+            )
+        candidates.sort(
+            key=lambda item: (
+                tier_rank(str(item.get("tier") or "")),
+                float(item.get("score") or 0.0),
+                int(item.get("matched_topic_count") or 0),
+            ),
+            reverse=True,
+        )
+        candidates = candidates[:limit_groups]
+        allowed = {str(candidate.get("ticker")) for candidate in candidates}
+        return {
+            "ticker_candidates": candidates,
+            "results_by_ticker": {
+                ticker: results_by_ticker[ticker]
+                for ticker in sorted(allowed)
+                if ticker in results_by_ticker
+            },
+            "search_diagnostics": {
+                "enabled": True,
+                "searched_objects": len(bundles),
+                "matched_tickers": len(candidates),
+                "query_diagnostics": diagnostics,
             },
         }
 
@@ -956,7 +1457,159 @@ class OntologyStore:
         results: dict[str, list[dict[str, Any]]] = {}
         comparison_evaluations: dict[str, dict[str, Any]] = {}
         comparison_contexts: dict[str, dict[str, Any]] = {}
+        available_tickers = self._available_tickers(ticker_list)
         for ticker in ticker_list:
+            if ticker not in available_tickers:
+                results[ticker] = []
+                comparison_evaluations[ticker] = {
+                    "direct_answerable": False,
+                    "related_context_available": False,
+                    "negative_answer_supported": False,
+                    "recommended_answer_mode": "not_answerable",
+                    "tier": "not_answerable",
+                    "trace_status": "untraced",
+                    "why_tier": "Ticker is not available in the current ontology index.",
+                }
+                comparison_contexts[ticker] = {
+                    "ticker": ticker,
+                    "available": False,
+                    "why_tier": "Ticker is not available in the current ontology index.",
+                }
+        searchable_tickers = [ticker for ticker in ticker_list if ticker in available_tickers]
+        if not metric and len(ticker_list) > 1:
+            index_signature = (str(self.index_path), self.index_path.stat().st_mtime_ns)
+            document_type_key = tuple(document_types or ())
+            period_key = tuple(periods or ())
+
+            def compare_one(ticker: str) -> tuple[str, list[dict[str, Any]], dict[str, Any], dict[str, Any]]:
+                cache_key = (
+                    *index_signature,
+                    ticker,
+                    topic,
+                    document_type_key,
+                    period_key,
+                    int(limit_per_ticker),
+                )
+                cached = _compare_ticker_cache_get(cache_key)
+                if cached is not None:
+                    ticker_results, evaluation, context = cached
+                    return ticker, ticker_results, evaluation, context
+                worker_started_at = time.perf_counter()
+                with OntologyStore(self.index_path) as store:
+                    context_started_at = time.perf_counter()
+                    context = store.query_context(
+                        question=topic or "",
+                        ticker=ticker,
+                        document_types=document_types,
+                        periods=periods,
+                        limit_results=limit_per_ticker,
+                        limit_tickers=1,
+                        include_internal_ids=True,
+                    )
+                    context_elapsed_ms = int((time.perf_counter() - context_started_at) * 1000)
+                    evaluation = _comparison_evaluation_from_query_context(context)
+                    bundle_started_at = time.perf_counter()
+                    context_bundles = store._compact_bundles_from_object_ids(
+                        _object_ids_from_query_context(context),
+                        limit=limit_per_ticker,
+                    )
+                    bundle_elapsed_ms = int((time.perf_counter() - bundle_started_at) * 1000)
+                    skipped_query_compact = bool(
+                        context_bundles and evaluation.get("direct_answerable")
+                    )
+                    skip_reason = (
+                        "direct_answerable"
+                        if context_bundles and evaluation.get("direct_answerable")
+                        else None
+                    )
+                    query_compact_elapsed_ms = 0
+                    query_compact_diagnostics: dict[str, Any] = {}
+                    if skipped_query_compact:
+                        query_bundles = []
+                    else:
+                        query_compact_started_at = time.perf_counter()
+                        query_bundles, query_compact_diagnostics = store.query_compact_with_diagnostics(
+                            topic=topic,
+                            tickers=[ticker],
+                            document_types=document_types,
+                            periods=periods,
+                            limit=limit_per_ticker,
+                        )
+                        query_compact_elapsed_ms = int((time.perf_counter() - query_compact_started_at) * 1000)
+                    ticker_results = _merge_bundle_lists(
+                        context_bundles,
+                        query_bundles,
+                        limit=max(limit_per_ticker * 2, limit_per_ticker + 2),
+                    )
+                    _apply_comparison_evaluation(ticker_results, evaluation)
+                    timing_payload = {
+                        "query_context": context_elapsed_ms,
+                        "context_bundle": bundle_elapsed_ms,
+                        "query_compact": query_compact_elapsed_ms,
+                        "total_worker": int((time.perf_counter() - worker_started_at) * 1000),
+                    }
+                    if query_compact_diagnostics:
+                        timing_payload["query_compact_strategy"] = (
+                            query_compact_diagnostics.get("search_strategy")
+                            or query_compact_diagnostics.get("fts_strategy")
+                            or {}
+                        )
+                    context_stage_timing = (
+                        (context.get("search_diagnostics") or {}).get("timing_ms")
+                        if isinstance(context.get("search_diagnostics"), Mapping)
+                        else None
+                    )
+                    if isinstance(context.get("search_diagnostics"), Mapping):
+                        timing_payload["query_context_fts_strategy"] = (context.get("search_diagnostics") or {}).get("fts_strategy")
+                        timing_payload["query_context_company_topic_attempts"] = (
+                            (context.get("search_diagnostics") or {}).get("company_topic_attempts")
+                            or []
+                        )
+                    if isinstance(context_stage_timing, Mapping):
+                        timing_payload["query_context_stages"] = dict(context_stage_timing)
+                    evaluation["timing_ms"] = timing_payload
+                    context_payload = _compact_comparison_context(context)
+                    context_payload["timing_ms"] = timing_payload
+                    if skipped_query_compact:
+                        context_payload["query_compact_skipped"] = True
+                        context_payload["query_compact_skip_reason"] = skip_reason
+                    _compare_ticker_cache_set(cache_key, (ticker_results, evaluation, context_payload))
+                    return ticker, ticker_results, evaluation, context_payload
+
+            max_workers = min(len(ticker_list), 4)
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_by_ticker = {
+                    executor.submit(compare_one, ticker): ticker
+                    for ticker in searchable_tickers
+                }
+                for future in as_completed(future_by_ticker):
+                    ticker, ticker_results, evaluation, context = future.result()
+                    results[ticker] = ticker_results
+                    comparison_evaluations[ticker] = evaluation
+                    comparison_contexts[ticker] = context
+            results = {ticker: results.get(ticker, []) for ticker in ticker_list}
+            comparison_evaluations = {
+                ticker: comparison_evaluations.get(ticker, {})
+                for ticker in ticker_list
+            }
+            comparison_contexts = {
+                ticker: comparison_contexts.get(ticker, {})
+                for ticker in ticker_list
+            }
+            return {
+                "mode": "topic",
+                "topic": topic,
+                "metric": metric,
+                "tickers": ticker_list,
+                "results": results,
+                "comparison_evaluations": comparison_evaluations,
+                "comparison_contexts": comparison_contexts,
+                "compact_fast_path": True,
+                "parallel_fast_path": True,
+            }
+        for ticker in ticker_list:
+            if ticker not in searchable_tickers:
+                continue
             if metric:
                 rows = self._query_metric(
                     metric,
@@ -986,13 +1639,17 @@ class OntologyStore:
                     _object_ids_from_query_context(context),
                     limit=limit_per_ticker,
                 )
-                query_bundles, _diagnostics = self.query_compact_with_diagnostics(
-                    topic=topic,
-                    tickers=[ticker],
-                    document_types=document_types,
-                    periods=periods,
-                    limit=limit_per_ticker,
-                )
+                if context_bundles and comparison_evaluations[ticker].get("direct_answerable"):
+                    query_bundles = []
+                    comparison_contexts[ticker]["query_compact_skipped"] = True
+                else:
+                    query_bundles, _diagnostics = self.query_compact_with_diagnostics(
+                        topic=topic,
+                        tickers=[ticker],
+                        document_types=document_types,
+                        periods=periods,
+                        limit=limit_per_ticker,
+                    )
                 results[ticker] = _merge_bundle_lists(
                     context_bundles,
                     query_bundles,
@@ -1089,15 +1746,21 @@ class OntologyStore:
         include_rejected: bool,
         limit: int,
     ) -> tuple[list[sqlite3.Row], dict[str, Any]]:
+        tickers = list(tickers) if tickers is not None else None
+        document_types = list(document_types) if document_types is not None else None
+        periods = list(periods) if periods is not None else None
+        object_types = tuple(object_types)
         attempts: list[dict[str, Any]] = []
         selected_rows: dict[str, sqlite3.Row] = {}
         expanded_topic = _expanded_topic(topic)
         original_terms = _query_terms(topic)
+        expanded_terms = _query_terms(expanded_topic)
         should_relax = expanded_topic != topic or len(original_terms) >= 3
 
         def run_attempt(mode: str, query_topic: str, *, operator: str) -> None:
             if len(selected_rows) >= limit:
                 return
+            attempt_started_at = time.perf_counter()
             fts_query = _fts_query(query_topic, operator=operator)
             if not fts_query:
                 attempts.append(
@@ -1108,6 +1771,7 @@ class OntologyStore:
                         "fts_query": "",
                         "result_count": 0,
                         "added_count": 0,
+                        "elapsed_ms": int((time.perf_counter() - attempt_started_at) * 1000),
                     }
                 )
                 return
@@ -1137,6 +1801,7 @@ class OntologyStore:
                     "fts_query": fts_query,
                     "result_count": len(rows),
                     "added_count": added_count,
+                    "elapsed_ms": int((time.perf_counter() - attempt_started_at) * 1000),
                 }
             )
 
@@ -1144,12 +1809,45 @@ class OntologyStore:
         if len(selected_rows) < limit and expanded_topic != topic:
             run_attempt("expanded_and", expanded_topic, operator="AND")
         if should_relax and len(selected_rows) < limit:
-            for split_topic in _split_topic_queries(expanded_topic):
+            split_limit = 12
+            if tickers and len(tickers) == 1 and not periods and limit <= 2:
+                split_limit = 5
+            split_topics = _split_topic_queries(expanded_topic, limit=split_limit)
+            should_prescan_split_terms = bool(
+                tickers
+                and periods
+            )
+            if should_prescan_split_terms:
+                present_terms = self._scoped_present_terms(
+                    tickers=tickers,
+                    document_types=document_types,
+                    periods=periods,
+                    object_types=object_types,
+                    include_rejected=include_rejected,
+                    terms=expanded_terms,
+                )
+                if present_terms:
+                    filtered_split_topics = [
+                        split_topic
+                        for split_topic in split_topics
+                        if all(term in present_terms for term in _query_terms(split_topic))
+                    ]
+                    if filtered_split_topics:
+                        split_topics = filtered_split_topics
+            for split_topic in split_topics:
                 run_attempt("split_and", split_topic, operator="AND")
                 if len(selected_rows) >= limit:
                     break
         if should_relax and len(selected_rows) < limit:
-            run_attempt("relaxed_or", expanded_topic, operator="OR")
+            max_or_terms = 8
+            if tickers and periods:
+                max_or_terms = 4
+            elif tickers and len(tickers) == 1 and limit <= 2:
+                max_or_terms = 3
+            elif tickers:
+                max_or_terms = 6
+            relaxed_topic = _limited_or_topic(expanded_topic, max_terms=max_or_terms)
+            run_attempt("relaxed_or", relaxed_topic, operator="OR")
 
         selected_mode = next(
             (attempt["mode"] for attempt in attempts if attempt.get("added_count")),
@@ -1158,7 +1856,7 @@ class OntologyStore:
         strategy = {
             "original_topic": topic,
             "expanded_topic": expanded_topic,
-            "expanded_terms": _query_terms(expanded_topic),
+            "expanded_terms": expanded_terms,
             "selected_mode": selected_mode,
             "attempts": attempts,
         }
@@ -1291,6 +1989,70 @@ class OntologyStore:
             [*params, limit],
         ).fetchall()
 
+    def _has_query_scope_objects(
+        self,
+        *,
+        tickers: Iterable[str] | None,
+        document_types: Iterable[str] | None,
+        periods: Iterable[str] | None,
+        object_types: Iterable[str],
+        include_rejected: bool,
+    ) -> bool:
+        where, params = _object_filters(
+            tickers=tickers,
+            document_types=document_types,
+            periods=periods,
+            object_types=object_types,
+            include_rejected=include_rejected,
+        )
+        row = self.conn.execute(
+            f"SELECT 1 FROM objects {where} LIMIT 1",
+            params,
+        ).fetchone()
+        return row is not None
+
+    def _scoped_present_terms(
+        self,
+        *,
+        tickers: Iterable[str] | None,
+        document_types: Iterable[str] | None,
+        periods: Iterable[str] | None,
+        object_types: Iterable[str],
+        include_rejected: bool,
+        terms: Sequence[str],
+    ) -> set[str]:
+        candidate_terms = _unique(
+            term
+            for term in terms
+            if term not in _SPLIT_TOPIC_STOP_TERMS and len(term) > 2
+        )
+        if not candidate_terms:
+            return set()
+        where, params = _object_filters(
+            tickers=tickers,
+            document_types=document_types,
+            periods=periods,
+            object_types=object_types,
+            include_rejected=include_rejected,
+        )
+        present: set[str] = set()
+        text_expr = "lower(COALESCE(object_search_text.compact_text, objects.text, ''))"
+        for term in candidate_terms:
+            row = self.conn.execute(
+                f"""
+                SELECT 1
+                FROM objects
+                LEFT JOIN object_search_text
+                  ON object_search_text.object_id = objects.id
+                {where} AND {text_expr} LIKE ?
+                LIMIT 1
+                """,
+                [*params, f"%{term}%"],
+            ).fetchone()
+            if row is not None:
+                present.add(term)
+        return present
+
     def _compact_bundles_from_rows(self, rows: Sequence[sqlite3.Row]) -> list[dict[str, Any]]:
         if not rows:
             return []
@@ -1382,14 +2144,16 @@ class OntologyStore:
             object_types=("MetricObservation",),
             include_rejected=False,
         )
+        metric_candidates = _unique([metric, _canonical_metric_name(metric)])
+        placeholders = ",".join("?" for _ in metric_candidates)
         return self.conn.execute(
             f"""
             SELECT * FROM objects
-            {where} AND metric_name = ?
+            {where} AND metric_name IN ({placeholders})
             ORDER BY period DESC, type
             LIMIT ?
             """,
-            [*params, metric, limit],
+            [*params, *metric_candidates, limit],
         ).fetchall()
 
     def _topic_map_objects(
@@ -2504,8 +3268,24 @@ def _fts_query(topic: str, *, operator: str) -> str:
     return " ".join(f"{term}*" for term in terms)
 
 
+def _discovery_search_topic(topic: str | None) -> str:
+    terms = [
+        term
+        for term in _query_terms(topic)
+        if term not in _SPLIT_TOPIC_STOP_TERMS
+    ]
+    if len(terms) >= 2:
+        return " ".join(terms)
+    return " ".join(str(topic or "").split())
+
+
 def _query_terms(topic: str | None) -> list[str]:
     return _unique(term.lower() for term in _TERM_RE.findall(topic or "") if len(term) > 1)
+
+
+def _canonical_metric_name(metric: str | None) -> str:
+    """Normalize human metric input to the canonical metric_name token shape."""
+    return "_".join(_query_terms(metric))
 
 
 def _expanded_topic(topic: str) -> str:
@@ -2538,6 +3318,17 @@ def _split_topic_queries(topic: str, *, limit: int = 12) -> list[str]:
     )
     chunks.extend(terms)
     return _unique(chunks)[:limit]
+
+
+def _limited_or_topic(topic: str, *, max_terms: int) -> str:
+    terms = [
+        term
+        for term in _query_terms(topic)
+        if term not in _SPLIT_TOPIC_STOP_TERMS and len(term) > 2
+    ]
+    if not terms:
+        terms = _query_terms(topic)
+    return " ".join(_unique(terms)[: max(1, int(max_terms))])
 
 
 def _search_diagnostics(
@@ -2926,3 +3717,204 @@ def _unique(values: Iterable[Any]) -> list[Any]:
         seen.add(value)
         output.append(value)
     return output
+
+
+def _compare_ticker_cache_get(
+    key: tuple[Any, ...],
+) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any]] | None:
+    with _COMPARE_TICKER_CACHE_LOCK:
+        cached = _COMPARE_TICKER_CACHE.get(key)
+        if cached is None:
+            return None
+        _COMPARE_TICKER_CACHE.move_to_end(key)
+        return cached
+
+
+def _compare_ticker_cache_set(
+    key: tuple[Any, ...],
+    value: tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any]],
+) -> None:
+    with _COMPARE_TICKER_CACHE_LOCK:
+        _COMPARE_TICKER_CACHE[key] = value
+        _COMPARE_TICKER_CACHE.move_to_end(key)
+        while len(_COMPARE_TICKER_CACHE) > _COMPARE_TICKER_CACHE_MAX:
+            _COMPARE_TICKER_CACHE.popitem(last=False)
+
+
+def _discovery_cache_key(
+    index_path: Path,
+    *,
+    question: str,
+    tickers: Iterable[str] | None,
+    document_types: Iterable[str] | None,
+    periods: Iterable[str] | None,
+    limit_groups: int,
+    limit_per_group: int,
+    limit: int,
+) -> tuple[Any, ...]:
+    try:
+        index_mtime_ns = index_path.stat().st_mtime_ns
+    except OSError:
+        index_mtime_ns = None
+    return (
+        str(index_path),
+        index_mtime_ns,
+        question,
+        _cache_tuple(tickers, upper=True),
+        _cache_tuple(document_types, upper=True),
+        _cache_tuple(periods, upper=True),
+        int(limit_groups),
+        int(limit_per_group),
+        int(limit),
+    )
+
+
+def _cache_tuple(values: Iterable[str] | None, *, upper: bool = False) -> tuple[str, ...]:
+    if not values:
+        return ()
+    output = []
+    for value in values:
+        text = str(value)
+        output.append(text.upper() if upper else text)
+    return tuple(output)
+
+
+def _discovery_cache_get(key: tuple[Any, ...]) -> dict[str, Any] | None:
+    with _DISCOVERY_CACHE_LOCK:
+        cached = _DISCOVERY_CACHE.get(key)
+        if cached is None:
+            return None
+        _DISCOVERY_CACHE.move_to_end(key)
+        return copy.deepcopy(cached)
+
+
+def _discovery_cache_set(key: tuple[Any, ...], value: dict[str, Any]) -> None:
+    with _DISCOVERY_CACHE_LOCK:
+        _DISCOVERY_CACHE[key] = copy.deepcopy(value)
+        _DISCOVERY_CACHE.move_to_end(key)
+        while len(_DISCOVERY_CACHE) > _DISCOVERY_CACHE_MAX:
+            _DISCOVERY_CACHE.popitem(last=False)
+
+
+def _query_compact_cache_key(
+    index_path: Path,
+    *,
+    topic: str | None,
+    tickers: Iterable[str] | None,
+    document_types: Iterable[str] | None,
+    periods: Iterable[str] | None,
+    object_types: Iterable[str] | None,
+    include_rejected: bool,
+    limit: int,
+) -> tuple[Any, ...]:
+    try:
+        index_mtime_ns = index_path.stat().st_mtime_ns
+    except OSError:
+        index_mtime_ns = None
+    return (
+        str(index_path),
+        index_mtime_ns,
+        topic,
+        _cache_tuple(tickers, upper=True),
+        _cache_tuple(document_types, upper=True),
+        _cache_tuple(periods, upper=True),
+        _cache_tuple(object_types, upper=False),
+        bool(include_rejected),
+        int(limit),
+    )
+
+
+def _query_compact_cache_get(
+    key: tuple[Any, ...],
+) -> tuple[list[dict[str, Any]], dict[str, Any]] | None:
+    with _QUERY_COMPACT_CACHE_LOCK:
+        cached = _QUERY_COMPACT_CACHE.get(key)
+        if cached is None:
+            return None
+        _QUERY_COMPACT_CACHE.move_to_end(key)
+        return copy.deepcopy(cached)
+
+
+def _query_compact_cache_set(
+    key: tuple[Any, ...],
+    value: tuple[list[dict[str, Any]], dict[str, Any]],
+) -> None:
+    with _QUERY_COMPACT_CACHE_LOCK:
+        _QUERY_COMPACT_CACHE[key] = copy.deepcopy(value)
+        _QUERY_COMPACT_CACHE.move_to_end(key)
+        while len(_QUERY_COMPACT_CACHE) > _QUERY_COMPACT_CACHE_MAX:
+            _QUERY_COMPACT_CACHE.popitem(last=False)
+
+
+def _query_context_cache_key(
+    index_path: Path,
+    *,
+    question: str,
+    requested_tickers: Sequence[str] | None,
+    document_types: Iterable[str] | None,
+    periods: Iterable[str] | None,
+    universe: str | None,
+    limit_results: int,
+    limit_tickers: int,
+    include_internal_ids: bool,
+) -> tuple[Any, ...]:
+    try:
+        index_mtime_ns = index_path.stat().st_mtime_ns
+    except OSError:
+        index_mtime_ns = None
+    return (
+        str(index_path),
+        index_mtime_ns,
+        question,
+        tuple(requested_tickers or ()),
+        _cache_tuple(document_types, upper=True),
+        _cache_tuple(periods, upper=True),
+        universe,
+        int(limit_results),
+        int(limit_tickers),
+        bool(include_internal_ids),
+    )
+
+
+def _query_context_cache_get(key: tuple[Any, ...]) -> dict[str, Any] | None:
+    with _QUERY_CONTEXT_CACHE_LOCK:
+        cached = _QUERY_CONTEXT_CACHE.get(key)
+        if cached is None:
+            return None
+        _QUERY_CONTEXT_CACHE.move_to_end(key)
+        return copy.deepcopy(cached)
+
+
+def _query_context_cache_set(key: tuple[Any, ...], value: dict[str, Any]) -> None:
+    with _QUERY_CONTEXT_CACHE_LOCK:
+        _QUERY_CONTEXT_CACHE[key] = copy.deepcopy(value)
+        _QUERY_CONTEXT_CACHE.move_to_end(key)
+        while len(_QUERY_CONTEXT_CACHE) > _QUERY_CONTEXT_CACHE_MAX:
+            _QUERY_CONTEXT_CACHE.popitem(last=False)
+
+
+def _query_context_discovery_limit(
+    *,
+    limit_results: int,
+    limit_tickers: int,
+    requested_tickers: Sequence[str] | None,
+) -> int:
+    if requested_tickers and len(requested_tickers) <= max(1, int(limit_tickers)):
+        return max(int(limit_results) * 5, 20)
+    return max(int(limit_results) * 10, 40)
+
+
+def _ticker_guard_query_diagnostics(
+    topic: str | None,
+    unavailable_tickers: Sequence[str],
+    *,
+    compact: bool = False,
+) -> dict[str, Any]:
+    diagnostics = _search_diagnostics(topic, result_count=0)
+    diagnostics.setdefault("warnings", [])
+    diagnostics["warnings"].append("ticker_not_available")
+    diagnostics["unavailable_tickers"] = list(unavailable_tickers)
+    diagnostics["ticker_guard"] = True
+    if compact:
+        diagnostics["compact_fast_path"] = True
+    return diagnostics

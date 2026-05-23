@@ -269,7 +269,11 @@ def query_tool(
     requested_object_types = _merge_scalar_list_alias(object_type, object_types)
     input_warnings = _input_warnings(extra_args)
     summary_mode = detail == ResponseDetail.TICKER_SUMMARY or normalized_group_by == "ticker"
-    fetch_limit = MAX_DISCOVERY_LIMIT if summary_mode else min(MAX_LIMIT + offset + 1, offset + limit + 1)
+    fetch_limit = (
+        _discovery_fetch_limit(limit, limit_groups, limit_per_group)
+        if summary_mode
+        else min(MAX_LIMIT + offset + 1, offset + limit + 1)
+    )
     normalized_object_types, invalid_object_types = _normalize_object_types(requested_object_types)
     if invalid_object_types:
         payload = _error_payload(
@@ -450,7 +454,7 @@ def retrieve_tool(
     normalized_tickers = _merge_ticker_alias(ticker=ticker, tickers=tickers)
     input_warnings = _input_warnings(extra_args)
     summary_mode = detail == ResponseDetail.TICKER_SUMMARY or normalized_group_by == "ticker"
-    fetch_limit = MAX_DISCOVERY_LIMIT if summary_mode else limit
+    fetch_limit = _discovery_fetch_limit(limit, limit_groups, limit_per_group) if summary_mode else limit
     if summary_mode:
         with _store(index) as store:
             discovery = store.discover_company_topics(
@@ -740,6 +744,7 @@ def compare_tool(
                 document_types=document_types,
                 periods=periods or [],
                 limit_per_period=limit_per_ticker,
+                compact=detail != ResponseDetail.FULL,
             )
         elif detail == ResponseDetail.FULL:
             result = store.compare(
@@ -909,33 +914,67 @@ def _compare_periods(
     document_types: list[str] | None,
     periods: list[str],
     limit_per_period: int,
+    compact: bool,
 ) -> dict[str, Any]:
     ticker = ticker.upper()
-    results: dict[str, list[dict[str, Any]]] = {}
-    for period in _upper_list(periods):
+    period_values = _upper_list(periods)
+
+    def run_period(period: str, period_store: OntologyStore) -> tuple[str, list[dict[str, Any]]]:
         if metric:
-            period_result = store.compare(
+            compare_fn = period_store.compare_compact if compact else period_store.compare
+            period_result = compare_fn(
                 tickers=[ticker],
                 metric=metric,
                 document_types=document_types,
                 periods=[period],
                 limit_per_ticker=limit_per_period,
             )
-            results[period] = period_result["results"].get(ticker, [])
-        else:
-            results[period] = store.query(
+            return period, period_result["results"].get(ticker, [])
+        if compact:
+            rows, _diagnostics = period_store.query_compact_with_diagnostics(
                 topic=topic,
                 tickers=[ticker],
                 document_types=document_types,
                 periods=[period],
                 limit=limit_per_period,
             )
+            return period, rows
+        return period, period_store.query(
+            topic=topic,
+            tickers=[ticker],
+            document_types=document_types,
+            periods=[period],
+            limit=limit_per_period,
+        )
+
+    results: dict[str, list[dict[str, Any]]] = {}
+    if compact and len(period_values) > 1:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        worker_count = min(len(period_values), 4)
+        period_results: dict[str, list[dict[str, Any]]] = {}
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            def run_period_with_own_store(period: str) -> tuple[str, list[dict[str, Any]]]:
+                with _store(store.index_path) as period_store:
+                    return run_period(period, period_store)
+
+            futures = {}
+            for period in period_values:
+                futures[executor.submit(run_period_with_own_store, period)] = period
+            for future in as_completed(futures):
+                period, rows = future.result()
+                period_results[period] = rows
+        results = {period: period_results.get(period, []) for period in period_values}
+    else:
+        for period in period_values:
+            period, rows = run_period(period, store)
+            results[period] = rows
     return {
         "mode": "period_metric" if metric else "period_topic",
         "ticker": ticker,
         "topic": topic,
         "metric": metric,
-        "periods": _upper_list(periods),
+        "periods": period_values,
         "results": results,
     }
 
@@ -1619,6 +1658,11 @@ def _bounded_limit_groups(limit: int) -> int:
 
 def _bounded_limit_per_group(limit: int) -> int:
     return max(1, min(int(limit), MAX_LIMIT_PER_GROUP))
+
+
+def _discovery_fetch_limit(limit: int, limit_groups: int, limit_per_group: int) -> int:
+    minimum = max(40, int(limit_groups) * int(limit_per_group) * 2)
+    return max(1, min(MAX_DISCOVERY_LIMIT, max(int(limit), minimum)))
 
 
 def _bounded_offset(offset: int) -> int:

@@ -1,0 +1,44 @@
+- generic [ref=e1]:
+  - generic [ref=e3]:
+    - generic [ref=e4]:
+      - progressbar [ref=e6]
+      - main [ref=e14]:
+        - generic [ref=e15]:
+          - img [ref=e18]
+          - generic [ref=e23]:
+            - heading "로그인" [level=1] [ref=e24]
+            - generic [ref=e25]: Google 계정으로 로그인하여 Google Drive로 이동하세요. 이 계정은 브라우저의 다른 Google 앱에서 사용할 수 있습니다
+        - generic [ref=e28]:
+          - generic [ref=e33]:
+            - generic [ref=e38]:
+              - textbox "이메일 또는 휴대전화" [active] [ref=e39]
+              - generic: 이메일 또는 휴대전화
+            - button "이메일을 잊으셨나요?" [ref=e43] [cursor=pointer]
+          - generic [ref=e46]:
+            - text: 내 컴퓨터가 아닌가요? 게스트 모드를 사용하여 비공개로 로그인하세요.
+            - link "게스트 모드 사용 방법 자세히 알아보기(외부, 새 창에서 열림)" [ref=e47] [cursor=pointer]:
+              - /url: https://support.google.com/chrome/answer/6130773?hl=ko
+              - text: 게스트 모드 사용 방법 자세히 알아보기
+        - generic [ref=e49]:
+          - button "다음" [ref=e53]:
+            - generic [ref=e56]: 다음
+          - button "계정 만들기" [ref=e61]:
+            - generic [ref=e64]: 계정 만들기
+    - contentinfo [ref=e68]:
+      - combobox "언어 변경 한국어" [ref=e72] [cursor=pointer]:
+        - generic:
+          - generic: 한국어
+        - generic:
+          - img
+      - list [ref=e74]:
+        - listitem [ref=e75]:
+          - link "도움말" [ref=e76] [cursor=pointer]:
+            - /url: https://support.google.com/accounts?hl=ko&p=account_iph
+        - listitem [ref=e77]:
+          - link "개인정보처리방침" [ref=e78] [cursor=pointer]:
+            - /url: https://accounts.google.com/TOS?loc=KR&hl=ko&privacy=true
+        - listitem [ref=e79]:
+          - link "약관" [ref=e80] [cursor=pointer]:
+            - /url: https://accounts.google.com/TOS?loc=KR&hl=ko
+  - iframe [ref=e81]:
+    

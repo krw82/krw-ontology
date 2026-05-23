@@ -646,6 +646,10 @@ def _create_base_secondary_indexes(conn: sqlite3.Connection) -> None:
             ON objects(ticker, doc_type_key, period, type);
         CREATE INDEX IF NOT EXISTS idx_objects_metric
             ON objects(metric_name, ticker, doc_type_key, period);
+        CREATE INDEX IF NOT EXISTS idx_objects_ticker_type_period
+            ON objects(ticker, type, period);
+        CREATE INDEX IF NOT EXISTS idx_objects_ticker_metric_period
+            ON objects(ticker, metric_name, period);
         CREATE INDEX IF NOT EXISTS idx_edges_from
             ON edges(from_id, relation_id);
         CREATE INDEX IF NOT EXISTS idx_edges_to
@@ -667,14 +671,22 @@ def _create_serving_secondary_indexes(conn: sqlite3.Connection) -> None:
         """
         CREATE INDEX IF NOT EXISTS idx_object_traceability_status
             ON object_traceability(trace_status, object_type);
+        CREATE INDEX IF NOT EXISTS idx_object_traceability_ticker_type_status
+            ON object_traceability(ticker, object_type, trace_status);
         CREATE INDEX IF NOT EXISTS idx_company_topic_ticker
             ON company_topic_index(ticker);
         CREATE INDEX IF NOT EXISTS idx_company_topic_scope
             ON company_topic_index(ticker, period, document_type, doc_type_key);
+        CREATE INDEX IF NOT EXISTS idx_company_topic_ticker_family
+            ON company_topic_index(ticker, topic_family);
+        CREATE INDEX IF NOT EXISTS idx_company_topic_answerability
+            ON company_topic_index(ticker, answer_candidate, trace_status, evidence_strength);
         CREATE INDEX IF NOT EXISTS idx_company_topic_source_object
             ON company_topic_source_objects(object_id);
         CREATE INDEX IF NOT EXISTS idx_company_topic_source_topic
             ON company_topic_source_objects(topic_id);
+        CREATE INDEX IF NOT EXISTS idx_company_topic_source_topic_rank
+            ON company_topic_source_objects(topic_id, rank);
         """
     )
 
@@ -1339,6 +1351,7 @@ def _flush_object_insert_batch(
             object_rows,
         )
     if fts_rows:
+        fts_rows = [_object_fts_row_with_scope_tokens(row) for row in fts_rows]
         if replace_fts_entries:
             conn.executemany("DELETE FROM object_fts WHERE object_id = ?", ((row[0],) for row in fts_rows))
             conn.executemany("DELETE FROM object_search_text WHERE object_id = ?", ((row[0],) for row in fts_rows))
@@ -1517,7 +1530,14 @@ def _rebuild_company_topic_index(conn: sqlite3.Connection) -> int:
                 topic.get("topic_label"),
                 topic.get("topic_summary"),
                 _company_topic_evidence_text(topic, retrieval_text),
-                " ".join(topic.get("entity_terms") or []),
+                _compact_space(
+                    " ".join(
+                        [
+                            _topic_scope_token_text(topic),
+                            " ".join(topic.get("entity_terms") or []),
+                        ]
+                    )
+                ),
                 " ".join(
                     list(topic.get("impact_channels") or [])
                     + list(topic.get("factor_terms") or [])
@@ -1530,6 +1550,7 @@ def _rebuild_company_topic_index(conn: sqlite3.Connection) -> int:
                     " ".join(
                         str(value or "")
                         for value in (
+                            _topic_scope_token_text(topic),
                             topic.get("topic_label"),
                             topic.get("topic_summary"),
                             str(topic.get("topic_text") or "")[:COMPANY_TOPIC_FTS_CHAR_LIMIT],
@@ -1553,6 +1574,82 @@ def _rebuild_company_topic_index(conn: sqlite3.Connection) -> int:
     _flush_company_topic_batch(conn, topic_rows, topic_fts_rows, topic_source_rows)
     conn.commit()
     return count
+
+
+def _object_fts_row_with_scope_tokens(row: tuple[Any, ...]) -> tuple[Any, ...]:
+    """Add indexed scope tokens to FTS text while preserving normal columns.
+
+    The ticker/document/period/type columns on FTS tables are UNINDEXED. These
+    tokens let MATCH narrow candidates at the FTS stage, while the normal SQL
+    filters still enforce correctness.
+    """
+    (
+        object_id,
+        object_type,
+        ticker,
+        document_type,
+        period,
+        text_self,
+        text_support,
+        text_related,
+        text_entities,
+        text_aliases,
+        compact_text,
+    ) = row
+    scope_text = _scope_token_text(
+        ticker=ticker,
+        document_type=document_type,
+        period=period,
+        object_type=object_type,
+    )
+    return (
+        object_id,
+        object_type,
+        ticker,
+        document_type,
+        period,
+        text_self,
+        text_support,
+        text_related,
+        _compact_space(" ".join([scope_text, str(text_entities or "")])),
+        text_aliases,
+        _compact_space(" ".join([scope_text, str(compact_text or "")])),
+    )
+
+
+def _topic_scope_token_text(topic: Mapping[str, Any]) -> str:
+    return _scope_token_text(
+        ticker=topic.get("ticker"),
+        document_type=topic.get("document_type"),
+        period=topic.get("period"),
+        object_type=topic.get("primary_object_type"),
+        topic_family=topic.get("topic_family"),
+    )
+
+
+def _scope_token_text(
+    *,
+    ticker: Any = None,
+    document_type: Any = None,
+    period: Any = None,
+    object_type: Any = None,
+    topic_family: Any = None,
+) -> str:
+    tokens = [
+        _scope_token("ticker", ticker),
+        _scope_token("doctype", document_type),
+        _scope_token("period", period),
+        _scope_token("otype", object_type),
+        _scope_token("family", topic_family),
+    ]
+    return " ".join(token for token in tokens if token)
+
+
+def _scope_token(prefix: str, value: Any) -> str:
+    normalized = re.sub(r"[^a-z0-9]+", "_", str(value or "").lower()).strip("_")
+    if not normalized:
+        return ""
+    return f"{prefix}_{normalized}"
 
 
 def _topic_retrieval_text(row: sqlite3.Row) -> str:

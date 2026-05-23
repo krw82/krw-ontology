@@ -1880,17 +1880,32 @@ class OntologyStore:
             object_types=object_types,
             include_rejected=include_rejected,
         )
-        return self.conn.execute(
-            f"""
-            SELECT objects.*
-            FROM object_fts
-            JOIN objects ON objects.id = object_fts.object_id
-            {where} AND object_fts MATCH ?
-            ORDER BY rank
-            LIMIT ?
-            """,
-            [*params, fts_query, limit],
-        ).fetchall()
+        scoped_query = _scoped_fts_query(
+            fts_query,
+            tickers=tickers,
+            document_types=document_types,
+            periods=periods,
+            object_types=object_types,
+        )
+
+        def run(query: str) -> list[sqlite3.Row]:
+            return self.conn.execute(
+                f"""
+                SELECT objects.*
+                FROM object_fts
+                JOIN objects ON objects.id = object_fts.object_id
+                {where} AND object_fts MATCH ?
+                ORDER BY rank
+                LIMIT ?
+                """,
+                [*params, query, limit],
+            ).fetchall()
+
+        if scoped_query != fts_query:
+            rows = run(scoped_query)
+            if rows:
+                return rows
+        return run(fts_query)
 
     def _query_company_topics(
         self,
@@ -1906,30 +1921,44 @@ class OntologyStore:
             document_types=document_types,
             periods=periods,
         )
-        return self.conn.execute(
-            f"""
-            SELECT company_topic_index.*
-            FROM company_topic_fts
-            JOIN company_topic_index
-              ON company_topic_index.topic_id = company_topic_fts.topic_id
-            {where} AND company_topic_fts MATCH ?
-            ORDER BY
-                rank,
-                CASE company_topic_index.trace_status
-                    WHEN 'traceable' THEN 3
-                    WHEN 'traceable_metric_lineage' THEN 3
-                    WHEN 'related' THEN 2
-                    ELSE 1
-                END DESC,
-                COALESCE(company_topic_index.specificity_score, 0) DESC,
-                COALESCE(company_topic_index.generic_score, 0) ASC,
-                COALESCE(company_topic_index.boilerplate_score, 0) ASC,
-                company_topic_index.evidence_chain_count DESC,
-                company_topic_index.support_quote_count + company_topic_index.support_claim_count + company_topic_index.support_metric_count DESC
-            LIMIT ?
-            """,
-            [*params, fts_query, limit],
-        ).fetchall()
+        scoped_query = _scoped_fts_query(
+            fts_query,
+            tickers=tickers,
+            document_types=document_types,
+            periods=periods,
+        )
+
+        def run(query: str) -> list[sqlite3.Row]:
+            return self.conn.execute(
+                f"""
+                SELECT company_topic_index.*
+                FROM company_topic_fts
+                JOIN company_topic_index
+                  ON company_topic_index.topic_id = company_topic_fts.topic_id
+                {where} AND company_topic_fts MATCH ?
+                ORDER BY
+                    rank,
+                    CASE company_topic_index.trace_status
+                        WHEN 'traceable' THEN 3
+                        WHEN 'traceable_metric_lineage' THEN 3
+                        WHEN 'related' THEN 2
+                        ELSE 1
+                    END DESC,
+                    COALESCE(company_topic_index.specificity_score, 0) DESC,
+                    COALESCE(company_topic_index.generic_score, 0) ASC,
+                    COALESCE(company_topic_index.boilerplate_score, 0) ASC,
+                    company_topic_index.evidence_chain_count DESC,
+                    company_topic_index.support_quote_count + company_topic_index.support_claim_count + company_topic_index.support_metric_count DESC
+                LIMIT ?
+                """,
+                [*params, query, limit],
+            ).fetchall()
+
+        if scoped_query != fts_query:
+            rows = run(scoped_query)
+            if rows:
+                return rows
+        return run(fts_query)
 
     def _bundles_from_object_ids(self, object_ids: Iterable[str], *, limit: int) -> list[dict[str, Any]]:
         bundles: list[dict[str, Any]] = []
@@ -3266,6 +3295,44 @@ def _fts_query(topic: str, *, operator: str) -> str:
     if operator == "OR":
         return " OR ".join(f"{term}*" for term in terms)
     return " ".join(f"{term}*" for term in terms)
+
+
+def _scoped_fts_query(
+    fts_query: str,
+    *,
+    tickers: Iterable[str] | None = None,
+    document_types: Iterable[str] | None = None,
+    periods: Iterable[str] | None = None,
+    object_types: Iterable[str] | None = None,
+) -> str:
+    scope_terms = [
+        *(_scope_tokens("ticker", tickers) if tickers else []),
+        *(_scope_tokens("doctype", document_types) if document_types else []),
+        *(_scope_tokens("period", periods) if periods else []),
+        *(_scope_tokens("otype", object_types) if object_types else []),
+    ]
+    if not fts_query or not scope_terms:
+        return fts_query
+    scope = " ".join(scope_terms)
+    if " OR " in fts_query:
+        return f"{scope} ({fts_query})"
+    return f"{scope} {fts_query}"
+
+
+def _scope_tokens(prefix: str, values: Iterable[Any]) -> list[str]:
+    tokens: list[str] = []
+    for value in values:
+        token = _scope_token(prefix, value)
+        if token:
+            tokens.append(token)
+    return _unique(tokens)
+
+
+def _scope_token(prefix: str, value: Any) -> str:
+    normalized = re.sub(r"[^a-z0-9]+", "_", str(value or "").lower()).strip("_")
+    if not normalized:
+        return ""
+    return f"{prefix}_{normalized}"
 
 
 def _discovery_search_topic(topic: str | None) -> str:

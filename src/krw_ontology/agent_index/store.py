@@ -156,7 +156,7 @@ _QUERY_COMPACT_CACHE_LOCK = Lock()
 _QUERY_CONTEXT_CACHE_MAX = 512
 _QUERY_CONTEXT_CACHE: OrderedDict[tuple[Any, ...], dict[str, Any]] = OrderedDict()
 _QUERY_CONTEXT_CACHE_LOCK = Lock()
-_METRIC_FAST_PATH_TYPES = frozenset({"MetricObservation", "Calculation"})
+_METRIC_FAST_PATH_TYPES = frozenset({"MetricObservation", "Calculation", "XBRLFact"})
 _METRIC_FAST_PATH_GENERIC_TERMS = frozenset(
     {
         "annual",
@@ -173,6 +173,47 @@ _METRIC_FAST_PATH_GENERIC_TERMS = frozenset(
         "periods",
         "year",
         "years",
+    }
+)
+_METRIC_LOOKUP_METRIC_TERMS = frozenset(
+    {
+        "assets",
+        "capex",
+        "cash",
+        "cagr",
+        "cost",
+        "costs",
+        "debt",
+        "earnings",
+        "ebit",
+        "ebitda",
+        "expense",
+        "expenses",
+        "flow",
+        "gross",
+        "growth",
+        "income",
+        "liabilities",
+        "margin",
+        "margins",
+        "net",
+        "nii",
+        "nim",
+        "operating",
+        "opex",
+        "percent",
+        "percentage",
+        "profit",
+        "rate",
+        "rates",
+        "ratio",
+        "revenue",
+        "revenues",
+        "sales",
+        "share",
+        "shares",
+        "total",
+        "yoy",
     }
 )
 _TYPED_PROJECTION_SPECS: dict[str, dict[str, Any]] = {
@@ -293,6 +334,14 @@ _TYPED_PROJECTION_SPECS: dict[str, dict[str, Any]] = {
         ),
     },
 }
+
+
+def _metric_lookup_selected_types(object_types: Iterable[str]) -> list[str]:
+    requested = list(object_types)
+    selected = [object_type for object_type in requested if object_type in _METRIC_FAST_PATH_TYPES]
+    if "MetricObservation" in set(requested) and "XBRLFact" not in selected:
+        selected.append("XBRLFact")
+    return selected
 
 
 class OntologyStore:
@@ -707,17 +756,25 @@ class OntologyStore:
                 normalization=metric_profile["normalization"],
             )
             if not rows and topic:
-                rows, fallback_strategy = self._query_fts_with_strategy(
-                    metric_profile["topic"],
-                    tickers=tickers,
-                    document_types=document_types,
-                    periods=periods,
-                    object_types=selected_types,
-                    include_rejected=include_rejected,
-                    limit=min(limit, 10),
+                fallback_types = _metric_lookup_fallback_object_types(
+                    selected_types,
+                    search_strategy=search_strategy,
                 )
-                search_strategy["fallback"] = fallback_strategy
-                search_strategy["fallback_used"] = True
+                if fallback_types:
+                    rows, fallback_strategy = self._query_fts_with_strategy(
+                        metric_profile["topic"],
+                        tickers=tickers,
+                        document_types=document_types,
+                        periods=periods,
+                        object_types=fallback_types,
+                        include_rejected=include_rejected,
+                        limit=min(limit, 10),
+                    )
+                    search_strategy["fallback"] = fallback_strategy
+                    search_strategy["fallback_used"] = True
+                else:
+                    search_strategy["fallback_used"] = False
+                    search_strategy["fallback_skipped"] = "dimension_metric_not_found"
         elif typed_profile["enabled"]:
             rows, search_strategy = self._query_typed_projection_with_strategy(
                 typed_profile,
@@ -799,11 +856,14 @@ class OntologyStore:
         explicit_object_types = object_types is not None
         object_types = list(object_types) if object_types is not None else None
         selected_types = tuple(object_types or DEFAULT_QUERY_TYPES)
+        scope_guard_types = selected_types
+        if _metric_lookup_topic_is_metric_like(topic or "") and set(selected_types).intersection(_METRIC_FAST_PATH_TYPES):
+            scope_guard_types = tuple(dict.fromkeys([*selected_types, "XBRLFact"]))
         if tickers and periods and not self._has_query_scope_objects(
             tickers=tickers,
             document_types=document_types,
             periods=periods,
-            object_types=selected_types,
+            object_types=scope_guard_types,
             include_rejected=include_rejected,
         ):
             diagnostics = _search_diagnostics(topic, result_count=0)
@@ -850,17 +910,25 @@ class OntologyStore:
                 normalization=metric_profile["normalization"],
             )
             if not rows and topic:
-                rows, fallback_strategy = self._query_fts_with_strategy(
-                    metric_profile["topic"],
-                    tickers=tickers,
-                    document_types=document_types,
-                    periods=periods,
-                    object_types=selected_types,
-                    include_rejected=include_rejected,
-                    limit=min(limit, 10),
+                fallback_types = _metric_lookup_fallback_object_types(
+                    selected_types,
+                    search_strategy=search_strategy,
                 )
-                search_strategy["fallback"] = fallback_strategy
-                search_strategy["fallback_used"] = True
+                if fallback_types:
+                    rows, fallback_strategy = self._query_fts_with_strategy(
+                        metric_profile["topic"],
+                        tickers=tickers,
+                        document_types=document_types,
+                        periods=periods,
+                        object_types=fallback_types,
+                        include_rejected=include_rejected,
+                        limit=min(limit, 10),
+                    )
+                    search_strategy["fallback"] = fallback_strategy
+                    search_strategy["fallback_used"] = True
+                else:
+                    search_strategy["fallback_used"] = False
+                    search_strategy["fallback_skipped"] = "dimension_metric_not_found"
         elif typed_profile["enabled"]:
             rows, search_strategy = self._query_typed_projection_with_strategy(
                 typed_profile,
@@ -2505,9 +2573,34 @@ class OntologyStore:
         normalization: Mapping[str, Any],
     ) -> tuple[list[sqlite3.Row], dict[str, Any]]:
         terms = _metric_lookup_search_terms(topic)
+        ticker_terms = {str(ticker).lower() for ticker in tickers or []}
+        dimension_anchors = [
+            term for term in _metric_lookup_dimension_anchors(topic)
+            if term not in ticker_terms
+        ]
+        metric_terms = [term for term in terms if term not in set(dimension_anchors)] or terms
         period_values = _metric_lookup_period_values(periods)
         years = _metric_lookup_years(periods)
-        selected_types = [object_type for object_type in object_types if object_type in _METRIC_FAST_PATH_TYPES]
+        selected_types = _metric_lookup_selected_types(object_types)
+        dimension_matches = self._resolve_metric_dimension_anchors(
+            topic=topic,
+            tickers=tickers,
+            dimension_anchors=dimension_anchors,
+        )
+        if dimension_anchors and dimension_matches and _table_exists(self.conn, "metric_dimension_lookup"):
+            return self._query_metric_dimension_lookup_with_strategy(
+                topic,
+                tickers=tickers,
+                document_types=document_types,
+                periods=periods,
+                object_types=object_types,
+                include_rejected=include_rejected,
+                limit=limit,
+                normalization=normalization,
+                metric_terms=metric_terms,
+                dimension_anchors=dimension_anchors,
+                dimension_matches=dimension_matches,
+            )
         where_parts = ["1 = 1"]
         where_params: list[Any] = []
         _add_in_filter(where_parts, where_params, "metric_lookup.ticker", [ticker.upper() for ticker in tickers or []])
@@ -2536,9 +2629,20 @@ class OntologyStore:
             where_parts.append("(objects.review_status IS NULL OR objects.review_status != 'rejected')")
         score_parts: list[str] = []
         score_params: list[Any] = []
-        if _metric_lookup_wants_total(topic):
-            score_parts.append("CASE WHEN metric_lookup.is_company_total = 1 THEN 30 ELSE 0 END")
-        for term in terms[:8]:
+        wants_total = _metric_lookup_wants_total(topic)
+        if wants_total and not dimension_anchors:
+            score_parts.append("CASE WHEN metric_lookup.is_company_total = 1 THEN 120 ELSE 0 END")
+        if {"net", "sales"}.issubset(set(metric_terms)):
+            for column, weight in (
+                ("metric_lookup.metric_alias_text", 45),
+                ("metric_lookup.text", 45),
+                ("metric_lookup.metric_name", 30),
+            ):
+                score_parts.append(
+                    f"CASE WHEN lower(COALESCE({column}, '')) LIKE ? THEN {weight} ELSE 0 END"
+                )
+                score_params.append("%net sales%")
+        for term in metric_terms[:8]:
             like = f"%{term}%"
             score_parts.append(
                 "CASE WHEN lower(COALESCE(metric_lookup.metric_name, '')) LIKE ? THEN 18 ELSE 0 END"
@@ -2548,22 +2652,42 @@ class OntologyStore:
                 "CASE WHEN lower(COALESCE(metric_lookup.metric_alias_text, '')) LIKE ? THEN 8 ELSE 0 END"
             )
             score_params.append(like)
-        canonical_candidates = _unique(_canonical_metric_name(term) for term in terms if term)
+        canonical_candidates = _unique(_canonical_metric_name(term) for term in metric_terms if term)
+        if "sales" in metric_terms or "revenue" in metric_terms:
+            canonical_candidates = _unique([*canonical_candidates, "revenue", "net_sales"])
         if canonical_candidates:
             placeholders = ",".join("?" for _ in canonical_candidates)
             score_parts.append(
-                f"CASE WHEN metric_lookup.canonical_metric IN ({placeholders}) THEN 25 ELSE 0 END"
+                f"CASE WHEN metric_lookup.canonical_metric IN ({placeholders}) THEN 40 ELSE 0 END"
             )
             score_params.extend(canonical_candidates)
-            term_clauses = []
-            term_params: list[Any] = []
-            for term in terms[:8]:
-                term_clauses.append("lower(COALESCE(metric_lookup.metric_alias_text, '')) LIKE ?")
-                term_params.append(f"%{term}%")
-            if term_clauses:
-                where_parts.append("(" + " OR ".join(term_clauses) + ")")
-                where_params.extend(term_params)
+            lookup_clauses = [f"metric_lookup.canonical_metric IN ({placeholders})"]
+            lookup_params: list[Any] = list(canonical_candidates)
+            for term in metric_terms[:8]:
+                lookup_clauses.append("lower(COALESCE(metric_lookup.metric_alias_text, '')) LIKE ?")
+                lookup_params.append(f"%{term}%")
+            if lookup_clauses:
+                where_parts.append("(" + " OR ".join(lookup_clauses) + ")")
+                where_params.extend(lookup_params)
         score_expr = " + ".join(score_parts) if score_parts else "0"
+        dimension_score_parts: list[str] = []
+        dimension_score_params: list[Any] = []
+        for anchor in dimension_anchors[:8]:
+            like = f"%{anchor}%"
+            for column, weight in (
+                ("metric_lookup.product_name", 80),
+                ("metric_lookup.segment_name", 80),
+                ("metric_lookup.geography_name", 80),
+                ("metric_lookup.dimensions_json", 60),
+                ("metric_lookup.metric_alias_text", 35),
+                ("metric_lookup.metric_name", 25),
+                ("metric_lookup.text", 25),
+            ):
+                dimension_score_parts.append(
+                    f"CASE WHEN lower(COALESCE({column}, '')) LIKE ? THEN {weight} ELSE 0 END"
+                )
+                dimension_score_params.append(like)
+        dimension_score_expr = " + ".join(dimension_score_parts) if dimension_score_parts else "0"
         where = "WHERE " + " AND ".join(where_parts)
         rows = self.conn.execute(
             f"""
@@ -2577,26 +2701,292 @@ class OntologyStore:
                 metric_lookup.product_name AS metric_lookup_product_name,
                 metric_lookup.geography_name AS metric_lookup_geography_name,
                 metric_lookup.is_company_total AS metric_lookup_is_company_total,
-                ({score_expr}) AS metric_match_score
+                ({score_expr}) AS metric_match_score,
+                ({dimension_score_expr}) AS dimension_match_score
             FROM metric_lookup
             JOIN objects ON objects.id = metric_lookup.object_id
             {where}
             ORDER BY
+                dimension_match_score DESC,
                 metric_match_score DESC,
-                metric_lookup.is_company_total DESC,
+                metric_lookup.is_company_total {"ASC" if dimension_anchors else "DESC"},
                 metric_lookup.fiscal_year ASC,
                 metric_lookup.period ASC,
                 metric_lookup.object_type ASC,
                 metric_lookup.object_id ASC
             LIMIT ?
             """,
-            [*score_params, *where_params, max(1, min(limit * 8, 200))],
+            [*score_params, *dimension_score_params, *where_params, max(1, min(limit * 8, 200))],
         ).fetchall()
+        dimension_metric_not_found = False
+        if dimension_anchors:
+            dimension_rows = [row for row in rows if row["dimension_match_score"] and row["dimension_match_score"] > 0]
+            dimension_metric_not_found = not dimension_rows
+            rows = dimension_rows
         rows = _dedupe_metric_lookup_rows(rows, limit=limit)
         strategy = {
             "mode": "metric_lookup",
             "normalized_topic": topic,
-            "terms": terms,
+            "terms": metric_terms,
+            "dimension_anchors": dimension_anchors,
+            "dimension_anchor_filter": bool(dimension_anchors),
+            "dimension_metric_not_found": dimension_metric_not_found,
+            "company_total_role": "denominator_or_support" if dimension_anchors else ("primary" if wants_total else None),
+            "period_values": period_values,
+            "period_years": years,
+            "object_types": selected_types,
+            "topic_normalization": dict(normalization),
+            "fallback_used": False,
+        }
+        return rows, strategy
+
+    def _resolve_metric_dimension_anchors(
+        self,
+        *,
+        topic: str | None,
+        tickers: Sequence[str] | None,
+        dimension_anchors: Sequence[str],
+    ) -> list[dict[str, Any]]:
+        if not topic or not tickers or not dimension_anchors or not _table_exists(self.conn, "company_dimension_catalog"):
+            return []
+        ticker_values = [ticker.upper() for ticker in tickers if ticker]
+        if not ticker_values:
+            return []
+        placeholders = ",".join("?" for _ in ticker_values)
+        rows = self.conn.execute(
+            f"""
+            SELECT ticker, dimension_key, dimension_label, dimension_kind, aliases_text
+            FROM company_dimension_catalog
+            WHERE ticker IN ({placeholders})
+            """,
+            ticker_values,
+        ).fetchall()
+        topic_space = f" {' '.join(str(topic or '').lower().split())} "
+        topic_key = _metric_dimension_key(topic)
+        anchor_keys = {_metric_dimension_key(anchor) for anchor in dimension_anchors if anchor}
+        matches: list[dict[str, Any]] = []
+        seen: set[tuple[str, str]] = set()
+        for row in rows:
+            dimension_key = str(row["dimension_key"] or "")
+            label = str(row["dimension_label"] or dimension_key)
+            aliases = " ".join(
+                part for part in (
+                    dimension_key.replace("_", " "),
+                    label.lower(),
+                    str(row["aliases_text"] or "").lower(),
+                )
+                if part
+            )
+            key_parts = set(part for part in dimension_key.split("_") if part)
+            matched = False
+            if dimension_key and dimension_key in topic_key:
+                matched = True
+            if f" {dimension_key.replace('_', ' ')} " in topic_space:
+                matched = True
+            if label and f" {label.lower()} " in topic_space:
+                matched = True
+            if key_parts and key_parts.issubset(anchor_keys):
+                matched = True
+            if not matched:
+                for anchor_key in anchor_keys:
+                    if anchor_key and re.search(rf"\b{re.escape(anchor_key.replace('_', ' '))}\b", aliases):
+                        matched = True
+                        break
+            dedupe_key = (str(row["ticker"]), dimension_key)
+            if matched and dimension_key and dedupe_key not in seen:
+                seen.add(dedupe_key)
+                matches.append(
+                    {
+                        "ticker": row["ticker"],
+                        "dimension_key": dimension_key,
+                        "dimension_label": label,
+                        "dimension_kind": row["dimension_kind"],
+                    }
+                )
+        return matches
+
+    def _query_metric_dimension_lookup_with_strategy(
+        self,
+        topic: str | None,
+        *,
+        tickers: Sequence[str] | None,
+        document_types: Iterable[str] | None,
+        periods: Iterable[str] | None,
+        object_types: Iterable[str],
+        include_rejected: bool,
+        limit: int,
+        normalization: Mapping[str, Any],
+        metric_terms: Sequence[str],
+        dimension_anchors: Sequence[str],
+        dimension_matches: Sequence[Mapping[str, Any]],
+    ) -> tuple[list[sqlite3.Row], dict[str, Any]]:
+        period_values = _metric_lookup_period_values(periods)
+        years = _metric_lookup_years(periods)
+        selected_types = _metric_lookup_selected_types(object_types)
+        canonical_candidates = _unique(_canonical_metric_name(term) for term in metric_terms if term)
+        if "sales" in metric_terms or "revenue" in metric_terms:
+            canonical_candidates = _unique([*canonical_candidates, "revenue", "net_sales"])
+        dimension_keys = _unique(str(match["dimension_key"]) for match in dimension_matches if match.get("dimension_key"))
+
+        def add_period_filters(parts: list[str], params: list[Any], prefix: str) -> None:
+            period_clause_parts: list[str] = []
+            period_params: list[Any] = []
+            if years:
+                placeholders = ",".join("?" for _ in years)
+                period_clause_parts.append(f"{prefix}.fiscal_year IN ({placeholders})")
+                period_params.extend(years)
+                if period_values:
+                    placeholders = ",".join("?" for _ in period_values)
+                    period_clause_parts.append(f"({prefix}.fiscal_year IS NULL AND {prefix}.period IN ({placeholders}))")
+                    period_params.extend(period_values)
+            elif period_values:
+                placeholders = ",".join("?" for _ in period_values)
+                period_clause_parts.append(f"{prefix}.period IN ({placeholders})")
+                period_params.extend(period_values)
+            if period_clause_parts:
+                parts.append("(" + " OR ".join(period_clause_parts) + ")")
+                params.extend(period_params)
+
+        def metric_score(prefix: str) -> tuple[str, list[Any], list[str], list[Any]]:
+            score_parts: list[str] = []
+            score_params: list[Any] = []
+            lookup_clauses: list[str] = []
+            lookup_params: list[Any] = []
+            if {"net", "sales"}.issubset(set(metric_terms)):
+                for column, weight in (
+                    (f"{prefix}.metric_alias_text", 45),
+                    (f"{prefix}.text", 45),
+                    (f"{prefix}.metric_name", 30),
+                ):
+                    score_parts.append(f"CASE WHEN lower(COALESCE({column}, '')) LIKE ? THEN {weight} ELSE 0 END")
+                    score_params.append("%net sales%")
+            for term in metric_terms[:8]:
+                like = f"%{term}%"
+                score_parts.append(f"CASE WHEN lower(COALESCE({prefix}.metric_name, '')) LIKE ? THEN 18 ELSE 0 END")
+                score_params.append(like)
+                score_parts.append(f"CASE WHEN lower(COALESCE({prefix}.metric_alias_text, '')) LIKE ? THEN 8 ELSE 0 END")
+                score_params.append(like)
+            if canonical_candidates:
+                placeholders = ",".join("?" for _ in canonical_candidates)
+                score_parts.append(f"CASE WHEN {prefix}.canonical_metric IN ({placeholders}) THEN 40 ELSE 0 END")
+                score_params.extend(canonical_candidates)
+                lookup_clauses.append(f"{prefix}.canonical_metric IN ({placeholders})")
+                lookup_params.extend(canonical_candidates)
+            for term in metric_terms[:8]:
+                lookup_clauses.append(f"lower(COALESCE({prefix}.metric_alias_text, '')) LIKE ?")
+                lookup_params.append(f"%{term}%")
+            return " + ".join(score_parts) if score_parts else "0", score_params, lookup_clauses, lookup_params
+
+        target_where = ["1 = 1"]
+        target_params: list[Any] = []
+        _add_in_filter(target_where, target_params, "metric_dimension_lookup.ticker", [ticker.upper() for ticker in tickers or []])
+        _add_in_filter(target_where, target_params, "metric_lookup.document_type", list(document_types or []))
+        _add_in_filter(target_where, target_params, "metric_lookup.object_type", selected_types)
+        _add_in_filter(target_where, target_params, "metric_dimension_lookup.dimension_key", dimension_keys)
+        add_period_filters(target_where, target_params, "metric_dimension_lookup")
+        if not include_rejected:
+            target_where.append("(objects.review_status IS NULL OR objects.review_status != 'rejected')")
+        score_expr, score_params, lookup_clauses, lookup_params = metric_score("metric_lookup")
+        if lookup_clauses:
+            target_where.append("(" + " OR ".join(lookup_clauses) + ")")
+            target_params.extend(lookup_params)
+        rows = self.conn.execute(
+            f"""
+            SELECT
+                objects.*,
+                metric_lookup.fiscal_year AS metric_lookup_fiscal_year,
+                metric_lookup.canonical_metric AS metric_lookup_canonical_metric,
+                metric_lookup.value_text AS metric_lookup_value_text,
+                metric_lookup.unit AS metric_lookup_unit,
+                metric_lookup.segment_name AS metric_lookup_segment_name,
+                metric_lookup.product_name AS metric_lookup_product_name,
+                metric_lookup.geography_name AS metric_lookup_geography_name,
+                metric_lookup.is_company_total AS metric_lookup_is_company_total,
+                metric_dimension_lookup.dimension_key AS metric_dimension_key,
+                metric_dimension_lookup.dimension_label AS metric_dimension_label,
+                metric_dimension_lookup.dimension_kind AS metric_dimension_kind,
+                ({score_expr}) AS metric_match_score,
+                100 AS dimension_match_score
+            FROM metric_dimension_lookup
+            JOIN metric_lookup ON metric_lookup.object_id = metric_dimension_lookup.object_id
+            JOIN objects ON objects.id = metric_lookup.object_id
+            WHERE {" AND ".join(target_where)}
+            ORDER BY
+                metric_dimension_lookup.dimension_key ASC,
+                metric_match_score DESC,
+                metric_dimension_lookup.fiscal_year ASC,
+                metric_dimension_lookup.period ASC,
+                metric_lookup.object_id ASC
+            LIMIT ?
+            """,
+            [*score_params, *target_params, max(1, min(limit * 8, 240))],
+        ).fetchall()
+
+        found_keys = {str(row["metric_dimension_key"]) for row in rows if row["metric_dimension_key"]}
+        missing_dimension_keys = [key for key in dimension_keys if key not in found_keys]
+        denominator_rows: list[sqlite3.Row] = []
+        denominator_needed = _metric_lookup_needs_denominator(topic)
+        if denominator_needed and rows:
+            total_where = ["metric_lookup.is_company_total = 1"]
+            total_params: list[Any] = []
+            _add_in_filter(total_where, total_params, "metric_lookup.ticker", [ticker.upper() for ticker in tickers or []])
+            _add_in_filter(total_where, total_params, "metric_lookup.document_type", list(document_types or []))
+            _add_in_filter(total_where, total_params, "metric_lookup.object_type", selected_types)
+            add_period_filters(total_where, total_params, "metric_lookup")
+            if not include_rejected:
+                total_where.append("(objects.review_status IS NULL OR objects.review_status != 'rejected')")
+            total_score_expr, total_score_params, total_lookup_clauses, total_lookup_params = metric_score("metric_lookup")
+            if total_lookup_clauses:
+                total_where.append("(" + " OR ".join(total_lookup_clauses) + ")")
+                total_params.extend(total_lookup_params)
+            denominator_rows = self.conn.execute(
+                f"""
+                SELECT
+                    objects.*,
+                    metric_lookup.fiscal_year AS metric_lookup_fiscal_year,
+                    metric_lookup.canonical_metric AS metric_lookup_canonical_metric,
+                    metric_lookup.value_text AS metric_lookup_value_text,
+                    metric_lookup.unit AS metric_lookup_unit,
+                    metric_lookup.segment_name AS metric_lookup_segment_name,
+                    metric_lookup.product_name AS metric_lookup_product_name,
+                    metric_lookup.geography_name AS metric_lookup_geography_name,
+                    metric_lookup.is_company_total AS metric_lookup_is_company_total,
+                    '__company_total__' AS metric_dimension_key,
+                    'Company Total' AS metric_dimension_label,
+                    'company_total' AS metric_dimension_kind,
+                    ({total_score_expr}) AS metric_match_score,
+                    0 AS dimension_match_score
+                FROM metric_lookup
+                JOIN objects ON objects.id = metric_lookup.object_id
+                WHERE {" AND ".join(total_where)}
+                ORDER BY
+                    metric_match_score DESC,
+                    metric_lookup.fiscal_year ASC,
+                    metric_lookup.period ASC,
+                    metric_lookup.object_id ASC
+                LIMIT ?
+                """,
+                [*total_score_params, *total_params, max(1, min(limit * 4, 120))],
+            ).fetchall()
+        role_by_object_id = {row["id"]: "target_dimension_metric" for row in rows if row["id"]}
+        for row in denominator_rows:
+            if row["id"]:
+                role_by_object_id[row["id"]] = "denominator_metric"
+        rows = _dedupe_metric_lookup_rows([*rows, *denominator_rows], limit=limit)
+        dimension_metric_not_found = not found_keys
+        strategy = {
+            "mode": "metric_dimension_lookup",
+            "normalized_topic": topic,
+            "terms": list(metric_terms),
+            "dimension_anchors": list(dimension_anchors),
+            "resolved_dimensions": [dict(match) for match in dimension_matches],
+            "dimension_keys": dimension_keys,
+            "missing_dimension_keys": missing_dimension_keys,
+            "dimension_anchor_filter": True,
+            "dimension_metric_not_found": dimension_metric_not_found,
+            "company_total_role": "denominator_or_support",
+            "denominator_needed": denominator_needed,
+            "metric_roles_by_object_id": role_by_object_id,
             "period_values": period_values,
             "period_years": years,
             "object_types": selected_types,
@@ -4068,9 +4458,47 @@ def _metric_lookup_search_terms(topic: str | None) -> list[str]:
     return _unique(terms)
 
 
+def _metric_lookup_dimension_anchors(topic: str | None) -> list[str]:
+    anchors: list[str] = []
+    for term in _metric_lookup_search_terms(topic):
+        if term in _METRIC_LOOKUP_METRIC_TERMS:
+            continue
+        canonical = _canonical_metric_name(term)
+        if canonical in _METRIC_LOOKUP_METRIC_TERMS:
+            continue
+        anchors.append(term)
+    return _unique(anchors)
+
+
+def _metric_lookup_fallback_object_types(
+    object_types: Sequence[str],
+    *,
+    search_strategy: Mapping[str, Any] | None,
+) -> tuple[str, ...]:
+    if not search_strategy or not search_strategy.get("dimension_metric_not_found"):
+        return tuple(object_types)
+    return tuple(object_type for object_type in object_types if object_type not in _METRIC_FAST_PATH_TYPES)
+
+
 def _metric_lookup_wants_total(topic: str | None) -> bool:
     terms = set(_query_terms(topic))
     return bool(terms & {"company", "consolidated", "total"})
+
+
+def _metric_lookup_needs_denominator(topic: str | None) -> bool:
+    text = str(topic or "").lower()
+    terms = set(_query_terms(topic))
+    return bool(terms & {"share", "shares", "percentage", "percent", "ratio"}) or "비중" in text
+
+
+def _metric_dimension_key(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    text = text.split("#")[-1].split("/")[-1].split(":")[-1]
+    text = re.sub(r"(?:member|axis|domain)$", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", text)
+    text = re.sub(r"[^a-z0-9]+", "_", text)
+    text = re.sub(r"_+", "_", text).strip("_")
+    return text
 
 
 def _metric_lookup_period_values(periods: Iterable[str] | None) -> list[str]:

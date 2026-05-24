@@ -756,6 +756,502 @@ def _write_context_fixture(
     )
 
 
+def _write_metric_dimension_fixture(root: Path) -> None:
+    period = "CY2025"
+    ontology_dir = root / "companies" / "AAPL" / "ontology" / "10K" / period
+    ontology_dir.mkdir(parents=True, exist_ok=True)
+
+    def metric(
+        suffix: str,
+        *,
+        metric_name: str,
+        value: str,
+        text: str,
+        dimensions: dict[str, str] | None = None,
+    ) -> dict:
+        return {
+            "id": f"metric_observation:AAPL:{period}:10K:{suffix}",
+            "type": "MetricObservation",
+            "object_type": "MetricObservation",
+            "ticker": "AAPL",
+            "source_document_id": f"source:AAPL:{period}:10K",
+            "document_type": "10-K",
+            "period": period,
+            "metric_name": metric_name,
+            "canonical_metric": metric_name,
+            "value": value,
+            "unit": "USD",
+            "dimensions": dimensions or {},
+            "text": text,
+            "review_status": "accepted",
+        }
+
+    metrics = [
+        metric(
+            "total-revenue",
+            metric_name="revenue",
+            value="416200000000",
+            text="CY2025 total net sales revenue was $416.2B.",
+        ),
+        metric(
+            "net-income",
+            metric_name="net_income",
+            value="112000000000",
+            text="CY2025 net income was $112.0B.",
+        ),
+        metric(
+            "iphone-net-sales",
+            metric_name="net_sales",
+            value="201200000000",
+            text="CY2025 iPhone net sales were $201.2B.",
+            dimensions={"product": "iPhone"},
+        ),
+        metric(
+            "services-net-sales",
+            metric_name="net_sales",
+            value="109200000000",
+            text="CY2025 Services net sales were $109.2B.",
+            dimensions={"segment": "Services"},
+        ),
+        metric(
+            "greater-china-net-sales",
+            metric_name="net_sales",
+            value="64300000000",
+            text="CY2025 Greater China net sales were $64.3B.",
+            dimensions={"geography": "Greater China"},
+        ),
+    ]
+
+    def xbrl_fact(
+        suffix: str,
+        *,
+        value: str,
+        fiscal_year: int,
+        dimensions: list[str],
+    ) -> dict:
+        return {
+            "id": f"xbrl:AAPL:{period}:10K:RevenueFromContractWithCustomerExcludingAssessedTax:{suffix}",
+            "type": "XBRLFact",
+            "ticker": "AAPL",
+            "source_document_id": f"source:AAPL:{period}:10K",
+            "document_type": "10-K",
+            "period": period,
+            "taxonomy_tag": "us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax",
+            "safe_taxonomy_tag": "RevenueFromContractWithCustomerExcludingAssessedTax",
+            "value": float(value),
+            "unit": "usd",
+            "context": {
+                "fiscal_year": fiscal_year,
+                "period_type": "duration",
+                "dimensions": dimensions,
+                "has_dimensions": bool(dimensions),
+            },
+            "review_status": "accepted",
+        }
+
+    xbrl_facts = [
+        xbrl_fact("mac-revenue", value="31000000000", fiscal_year=2025, dimensions=["aapl:MacMember"]),
+        xbrl_fact("ipad-revenue", value="28000000000", fiscal_year=2025, dimensions=["aapl:IPadMember"]),
+    ]
+
+    write_jsonl(ontology_dir / "metric_observations.jsonl", metrics)
+    write_jsonl(ontology_dir / "xbrl_facts.jsonl", xbrl_facts)
+    atomic_write_json(
+        ontology_dir / "artifact_index.json",
+        {
+            "ticker": "AAPL",
+            "document_type": "10-K",
+            "doc_type_key": "10K",
+            "period": period,
+            "files": {
+                "metric_observations": f"companies/AAPL/ontology/10K/{period}/metric_observations.jsonl",
+                "xbrl_facts": f"companies/AAPL/ontology/10K/{period}/xbrl_facts.jsonl",
+            },
+            "counts": {
+                "metric_observations": len(metrics),
+                "xbrl_facts": len(xbrl_facts),
+            },
+        },
+    )
+
+    def write_company_metrics(
+        ticker: str,
+        specs: list[tuple[str, str, str, str, Any]],
+    ) -> None:
+        company_dir = root / "companies" / ticker / "ontology" / "10K" / period
+        company_dir.mkdir(parents=True, exist_ok=True)
+        company_metrics = [
+            {
+                "id": f"metric_observation:{ticker}:{period}:10K:{suffix}",
+                "type": "MetricObservation",
+                "object_type": "MetricObservation",
+                "ticker": ticker,
+                "source_document_id": f"source:{ticker}:{period}:10K",
+                "document_type": "10-K",
+                "period": period,
+                "metric_name": metric_name,
+                "canonical_metric": metric_name,
+                "value": value,
+                "unit": "USD",
+                "dimensions": dimensions or {},
+                "text": text,
+                "review_status": "accepted",
+            }
+            for suffix, metric_name, value, text, dimensions in specs
+        ]
+        write_jsonl(company_dir / "metric_observations.jsonl", company_metrics)
+        atomic_write_json(
+            company_dir / "artifact_index.json",
+            {
+                "ticker": ticker,
+                "document_type": "10-K",
+                "doc_type_key": "10K",
+                "period": period,
+                "files": {
+                    "metric_observations": f"companies/{ticker}/ontology/10K/{period}/metric_observations.jsonl",
+                },
+                "counts": {
+                    "metric_observations": len(company_metrics),
+                },
+            },
+        )
+
+    write_company_metrics(
+        "NVDA",
+        [
+            (
+                "total-revenue",
+                "revenue",
+                "60000000000",
+                "CY2025 total revenue was $60.0B.",
+                None,
+            ),
+            (
+                "data-center-revenue",
+                "revenue",
+                "47000000000",
+                "CY2025 Data Center revenue was $47.0B.",
+                {"segment": "Data Center"},
+            ),
+            (
+                "gaming-revenue",
+                "revenue",
+                "10000000000",
+                "CY2025 Gaming revenue was $10.0B.",
+                {"segment": "Gaming"},
+            ),
+        ],
+    )
+    write_company_metrics(
+        "AMZN",
+        [
+            (
+                "total-revenue",
+                "revenue",
+                "638000000000",
+                "CY2025 total net sales were $638.0B.",
+                None,
+            ),
+            (
+                "aws-operating-income",
+                "operating_income",
+                "43000000000",
+                "CY2025 AWS operating income was $43.0B.",
+                {"segment": "AWS"},
+            ),
+        ],
+    )
+    write_company_metrics(
+        "MSFT",
+        [
+            (
+                "total-revenue",
+                "revenue",
+                "281000000000",
+                "CY2025 total revenue was $281.0B.",
+                None,
+            ),
+            (
+                "intelligent-cloud-revenue",
+                "revenue",
+                "105000000000",
+                "CY2025 Intelligent Cloud revenue was $105.0B.",
+                [{"axis": "BusinessSegmentAxis", "member": "IntelligentCloudMember"}],
+            ),
+        ],
+    )
+    write_company_metrics(
+        "GOOGL",
+        [
+            (
+                "total-revenue",
+                "revenue",
+                "350000000000",
+                "CY2025 total revenue was $350.0B.",
+                None,
+            ),
+            (
+                "google-cloud-revenue",
+                "revenue",
+                "47000000000",
+                "CY2025 Google Cloud revenue was $47.0B.",
+                None,
+            ),
+        ],
+    )
+
+    service_dir = root / "companies" / "SVCX" / "ontology" / "10K" / period
+    service_dir.mkdir(parents=True, exist_ok=True)
+    service_facts = [
+        {
+            "id": f"xbrl:SVCX:{period}:10K:RevenueFromContractWithCustomerExcludingAssessedTax:service-revenue",
+            "type": "XBRLFact",
+            "ticker": "SVCX",
+            "source_document_id": f"source:SVCX:{period}:10K",
+            "document_type": "10-K",
+            "period": period,
+            "taxonomy_tag": "us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax",
+            "safe_taxonomy_tag": "RevenueFromContractWithCustomerExcludingAssessedTax",
+            "value": 123000000.0,
+            "unit": "usd",
+            "context": {
+                "fiscal_year": 2025,
+                "period_type": "duration",
+                "dimensions": ["us-gaap:ServiceMember"],
+                "has_dimensions": True,
+            },
+            "review_status": "accepted",
+        }
+    ]
+    write_jsonl(service_dir / "xbrl_facts.jsonl", service_facts)
+    atomic_write_json(
+        service_dir / "artifact_index.json",
+        {
+            "ticker": "SVCX",
+            "document_type": "10-K",
+            "doc_type_key": "10K",
+            "period": period,
+            "files": {
+                "xbrl_facts": f"companies/SVCX/ontology/10K/{period}/xbrl_facts.jsonl",
+            },
+            "counts": {
+                "xbrl_facts": len(service_facts),
+            },
+        },
+    )
+
+
+def test_metric_lookup_is_dimension_aware_not_company_total_only(tmp_path: Path) -> None:
+    _write_metric_dimension_fixture(tmp_path)
+    index = build_agent_index(tmp_path)
+
+    with OntologyStore(index["index_path"]) as store:
+        total_results, total_diagnostics = store.query_compact_with_diagnostics(
+            topic="total net sales",
+            tickers=["AAPL"],
+            document_types=["10-K"],
+            periods=["CY2025"],
+            object_types=["MetricObservation"],
+            limit=3,
+        )
+        assert total_results[0]["id"].endswith("total-revenue")
+        assert total_diagnostics["search_strategy"]["company_total_role"] == "primary"
+
+        iphone_results, iphone_diagnostics = store.query_compact_with_diagnostics(
+            topic="iPhone net sales",
+            tickers=["AAPL"],
+            document_types=["10-K"],
+            periods=["CY2025"],
+            object_types=["MetricObservation"],
+            limit=3,
+        )
+        assert iphone_results[0]["id"].endswith("iphone-net-sales")
+        assert iphone_results[0]["object"]["dimensions"]["product"] == "iPhone"
+        assert iphone_diagnostics["search_strategy"]["dimension_anchors"] == ["iphone"]
+        assert iphone_diagnostics["search_strategy"]["company_total_role"] == "denominator_or_support"
+
+        services_results, _services_diagnostics = store.query_compact_with_diagnostics(
+            topic="Services net sales",
+            tickers=["AAPL"],
+            document_types=["10-K"],
+            periods=["CY2025"],
+            object_types=["MetricObservation"],
+            limit=3,
+        )
+        assert services_results[0]["id"].endswith("services-net-sales")
+        assert services_results[0]["object"]["dimensions"]["segment"] == "Services"
+
+        geography_results, _geography_diagnostics = store.query_compact_with_diagnostics(
+            topic="Greater China net sales",
+            tickers=["AAPL"],
+            document_types=["10-K"],
+            periods=["CY2025"],
+            object_types=["MetricObservation"],
+            limit=3,
+        )
+        assert geography_results[0]["id"].endswith("greater-china-net-sales")
+        assert geography_results[0]["object"]["dimensions"]["geography"] == "Greater China"
+
+        mac_results, mac_diagnostics = store.query_compact_with_diagnostics(
+            topic="Mac net sales",
+            tickers=["AAPL"],
+            document_types=["10-K"],
+            periods=["CY2025"],
+            object_types=["MetricObservation"],
+            limit=3,
+        )
+        assert mac_results[0]["id"].endswith("mac-revenue")
+        assert mac_results[0]["type"] == "XBRLFact"
+        assert mac_diagnostics["search_strategy"]["mode"] == "metric_dimension_lookup"
+        assert mac_diagnostics["search_strategy"]["dimension_anchors"] == ["mac"]
+        assert mac_diagnostics["search_strategy"]["metric_roles_by_object_id"][mac_results[0]["id"]] == "target_dimension_metric"
+
+        service_xbrl_results, service_xbrl_diagnostics = store.query_compact_with_diagnostics(
+            topic="Services revenue",
+            tickers=["SVCX"],
+            document_types=["10-K"],
+            periods=["CY2025"],
+            object_types=["MetricObservation"],
+            limit=3,
+        )
+        assert service_xbrl_results[0]["id"].endswith("service-revenue")
+        assert service_xbrl_results[0]["type"] == "XBRLFact"
+        assert service_xbrl_diagnostics["search_strategy"]["dimension_anchors"] == ["services"]
+
+        missing_results, missing_diagnostics = store.query_compact_with_diagnostics(
+            topic="Data Center net sales",
+            tickers=["AAPL"],
+            document_types=["10-K"],
+            periods=["CY2025"],
+            object_types=["MetricObservation"],
+            limit=3,
+        )
+        assert missing_results == []
+        assert missing_diagnostics["search_strategy"]["dimension_metric_not_found"] is True
+        assert missing_diagnostics["search_strategy"]["fallback_skipped"] == "dimension_metric_not_found"
+
+        compound_results, compound_diagnostics = store.query_compact_with_diagnostics(
+            topic="iPhone Services net sales",
+            tickers=["AAPL"],
+            document_types=["10-K"],
+            periods=["CY2025"],
+            object_types=["MetricObservation"],
+            limit=5,
+        )
+        compound_ids = {result["id"].rsplit(":", 1)[-1] for result in compound_results}
+        assert {"iphone-net-sales", "services-net-sales"}.issubset(compound_ids)
+        assert "total-revenue" not in compound_ids
+        assert compound_diagnostics["search_strategy"]["dimension_anchors"] == ["iphone", "services"]
+
+        data_center_results, data_center_diagnostics = store.query_compact_with_diagnostics(
+            topic="Data Center revenue",
+            tickers=["NVDA"],
+            document_types=["10-K"],
+            periods=["CY2025"],
+            object_types=["MetricObservation"],
+            limit=3,
+        )
+        assert data_center_results[0]["id"].endswith("data-center-revenue")
+        assert data_center_results[0]["object"]["dimensions"]["segment"] == "Data Center"
+        assert data_center_diagnostics["search_strategy"]["company_total_role"] == "denominator_or_support"
+
+        aws_results, aws_diagnostics = store.query_compact_with_diagnostics(
+            topic="AWS operating income",
+            tickers=["AMZN"],
+            document_types=["10-K"],
+            periods=["CY2025"],
+            object_types=["MetricObservation"],
+            limit=3,
+        )
+        assert aws_results[0]["id"].endswith("aws-operating-income")
+        assert aws_results[0]["object"]["dimensions"]["segment"] == "AWS"
+        assert aws_diagnostics["search_strategy"]["dimension_anchors"] == ["aws"]
+
+        intelligent_cloud_results, _intelligent_cloud_diagnostics = store.query_compact_with_diagnostics(
+            topic="Intelligent Cloud revenue",
+            tickers=["MSFT"],
+            document_types=["10-K"],
+            periods=["CY2025"],
+            object_types=["MetricObservation"],
+            limit=3,
+        )
+        assert intelligent_cloud_results[0]["id"].endswith("intelligent-cloud-revenue")
+        intelligent_cloud_lookup = store.conn.execute(
+            "SELECT segment_name, dimensions_json FROM metric_lookup WHERE object_id = ?",
+            (intelligent_cloud_results[0]["id"],),
+        ).fetchone()
+        assert intelligent_cloud_lookup["segment_name"] == "Intelligent Cloud"
+        assert json.loads(intelligent_cloud_lookup["dimensions_json"])["Business Segment"] == "Intelligent Cloud"
+
+        google_cloud_results, _google_cloud_diagnostics = store.query_compact_with_diagnostics(
+            topic="Google Cloud revenue",
+            tickers=["GOOGL"],
+            document_types=["10-K"],
+            periods=["CY2025"],
+            object_types=["MetricObservation"],
+            limit=3,
+        )
+        assert google_cloud_results[0]["id"].endswith("google-cloud-revenue")
+        google_cloud_lookup = store.conn.execute(
+            "SELECT segment_name, dimensions_json FROM metric_lookup WHERE object_id = ?",
+            (google_cloud_results[0]["id"],),
+        ).fetchone()
+        assert google_cloud_lookup["segment_name"] == "Google Cloud"
+        assert json.loads(google_cloud_lookup["dimensions_json"])["inferred_segment"] == "Google Cloud"
+
+        catalog_rows = store.conn.execute(
+            """
+            SELECT ticker, dimension_key, dimension_label, dimension_kind
+            FROM company_dimension_catalog
+            WHERE ticker IN ('AAPL', 'NVDA', 'AMZN', 'MSFT', 'GOOGL', 'SVCX')
+            ORDER BY ticker, dimension_key
+            """
+        ).fetchall()
+        catalog_keys = {(row["ticker"], row["dimension_key"]) for row in catalog_rows}
+        assert ("AAPL", "iphone") in catalog_keys
+        assert ("AAPL", "mac") in catalog_keys
+        assert ("AAPL", "services") in catalog_keys
+        assert ("AAPL", "greater_china") in catalog_keys
+        assert ("NVDA", "data_center") in catalog_keys
+        assert ("AMZN", "aws") in catalog_keys
+        assert ("MSFT", "intelligent_cloud") in catalog_keys
+        assert ("GOOGL", "google_cloud") in catalog_keys
+        assert ("SVCX", "services") in catalog_keys
+
+        dimension_rows = store.conn.execute(
+            """
+            SELECT object_id, dimension_key, dimension_label, dimension_kind
+            FROM metric_dimension_lookup
+            WHERE dimension_key IN ('iphone', 'mac', 'services', 'data_center', 'aws', 'intelligent_cloud', 'google_cloud')
+            """
+        ).fetchall()
+        assert {row["dimension_key"] for row in dimension_rows} >= {
+            "iphone",
+            "mac",
+            "services",
+            "data_center",
+            "aws",
+            "intelligent_cloud",
+            "google_cloud",
+        }
+
+        share_results, share_diagnostics = store.query_compact_with_diagnostics(
+            topic="iPhone Services net sales share",
+            tickers=["AAPL"],
+            document_types=["10-K"],
+            periods=["CY2025"],
+            object_types=["MetricObservation"],
+            limit=10,
+        )
+        share_ids = {result["id"].rsplit(":", 1)[-1] for result in share_results}
+        assert {"iphone-net-sales", "services-net-sales", "total-revenue"}.issubset(share_ids)
+        share_strategy = share_diagnostics["search_strategy"]
+        assert share_strategy["mode"] == "metric_dimension_lookup"
+        assert share_strategy["denominator_needed"] is True
+        assert share_strategy["metric_roles_by_object_id"]["metric_observation:AAPL:CY2025:10K:total-revenue"] == "denominator_metric"
+        assert share_strategy["metric_roles_by_object_id"]["metric_observation:AAPL:CY2025:10K:iphone-net-sales"] == "target_dimension_metric"
+
+
 def test_query_ticker_summary_discovery_contract(tmp_path: Path) -> None:
     _write_fixture(tmp_path)
     build_agent_index(tmp_path)

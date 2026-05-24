@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from krw_ontology.agent_index import builder as agent_index_builder
 from krw_ontology.agent_index import OntologyStore, build_agent_index
 from krw_ontology.mcp_server.server import health_payload, mcp
 from krw_ontology.mcp_server.tools import (
@@ -850,6 +851,7 @@ def _write_metric_dimension_fixture(root: Path) -> None:
         }
 
     xbrl_facts = [
+        xbrl_fact("company-total-revenue", value="416200000000", fiscal_year=2025, dimensions=[]),
         xbrl_fact("mac-revenue", value="31000000000", fiscal_year=2025, dimensions=["aapl:MacMember"]),
         xbrl_fact("ipad-revenue", value="28000000000", fiscal_year=2025, dimensions=["aapl:IPadMember"]),
     ]
@@ -1044,8 +1046,14 @@ def _write_metric_dimension_fixture(root: Path) -> None:
 def test_metric_lookup_is_dimension_aware_not_company_total_only(tmp_path: Path) -> None:
     _write_metric_dimension_fixture(tmp_path)
     index = build_agent_index(tmp_path)
+    assert index["totals"]["metric_lookup"] > 0
+    assert index["totals"]["metric_dimension_lookup"] > 0
+    assert index["totals"]["company_dimension_catalog"] > 0
 
     with OntologyStore(index["index_path"]) as store:
+        integrity = store.conn.execute("PRAGMA integrity_check").fetchone()
+        assert integrity[0] == "ok"
+
         total_results, total_diagnostics = store.query_compact_with_diagnostics(
             topic="total net sales",
             tickers=["AAPL"],
@@ -1056,6 +1064,18 @@ def test_metric_lookup_is_dimension_aware_not_company_total_only(tmp_path: Path)
         )
         assert total_results[0]["id"].endswith("total-revenue")
         assert total_diagnostics["search_strategy"]["company_total_role"] == "primary"
+        assert "XBRLFact" not in total_diagnostics["search_strategy"]["object_types"]
+        assert all(result["type"] != "XBRLFact" for result in total_results)
+        skipped_xbrl_total = store.conn.execute(
+            "SELECT COUNT(*) AS count FROM metric_lookup WHERE object_id LIKE '%company-total-revenue'"
+        ).fetchone()
+        assert skipped_xbrl_total["count"] == 0
+
+        context = store.index_context()
+        assert context["serving_counts"]["metric_dimension_lookup"] > 0
+        assert context["serving_counts"]["company_dimension_catalog"] > 0
+        assert context["capabilities"]["metric_dimension_lookup"] is True
+        assert context["capabilities"]["company_dimension_catalog"] is True
 
         iphone_results, iphone_diagnostics = store.query_compact_with_diagnostics(
             topic="iPhone net sales",
@@ -1196,8 +1216,8 @@ def test_metric_lookup_is_dimension_aware_not_company_total_only(tmp_path: Path)
             "SELECT segment_name, dimensions_json FROM metric_lookup WHERE object_id = ?",
             (google_cloud_results[0]["id"],),
         ).fetchone()
-        assert google_cloud_lookup["segment_name"] == "Google Cloud"
-        assert json.loads(google_cloud_lookup["dimensions_json"])["inferred_segment"] == "Google Cloud"
+        assert google_cloud_lookup["segment_name"] is None
+        assert json.loads(google_cloud_lookup["dimensions_json"])["inferred_unknown"] == "Google Cloud"
 
         catalog_rows = store.conn.execute(
             """
@@ -1208,7 +1228,7 @@ def test_metric_lookup_is_dimension_aware_not_company_total_only(tmp_path: Path)
             """
         ).fetchall()
         catalog_keys = {(row["ticker"], row["dimension_key"]) for row in catalog_rows}
-        assert ("AAPL", "iphone") in catalog_keys
+        assert ("AAPL", "i_phone") in catalog_keys
         assert ("AAPL", "mac") in catalog_keys
         assert ("AAPL", "services") in catalog_keys
         assert ("AAPL", "greater_china") in catalog_keys
@@ -1216,17 +1236,37 @@ def test_metric_lookup_is_dimension_aware_not_company_total_only(tmp_path: Path)
         assert ("AMZN", "aws") in catalog_keys
         assert ("MSFT", "intelligent_cloud") in catalog_keys
         assert ("GOOGL", "google_cloud") in catalog_keys
-        assert ("SVCX", "services") in catalog_keys
+        assert ("SVCX", "service") in catalog_keys
+
+        iphone_catalog = store.conn.execute(
+            """
+            SELECT dimension_label, aliases_text
+            FROM company_dimension_catalog
+            WHERE ticker = 'AAPL' AND dimension_key = 'i_phone'
+            """
+        ).fetchone()
+        assert iphone_catalog["dimension_label"] == "i Phone"
+        assert "iphone" in iphone_catalog["aliases_text"].lower().split()
+
+        service_catalog = store.conn.execute(
+            """
+            SELECT dimension_label, aliases_text
+            FROM company_dimension_catalog
+            WHERE ticker = 'SVCX' AND dimension_key = 'service'
+            """
+        ).fetchone()
+        assert service_catalog["dimension_label"] == "Service"
+        assert "services" in service_catalog["aliases_text"].lower().split()
 
         dimension_rows = store.conn.execute(
             """
             SELECT object_id, dimension_key, dimension_label, dimension_kind
             FROM metric_dimension_lookup
-            WHERE dimension_key IN ('iphone', 'mac', 'services', 'data_center', 'aws', 'intelligent_cloud', 'google_cloud')
+            WHERE dimension_key IN ('i_phone', 'mac', 'services', 'data_center', 'aws', 'intelligent_cloud', 'google_cloud')
             """
         ).fetchall()
         assert {row["dimension_key"] for row in dimension_rows} >= {
-            "iphone",
+            "i_phone",
             "mac",
             "services",
             "data_center",
@@ -1250,6 +1290,18 @@ def test_metric_lookup_is_dimension_aware_not_company_total_only(tmp_path: Path)
         assert share_strategy["denominator_needed"] is True
         assert share_strategy["metric_roles_by_object_id"]["metric_observation:AAPL:CY2025:10K:total-revenue"] == "denominator_metric"
         assert share_strategy["metric_roles_by_object_id"]["metric_observation:AAPL:CY2025:10K:iphone-net-sales"] == "target_dimension_metric"
+
+
+def test_metric_dimension_normalization_uses_generic_rules_not_value_special_cases() -> None:
+    assert agent_index_builder._metric_lookup_clean_dimension_label("aapl:IPhoneMember") == "I Phone"
+    assert agent_index_builder._metric_lookup_clean_dimension_label("us-gaap:ServiceMember") == "Service"
+    assert agent_index_builder._metric_dimension_key("aapl:IPhoneMember") == "i_phone"
+    assert agent_index_builder._metric_dimension_key("us-gaap:ServiceMember") == "service"
+    assert agent_index_builder._metric_dimension_kind("aapl:IPhoneMember", "I Phone") == "unknown"
+    assert agent_index_builder._metric_dimension_kind("ProductOrServiceAxis", "IPhone") == "product"
+    assert agent_index_builder._metric_dimension_kind("StatementGeographicalAxis", "Greater China") == "geography"
+    aliases = agent_index_builder._metric_dimension_aliases("Service", "service")
+    assert "services" in {alias.lower() for alias in aliases}
 
 
 def test_query_ticker_summary_discovery_contract(tmp_path: Path) -> None:

@@ -336,10 +336,10 @@ _TYPED_PROJECTION_SPECS: dict[str, dict[str, Any]] = {
 }
 
 
-def _metric_lookup_selected_types(object_types: Iterable[str]) -> list[str]:
+def _metric_lookup_selected_types(object_types: Iterable[str], *, include_xbrl: bool = False) -> list[str]:
     requested = list(object_types)
     selected = [object_type for object_type in requested if object_type in _METRIC_FAST_PATH_TYPES]
-    if "MetricObservation" in set(requested) and "XBRLFact" not in selected:
+    if include_xbrl and "MetricObservation" in set(requested) and "XBRLFact" not in selected:
         selected.append("XBRLFact")
     return selected
 
@@ -478,6 +478,8 @@ class OntologyStore:
                 "objects": _table_count(self.conn, "objects"),
                 "object_search_text": _table_count(self.conn, "object_search_text"),
                 "metric_lookup": _table_count(self.conn, "metric_lookup"),
+                "metric_dimension_lookup": _table_count(self.conn, "metric_dimension_lookup"),
+                "company_dimension_catalog": _table_count(self.conn, "company_dimension_catalog"),
                 "exposure_lookup": _table_count(self.conn, "exposure_lookup"),
                 "agreement_lookup": _table_count(self.conn, "agreement_lookup"),
                 "event_lookup": _table_count(self.conn, "event_lookup"),
@@ -499,6 +501,8 @@ class OntologyStore:
                 "company_topic_index": _table_exists(self.conn, "company_topic_index"),
                 "object_search_text": _table_exists(self.conn, "object_search_text"),
                 "metric_lookup": _table_exists(self.conn, "metric_lookup"),
+                "metric_dimension_lookup": _table_exists(self.conn, "metric_dimension_lookup"),
+                "company_dimension_catalog": _table_exists(self.conn, "company_dimension_catalog"),
                 "exposure_lookup": _table_exists(self.conn, "exposure_lookup"),
                 "agreement_lookup": _table_exists(self.conn, "agreement_lookup"),
                 "event_lookup": _table_exists(self.conn, "event_lookup"),
@@ -857,7 +861,11 @@ class OntologyStore:
         object_types = list(object_types) if object_types is not None else None
         selected_types = tuple(object_types or DEFAULT_QUERY_TYPES)
         scope_guard_types = selected_types
-        if _metric_lookup_topic_is_metric_like(topic or "") and set(selected_types).intersection(_METRIC_FAST_PATH_TYPES):
+        if (
+            _metric_lookup_topic_is_metric_like(topic or "")
+            and _metric_lookup_dimension_anchors(topic or "")
+            and set(selected_types).intersection(_METRIC_FAST_PATH_TYPES)
+        ):
             scope_guard_types = tuple(dict.fromkeys([*selected_types, "XBRLFact"]))
         if tickers and periods and not self._has_query_scope_objects(
             tickers=tickers,
@@ -2581,7 +2589,7 @@ class OntologyStore:
         metric_terms = [term for term in terms if term not in set(dimension_anchors)] or terms
         period_values = _metric_lookup_period_values(periods)
         years = _metric_lookup_years(periods)
-        selected_types = _metric_lookup_selected_types(object_types)
+        selected_types = _metric_lookup_selected_types(object_types, include_xbrl=bool(dimension_anchors))
         dimension_matches = self._resolve_metric_dimension_anchors(
             topic=topic,
             tickers=tickers,
@@ -2822,7 +2830,7 @@ class OntologyStore:
     ) -> tuple[list[sqlite3.Row], dict[str, Any]]:
         period_values = _metric_lookup_period_values(periods)
         years = _metric_lookup_years(periods)
-        selected_types = _metric_lookup_selected_types(object_types)
+        selected_types = _metric_lookup_selected_types(object_types, include_xbrl=True)
         canonical_candidates = _unique(_canonical_metric_name(term) for term in metric_terms if term)
         if "sales" in metric_terms or "revenue" in metric_terms:
             canonical_candidates = _unique([*canonical_candidates, "revenue", "net_sales"])

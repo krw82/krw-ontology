@@ -97,15 +97,11 @@ _SECTOR_PATTERNS: dict[str, tuple[str, ...]] = {
         "data center",
         "accelerated computing",
     ),
-    "consumer_devices": ("iphone", "ipad", "mac", "consumer electronics", "device"),
+    "consumer_devices": ("consumer electronics", "device", "devices", "smartphone", "tablet", "wearable"),
     "financials": ("bank", "deposit", "loan", "credit", "markets", "trading"),
 }
 
 _ANCHOR_PATTERNS: dict[str, tuple[str, ...]] = {
-    "iphone": ("iphone",),
-    "ipad": ("ipad",),
-    "mac": ("mac",),
-    "services": ("services", "app store"),
     "hbm": ("hbm", "high bandwidth memory"),
     "gpu": ("gpu", "gpus"),
     "semiconductor_memory": ("semiconductor memory", "memory chip", "memory chips", "memory price"),
@@ -634,12 +630,15 @@ def tier_rank(tier: str) -> int:
 
 
 def _extract_facets(text: str, *, is_query: bool) -> dict[str, set[str]]:
+    raw_text = str(text or "")
     normalized = _normalize(text)
     core = _matches(normalized, _CORE_DOMAIN_PATTERNS)
     mechanisms = _matches(normalized, _MECHANISM_PATTERNS)
     sectors = _matches(normalized, _SECTOR_PATTERNS)
     channels = _matches(normalized, _IMPACT_CHANNEL_PATTERNS)
     anchors = _matches(normalized, _ANCHOR_PATTERNS)
+    if not core and not mechanisms:
+        anchors |= _metric_dimension_anchor_terms(raw_text)
     predicates = _matches(normalized, _PREDICATE_PATTERNS)
     contexts = _matches(normalized, _CONTEXT_PATTERNS)
     generic = _matches(normalized, _GENERIC_PATTERNS)
@@ -675,8 +674,8 @@ def _infer_query_frame_type(raw_query: str, normalized: str, facets: Mapping[str
         for marker in ("if ", "what happens", "scenario", "시나리오", "좋은가", "나쁜가", "내려가", "올라가", "상승", "하락")
     ):
         return "scenario"
-    product_anchors = set(facets.get("anchor_terms") or set()) & {"iphone", "ipad", "mac", "services"}
-    if product_anchors and (
+    metric_dimension_anchors = _metric_dimension_anchor_terms(raw_query)
+    if metric_dimension_anchors and not facets.get("core_domain_terms") and not facets.get("mechanism_terms") and (
         facets.get("impact_channels") or facets.get("predicate_terms") or _has_any(normalized, ("growth", "driver", "demand"))
     ):
         return "product_revenue_driver"
@@ -730,6 +729,84 @@ def _matches(text: str, patterns: Mapping[str, tuple[str, ...]]) -> set[str]:
 
 def _has_any(text: str, phrases: tuple[str, ...]) -> bool:
     return any(_contains_phrase(text, phrase) for phrase in phrases)
+
+
+def _metric_dimension_anchor_terms(text: str) -> set[str]:
+    """Extract product/segment-like metric anchors without company/product vocabulary."""
+    raw_tokens = re.findall(r"[A-Za-z][A-Za-z0-9]*", str(text or ""))
+    if not raw_tokens:
+        return set()
+    metric_markers = {
+        "sales",
+        "revenue",
+        "revenues",
+        "demand",
+        "orders",
+        "bookings",
+        "margin",
+        "margins",
+        "income",
+    }
+    stopwords = {
+        "a",
+        "an",
+        "and",
+        "are",
+        "as",
+        "by",
+        "company",
+        "consolidated",
+        "due",
+        "for",
+        "from",
+        "growth",
+        "higher",
+        "increased",
+        "lower",
+        "net",
+        "of",
+        "operating",
+        "revenue",
+        "revenues",
+        "sales",
+        "strong",
+        "the",
+        "to",
+        "total",
+        "was",
+        "were",
+        "year",
+    }
+    anchors: set[str] = set()
+    normalized_tokens = [token.lower() for token in raw_tokens]
+    for idx, token in enumerate(normalized_tokens):
+        if token not in metric_markers:
+            continue
+        candidate_parts: list[str] = []
+        raw_candidate_parts: list[str] = []
+        cursor = idx - 1
+        skipped_stopword = False
+        while cursor >= 0 and len(candidate_parts) < 3:
+            normalized_part = normalized_tokens[cursor]
+            raw_part = raw_tokens[cursor]
+            if normalized_part in stopwords:
+                skipped_stopword = True
+                cursor -= 1
+                continue
+            if skipped_stopword and candidate_parts:
+                break
+            candidate_parts.insert(0, normalized_part)
+            raw_candidate_parts.insert(0, raw_part)
+            cursor -= 1
+        if not candidate_parts:
+            continue
+        raw_candidate = "".join(raw_candidate_parts)
+        if raw_candidate.isupper() and 1 <= len(raw_candidate) <= 5:
+            continue
+        key = re.sub(r"[^a-z0-9]+", "_", " ".join(candidate_parts)).strip("_")
+        if key and key not in stopwords:
+            anchors.add(key)
+    return anchors
 
 
 def _contains_phrase(text: str, phrase: str) -> bool:

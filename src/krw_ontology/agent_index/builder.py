@@ -9,9 +9,12 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+import resource
 import sqlite3
 import hashlib
+import sys
 import time
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
@@ -195,10 +198,15 @@ TEXT_KEYS_BY_TYPE = {
 }
 
 _NON_WORD_RE = re.compile(r"\s+")
-BULK_INSERT_CHUNK_SIZE = 5_000
-COMPANY_TOPIC_BATCH_SIZE = 500
-SQLITE_CACHE_SIZE_KIB = 200_000
-SQLITE_MMAP_SIZE_BYTES = 256 * 1024 * 1024
+DEFAULT_BUILD_RESOURCE_PROFILE = "max-local"
+DEFAULT_BULK_INSERT_CHUNK_SIZE = 20_000
+DEFAULT_COMPANY_TOPIC_BATCH_SIZE = 2_000
+DEFAULT_SQLITE_CACHE_SIZE_KIB = 4_096 * 1024
+DEFAULT_SQLITE_MMAP_SIZE_BYTES = 16 * 1024 * 1024 * 1024
+BULK_INSERT_CHUNK_SIZE = DEFAULT_BULK_INSERT_CHUNK_SIZE
+COMPANY_TOPIC_BATCH_SIZE = DEFAULT_COMPANY_TOPIC_BATCH_SIZE
+SQLITE_CACHE_SIZE_KIB = DEFAULT_SQLITE_CACHE_SIZE_KIB
+SQLITE_MMAP_SIZE_BYTES = DEFAULT_SQLITE_MMAP_SIZE_BYTES
 COMPANY_TOPIC_TEXT_CHAR_LIMIT = 2_500
 COMPANY_TOPIC_FIELD_CHAR_LIMIT = 700
 COMPANY_TOPIC_FTS_CHAR_LIMIT = 1_800
@@ -217,6 +225,168 @@ TYPED_PROJECTION_OBJECT_TYPES = {
     "factor_lookup": ("BusinessFactor",),
 }
 
+_SQLITE_SYNCHRONOUS_VALUES = {"OFF", "NORMAL", "FULL", "EXTRA"}
+_ACTIVE_BUILD_PROGRESS_LOGGER: _BuildProgressLogger | None = None
+
+
+def _env_int(name: str, default: int, *, min_value: int = 0) -> int:
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        value = int(str(raw).strip())
+    except ValueError:
+        logger.warning(
+            "build_agent_index: ignoring invalid integer env %s=%r",
+            name,
+            raw,
+            extra={"stage": "build_agent_index"},
+        )
+        return default
+    return max(min_value, value)
+
+
+def _env_float(name: str, default: float, *, min_value: float = 0.0) -> float:
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        value = float(str(raw).strip())
+    except ValueError:
+        logger.warning(
+            "build_agent_index: ignoring invalid float env %s=%r",
+            name,
+            raw,
+            extra={"stage": "build_agent_index"},
+        )
+        return default
+    return max(min_value, value)
+
+
+def _default_progress_log_path(index_path: Path | None = None) -> str:
+    if index_path is None:
+        return ""
+    return str(index_path.parent / "build_progress.jsonl")
+
+
+def _build_resource_settings(index_path: Path | None = None) -> dict[str, Any]:
+    profile = str(os.getenv("KRW_BUILD_RESOURCE_PROFILE") or DEFAULT_BUILD_RESOURCE_PROFILE).strip().lower() or DEFAULT_BUILD_RESOURCE_PROFILE
+    max_local = profile == "max-local"
+    default_cache_mib = max(1, DEFAULT_SQLITE_CACHE_SIZE_KIB // 1024)
+    default_mmap_gib = DEFAULT_SQLITE_MMAP_SIZE_BYTES / float(1024**3)
+    default_batch_size = DEFAULT_BULK_INSERT_CHUNK_SIZE
+    default_company_topic_batch_size = DEFAULT_COMPANY_TOPIC_BATCH_SIZE
+    default_checkpoint_every_artifacts = 10
+
+    synchronous = str(os.getenv("KRW_SQLITE_SYNCHRONOUS") or "OFF").strip().upper()
+    if synchronous not in _SQLITE_SYNCHRONOUS_VALUES:
+        logger.warning(
+            "build_agent_index: ignoring invalid KRW_SQLITE_SYNCHRONOUS=%r",
+            synchronous,
+            extra={"stage": "build_agent_index"},
+        )
+        synchronous = "OFF"
+
+    cache_mib = _env_int("KRW_SQLITE_CACHE_MIB", default_cache_mib, min_value=1)
+    mmap_gib = _env_float("KRW_SQLITE_MMAP_GIB", default_mmap_gib, min_value=0.0)
+    return {
+        "resource_profile": profile,
+        "sqlite_synchronous": synchronous,
+        "sqlite_cache_mib": cache_mib,
+        "sqlite_cache_size_kib": cache_mib * 1024,
+        "sqlite_mmap_gib": mmap_gib,
+        "sqlite_mmap_size_bytes": int(mmap_gib * 1024**3),
+        "sqlite_wal_autocheckpoint": _env_int("KRW_SQLITE_WAL_AUTOCHECKPOINT", 0, min_value=0),
+        "bulk_insert_chunk_size": _env_int("KRW_BUILD_BATCH_SIZE", default_batch_size, min_value=1),
+        "company_topic_batch_size": _env_int(
+            "KRW_COMPANY_TOPIC_BATCH_SIZE",
+            default_company_topic_batch_size,
+            min_value=1,
+        ),
+        "checkpoint_every_artifacts": _env_int(
+            "KRW_BUILD_CHECKPOINT_EVERY_ARTIFACTS",
+            default_checkpoint_every_artifacts,
+            min_value=0,
+        ),
+        "progress_log_path": os.getenv("KRW_BUILD_PROGRESS_LOG") or _default_progress_log_path(index_path),
+        "progress_log_interval_sec": _env_float("KRW_BUILD_LOG_INTERVAL_SEC", 10.0, min_value=0.0),
+    }
+
+
+def _apply_build_resource_settings(settings: Mapping[str, Any]) -> None:
+    global BULK_INSERT_CHUNK_SIZE, COMPANY_TOPIC_BATCH_SIZE, SQLITE_CACHE_SIZE_KIB, SQLITE_MMAP_SIZE_BYTES
+    BULK_INSERT_CHUNK_SIZE = int(settings["bulk_insert_chunk_size"])
+    COMPANY_TOPIC_BATCH_SIZE = int(settings["company_topic_batch_size"])
+    SQLITE_CACHE_SIZE_KIB = int(settings["sqlite_cache_size_kib"])
+    SQLITE_MMAP_SIZE_BYTES = int(settings["sqlite_mmap_size_bytes"])
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, Mapping):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [_json_safe(item) for item in value]
+    return value
+
+
+def _rss_mb() -> float | None:
+    try:
+        max_rss = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    except Exception:
+        return None
+    divisor = 1024 * 1024 if sys.platform == "darwin" else 1024
+    return round(max_rss / divisor, 1)
+
+
+class _BuildProgressLogger:
+    def __init__(self, *, path: Path, index_path: Path, settings: Mapping[str, Any]) -> None:
+        self.path = path
+        self.index_path = index_path
+        self.settings = dict(settings)
+        self.started_at = time.perf_counter()
+        self.last_write_at = 0.0
+        self.interval_sec = float(settings.get("progress_log_interval_sec") or 0.0)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+
+    def write(self, phase: str, fields: Mapping[str, Any]) -> None:
+        now = time.perf_counter()
+        must_write = (
+            self.last_write_at == 0.0
+            or phase == "start"
+            or phase.endswith("_start")
+            or phase.endswith("_done")
+            or phase == "finalize_done"
+            or self.interval_sec == 0.0
+            or now - self.last_write_at >= self.interval_sec
+        )
+        if not must_write:
+            return
+        self.last_write_at = now
+        wal_path = Path(str(self.index_path) + "-wal")
+        shm_path = Path(str(self.index_path) + "-shm")
+        payload = {
+            "event": "build_phase",
+            "phase": phase,
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "pid": os.getpid(),
+            "elapsed_sec": round(now - self.started_at, 3),
+            "rss_mb": _rss_mb(),
+            "db_size_mb": round(self.index_path.stat().st_size / 1024 / 1024, 1) if self.index_path.exists() else 0.0,
+            "wal_size_mb": round(wal_path.stat().st_size / 1024 / 1024, 1) if wal_path.exists() else 0.0,
+            "shm_size_mb": round(shm_path.stat().st_size / 1024 / 1024, 1) if shm_path.exists() else 0.0,
+            "resource_profile": self.settings.get("resource_profile"),
+            "sqlite_synchronous": self.settings.get("sqlite_synchronous"),
+            "sqlite_cache_mib": self.settings.get("sqlite_cache_mib"),
+            "sqlite_mmap_gib": self.settings.get("sqlite_mmap_gib"),
+            "bulk_insert_chunk_size": self.settings.get("bulk_insert_chunk_size"),
+            "checkpoint_every_artifacts": self.settings.get("checkpoint_every_artifacts"),
+            "fields": _json_safe(dict(fields)),
+        }
+        with self.path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+
 
 def _elapsed(started_at: float) -> float:
     return round(time.perf_counter() - started_at, 3)
@@ -228,6 +398,8 @@ def _log_build_phase(phase: str, **fields: Any) -> None:
     if rendered:
         message = f"{message} {rendered}"
     logger.info(message, extra={"stage": "build_agent_index"})
+    if _ACTIVE_BUILD_PROGRESS_LOGGER is not None:
+        _ACTIVE_BUILD_PROGRESS_LOGGER.write(phase, fields)
 
 
 def _compact_space(value: str) -> str:
@@ -241,18 +413,28 @@ def build_agent_index(
     force: bool = True,
 ) -> dict[str, Any]:
     """Build a global SQLite agent index from all discovered artifact indexes."""
+    global _ACTIVE_BUILD_PROGRESS_LOGGER
     root = root.resolve()
     index_path = (index_path or root / DEFAULT_INDEX_RELATIVE_PATH).resolve()
     if force and index_path.exists():
         index_path.unlink()
     index_path.parent.mkdir(parents=True, exist_ok=True)
+    build_settings = _build_resource_settings(index_path)
+    _apply_build_resource_settings(build_settings)
 
     artifact_indexes = discover_artifact_indexes(root)
+    progress_log_path = str(build_settings.get("progress_log_path") or "").strip()
+    previous_progress_logger = _ACTIVE_BUILD_PROGRESS_LOGGER
+    _ACTIVE_BUILD_PROGRESS_LOGGER = (
+        _BuildProgressLogger(path=Path(progress_log_path), index_path=index_path, settings=build_settings)
+        if progress_log_path
+        else None
+    )
     conn = sqlite3.connect(index_path, timeout=60)
     build_started_at = time.perf_counter()
     try:
         conn.row_factory = sqlite3.Row
-        _configure_connection(conn)
+        _configure_connection(conn, build_settings)
         _create_schema(conn)
         _log_build_phase(
             "start",
@@ -260,6 +442,7 @@ def build_agent_index(
             index_path=str(index_path),
             force=force,
             artifact_indexes=len(artifact_indexes),
+            build_settings=build_settings,
         )
         totals = {
             "documents": 0,
@@ -295,7 +478,7 @@ def build_agent_index(
                 )
             for key, value in stats.items():
                 totals[key] += value
-            _checkpoint_wal(conn)
+            _checkpoint_wal(conn, settings=build_settings, artifact_number=artifact_number)
             _log_build_phase(
                 "index_artifact_done",
                 artifact_number=artifact_number,
@@ -400,6 +583,7 @@ def build_agent_index(
                             "typed_projection_builder_version": TYPED_PROJECTION_BUILDER_VERSION,
                             "typed_projection_lookup_enabled": True,
                             "company_topic_fts_enabled": True,
+                            "build_settings": build_settings,
                             "totals": totals,
                         },
                         ensure_ascii=False,
@@ -427,9 +611,11 @@ def build_agent_index(
             "root": root,
             "artifact_indexes": len(artifact_indexes),
             "totals": totals,
+            "build_settings": build_settings,
         }
     finally:
         conn.close()
+        _ACTIVE_BUILD_PROGRESS_LOGGER = previous_progress_logger
 
 
 def discover_artifact_indexes(root: Path) -> list[Path]:
@@ -458,16 +644,27 @@ def discover_artifact_indexes(root: Path) -> list[Path]:
     return sorted(found)
 
 
-def _configure_connection(conn: sqlite3.Connection) -> None:
+def _configure_connection(conn: sqlite3.Connection, settings: Mapping[str, Any] | None = None) -> None:
+    settings = dict(settings or _build_resource_settings())
     conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute(f"PRAGMA synchronous={settings['sqlite_synchronous']}")
     conn.execute("PRAGMA temp_store=MEMORY")
-    conn.execute(f"PRAGMA cache_size=-{SQLITE_CACHE_SIZE_KIB}")
-    conn.execute(f"PRAGMA mmap_size={SQLITE_MMAP_SIZE_BYTES}")
-    conn.execute("PRAGMA wal_autocheckpoint=10000")
+    conn.execute(f"PRAGMA cache_size=-{int(settings['sqlite_cache_size_kib'])}")
+    conn.execute(f"PRAGMA mmap_size={int(settings['sqlite_mmap_size_bytes'])}")
+    conn.execute(f"PRAGMA wal_autocheckpoint={int(settings['sqlite_wal_autocheckpoint'])}")
 
 
-def _checkpoint_wal(conn: sqlite3.Connection, *, truncate: bool = False) -> None:
+def _checkpoint_wal(
+    conn: sqlite3.Connection,
+    *,
+    truncate: bool = False,
+    settings: Mapping[str, Any] | None = None,
+    artifact_number: int | None = None,
+) -> None:
+    if artifact_number is not None and settings is not None:
+        checkpoint_every = int(settings.get("checkpoint_every_artifacts") or 0)
+        if checkpoint_every <= 0 or artifact_number % checkpoint_every != 0:
+            return
     mode = "TRUNCATE" if truncate else "PASSIVE"
     try:
         conn.execute(f"PRAGMA wal_checkpoint({mode})").fetchall()
@@ -1769,6 +1966,9 @@ def _rebuild_metric_lookup(conn: sqlite3.Connection) -> int:
             obj = json.loads(row["json"] or "{}")
         except json.JSONDecodeError:
             obj = {}
+        dimensions = _metric_lookup_xbrl_dimensions(obj)
+        if not dimensions:
+            continue
         metric_name = _metric_lookup_xbrl_metric_name(obj)
         if not metric_name:
             continue
@@ -1779,7 +1979,6 @@ def _rebuild_metric_lookup(conn: sqlite3.Connection) -> int:
             period=row["period"],
         )
         canonical_metric = _metric_lookup_canonical(metric_name)
-        dimensions = _metric_lookup_xbrl_dimensions(obj)
         segment_name = _metric_lookup_dimension(dimensions, ("segment", "segment_name", "business_segment"))
         product_name = _metric_lookup_dimension(dimensions, ("product", "product_name", "product_line"))
         geography_name = _metric_lookup_dimension(dimensions, ("geography", "geography_name", "region", "country"))
@@ -1980,7 +2179,7 @@ def _rebuild_company_dimension_catalog(conn: sqlite3.Connection) -> int:
             entry["periods"].add(row["period"])
         if row["object_id"]:
             entry["object_ids"].add(row["object_id"])
-        entry["aliases"].update({label, row["dimension_key"], row["dimension_key"].replace("_", " ")})
+        entry["aliases"].update(_metric_dimension_aliases(label, row["dimension_key"]))
     catalog_rows: list[tuple[Any, ...]] = []
     for entry in catalog.values():
         label = max(entry["labels"].items(), key=lambda item: (item[1], len(item[0])))[0]
@@ -2189,11 +2388,9 @@ def _metric_lookup_clean_dimension_label(value: Any) -> str:
     text = text.split("#")[-1].split("/")[-1].split(":")[-1]
     text = re.sub(r"(?:Member|Axis|Domain)$", "", text)
     text = text.replace("_", " ").replace("-", " ")
+    text = re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", " ", text)
     text = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", text)
-    text = re.sub(r"\b[iI] (?=(?:Phone|Pad|Pod|Mac)\b)", "i", text)
     text = re.sub(r"\s+", " ", text).strip()
-    if text.lower() == "service":
-        return "Services"
     return text
 
 
@@ -2206,7 +2403,6 @@ def _metric_dimension_key(value: Any) -> str:
 
 def _metric_dimension_kind(axis: Any, label: Any) -> str:
     axis_key = _metric_dimension_key(axis)
-    label_text = str(label or "").lower()
     if any(term in axis_key for term in ("geograph", "region", "country", "area")):
         return "geography"
     if any(term in axis_key for term in ("product", "service", "brand")):
@@ -2217,7 +2413,7 @@ def _metric_dimension_kind(axis: Any, label: Any) -> str:
         return "customer"
     if any(term in axis_key for term in ("channel", "market")):
         return "channel"
-    return _metric_lookup_dimension_kind(label_text)
+    return "unknown"
 
 
 def _metric_lookup_dimension(dimensions: Mapping[str, Any], keys: Sequence[str]) -> str | None:
@@ -2307,12 +2503,7 @@ def _metric_lookup_clean_inferred_dimension_label(label: str) -> str:
 
 
 def _metric_lookup_dimension_kind(label: str) -> str:
-    lower = label.lower()
-    if any(term in lower for term in ("china", "europe", "americas", "asia", "japan", "international", "region")):
-        return "geography"
-    if any(term in lower for term in ("iphone", "ipad", "mac", "wearable", "product", "service")):
-        return "product"
-    return "segment"
+    return "unknown"
 
 
 def _metric_lookup_is_company_total(
@@ -2363,9 +2554,35 @@ def _metric_lookup_alias_text(
     for key, value in dimensions.items():
         if key:
             pieces.append(str(key))
+            pieces.extend(_metric_dimension_aliases(key, _metric_dimension_key(key)))
         if value:
             pieces.append(str(value))
+            pieces.extend(_metric_dimension_aliases(value, _metric_dimension_key(value)))
     return " ".join(piece for piece in pieces if piece)[:4000]
+
+
+def _metric_dimension_aliases(label: Any, dimension_key: Any) -> set[str]:
+    aliases: set[str] = set()
+    label_text = _metric_lookup_clean_dimension_label(label)
+    key_text = str(dimension_key or "").strip()
+    key_space = key_text.replace("_", " ")
+    for value in (label_text, key_text, key_space):
+        value = str(value or "").strip()
+        if not value:
+            continue
+        aliases.add(value)
+        aliases.add(value.lower())
+        compact = re.sub(r"[^A-Za-z0-9]+", "", value)
+        if compact:
+            aliases.add(compact)
+            aliases.add(compact.lower())
+        if value.endswith("s") and len(value) > 3:
+            aliases.add(value[:-1])
+            aliases.add(value[:-1].lower())
+        elif re.search(r"[A-Za-z]$", value):
+            aliases.add(f"{value}s")
+            aliases.add(f"{value.lower()}s")
+    return aliases
 
 
 def _rebuild_typed_projection_lookup(conn: sqlite3.Connection, table_name: str) -> int:

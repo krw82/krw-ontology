@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 from pathlib import Path
@@ -128,6 +129,106 @@ def test_build_agent_index_cli(tmp_path: Path):
     assert "Agent index built:" in result.output
     assert "1 documents" in result.output
     assert (tmp_path / "indexes" / "agent_index.sqlite").exists()
+
+
+def test_build_agent_index_resource_env_and_progress_log(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    _write_document_fixture(
+        tmp_path,
+        ticker="VG",
+        document_type="10-Q",
+        doc_type_key="10Q",
+        period="FY2025Q3",
+        section_quality={"status": "pass", "missing_core_sections": [], "fail_reasons": []},
+        topic_text="Margin pressure increased because customers demanded lower prices.",
+        metric_name="capex",
+        metric_value=125.0,
+    )
+    progress_log = tmp_path / "indexes" / "build_progress.jsonl"
+    monkeypatch.setenv("KRW_BUILD_RESOURCE_PROFILE", "max-local")
+    monkeypatch.setenv("KRW_SQLITE_SYNCHRONOUS", "OFF")
+    monkeypatch.setenv("KRW_SQLITE_CACHE_MIB", "64")
+    monkeypatch.setenv("KRW_SQLITE_MMAP_GIB", "1")
+    monkeypatch.setenv("KRW_BUILD_BATCH_SIZE", "1234")
+    monkeypatch.setenv("KRW_COMPANY_TOPIC_BATCH_SIZE", "234")
+    monkeypatch.setenv("KRW_SQLITE_WAL_AUTOCHECKPOINT", "0")
+    monkeypatch.setenv("KRW_BUILD_CHECKPOINT_EVERY_ARTIFACTS", "7")
+    monkeypatch.setenv("KRW_BUILD_LOG_INTERVAL_SEC", "0")
+    monkeypatch.setenv("KRW_BUILD_PROGRESS_LOG", str(progress_log))
+
+    result = build_agent_index(tmp_path)
+
+    settings = result["build_settings"]
+    assert settings["resource_profile"] == "max-local"
+    assert settings["sqlite_synchronous"] == "OFF"
+    assert settings["sqlite_cache_mib"] == 64
+    assert settings["sqlite_mmap_gib"] == 1.0
+    assert settings["bulk_insert_chunk_size"] == 1234
+    assert settings["company_topic_batch_size"] == 234
+    assert settings["sqlite_wal_autocheckpoint"] == 0
+    assert settings["checkpoint_every_artifacts"] == 7
+
+    with sqlite3.connect(result["index_path"]) as conn:
+        raw_build_metadata = conn.execute(
+            "SELECT value FROM metadata WHERE key = 'build'"
+        ).fetchone()[0]
+    build_metadata = json.loads(raw_build_metadata)
+    assert build_metadata["build_settings"]["sqlite_synchronous"] == "OFF"
+    assert build_metadata["build_settings"]["sqlite_cache_mib"] == 64
+    assert build_metadata["build_settings"]["bulk_insert_chunk_size"] == 1234
+
+    log_rows = [json.loads(line) for line in progress_log.read_text().splitlines()]
+    assert log_rows
+    assert log_rows[0]["phase"] == "start"
+    assert any(row["phase"] == "finalize_done" for row in log_rows)
+    assert all(row["event"] == "build_phase" for row in log_rows)
+    assert log_rows[0]["sqlite_synchronous"] == "OFF"
+    assert log_rows[0]["sqlite_cache_mib"] == 64
+    assert "db_size_mb" in log_rows[0]
+    assert "wal_size_mb" in log_rows[0]
+
+
+def test_build_resource_settings_default_to_off_and_max_local_profile(monkeypatch: pytest.MonkeyPatch):
+    for name in (
+        "KRW_BUILD_RESOURCE_PROFILE",
+        "KRW_SQLITE_SYNCHRONOUS",
+        "KRW_SQLITE_CACHE_MIB",
+        "KRW_SQLITE_MMAP_GIB",
+        "KRW_BUILD_BATCH_SIZE",
+        "KRW_COMPANY_TOPIC_BATCH_SIZE",
+        "KRW_SQLITE_WAL_AUTOCHECKPOINT",
+        "KRW_BUILD_CHECKPOINT_EVERY_ARTIFACTS",
+        "KRW_BUILD_PROGRESS_LOG",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    index_path = Path("/tmp/krw-test/indexes/agent_index.sqlite")
+    default_settings = agent_index_builder._build_resource_settings(index_path)
+    assert default_settings["resource_profile"] == "max-local"
+    assert default_settings["sqlite_synchronous"] == "OFF"
+    assert default_settings["sqlite_cache_mib"] == 4096
+    assert default_settings["sqlite_mmap_gib"] == 16.0
+    assert default_settings["bulk_insert_chunk_size"] == 20_000
+    assert default_settings["company_topic_batch_size"] == 2_000
+    assert default_settings["sqlite_wal_autocheckpoint"] == 0
+    assert default_settings["progress_log_path"] == "/tmp/krw-test/indexes/build_progress.jsonl"
+
+    monkeypatch.setenv("KRW_BUILD_RESOURCE_PROFILE", "default")
+    max_local_settings = agent_index_builder._build_resource_settings(index_path)
+    assert max_local_settings["resource_profile"] == "default"
+    assert max_local_settings["sqlite_synchronous"] == "OFF"
+    assert max_local_settings["sqlite_cache_mib"] == 4096
+    assert max_local_settings["sqlite_mmap_gib"] == 16.0
+    assert max_local_settings["bulk_insert_chunk_size"] == 20_000
+    assert max_local_settings["company_topic_batch_size"] == 2_000
+
+    monkeypatch.setenv("KRW_BUILD_RESOURCE_PROFILE", "max-local")
+    max_local_settings = agent_index_builder._build_resource_settings(index_path)
+    assert max_local_settings["resource_profile"] == "max-local"
+    assert max_local_settings["sqlite_synchronous"] == "OFF"
+    assert max_local_settings["sqlite_cache_mib"] == 4096
+    assert max_local_settings["sqlite_mmap_gib"] == 16.0
+    assert max_local_settings["bulk_insert_chunk_size"] == 20_000
+    assert max_local_settings["company_topic_batch_size"] == 2_000
 
 
 def test_force_build_skips_existing_fts_delete(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

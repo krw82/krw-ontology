@@ -257,6 +257,60 @@ def test_product_anchor_is_hard_gate_but_channel_is_soft_score():
     assert by_id["claim:AAPL:iphone-net-sales"]["channel_score"] == 1.0
 
 
+def test_metric_dimension_anchor_does_not_require_product_vocabulary():
+    plan = QueryPlan(
+        question="Was Flurbo a revenue growth driver for ACME?",
+        intent="evidence_search",
+        tickers=["ACME"],
+        document_types=["10-K"],
+        periods=["FY2025"],
+        topics=["Flurbo revenue growth driver"],
+        object_types=["ResearchClaim", "EvidenceQuote"],
+        limit=5,
+    )
+    candidates = [
+        {
+            "id": "claim:ACME:other-product",
+            "type": "ResearchClaim",
+            "ticker": "ACME",
+            "text": "OtherProduct net sales increased year over year.",
+            "object": {"text": "OtherProduct net sales increased year over year."},
+            "evidence": {"quotes": [{"id": "quote:ACME:other", "text": "OtherProduct net sales increased."}], "claims": [], "spans": []},
+            "quality": {},
+        },
+        {
+            "id": "claim:ACME:flurbo-demand",
+            "type": "ResearchClaim",
+            "ticker": "ACME",
+            "text": "Flurbo demand was strong.",
+            "object": {"text": "Flurbo demand was strong."},
+            "evidence": {"quotes": [{"id": "quote:ACME:flurbo-demand", "text": "Flurbo demand was strong."}], "claims": [], "spans": []},
+            "quality": {},
+        },
+        {
+            "id": "claim:ACME:flurbo-sales",
+            "type": "ResearchClaim",
+            "ticker": "ACME",
+            "text": "Net sales increased due to higher Flurbo sales.",
+            "object": {"text": "Net sales increased due to higher Flurbo sales."},
+            "evidence": {"quotes": [{"id": "quote:ACME:flurbo-sales", "text": "Net sales increased due to higher Flurbo sales."}], "claims": [], "spans": []},
+            "quality": {},
+        },
+    ]
+
+    annotated, answerability = _annotate_retrieval_answerability(plan, candidates)
+    by_id = {item["id"]: item for item in annotated}
+
+    assert answerability["direct_answerable"] is True
+    assert answerability["query_frame"]["must_for_direct"] == ["flurbo"]
+    assert by_id["claim:ACME:other-product"]["tier"] == "traceable_related"
+    assert by_id["claim:ACME:other-product"]["anchor_score"] == 0.0
+    assert by_id["claim:ACME:flurbo-demand"]["tier"] == "traceable_direct"
+    assert by_id["claim:ACME:flurbo-demand"]["channel_score"] < 1.0
+    assert by_id["claim:ACME:flurbo-sales"]["tier"] == "traceable_direct"
+    assert by_id["claim:ACME:flurbo-sales"]["channel_score"] == 1.0
+
+
 def test_split_retrieval_context_exposes_new_contract_buckets():
     context = _split_retrieval_context(
         [

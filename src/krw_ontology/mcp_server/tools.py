@@ -285,6 +285,11 @@ def query_tool(
         return _format_response(payload, response_format, _markdown_error)
     if answer_candidate_only:
         normalized_object_types = _answer_candidate_object_types(normalized_object_types)
+    search_topic, topic_normalization = _normalize_metric_query_topic_for_tool(
+        topic,
+        periods=normalized_periods,
+        object_types=normalized_object_types,
+    )
 
     if summary_mode and topic:
         with _store(index) as store:
@@ -331,7 +336,7 @@ def query_tool(
     with _store(index) as store:
         if detail == ResponseDetail.FULL:
             bundles, search_diagnostics = store.query_with_diagnostics(
-                topic=topic,
+                topic=search_topic,
                 tickers=normalized_tickers,
                 document_types=normalized_document_types,
                 periods=normalized_periods,
@@ -341,7 +346,7 @@ def query_tool(
             )
         else:
             bundles, search_diagnostics = store.query_compact_with_diagnostics(
-                topic=topic,
+                topic=search_topic,
                 tickers=normalized_tickers,
                 document_types=normalized_document_types,
                 periods=normalized_periods,
@@ -360,6 +365,7 @@ def query_tool(
     payload = {
         "query": {
             "topic": topic,
+            "search_topic": search_topic,
             "tickers": _upper_list(normalized_tickers),
             "ticker_alias": ticker,
             "document_type_alias": document_type,
@@ -380,6 +386,9 @@ def query_tool(
         "results": results,
         "pagination": _pagination(len(bundles), offset, len(page), limit),
     }
+    if topic_normalization:
+        payload["query"]["topic_normalization"] = topic_normalization
+        search_diagnostics.setdefault("topic_normalization", topic_normalization)
     if input_warnings:
         payload["input_warnings"] = input_warnings
         search_diagnostics.setdefault("warnings", [])
@@ -1002,6 +1011,55 @@ def _coerce_response_detail(response_detail: ResponseDetail | str) -> ResponseDe
         return ResponseDetail(response_detail)
     except ValueError:
         return ResponseDetail.COMPACT
+
+
+def _normalize_metric_query_topic_for_tool(
+    topic: str | None,
+    *,
+    periods: Sequence[str] | None,
+    object_types: Sequence[str] | None,
+) -> tuple[str | None, dict[str, Any]]:
+    if not topic or not periods:
+        return topic, {}
+    if not set(object_types or ()).intersection({"MetricObservation", "Calculation"}):
+        return topic, {}
+    original = " ".join(str(topic).split())
+    removed_tokens: list[str] = []
+
+    def replace_period_token(match: re.Match[str]) -> str:
+        removed_tokens.append(match.group(0))
+        return " "
+
+    normalized = re.sub(
+        r"\b(?:CY|FY)?(?:19|20)\d{2}(?:Q[1-4])?\b",
+        replace_period_token,
+        original,
+        flags=re.IGNORECASE,
+    )
+    normalized = " ".join(normalized.split())
+    if normalized == original:
+        return topic, {}
+    period_years = sorted(
+        {
+            int(year)
+            for period in periods or []
+            for year in re.findall(r"(?:19|20)\d{2}", str(period or ""))
+        }
+    )
+    topic_years = sorted({int(year) for year in re.findall(r"\b((?:19|20)\d{2})\b", original)})
+    diagnostics: dict[str, Any] = {
+        "original_topic": original,
+        "normalized_topic": normalized,
+        "removed_period_tokens": removed_tokens,
+        "reason": "metric_query_period_tokens_are_filters_not_fts_terms",
+    }
+    if period_years:
+        diagnostics["period_years"] = period_years
+        topic_only_years = [year for year in topic_years if year not in period_years]
+        if topic_only_years:
+            diagnostics["warning"] = "topic_years_differ_from_period_filters"
+            diagnostics["topic_only_years"] = topic_only_years
+    return normalized or topic, diagnostics
 
 
 def _coerce_group_by(group_by: str | None) -> str | None:

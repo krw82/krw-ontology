@@ -14,6 +14,7 @@ import sqlite3
 import hashlib
 import time
 from collections import defaultdict
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -253,6 +254,7 @@ def build_agent_index(
             "edges": 0,
             "quality_events": 0,
             "object_traceability": 0,
+            "metric_lookup": 0,
             "company_topics": 0,
         }
 
@@ -307,6 +309,17 @@ def build_agent_index(
             object_traceability=totals["object_traceability"],
         )
 
+        metric_started_at = time.perf_counter()
+        _log_build_phase("metric_lookup_start", objects=totals["objects"])
+        with conn:
+            totals["metric_lookup"] = _rebuild_metric_lookup(conn)
+        _checkpoint_wal(conn)
+        _log_build_phase(
+            "metric_lookup_done",
+            elapsed_seconds=_elapsed(metric_started_at),
+            metric_lookup=totals["metric_lookup"],
+        )
+
         topic_started_at = time.perf_counter()
         _log_build_phase("company_topic_index_start", objects=totals["objects"])
         totals["company_topics"] = _rebuild_company_topic_index(conn)
@@ -343,6 +356,7 @@ def build_agent_index(
                             "company_topic_builder_version": COMPANY_TOPIC_BUILDER_VERSION,
                             "company_topic_profile_mode": "rich_materialized",
                             "object_search_text_enabled": True,
+                            "metric_lookup_enabled": True,
                             "company_topic_fts_enabled": True,
                             "totals": totals,
                         },
@@ -501,6 +515,7 @@ def _create_schema(conn: sqlite3.Connection) -> None:
         DROP TABLE IF EXISTS object_text;
         DROP TABLE IF EXISTS object_search_text;
         DROP TABLE IF EXISTS object_traceability;
+        DROP TABLE IF EXISTS metric_lookup;
         DROP TABLE IF EXISTS company_topic_source_objects;
         DROP TABLE IF EXISTS company_topic_fts;
         DROP TABLE IF EXISTS company_topic_index;
@@ -564,6 +579,30 @@ def _create_schema(conn: sqlite3.Connection) -> None:
             metric_lineage_status TEXT,
             answer_candidate INTEGER DEFAULT 0,
             json TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS metric_lookup (
+            object_id TEXT PRIMARY KEY,
+            object_type TEXT NOT NULL,
+            ticker TEXT NOT NULL,
+            document_type TEXT NOT NULL,
+            doc_type_key TEXT NOT NULL,
+            period TEXT NOT NULL,
+            fiscal_year INTEGER,
+            fiscal_quarter INTEGER,
+            metric_name TEXT,
+            canonical_metric TEXT,
+            metric_alias_text TEXT,
+            value_text TEXT,
+            unit TEXT,
+            dimensions_json TEXT NOT NULL,
+            is_company_total INTEGER DEFAULT 0,
+            segment_name TEXT,
+            product_name TEXT,
+            geography_name TEXT,
+            trace_status TEXT,
+            metric_lineage_status TEXT,
+            text TEXT NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS company_topic_index (
@@ -673,6 +712,14 @@ def _create_serving_secondary_indexes(conn: sqlite3.Connection) -> None:
             ON object_traceability(trace_status, object_type);
         CREATE INDEX IF NOT EXISTS idx_object_traceability_ticker_type_status
             ON object_traceability(ticker, object_type, trace_status);
+        CREATE INDEX IF NOT EXISTS idx_metric_lookup_ticker_period_metric
+            ON metric_lookup(ticker, period, canonical_metric);
+        CREATE INDEX IF NOT EXISTS idx_metric_lookup_ticker_year_metric
+            ON metric_lookup(ticker, fiscal_year, canonical_metric);
+        CREATE INDEX IF NOT EXISTS idx_metric_lookup_ticker_type_period
+            ON metric_lookup(ticker, object_type, period);
+        CREATE INDEX IF NOT EXISTS idx_metric_lookup_total
+            ON metric_lookup(ticker, is_company_total, canonical_metric);
         CREATE INDEX IF NOT EXISTS idx_company_topic_ticker
             ON company_topic_index(ticker);
         CREATE INDEX IF NOT EXISTS idx_company_topic_scope
@@ -1391,6 +1438,221 @@ def _flush_object_insert_batch(
         )
     object_rows.clear()
     fts_rows.clear()
+
+
+def _rebuild_metric_lookup(conn: sqlite3.Connection) -> int:
+    """Materialize metric-oriented objects for structured numeric lookup."""
+    conn.execute("DELETE FROM metric_lookup")
+    rows = conn.execute(
+        """
+        SELECT
+            objects.id,
+            objects.type,
+            objects.ticker,
+            objects.document_type,
+            objects.doc_type_key,
+            objects.period,
+            objects.metric_name,
+            objects.text,
+            objects.json,
+            object_traceability.trace_status,
+            object_traceability.metric_lineage_status
+        FROM objects
+        LEFT JOIN object_traceability
+          ON object_traceability.object_id = objects.id
+        WHERE objects.type IN ('MetricObservation', 'Calculation')
+          AND (objects.review_status IS NULL OR objects.review_status != 'rejected')
+        """
+    ).fetchall()
+    lookup_rows: list[tuple[Any, ...]] = []
+    for row in rows:
+        try:
+            obj = json.loads(row["json"] or "{}")
+        except json.JSONDecodeError:
+            obj = {}
+        metric_name = str(row["metric_name"] or _metric_lookup_metric_name(obj, row["type"]) or "")
+        canonical_metric = _metric_lookup_canonical(metric_name)
+        dimensions = obj.get("dimensions") or obj.get("dimension") or {}
+        if not isinstance(dimensions, Mapping):
+            dimensions = {}
+        segment_name = _metric_lookup_dimension(dimensions, ("segment", "segment_name", "business_segment"))
+        product_name = _metric_lookup_dimension(dimensions, ("product", "product_name", "product_line"))
+        geography_name = _metric_lookup_dimension(dimensions, ("geography", "geography_name", "region", "country"))
+        fiscal_year = _metric_lookup_year(obj, row["period"])
+        fiscal_quarter = _metric_lookup_quarter(obj, row["period"])
+        alias_text = _metric_lookup_alias_text(
+            metric_name=metric_name,
+            canonical_metric=canonical_metric,
+            obj=obj,
+            dimensions=dimensions,
+            text=row["text"],
+        )
+        lookup_rows.append(
+            (
+                row["id"],
+                row["type"],
+                row["ticker"],
+                row["document_type"],
+                row["doc_type_key"],
+                row["period"],
+                fiscal_year,
+                fiscal_quarter,
+                metric_name or None,
+                canonical_metric or None,
+                alias_text,
+                _metric_lookup_value_text(obj),
+                _metric_lookup_unit(obj),
+                json.dumps(dimensions, ensure_ascii=False, sort_keys=True),
+                1
+                if _metric_lookup_is_company_total(
+                    metric_name=metric_name,
+                    dimensions=dimensions,
+                    text=row["text"],
+                )
+                else 0,
+                segment_name,
+                product_name,
+                geography_name,
+                row["trace_status"],
+                row["metric_lineage_status"],
+                row["text"],
+            )
+        )
+        if len(lookup_rows) >= BULK_INSERT_CHUNK_SIZE:
+            _flush_metric_lookup_batch(conn, lookup_rows)
+    _flush_metric_lookup_batch(conn, lookup_rows)
+    return len(rows)
+
+
+def _flush_metric_lookup_batch(conn: sqlite3.Connection, rows: list[tuple[Any, ...]]) -> None:
+    if not rows:
+        return
+    conn.executemany(
+        """
+        INSERT OR REPLACE INTO metric_lookup(
+            object_id, object_type, ticker, document_type, doc_type_key,
+            period, fiscal_year, fiscal_quarter, metric_name, canonical_metric,
+            metric_alias_text, value_text, unit, dimensions_json,
+            is_company_total, segment_name, product_name, geography_name,
+            trace_status, metric_lineage_status, text
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        rows,
+    )
+    rows.clear()
+
+
+def _metric_lookup_metric_name(obj: Mapping[str, Any], object_type: str) -> str:
+    if object_type == "Calculation":
+        for key in ("output_metric_name", "output_metric_id", "calculation_type", "name"):
+            if obj.get(key):
+                return str(obj[key])
+    for key in ("metric_name", "canonical_metric", "name", "label"):
+        if obj.get(key):
+            return str(obj[key])
+    return ""
+
+
+def _metric_lookup_canonical(metric_name: str | None) -> str:
+    terms = re.findall(r"[A-Za-z0-9_]+", str(metric_name or "").lower())
+    return "_".join(term for term in terms if term)
+
+
+def _metric_lookup_year(obj: Mapping[str, Any], period: Any) -> int | None:
+    for key in ("fiscal_year", "year", "calendar_year"):
+        value = obj.get(key)
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str) and value.isdigit():
+            return int(value)
+    match = re.search(r"(?:CY|FY)?(20\d{2}|19\d{2})", str(period or ""), re.IGNORECASE)
+    return int(match.group(1)) if match else None
+
+
+def _metric_lookup_quarter(obj: Mapping[str, Any], period: Any) -> int | None:
+    for key in ("fiscal_quarter", "quarter"):
+        value = obj.get(key)
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str) and value.isdigit():
+            return int(value)
+    match = re.search(r"Q([1-4])", str(period or ""), re.IGNORECASE)
+    return int(match.group(1)) if match else None
+
+
+def _metric_lookup_value_text(obj: Mapping[str, Any]) -> str | None:
+    for key in ("value", "numeric_value", "amount", "reported_value"):
+        value = obj.get(key)
+        if value is not None:
+            return str(value)
+    return None
+
+
+def _metric_lookup_unit(obj: Mapping[str, Any]) -> str | None:
+    for key in ("unit", "unit_ref", "currency", "scale"):
+        value = obj.get(key)
+        if value:
+            return str(value)
+    return None
+
+
+def _metric_lookup_dimension(dimensions: Mapping[str, Any], keys: Sequence[str]) -> str | None:
+    for key in keys:
+        value = dimensions.get(key)
+        if value:
+            return str(value)
+    for key, value in dimensions.items():
+        key_lower = str(key).lower()
+        if any(marker in key_lower for marker in keys) and value:
+            return str(value)
+    return None
+
+
+def _metric_lookup_is_company_total(
+    *,
+    metric_name: str,
+    dimensions: Mapping[str, Any],
+    text: Any,
+) -> bool:
+    if not any(value for value in dimensions.values()):
+        return True
+    haystack = f"{metric_name} {text}".lower()
+    if any(term in haystack for term in ("total", "consolidated", "company")):
+        return True
+    segment_markers = ("segment", "product", "geograph", "region", "country", "customer")
+    return not any(marker in str(key).lower() for key in dimensions for marker in segment_markers)
+
+
+def _metric_lookup_alias_text(
+    *,
+    metric_name: str,
+    canonical_metric: str,
+    obj: Mapping[str, Any],
+    dimensions: Mapping[str, Any],
+    text: Any,
+) -> str:
+    pieces: list[str] = [metric_name, canonical_metric, str(text or "")]
+    for key in (
+        "label",
+        "description",
+        "source_label",
+        "xbrl_concept",
+        "concept",
+        "normalization",
+        "source_type",
+        "calculation_type",
+        "formula",
+    ):
+        value = obj.get(key)
+        if value:
+            pieces.append(str(value))
+    for key, value in dimensions.items():
+        if key:
+            pieces.append(str(key))
+        if value:
+            pieces.append(str(value))
+    return " ".join(piece for piece in pieces if piece)[:4000]
 
 
 def _rebuild_company_topic_index(conn: sqlite3.Connection) -> int:

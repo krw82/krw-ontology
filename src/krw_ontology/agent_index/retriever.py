@@ -448,13 +448,17 @@ class AgentRetriever:
                 "tickers": plan.tickers or None,
                 "document_types": plan.document_types or None,
                 "periods": resolved_periods or None,
-                "object_types": None,
+                "object_types": plan.object_types or None,
                 "include_rejected": plan.include_rejected,
                 "limit": per_topic_limit,
                 "compact_fallback": True,
             }
             executed_queries.append(query)
-            candidates.extend(self.store.query(**{key: value for key, value in query.items() if key != "compact_fallback"}))
+            bundles, diagnostics = self.store.query_compact_with_diagnostics(
+                **{key: value for key, value in query.items() if key != "compact_fallback"}
+            )
+            query["diagnostics"] = diagnostics
+            candidates.extend(bundles)
             if len(candidates) >= plan.limit:
                 break
         return _dedupe_bundles(candidates)[: plan.limit]

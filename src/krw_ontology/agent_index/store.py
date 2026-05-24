@@ -156,6 +156,25 @@ _QUERY_COMPACT_CACHE_LOCK = Lock()
 _QUERY_CONTEXT_CACHE_MAX = 512
 _QUERY_CONTEXT_CACHE: OrderedDict[tuple[Any, ...], dict[str, Any]] = OrderedDict()
 _QUERY_CONTEXT_CACHE_LOCK = Lock()
+_METRIC_FAST_PATH_TYPES = frozenset({"MetricObservation", "Calculation"})
+_METRIC_FAST_PATH_GENERIC_TERMS = frozenset(
+    {
+        "annual",
+        "annually",
+        "calendar",
+        "compare",
+        "comparison",
+        "fiscal",
+        "metric",
+        "metrics",
+        "number",
+        "numbers",
+        "period",
+        "periods",
+        "year",
+        "years",
+    }
+)
 
 
 class OntologyStore:
@@ -291,6 +310,7 @@ class OntologyStore:
                 "documents": _table_count(self.conn, "documents"),
                 "objects": _table_count(self.conn, "objects"),
                 "object_search_text": _table_count(self.conn, "object_search_text"),
+                "metric_lookup": _table_count(self.conn, "metric_lookup"),
                 "object_fts": _table_count(self.conn, "object_fts"),
                 "object_traceability": _table_count(self.conn, "object_traceability"),
                 "company_topic_index": _table_count(self.conn, "company_topic_index"),
@@ -307,6 +327,7 @@ class OntologyStore:
                 "quality": True,
                 "company_topic_index": _table_exists(self.conn, "company_topic_index"),
                 "object_search_text": _table_exists(self.conn, "object_search_text"),
+                "metric_lookup": _table_exists(self.conn, "metric_lookup"),
                 "company_context": _table_exists(self.conn, "company_topic_index"),
                 "query_context": _table_exists(self.conn, "company_topic_index"),
                 "answerability_tiers": True,
@@ -529,9 +550,40 @@ class OntologyStore:
         tickers, unavailable_tickers = self._query_available_tickers(original_tickers)
         if original_tickers is not None and not tickers:
             return [], _ticker_guard_query_diagnostics(topic, unavailable_tickers)
+        explicit_object_types = object_types is not None
         selected_types = tuple(object_types or DEFAULT_QUERY_TYPES)
         search_strategy: dict[str, Any] | None = None
-        if topic:
+        metric_profile = self._metric_query_profile(
+            topic=topic,
+            tickers=tickers,
+            periods=periods,
+            object_types=selected_types,
+            explicit_object_types=explicit_object_types,
+        )
+        if metric_profile["enabled"]:
+            rows, search_strategy = self._query_metric_lookup_with_strategy(
+                metric_profile["topic"],
+                tickers=tickers,
+                document_types=document_types,
+                periods=periods,
+                object_types=selected_types,
+                include_rejected=include_rejected,
+                limit=limit,
+                normalization=metric_profile["normalization"],
+            )
+            if not rows and topic:
+                rows, fallback_strategy = self._query_fts_with_strategy(
+                    metric_profile["topic"],
+                    tickers=tickers,
+                    document_types=document_types,
+                    periods=periods,
+                    object_types=selected_types,
+                    include_rejected=include_rejected,
+                    limit=min(limit, 10),
+                )
+                search_strategy["fallback"] = fallback_strategy
+                search_strategy["fallback_used"] = True
+        elif topic:
             rows, search_strategy = self._query_fts_with_strategy(
                 topic,
                 tickers=tickers,
@@ -556,6 +608,9 @@ class OntologyStore:
             result_count=len(bundles),
             search_strategy=search_strategy,
         )
+        if metric_profile["enabled"]:
+            diagnostics["metric_fast_path"] = True
+            diagnostics["topic_normalization"] = metric_profile["normalization"]
         if unavailable_tickers:
             diagnostics.setdefault("warnings", [])
             diagnostics["warnings"].append("ticker_not_available")
@@ -581,6 +636,7 @@ class OntologyStore:
             return [], _ticker_guard_query_diagnostics(topic, unavailable_tickers, compact=True)
         document_types = list(document_types) if document_types is not None else None
         periods = list(periods) if periods is not None else None
+        explicit_object_types = object_types is not None
         object_types = list(object_types) if object_types is not None else None
         selected_types = tuple(object_types or DEFAULT_QUERY_TYPES)
         if tickers and periods and not self._has_query_scope_objects(
@@ -610,7 +666,37 @@ class OntologyStore:
             diagnostics = {**diagnostics, "cache_hit": True}
             return bundles, diagnostics
         search_strategy: dict[str, Any] | None = None
-        if topic:
+        metric_profile = self._metric_query_profile(
+            topic=topic,
+            tickers=tickers,
+            periods=periods,
+            object_types=selected_types,
+            explicit_object_types=explicit_object_types,
+        )
+        if metric_profile["enabled"]:
+            rows, search_strategy = self._query_metric_lookup_with_strategy(
+                metric_profile["topic"],
+                tickers=tickers,
+                document_types=document_types,
+                periods=periods,
+                object_types=selected_types,
+                include_rejected=include_rejected,
+                limit=limit,
+                normalization=metric_profile["normalization"],
+            )
+            if not rows and topic:
+                rows, fallback_strategy = self._query_fts_with_strategy(
+                    metric_profile["topic"],
+                    tickers=tickers,
+                    document_types=document_types,
+                    periods=periods,
+                    object_types=selected_types,
+                    include_rejected=include_rejected,
+                    limit=min(limit, 10),
+                )
+                search_strategy["fallback"] = fallback_strategy
+                search_strategy["fallback_used"] = True
+        elif topic:
             rows, search_strategy = self._query_fts_with_strategy(
                 topic,
                 tickers=tickers,
@@ -636,6 +722,9 @@ class OntologyStore:
             search_strategy=search_strategy,
         )
         diagnostics["compact_fast_path"] = True
+        if metric_profile["enabled"]:
+            diagnostics["metric_fast_path"] = True
+            diagnostics["topic_normalization"] = metric_profile["normalization"]
         if unavailable_tickers:
             diagnostics.setdefault("warnings", [])
             diagnostics["warnings"].append("ticker_not_available")
@@ -2157,6 +2246,143 @@ class OntologyStore:
             for row in rows
         }
 
+    def _metric_query_profile(
+        self,
+        *,
+        topic: str | None,
+        tickers: Sequence[str] | None,
+        periods: Iterable[str] | None,
+        object_types: Sequence[str],
+        explicit_object_types: bool,
+    ) -> dict[str, Any]:
+        if not topic or not tickers or not periods:
+            return {"enabled": False, "topic": topic, "normalization": {}}
+        if not explicit_object_types and not _metric_lookup_topic_is_metric_like(topic):
+            return {"enabled": False, "topic": topic, "normalization": {}}
+        if not set(object_types).intersection(_METRIC_FAST_PATH_TYPES):
+            return {"enabled": False, "topic": topic, "normalization": {}}
+        if not _table_exists(self.conn, "metric_lookup"):
+            return {"enabled": False, "topic": topic, "normalization": {"warning": "metric_lookup_unavailable"}}
+        normalized_topic, normalization = _normalize_metric_lookup_topic(topic, periods)
+        return {
+            "enabled": True,
+            "topic": normalized_topic,
+            "normalization": normalization,
+        }
+
+    def _query_metric_lookup_with_strategy(
+        self,
+        topic: str | None,
+        *,
+        tickers: Sequence[str] | None,
+        document_types: Iterable[str] | None,
+        periods: Iterable[str] | None,
+        object_types: Iterable[str],
+        include_rejected: bool,
+        limit: int,
+        normalization: Mapping[str, Any],
+    ) -> tuple[list[sqlite3.Row], dict[str, Any]]:
+        terms = _metric_lookup_search_terms(topic)
+        period_values = _metric_lookup_period_values(periods)
+        years = _metric_lookup_years(periods)
+        selected_types = [object_type for object_type in object_types if object_type in _METRIC_FAST_PATH_TYPES]
+        where_parts = ["1 = 1"]
+        where_params: list[Any] = []
+        _add_in_filter(where_parts, where_params, "metric_lookup.ticker", [ticker.upper() for ticker in tickers or []])
+        _add_in_filter(where_parts, where_params, "metric_lookup.document_type", list(document_types or []))
+        _add_in_filter(where_parts, where_params, "metric_lookup.object_type", selected_types)
+        period_clause_parts: list[str] = []
+        period_params: list[Any] = []
+        if years:
+            placeholders = ",".join("?" for _ in years)
+            period_clause_parts.append(f"metric_lookup.fiscal_year IN ({placeholders})")
+            period_params.extend(years)
+            if period_values:
+                placeholders = ",".join("?" for _ in period_values)
+                period_clause_parts.append(
+                    f"(metric_lookup.fiscal_year IS NULL AND metric_lookup.period IN ({placeholders}))"
+                )
+                period_params.extend(period_values)
+        elif period_values:
+            placeholders = ",".join("?" for _ in period_values)
+            period_clause_parts.append(f"metric_lookup.period IN ({placeholders})")
+            period_params.extend(period_values)
+        if period_clause_parts:
+            where_parts.append("(" + " OR ".join(period_clause_parts) + ")")
+            where_params.extend(period_params)
+        if not include_rejected:
+            where_parts.append("(objects.review_status IS NULL OR objects.review_status != 'rejected')")
+        score_parts: list[str] = []
+        score_params: list[Any] = []
+        if _metric_lookup_wants_total(topic):
+            score_parts.append("CASE WHEN metric_lookup.is_company_total = 1 THEN 30 ELSE 0 END")
+        for term in terms[:8]:
+            like = f"%{term}%"
+            score_parts.append(
+                "CASE WHEN lower(COALESCE(metric_lookup.metric_name, '')) LIKE ? THEN 18 ELSE 0 END"
+            )
+            score_params.append(like)
+            score_parts.append(
+                "CASE WHEN lower(COALESCE(metric_lookup.metric_alias_text, '')) LIKE ? THEN 8 ELSE 0 END"
+            )
+            score_params.append(like)
+        canonical_candidates = _unique(_canonical_metric_name(term) for term in terms if term)
+        if canonical_candidates:
+            placeholders = ",".join("?" for _ in canonical_candidates)
+            score_parts.append(
+                f"CASE WHEN metric_lookup.canonical_metric IN ({placeholders}) THEN 25 ELSE 0 END"
+            )
+            score_params.extend(canonical_candidates)
+            term_clauses = []
+            term_params: list[Any] = []
+            for term in terms[:8]:
+                term_clauses.append("lower(COALESCE(metric_lookup.metric_alias_text, '')) LIKE ?")
+                term_params.append(f"%{term}%")
+            if term_clauses:
+                where_parts.append("(" + " OR ".join(term_clauses) + ")")
+                where_params.extend(term_params)
+        score_expr = " + ".join(score_parts) if score_parts else "0"
+        where = "WHERE " + " AND ".join(where_parts)
+        rows = self.conn.execute(
+            f"""
+            SELECT
+                objects.*,
+                metric_lookup.fiscal_year AS metric_lookup_fiscal_year,
+                metric_lookup.canonical_metric AS metric_lookup_canonical_metric,
+                metric_lookup.value_text AS metric_lookup_value_text,
+                metric_lookup.unit AS metric_lookup_unit,
+                metric_lookup.segment_name AS metric_lookup_segment_name,
+                metric_lookup.product_name AS metric_lookup_product_name,
+                metric_lookup.geography_name AS metric_lookup_geography_name,
+                metric_lookup.is_company_total AS metric_lookup_is_company_total,
+                ({score_expr}) AS metric_match_score
+            FROM metric_lookup
+            JOIN objects ON objects.id = metric_lookup.object_id
+            {where}
+            ORDER BY
+                metric_match_score DESC,
+                metric_lookup.is_company_total DESC,
+                metric_lookup.fiscal_year ASC,
+                metric_lookup.period ASC,
+                metric_lookup.object_type ASC,
+                metric_lookup.object_id ASC
+            LIMIT ?
+            """,
+            [*score_params, *where_params, max(1, min(limit * 8, 200))],
+        ).fetchall()
+        rows = _dedupe_metric_lookup_rows(rows, limit=limit)
+        strategy = {
+            "mode": "metric_lookup",
+            "normalized_topic": topic,
+            "terms": terms,
+            "period_values": period_values,
+            "period_years": years,
+            "object_types": selected_types,
+            "topic_normalization": dict(normalization),
+            "fallback_used": False,
+        }
+        return rows, strategy
+
     def _query_metric(
         self,
         metric: str,
@@ -3313,10 +3539,10 @@ def _scoped_fts_query(
     ]
     if not fts_query or not scope_terms:
         return fts_query
-    scope = " ".join(scope_terms)
+    scope = " AND ".join(scope_terms)
     if " OR " in fts_query:
-        return f"{scope} ({fts_query})"
-    return f"{scope} {fts_query}"
+        return f"{scope} AND ({fts_query})"
+    return f"{scope} AND {fts_query}"
 
 
 def _scope_tokens(prefix: str, values: Iterable[Any]) -> list[str]:
@@ -3348,6 +3574,132 @@ def _discovery_search_topic(topic: str | None) -> str:
 
 def _query_terms(topic: str | None) -> list[str]:
     return _unique(term.lower() for term in _TERM_RE.findall(topic or "") if len(term) > 1)
+
+
+def _normalize_metric_lookup_topic(
+    topic: str | None,
+    periods: Iterable[str] | None,
+) -> tuple[str | None, dict[str, Any]]:
+    original = " ".join(str(topic or "").split())
+    if not original:
+        return topic, {}
+    period_years = _metric_lookup_years(periods)
+    removed_tokens: list[str] = []
+
+    def replace_period_token(match: re.Match[str]) -> str:
+        token = match.group(0)
+        removed_tokens.append(token)
+        return " "
+
+    normalized = re.sub(r"\b(?:CY|FY)?(?:19|20)\d{2}(?:Q[1-4])?\b", replace_period_token, original, flags=re.IGNORECASE)
+    topic_years = sorted({int(year) for year in re.findall(r"\b((?:19|20)\d{2})\b", original)})
+    normalized = " ".join(normalized.split())
+    diagnostics: dict[str, Any] = {
+        "original_topic": original,
+        "normalized_topic": normalized,
+        "removed_period_tokens": removed_tokens,
+        "reason": "metric_query_period_tokens_are_filters_not_fts_terms",
+    }
+    if period_years:
+        diagnostics["period_years"] = period_years
+        topic_only_years = [year for year in topic_years if year not in period_years]
+        if topic_only_years:
+            diagnostics["warning"] = "topic_years_differ_from_period_filters"
+            diagnostics["topic_only_years"] = topic_only_years
+    return normalized or topic, diagnostics
+
+
+def _metric_lookup_topic_is_metric_like(topic: str | None) -> bool:
+    terms = set(_query_terms(topic))
+    metric_markers = {
+        "capex",
+        "cash",
+        "cost",
+        "costs",
+        "earnings",
+        "ebit",
+        "ebitda",
+        "expense",
+        "expenses",
+        "flow",
+        "gross",
+        "income",
+        "margin",
+        "margins",
+        "net",
+        "nii",
+        "nim",
+        "opex",
+        "operating",
+        "profit",
+        "revenue",
+        "revenues",
+        "sales",
+    }
+    return bool(terms & metric_markers)
+
+
+def _metric_lookup_search_terms(topic: str | None) -> list[str]:
+    terms = []
+    for term in _query_terms(topic):
+        if re.fullmatch(r"(?:19|20)\d{2}", term):
+            continue
+        if term in _SPLIT_TOPIC_STOP_TERMS or term in _METRIC_FAST_PATH_GENERIC_TERMS:
+            continue
+        if len(term) <= 2 and term not in {"ni"}:
+            continue
+        terms.append(term)
+    return _unique(terms)
+
+
+def _metric_lookup_wants_total(topic: str | None) -> bool:
+    terms = set(_query_terms(topic))
+    return bool(terms & {"company", "consolidated", "total"})
+
+
+def _metric_lookup_period_values(periods: Iterable[str] | None) -> list[str]:
+    values: list[str] = []
+    for period in periods or []:
+        raw = str(period or "").upper()
+        if not raw:
+            continue
+        values.append(raw)
+        match = re.search(r"(20\d{2}|19\d{2})(Q[1-4])?$", raw)
+        if match:
+            year, quarter = match.group(1), match.group(2) or ""
+            values.extend([f"CY{year}{quarter}", f"FY{year}{quarter}", f"{year}{quarter}"])
+    return _unique(values)
+
+
+def _metric_lookup_years(periods: Iterable[str] | None) -> list[int]:
+    years: list[int] = []
+    for period in periods or []:
+        for year in re.findall(r"(20\d{2}|19\d{2})", str(period or "")):
+            years.append(int(year))
+    return sorted(set(years))
+
+
+def _dedupe_metric_lookup_rows(rows: Sequence[sqlite3.Row], *, limit: int) -> list[sqlite3.Row]:
+    seen: set[tuple[Any, ...]] = set()
+    deduped: list[sqlite3.Row] = []
+    for row in rows:
+        key = (
+            row["metric_lookup_canonical_metric"],
+            row["metric_lookup_fiscal_year"],
+            row["metric_lookup_value_text"],
+            row["metric_lookup_unit"],
+            row["metric_lookup_segment_name"],
+            row["metric_lookup_product_name"],
+            row["metric_lookup_geography_name"],
+            row["metric_lookup_is_company_total"],
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(row)
+        if len(deduped) >= limit:
+            break
+    return deduped
 
 
 def _canonical_metric_name(metric: str | None) -> str:

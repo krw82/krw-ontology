@@ -5,7 +5,10 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from krw_ontology.agent_index import builder as agent_index_builder
+from krw_ontology.agent_index import store as agent_index_store
 from krw_ontology.agent_index import OntologyStore, build_agent_index
 from krw_ontology.mcp_server.server import health_payload, mcp
 from krw_ontology.mcp_server.tools import (
@@ -15,9 +18,12 @@ from krw_ontology.mcp_server.tools import (
     compare_tool,
     plan_query_tool,
     quality_tool,
+    query_context_tool,
     query_tool,
+    retrieve_tool,
     trace_tool,
     topic_map_tool,
+    ResponseFormat,
 )
 from krw_ontology.utils.io import atomic_write_json, write_jsonl
 
@@ -82,6 +88,17 @@ def test_mcp_tools_query_trace_quality_and_compare(tmp_path: Path, monkeypatch):
     )
     assert compare["results"]["VG"]
     assert compare["results"]["XOM"] == []
+    assert compare["comparison_contexts"]["VG"]["research_status"] in {
+        "sufficient_for_default_answer",
+        "sufficient_but_trace_recommended",
+        "partial_answer_possible",
+    }
+    assert compare["comparison_contexts"]["VG"]["agent_autonomy"]["mode"] == "bounded"
+    assert "strong_claim_allowed" in compare["comparison_contexts"]["VG"]["directness_guard"]
+    summary = compare["comparison_contexts"]["VG"]["research_pack_summary"]
+    assert "metric_series_count" in summary
+    assert "metric_growth_difference_count" in summary
+    assert "metric_period_alignment" in summary
     assert {row["comparison_key"] for row in compare["comparison_rows"]} == {"VG", "XOM"}
     vg_row = next(row for row in compare["comparison_rows"] if row["comparison_key"] == "VG")
     xom_row = next(row for row in compare["comparison_rows"] if row["comparison_key"] == "XOM")
@@ -307,6 +324,24 @@ def test_mcp_compare_allows_single_ticker_period_comparison(tmp_path: Path, monk
     assert all(row["missing"] is False for row in compare["comparison_rows"])
 
 
+def test_mcp_compare_markdown_includes_directness_guard(tmp_path: Path, monkeypatch):
+    _write_fixture(tmp_path)
+    build_agent_index(tmp_path)
+    monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
+
+    markdown = compare_tool(
+        tickers=["VG", "XOM"],
+        topic="direct revenue growth exposure",
+        document_types=["10-K"],
+        limit_per_ticker=2,
+        response_format=ResponseFormat.MARKDOWN,
+    )
+
+    assert "## Directness Guards" in markdown
+    assert "strong_claim_allowed=" in markdown
+    assert "traceable_direct,traceable_metric_lineage" in markdown
+
+
 def test_mcp_trace_accepts_unique_id_prefix(tmp_path: Path, monkeypatch):
     _write_fixture(tmp_path)
     build_agent_index(tmp_path)
@@ -346,6 +381,371 @@ def test_mcp_server_registers_expected_tools():
         "krw_ontology_compare",
         "krw_ontology_plan_query",
     }.issubset(tool_names)
+
+
+def test_mcp_query_context_returns_research_pack_and_bounded_chain(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _write_fixture(tmp_path)
+    build_agent_index(tmp_path)
+    monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
+
+    payload = json.loads(
+        query_context_tool(
+            question="VG revenue growth and regulatory risk mechanism",
+            ticker="VG",
+            limit_results=5,
+        )
+    )
+
+    assert payload["research_context_version"] == "v1"
+    assert payload["research_status"] in {
+        "sufficient_for_default_answer",
+        "sufficient_but_trace_recommended",
+        "partial_answer_possible",
+    }
+    assert payload["agent_autonomy"]["mode"] == "bounded"
+    assert payload["agent_autonomy"]["max_additional_tool_calls"] <= 3
+    assert "krw_ontology_retrieve" in payload["do_not_call"]
+    assert payload["research_pack"]["company_topic_pack"]["top_candidates"]
+    assert payload["research_pack"]["chain_pack"]["max_roots"] == 2
+    assert len(payload["research_pack"]["chain_pack"]["primary_chains"]) <= 2
+
+
+def test_mcp_query_context_stops_out_of_scope_valuation(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _write_fixture(tmp_path)
+    build_agent_index(tmp_path)
+    monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
+
+    payload = json.loads(
+        query_context_tool(
+            question="VG의 매출 성장 지속성 가정 하에 12개월 목표치를 추정해줘.",
+            ticker="VG",
+            limit_results=5,
+        )
+    )
+
+    assert payload["research_status"] == "out_of_scope_for_filing_ontology"
+    assert payload["agent_autonomy"]["may_continue_research"] is False
+    assert payload["agent_autonomy"]["max_additional_tool_calls"] == 0
+    assert "krw_ontology_query" in payload["do_not_call"]
+    assert payload["stop_guard"]["cannot_answer_reason"]
+    assert payload["research_pack"]["stop_guard"]["cannot_answer_reason"]
+    assert payload["research_pack"]["valuation_guard"]["cannot_answer_reason"]
+    assert payload["ticker_candidates"] == []
+    markdown = query_context_tool(
+        question="VG의 매출 성장 지속성 가정 하에 12개월 목표치를 추정해줘.",
+        ticker="VG",
+        limit_results=5,
+        response_format=ResponseFormat.MARKDOWN,
+    )
+    assert "cannot_answer_reason:" in markdown
+    assert "valuation model inputs" in markdown
+
+
+def test_mcp_query_context_includes_metric_series_research_pack(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _write_metric_dimension_fixture(tmp_path)
+    build_agent_index(tmp_path)
+    monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
+
+    payload = json.loads(
+        query_context_tool(
+            question="AAPL의 iPhone과 Services 매출 비중은 2021~2025년에 어떻게 달라졌는지 비교해줘.",
+            ticker="AAPL",
+            periods=["CY2021", "CY2022", "CY2023", "CY2024", "CY2025"],
+            limit_results=10,
+        )
+    )
+
+    metric_pack = payload["research_pack"]["metric_series_pack"]
+    assert payload["research_context_version"] == "v1"
+    assert payload["research_status"] == "sufficient_for_default_answer"
+    assert metric_pack["mode"] == "metric_dimension_lookup"
+    assert metric_pack["result_count"] > 0
+    assert "target_dimension_metric" in metric_pack["roles"]
+    assert "denominator_metric" in metric_pack["roles"]
+    assert metric_pack["denominator_needed"] is True
+    assert {series["metric_role"] for series in metric_pack["series"]} >= {
+        "target_dimension_metric",
+        "denominator_metric",
+    }
+    shares = metric_pack["calculations"]["share_of_total"]
+    assert {share["label"] for share in shares} >= {"iPhone", "Services"}
+    iphone_share = next(share for share in shares if share["label"] == "iPhone")
+    assert iphone_share["share"] == pytest.approx(201200000000 / 416200000000)
+    assert metric_pack["quality"]["period_alignment"] is True
+    assert metric_pack["quality"]["unit_consistency"] is True
+    assert metric_pack["quality"]["dimension_metric_not_found"] is False
+
+
+def test_mcp_query_context_projection_pack_marks_candidates_search_only_for_direct_question(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _write_fixture(tmp_path)
+    build_agent_index(tmp_path)
+    monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
+
+    payload = json.loads(
+        query_context_tool(
+            question="VG는 GPU HBM 가격 변동에 직접 노출되어 있나?",
+            ticker="VG",
+            limit_results=5,
+        )
+    )
+
+    projection_pack = payload["research_pack"]["projection_pack"]
+    top_level_guard = payload["research_pack"]["directness_guard"]
+    directness = projection_pack["directness"]
+    assert top_level_guard["requires_direct_match"] is True
+    assert top_level_guard["strong_claim_allowed"] is False
+    assert top_level_guard["strong_claim_requires"] == ["traceable_direct", "traceable_metric_lineage"]
+    assert directness["requires_direct_match"] is True
+    assert directness["strong_claim_allowed"] is False
+    assert directness["projection_candidates_are_search_candidates_only"] is True
+    assert directness["strong_claim_requires"] == ["traceable_direct", "traceable_metric_lineage"]
+
+
+def test_metric_series_calculations_include_growth_difference() -> None:
+    series = [
+        {
+            "series_key": "target|net_sales|product:iPhone",
+            "label": "iPhone",
+            "metric_role": "target_dimension_metric",
+            "unit": "USD",
+            "periods": ["CY2024", "CY2025"],
+            "points": [
+                {"period": "CY2024", "value": 100.0},
+                {"period": "CY2025", "value": 110.0},
+            ],
+        },
+        {
+            "series_key": "target|net_sales|segment:Services",
+            "label": "Services",
+            "metric_role": "target_dimension_metric",
+            "unit": "USD",
+            "periods": ["CY2024", "CY2025"],
+            "points": [
+                {"period": "CY2024", "value": 200.0},
+                {"period": "CY2025", "value": 250.0},
+            ],
+        },
+        {
+            "series_key": "denominator|revenue|Company total",
+            "label": "Company total",
+            "metric_role": "denominator_metric",
+            "unit": "USD",
+            "periods": ["CY2024", "CY2025"],
+            "points": [
+                {"period": "CY2024", "value": 1000.0},
+                {"period": "CY2025", "value": 1250.0},
+            ],
+        },
+    ]
+
+    calculations = agent_index_store._metric_series_calculations(series, denominator_needed=True)
+
+    assert {share["label"] for share in calculations["share_of_total"]} == {"iPhone", "Services"}
+    assert calculations["growth_rate"][0]["growth"] == pytest.approx(0.10)
+    growth_difference = calculations["growth_difference"][0]
+    assert growth_difference["left_label"] == "iPhone"
+    assert growth_difference["right_label"] == "Services"
+    assert growth_difference["difference"] == pytest.approx(0.10 - 0.25)
+
+
+def test_metric_lookup_period_filters_infer_topic_year_range() -> None:
+    assert agent_index_store._metric_lookup_period_filters("AAPL revenue 2021~2025", None) == [
+        "2021",
+        "2022",
+        "2023",
+        "2024",
+        "2025",
+    ]
+    assert agent_index_store._metric_lookup_period_filters("AAPL revenue 2021~2025년에", None) == [
+        "2021",
+        "2022",
+        "2023",
+        "2024",
+        "2025",
+    ]
+    assert agent_index_store._metric_lookup_period_filters(
+        "AAPL revenue 2021~2025",
+        ["CY2024"],
+    ) == ["CY2024"]
+    assert agent_index_store._metric_lookup_research_period_filters(
+        "AAPL revenue 2021~2025년에",
+        ["2021", "2025"],
+    ) == ["2021", "2022", "2023", "2024", "2025"]
+    assert agent_index_store._metric_lookup_period_filters_are_annual(["2021", "2022"]) is True
+    assert agent_index_store._metric_lookup_period_filters_are_annual(["CY2026Q1"]) is False
+
+
+def test_metric_lookup_base_metric_terms_exclude_calculation_intents() -> None:
+    assert agent_index_store._metric_lookup_base_metric_terms(
+        ["revenue", "net", "sales", "share", "total", "growth"]
+    ) == ["revenue", "net", "sales"]
+
+
+def test_research_metric_topic_preserves_raw_year_range() -> None:
+    topic = agent_index_store._research_metric_topic(
+        "AAPL의 iPhone과 Services 매출 비중은 2021~2025년에?",
+        "aapl iphone services 2021 2025",
+    )
+    assert topic is not None
+    assert "2021~2025" in topic
+    assert agent_index_store._metric_lookup_research_period_filters(topic, None) == [
+        "2021",
+        "2022",
+        "2023",
+        "2024",
+        "2025",
+    ]
+
+
+def test_metric_series_from_observations_dedupes_same_period_points() -> None:
+    series = agent_index_store._metric_series_from_observations(
+        [
+            {
+                "id": "metric:one",
+                "ticker": "AAPL",
+                "period": "CY2025",
+                "metric_role": "target_dimension_metric",
+                "canonical_metric": "net_sales",
+                "unit": "USD",
+                "value": 100,
+                "dimensions": {"product": "iPhone"},
+            },
+            {
+                "id": "metric:two",
+                "ticker": "AAPL",
+                "period": "CY2025",
+                "metric_role": "target_dimension_metric",
+                "canonical_metric": "net_sales",
+                "unit": "USD",
+                "value": 100,
+                "dimensions": {"product": "iPhone"},
+            },
+        ]
+    )
+    assert series[0]["periods"] == ["CY2025"]
+    assert series[0]["point_count"] == 1
+
+
+def test_mcp_retrieve_uses_research_context_stop_guard(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _write_fixture(tmp_path)
+    build_agent_index(tmp_path)
+    monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
+
+    payload = json.loads(
+        retrieve_tool(
+            question="VG의 매출 성장 지속성 가정 하에 12개월 목표치를 추정해줘.",
+            ticker="VG",
+            limit=5,
+        )
+    )
+
+    assert payload["research_status"] == "out_of_scope_for_filing_ontology"
+    assert payload["agent_autonomy"]["may_continue_research"] is False
+    assert payload["agent_autonomy"]["max_additional_tool_calls"] == 0
+    assert payload["direct_evidence"] == []
+    assert payload["related_context"] == []
+    assert "krw_ontology_query" in payload["do_not_call"]
+    assert payload["stop_guard"]["cannot_answer_reason"]
+    assert payload["research_pack"]["stop_guard"]["cannot_answer_reason"]
+    markdown = retrieve_tool(
+        question="VG의 매출 성장 지속성 가정 하에 12개월 목표치를 추정해줘.",
+        ticker="VG",
+        limit=5,
+        response_format=ResponseFormat.MARKDOWN,
+    )
+    assert "Cannot answer reason:" in markdown
+    assert "valuation model inputs" in markdown
+
+
+def test_mcp_retrieve_attaches_research_context_for_normal_question(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _write_fixture(tmp_path)
+    build_agent_index(tmp_path)
+    monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
+
+    payload = json.loads(
+        retrieve_tool(
+            question="VG revenue growth evidence",
+            ticker="VG",
+            limit=3,
+        )
+    )
+
+    assert payload["query"]["tickers"] == ["VG"]
+    assert payload["research_context"]["research_status"] in {
+        "sufficient_for_default_answer",
+        "sufficient_but_trace_recommended",
+        "partial_answer_possible",
+    }
+    assert payload["research_context"]["agent_autonomy"]["mode"] == "bounded"
+    assert "krw_ontology_retrieve" in payload["research_context"]["do_not_call"]
+    assert "strong_claim_allowed" in payload["directness_guard"]
+    assert payload["research_context"]["directness_guard"] == payload["directness_guard"]
+
+
+def test_mcp_retrieve_exposes_directness_guard_for_direct_question(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _write_fixture(tmp_path)
+    build_agent_index(tmp_path)
+    monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
+
+    payload = json.loads(
+        retrieve_tool(
+            question="VG는 GPU HBM 가격 변동에 직접 노출되어 있나?",
+            ticker="VG",
+            limit=3,
+        )
+    )
+
+    assert payload["directness_guard"]["requires_direct_match"] is True
+    assert payload["directness_guard"]["strong_claim_allowed"] is False
+    assert payload["directness_guard"]["strong_claim_requires"] == ["traceable_direct", "traceable_metric_lineage"]
+
+
+def test_mcp_markdown_outputs_include_directness_guard(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _write_fixture(tmp_path)
+    build_agent_index(tmp_path)
+    monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
+
+    context_markdown = query_context_tool(
+        question="VG는 GPU HBM 가격 변동에 직접 노출되어 있나?",
+        ticker="VG",
+        limit_results=5,
+        response_format=ResponseFormat.MARKDOWN,
+    )
+    retrieve_markdown = retrieve_tool(
+        question="VG는 GPU HBM 가격 변동에 직접 노출되어 있나?",
+        ticker="VG",
+        limit=3,
+        response_format=ResponseFormat.MARKDOWN,
+    )
+
+    assert "strong_claim_allowed: False" in context_markdown
+    assert "traceable_direct, traceable_metric_lineage" in context_markdown
+    assert "Strong claim allowed: False" in retrieve_markdown
+    assert "traceable_direct, traceable_metric_lineage" in retrieve_markdown
 
 
 def test_mcp_health_payload_reports_index_counts(tmp_path: Path):
@@ -1331,6 +1731,8 @@ def test_query_ticker_summary_discovery_contract(tmp_path: Path) -> None:
     assert payload["ticker_candidates"][0]["tier"] == "traceable_direct"
     assert payload["ticker_candidates"][0]["trace_status"] == "traceable"
     assert payload["ticker_candidates"][0]["trace_counts"]["evidence_chains"] > 0
+    assert payload["directness_guard"]["strong_claim_allowed"] is True
+    assert payload["directness_guard"]["strong_claim_requires"] == ["traceable_direct", "traceable_metric_lineage"]
     assert payload["ticker_candidates"][0]["top_object_ids"]
     assert payload["ticker_candidates"][0]["matched_topics"]
     reason = payload["ticker_candidates"][0]["top_reasons"][0]
@@ -1342,6 +1744,35 @@ def test_query_ticker_summary_discovery_contract(tmp_path: Path) -> None:
     assert "SupportLink" not in payload["ticker_candidates"][0]["matched_object_counts"]
     assert "VG" in payload["results_by_ticker"]
     assert len(payload["results_by_ticker"]["VG"]) <= 2
+
+
+def test_query_compact_exposes_directness_guard_for_direct_question(tmp_path: Path, monkeypatch) -> None:
+    _write_fixture(tmp_path)
+    build_agent_index(tmp_path)
+    monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
+
+    payload = json.loads(
+        query_tool(
+            topic="VG GPU HBM direct exposure",
+            tickers=["VG"],
+            object_types=["ExternalFactorExposure"],
+            response_detail="compact",
+            limit=5,
+        )
+    )
+    markdown = query_tool(
+        topic="VG GPU HBM direct exposure",
+        tickers=["VG"],
+        object_types=["ExternalFactorExposure"],
+        response_detail="compact",
+        response_format=ResponseFormat.MARKDOWN,
+        limit=5,
+    )
+
+    assert payload["directness_guard"]["requires_direct_match"] is True
+    assert payload["directness_guard"]["strong_claim_allowed"] is False
+    assert payload["directness_guard"]["strong_claim_requires"] == ["traceable_direct", "traceable_metric_lineage"]
+    assert "Strong claim allowed: False" in markdown
 
 
 def test_query_ids_only_response_detail_contract(tmp_path: Path) -> None:
@@ -1395,6 +1826,29 @@ def test_retrieve_ticker_summary_discovery_contract(tmp_path: Path) -> None:
     }
     assert payload["ticker_candidates"][0]["top_reasons"][0]["matched_core_terms"]
     assert len(payload["results_by_ticker"]["VG"]) <= 2
+
+
+def test_retrieve_ticker_summary_exposes_directness_guard_for_direct_question(tmp_path: Path) -> None:
+    from krw_ontology.mcp_server.tools import retrieve_tool
+
+    _write_fixture(tmp_path)
+    build_agent_index(tmp_path)
+
+    payload = json.loads(
+        retrieve_tool(
+            root=str(tmp_path),
+            question="VG는 GPU HBM 가격 변동에 직접 노출되어 있나?",
+            response_detail="ticker_summary",
+            group_by="ticker",
+            limit=20,
+            limit_groups=5,
+            limit_per_group=2,
+        )
+    )
+
+    assert payload["directness_guard"]["requires_direct_match"] is True
+    assert payload["directness_guard"]["strong_claim_allowed"] is False
+    assert payload["directness_guard"]["strong_claim_requires"] == ["traceable_direct", "traceable_metric_lineage"]
 
 
 def test_ticker_summary_demotes_untraced_direct_candidate(tmp_path: Path) -> None:

@@ -325,6 +325,12 @@ def query_tool(
         }
         if input_warnings:
             payload["input_warnings"] = input_warnings
+        if isinstance(payload.get("results_by_ticker"), Mapping):
+            payload["results_by_ticker"] = {
+                ticker_key: list(rows or [])[:limit_per_group]
+                for ticker_key, rows in payload["results_by_ticker"].items()
+            }
+        payload["directness_guard"] = _directness_guard_from_summary_payload(payload, topic=topic)
         payload["pagination"] = _pagination(
             len(payload.get("ticker_candidates") or []),
             0,
@@ -393,6 +399,7 @@ def query_tool(
         payload["input_warnings"] = input_warnings
         search_diagnostics.setdefault("warnings", [])
         search_diagnostics["warnings"].extend(warning["code"] for warning in input_warnings)
+    payload["directness_guard"] = _directness_guard_from_summary_payload(payload, topic=topic)
     if summary_mode:
         payload.pop("results", None)
         payload.update(
@@ -466,24 +473,42 @@ def retrieve_tool(
     fetch_limit = _discovery_fetch_limit(limit, limit_groups, limit_per_group) if summary_mode else limit
     if summary_mode:
         with _store(index) as store:
-            discovery = store.discover_company_topics(
+            context = store.query_context(
                 question=question,
                 tickers=normalized_tickers,
                 document_types=document_types,
                 periods=periods,
-                limit_groups=limit_groups,
-                limit_per_group=limit_per_group,
-                limit=fetch_limit,
+                limit_results=limit,
+                limit_tickers=limit_groups,
+                include_internal_ids=True,
             )
-        payload = {
-            "answerability": {
-                "direct_answerable": bool(discovery.get("ticker_candidates")),
-                "related_context_available": False,
-                "negative_answer_supported": False,
-                "needs_user_clarification": False,
-                "recommended_answer_mode": "ticker_discovery",
-            },
+            discovery = {
+                key: value
+                for key, value in context.items()
+                if key not in {"question"}
+            }
+            if not discovery.get("ticker_candidates"):
+                fallback_discovery = store.discover_company_topics(
+                    question=question,
+                    tickers=normalized_tickers,
+                    document_types=document_types,
+                    periods=periods,
+                    limit_groups=limit_groups,
+                    limit_per_group=limit_per_group,
+                    limit=fetch_limit,
+                )
+                discovery.update(fallback_discovery)
+        answerability = discovery.get("answerability") or {
+            "direct_answerable": bool(discovery.get("ticker_candidates")),
+            "related_context_available": False,
+            "negative_answer_supported": False,
+            "needs_user_clarification": False,
             "recommended_answer_mode": "ticker_discovery",
+        }
+        payload = {
+            "answerability": answerability,
+            "recommended_answer_mode": answerability.get("recommended_answer_mode") or "ticker_discovery",
+            "directness_guard": _directness_guard_from_research_context(discovery),
             "question": question,
             "query": {
                 "question": question,
@@ -501,6 +526,15 @@ def retrieve_tool(
         }
         if input_warnings:
             payload["input_warnings"] = input_warnings
+        if isinstance(payload.get("results_by_ticker"), Mapping):
+            payload["results_by_ticker"] = {
+                ticker_key: list(rows or [])[:limit_per_group]
+                for ticker_key, rows in payload["results_by_ticker"].items()
+            }
+        payload["directness_guard"] = payload.get("directness_guard") or _directness_guard_from_summary_payload(
+            payload,
+            topic=question,
+        )
         payload["pagination"] = _pagination(
             len(payload.get("ticker_candidates") or []),
             0,
@@ -510,6 +544,48 @@ def retrieve_tool(
         return _format_response(payload, response_format, _markdown_retrieve)
 
     with _store(index) as store:
+        research_context = store.query_context(
+            question=question,
+            tickers=normalized_tickers,
+            document_types=document_types,
+            periods=periods,
+            limit_results=limit,
+            limit_tickers=max(1, min(limit_groups, 20)),
+            include_internal_ids=detail == ResponseDetail.FULL,
+        )
+        if research_context.get("research_status") == "out_of_scope_for_filing_ontology":
+            payload = {
+                "question": question,
+                "query": {
+                    "question": question,
+                    "tickers": _upper_list(normalized_tickers),
+                    "ticker_alias": ticker,
+                    "document_types": document_types or [],
+                    "periods": _upper_list(periods),
+                    "group_by": normalized_group_by,
+                    "limit_groups": limit_groups,
+                    "limit_per_group": limit_per_group,
+                    "answer_candidate_only": answer_candidate_only,
+                },
+                "answerability": research_context.get("answerability") or {},
+                "recommended_answer_mode": (research_context.get("answerability") or {}).get("recommended_answer_mode"),
+                "directness_guard": _directness_guard_from_research_context(research_context),
+                "research_context_version": research_context.get("research_context_version"),
+                "research_status": research_context.get("research_status"),
+                "stop_guard": _stop_guard_from_research_context(research_context),
+                "research_pack": research_context.get("research_pack"),
+                "agent_autonomy": research_context.get("agent_autonomy"),
+                "missing_parts": research_context.get("missing_parts") or [],
+                "do_not_call": research_context.get("do_not_call") or [],
+                "direct_evidence": [],
+                "related_context": [],
+                "rejected_context": [],
+                "response_detail": detail.value,
+            }
+            if input_warnings:
+                payload["input_warnings"] = input_warnings
+            return _format_response(payload, response_format, _markdown_retrieve)
+
         result = AgentRetriever(store).retrieve(
             question,
             tickers=normalized_tickers,
@@ -519,6 +595,18 @@ def retrieve_tool(
             limit=fetch_limit,
             include_evidence_bundle=detail == ResponseDetail.FULL,
         )
+    result["research_context"] = {
+        "research_context_version": research_context.get("research_context_version"),
+        "research_status": research_context.get("research_status"),
+        "agent_autonomy": research_context.get("agent_autonomy"),
+        "missing_parts": research_context.get("missing_parts") or [],
+        "do_not_call": research_context.get("do_not_call") or [],
+        "directness_guard": _directness_guard_from_research_context(research_context),
+        "research_pack": research_context.get("research_pack"),
+    }
+    result["directness_guard"] = _directness_guard_from_research_context(research_context)
+    result.setdefault("answerability", research_context.get("answerability") or {})
+    result.setdefault("recommended_answer_mode", (research_context.get("answerability") or {}).get("recommended_answer_mode"))
     if answer_candidate_only:
         result = _map_retrieval_context(result, _answer_candidate_bundles)
     if summary_mode:
@@ -903,12 +991,22 @@ def _markdown_company_context(payload: Mapping[str, Any]) -> str:
 
 def _markdown_query_context(payload: Mapping[str, Any]) -> str:
     answerability = payload.get("answerability") or {}
+    autonomy = payload.get("agent_autonomy") or {}
+    guard = _directness_guard_from_research_context(payload)
+    stop_guard = _stop_guard_from_research_context(payload)
     lines = [
         "# KRW Ontology Query Context",
+        f"- research_status: {payload.get('research_status')}",
         f"- direct_answerable: {answerability.get('direct_answerable')}",
         f"- related_context_available: {answerability.get('related_context_available')}",
         f"- recommended_answer_mode: {answerability.get('recommended_answer_mode')}",
+        f"- strong_claim_allowed: {guard.get('strong_claim_allowed')}",
+        f"- strong_claim_requires: {', '.join(guard.get('strong_claim_requires') or [])}",
+        f"- allowed_next_tools: {', '.join(autonomy.get('allowed_next_tools') or [])}",
+        f"- max_additional_tool_calls: {autonomy.get('max_additional_tool_calls')}",
     ]
+    if stop_guard:
+        lines.append(f"- cannot_answer_reason: {stop_guard.get('cannot_answer_reason')}")
     for candidate in payload.get("ticker_candidates") or []:
         lines.append(f"- {candidate.get('ticker')}: {candidate.get('tier') or candidate.get('top_tier')}")
     return "\n".join(lines)
@@ -1265,7 +1363,100 @@ def _compact_compare(result: dict[str, Any]) -> dict[str, Any]:
             ticker: [_compact_bundle(item) for item in items]
             for ticker, items in result.get("results", {}).items()
         },
+        "comparison_contexts": {
+            ticker: _compact_research_context(context)
+            for ticker, context in (result.get("comparison_contexts") or {}).items()
+        },
     }
+
+
+def _compact_research_context(context: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "answerability": context.get("answerability") or {},
+        "query_frame": context.get("query_frame") or {},
+        "top_candidate": context.get("top_candidate"),
+        "recommended_tools": list(context.get("recommended_tools") or [])[:3],
+        "research_status": context.get("research_status"),
+        "agent_autonomy": context.get("agent_autonomy") or {},
+        "missing_parts": context.get("missing_parts") or [],
+        "do_not_call": context.get("do_not_call") or [],
+        "directness_guard": context.get("directness_guard") or {},
+        "research_pack_summary": context.get("research_pack_summary") or {},
+    }
+
+
+def _directness_guard_from_research_context(context: Mapping[str, Any]) -> dict[str, Any]:
+    research_pack = context.get("research_pack") if isinstance(context, Mapping) else None
+    if isinstance(research_pack, Mapping) and isinstance(research_pack.get("directness_guard"), Mapping):
+        return dict(research_pack["directness_guard"])
+    if isinstance(context.get("directness_guard"), Mapping):
+        return dict(context["directness_guard"])
+    return {}
+
+
+def _stop_guard_from_research_context(context: Mapping[str, Any]) -> dict[str, Any]:
+    if isinstance(context.get("stop_guard"), Mapping):
+        return dict(context["stop_guard"])
+    research_pack = context.get("research_pack") if isinstance(context, Mapping) else None
+    if isinstance(research_pack, Mapping):
+        for key in ("stop_guard", "valuation_guard"):
+            if isinstance(research_pack.get(key), Mapping):
+                return dict(research_pack[key])
+    return {}
+
+
+def _directness_guard_from_summary_payload(payload: Mapping[str, Any], *, topic: str | None) -> dict[str, Any]:
+    existing = _directness_guard_from_research_context(payload)
+    if existing:
+        return existing
+    candidates = list(payload.get("ticker_candidates") or [])
+    tiers = [str(candidate.get("tier") or "") for candidate in candidates if isinstance(candidate, Mapping)]
+    result_rows = list(payload.get("results") or [])
+    if not tiers and result_rows:
+        tiers = [str(row.get("tier") or "") for row in result_rows if isinstance(row, Mapping)]
+    has_direct = any(tier in {"traceable_direct", "traceable_metric_lineage"} for tier in tiers)
+    has_related = any(
+        tier
+        in {
+            "traceable_related",
+            "untraced_related",
+            "broad_related_candidate",
+            "untraced_direct_candidate",
+            "related",
+        }
+        for tier in tiers
+    )
+    if not has_direct and not has_related and result_rows:
+        has_related = True
+    query_frame = payload.get("query_frame") if isinstance(payload.get("query_frame"), Mapping) else {}
+    requires_direct = bool(
+        query_frame.get("question_requires_direct_match")
+        or query_frame.get("requires_direct_match")
+        or _topic_text_requires_direct_match(topic)
+    )
+    recommended_answer_mode = (
+        "direct_answer"
+        if has_direct
+        else "no_direct_evidence_with_related_context"
+        if requires_direct and has_related
+        else "related_context_only"
+        if has_related
+        else "not_answerable"
+    )
+    return {
+        "requires_direct_match": requires_direct,
+        "direct_answerable": has_direct,
+        "related_context_available": has_related,
+        "negative_answer_supported": bool(requires_direct and not has_direct and has_related),
+        "recommended_answer_mode": recommended_answer_mode,
+        "strong_claim_allowed": has_direct,
+        "strong_claim_requires": ["traceable_direct", "traceable_metric_lineage"],
+    }
+
+
+def _topic_text_requires_direct_match(topic: str | None) -> bool:
+    text = str(topic or "").lower()
+    return any(term in text for term in ("direct", "directly", "직접", "direct exposure", "directly exposed"))
 
 
 def _comparison_rows(result: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1837,7 +2028,13 @@ def _markdown_catalog(payload: dict[str, Any]) -> str:
 def _markdown_bundles(payload: dict[str, Any]) -> str:
     if payload.get("response_detail") == ResponseDetail.TICKER_SUMMARY.value:
         return _markdown_ticker_summary(payload)
-    lines = ["# Ontology Query Results", f"- Results: {payload['pagination']['count']}"]
+    guard = _directness_guard_from_research_context(payload)
+    lines = [
+        "# Ontology Query Results",
+        f"- Results: {payload['pagination']['count']}",
+        f"- Strong claim allowed: {guard.get('strong_claim_allowed')}",
+        f"- Strong claim requires: {', '.join(guard.get('strong_claim_requires') or [])}",
+    ]
     diagnostics = payload.get("search_diagnostics") or {}
     warnings = diagnostics.get("warnings") or []
     if warnings:
@@ -1897,13 +2094,19 @@ def _markdown_retrieve(payload: dict[str, Any]) -> str:
     if payload.get("response_detail") == ResponseDetail.TICKER_SUMMARY.value:
         return _markdown_ticker_summary(payload)
     answerability = payload.get("answerability") or {}
+    guard = _directness_guard_from_research_context(payload)
+    stop_guard = _stop_guard_from_research_context(payload)
     lines = [
         "# Ontology Retrieval",
         f"- Direct answerable: {answerability.get('direct_answerable')}",
         f"- Related context available: {answerability.get('related_context_available')}",
         f"- Recommended answer mode: {payload.get('recommended_answer_mode') or answerability.get('recommended_answer_mode')}",
+        f"- Strong claim allowed: {guard.get('strong_claim_allowed')}",
+        f"- Strong claim requires: {', '.join(guard.get('strong_claim_requires') or [])}",
         f"- Plan: `{json.dumps(payload.get('plan', {}), ensure_ascii=False)}`",
     ]
+    if stop_guard:
+        lines.append(f"- Cannot answer reason: {stop_guard.get('cannot_answer_reason')}")
     for title, field_name in (
         ("Direct Evidence", "direct_evidence"),
         ("Related Context", "related_context"),
@@ -1921,7 +2124,16 @@ def _markdown_ticker_summary(payload: dict[str, Any]) -> str:
     candidates = payload.get("ticker_candidates") or []
     if not candidates:
         return "No ticker candidates found."
-    lines = ["# Ticker Discovery Summary", ""]
+    answerability = payload.get("answerability") or {}
+    guard = _directness_guard_from_research_context(payload)
+    lines = [
+        "# Ticker Discovery Summary",
+        "",
+        f"- Recommended answer mode: {payload.get('recommended_answer_mode') or answerability.get('recommended_answer_mode')}",
+        f"- Strong claim allowed: {guard.get('strong_claim_allowed')}",
+        f"- Strong claim requires: {', '.join(guard.get('strong_claim_requires') or [])}",
+        "",
+    ]
     for index, candidate in enumerate(candidates, 1):
         lines.append(
             f"{index}. `{candidate.get('ticker')}` "
@@ -2042,6 +2254,17 @@ def _markdown_compare(payload: dict[str, Any]) -> str:
             lines.append(
                 f"- `{row.get('comparison_key')}` {status}: "
                 f"{_short_text(row.get('summary') or row.get('missing_reason'))}"
+            )
+    comparison_contexts = payload.get("comparison_contexts") or {}
+    if comparison_contexts:
+        lines.append("## Directness Guards")
+        for ticker, context in comparison_contexts.items():
+            guard = context.get("directness_guard") or {}
+            answerability = context.get("answerability") or {}
+            lines.append(
+                f"- `{ticker}` mode={answerability.get('recommended_answer_mode')} "
+                f"strong_claim_allowed={guard.get('strong_claim_allowed')} "
+                f"requires={','.join(guard.get('strong_claim_requires') or [])}"
             )
     for ticker, items in payload.get("results", {}).items():
         lines.append(f"## {ticker}")

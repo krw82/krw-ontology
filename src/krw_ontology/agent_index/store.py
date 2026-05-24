@@ -216,6 +216,21 @@ _METRIC_LOOKUP_METRIC_TERMS = frozenset(
         "yoy",
     }
 )
+_METRIC_LOOKUP_CALCULATION_TERMS = frozenset(
+    {
+        "cagr",
+        "growth",
+        "percent",
+        "percentage",
+        "rate",
+        "rates",
+        "ratio",
+        "share",
+        "shares",
+        "total",
+        "yoy",
+    }
+)
 _TYPED_PROJECTION_SPECS: dict[str, dict[str, Any]] = {
     "exposure_lookup": {
         "object_types": {"ExternalFactorExposure"},
@@ -628,6 +643,72 @@ class OntologyStore:
             cached.setdefault("search_diagnostics", {})["cache_hit"] = True
             return cached
 
+        valuation_guard = _research_context_valuation_guard(question)
+        if valuation_guard is not None:
+            payload = {
+                "question": question,
+                "query_frame": {
+                    "raw_query": question,
+                    "query_type": "valuation_or_price_target",
+                },
+                "answerability": {
+                    "direct_answerable": False,
+                    "related_context_available": False,
+                    "negative_answer_supported": False,
+                    "needs_user_clarification": False,
+                    "recommended_answer_mode": "out_of_scope_for_filing_ontology",
+                },
+                "ticker_candidates": [],
+                "recommended_tools": [],
+                "search_diagnostics": {
+                    "mode": "research_context_stop_guard",
+                    "timing_ms": {
+                        "query_context_total": int((time.perf_counter() - query_context_started_at) * 1000),
+                    },
+                },
+                "final_answer_guidance": {
+                    "safe_answer_pattern": valuation_guard["allowed_answer"],
+                    "cannot_answer_reason": valuation_guard["cannot_answer_reason"],
+                    "do_not_expose_internal_ids": True,
+                },
+                "research_context_version": "v1",
+                "research_status": "out_of_scope_for_filing_ontology",
+                "stop_guard": valuation_guard,
+                "research_pack": {
+                    "stop_guard": valuation_guard,
+                    "valuation_guard": valuation_guard,
+                    "metric_series_pack": None,
+                    "projection_pack": None,
+                    "company_topic_pack": {"top_candidates": []},
+                    "chain_pack": {
+                        "primary_chains": [],
+                        "needs_additional_chain": False,
+                    },
+                    "trace_candidates": [],
+                },
+                "missing_parts": [],
+                "agent_autonomy": _research_agent_autonomy(
+                    "out_of_scope_for_filing_ontology",
+                    needs_trace=False,
+                ),
+                "do_not_call": [
+                    "krw_ontology_query",
+                    "krw_ontology_retrieve",
+                    "krw_ontology_compare",
+                    "krw_ontology_trace",
+                    "krw_ontology_chain",
+                ],
+                "internal_only_fields": [
+                    "topic_id",
+                    "primary_object_id",
+                    "source_object_ids",
+                    "top_traceable_object_ids",
+                    "recommended_tools.object_id",
+                ],
+            }
+            _query_context_cache_set(cache_key, payload)
+            return payload
+
         discovery_started_at = time.perf_counter()
         discovery = self.discover_company_topics(
             question=question,
@@ -651,6 +732,26 @@ class OntologyStore:
             query_frame["question_requires_direct_match"] = True
         answerability = _answerability_from_candidates(query_frame, selected_candidates)
         recommended_tools = _recommended_trace_tools(selected_candidates, limit=max(1, min(int(limit_results), 10)))
+        research_pack = self._research_context_pack(
+            question=question,
+            search_topic=(discovery.get("search_diagnostics") or {}).get("search_topic"),
+            query_frame=query_frame,
+            answerability=answerability,
+            requested_tickers=requested_tickers,
+            document_types=document_types,
+            periods=periods,
+            selected_candidates=selected_candidates,
+            recommended_tools=recommended_tools,
+            limit_results=limit_results,
+            include_internal_ids=include_internal_ids,
+        )
+        research_status = _research_status_from_pack(
+            answerability=answerability,
+            candidates=selected_candidates,
+            research_pack=research_pack,
+        )
+        missing_parts = _research_missing_parts(research_pack)
+        needs_trace = research_status == "sufficient_but_trace_recommended" or bool(recommended_tools)
         payload = {
             "question": question,
             "query_frame": query_frame,
@@ -659,6 +760,16 @@ class OntologyStore:
             "recommended_tools": recommended_tools,
             "search_diagnostics": discovery.get("search_diagnostics"),
             "final_answer_guidance": _final_answer_guidance(answerability, selected_candidates),
+            "research_context_version": "v1",
+            "research_status": research_status,
+            "research_pack": research_pack,
+            "missing_parts": missing_parts,
+            "agent_autonomy": _research_agent_autonomy(
+                research_status,
+                needs_trace=needs_trace,
+                missing_parts=missing_parts,
+            ),
+            "do_not_call": _research_do_not_call(research_status),
             "internal_only_fields": ["topic_id", "primary_object_id", "source_object_ids", "top_traceable_object_ids", "recommended_tools.object_id"],
         }
         if include_internal_ids:
@@ -672,6 +783,117 @@ class OntologyStore:
             search_diagnostics["timing_ms"] = timing
         _query_context_cache_set(cache_key, payload)
         return payload
+
+    def _research_context_pack(
+        self,
+        *,
+        question: str,
+        search_topic: str | None,
+        query_frame: Mapping[str, Any],
+        answerability: Mapping[str, Any],
+        requested_tickers: Sequence[str] | None,
+        document_types: Sequence[str] | None,
+        periods: Sequence[str] | None,
+        selected_candidates: Sequence[Mapping[str, Any]],
+        recommended_tools: Sequence[Mapping[str, Any]],
+        limit_results: int,
+        include_internal_ids: bool,
+    ) -> dict[str, Any]:
+        """Compile a bounded research workbench for agent synthesis."""
+        metric_series_pack: dict[str, Any] | None = None
+        projection_pack: dict[str, Any] | None = None
+        compact_limit = max(3, min(int(limit_results), 12))
+        metric_topic = _research_metric_topic(question, search_topic)
+        if requested_tickers and metric_topic:
+            metric_limit = max(compact_limit, 20) if _metric_lookup_needs_denominator(metric_topic) else compact_limit
+            metric_periods = _metric_lookup_research_period_filters(metric_topic, periods)
+            metric_document_types = document_types
+            if not metric_document_types and metric_periods and _metric_lookup_period_filters_are_annual(metric_periods):
+                metric_document_types = ["10-K"]
+            metric_results, metric_diagnostics = self.query_compact_with_diagnostics(
+                topic=metric_topic,
+                tickers=requested_tickers,
+                document_types=metric_document_types,
+                periods=metric_periods or periods,
+                object_types=["MetricObservation", "Calculation", "XBRLFact"],
+                limit=metric_limit,
+            )
+            metric_series_pack = _metric_series_research_pack(metric_results, metric_diagnostics)
+
+        typed_profile = self._typed_projection_profile(
+            topic=question,
+            object_types=DEFAULT_QUERY_TYPES,
+            explicit_object_types=False,
+        )
+        if typed_profile.get("enabled"):
+            projection_results, projection_diagnostics = self.query_compact_with_diagnostics(
+                topic=question,
+                tickers=requested_tickers,
+                document_types=document_types,
+                periods=periods,
+                object_types=typed_profile.get("object_types") or DEFAULT_QUERY_TYPES,
+                limit=compact_limit,
+            )
+            projection_pack = _projection_research_pack(
+                projection_results,
+                projection_diagnostics,
+                query_frame=query_frame,
+                answerability=answerability,
+            )
+
+        chain_roots = _research_chain_roots(
+            selected_candidates=selected_candidates,
+            recommended_tools=recommended_tools,
+            metric_series_pack=metric_series_pack,
+            projection_pack=projection_pack,
+            limit=2,
+        )
+        chain_pack = self._research_chain_pack(
+            chain_roots,
+            include_internal_ids=include_internal_ids,
+        )
+
+        return {
+            "metric_series_pack": metric_series_pack,
+            "projection_pack": projection_pack,
+            "company_topic_pack": _company_topic_research_pack(selected_candidates),
+            "chain_pack": chain_pack,
+            "trace_candidates": [dict(tool) for tool in recommended_tools[:3]],
+            "directness_guard": _research_directness_guard(query_frame, answerability),
+        }
+
+    def _research_chain_pack(
+        self,
+        object_ids: Sequence[str],
+        *,
+        include_internal_ids: bool,
+    ) -> dict[str, Any]:
+        chains: list[dict[str, Any]] = []
+        for object_id in object_ids[:2]:
+            chain = self.chain(object_id, max_depth=1, direction="both", include_quote_text=False)
+            if not chain:
+                continue
+            root = chain.get("object") or {}
+            chain_payload: dict[str, Any] = {
+                "root_label": root.get("label") or root.get("name") or root.get("id"),
+                "root_type": root.get("type"),
+                "chain_depth": (chain.get("chain") or {}).get("max_depth"),
+                "semantic_neighbor_count": len((chain.get("chain") or {}).get("semantic_neighbors") or []),
+                "temporal_context_count": len((chain.get("chain") or {}).get("temporal_context") or []),
+                "evidence_claim_count": len(((chain.get("chain") or {}).get("evidence_chain") or {}).get("claims") or []),
+                "evidence_quote_count": len(((chain.get("chain") or {}).get("evidence_chain") or {}).get("quotes") or []),
+                "quality_warnings": (chain.get("quality") or {}).get("warnings") or [],
+            }
+            if include_internal_ids:
+                chain_payload["root_object_id"] = object_id
+            chains.append(chain_payload)
+        return {
+            "chain_depth": 1,
+            "max_roots": 2,
+            "primary_chains": chains,
+            "needs_additional_chain": False,
+            "allowed_additional_chain_depth": 1,
+        }
 
     def get_object(self, object_id: str) -> dict[str, Any] | None:
         row = self.conn.execute(
@@ -743,6 +965,7 @@ class OntologyStore:
             object_types=selected_types,
             explicit_object_types=explicit_object_types,
         )
+        metric_periods = metric_profile.get("periods") or periods
         typed_profile = self._typed_projection_profile(
             topic=topic,
             object_types=selected_types,
@@ -753,7 +976,7 @@ class OntologyStore:
                 metric_profile["topic"],
                 tickers=tickers,
                 document_types=document_types,
-                periods=periods,
+                periods=metric_periods,
                 object_types=selected_types,
                 include_rejected=include_rejected,
                 limit=limit,
@@ -769,7 +992,7 @@ class OntologyStore:
                         metric_profile["topic"],
                         tickers=tickers,
                         document_types=document_types,
-                        periods=periods,
+                        periods=metric_periods,
                         object_types=fallback_types,
                         include_rejected=include_rejected,
                         limit=min(limit, 10),
@@ -860,6 +1083,14 @@ class OntologyStore:
         explicit_object_types = object_types is not None
         object_types = list(object_types) if object_types is not None else None
         selected_types = tuple(object_types or DEFAULT_QUERY_TYPES)
+        metric_profile = self._metric_query_profile(
+            topic=topic,
+            tickers=tickers,
+            periods=periods,
+            object_types=selected_types,
+            explicit_object_types=explicit_object_types,
+        )
+        metric_periods = metric_profile.get("periods") or periods
         scope_guard_types = selected_types
         if (
             _metric_lookup_topic_is_metric_like(topic or "")
@@ -873,7 +1104,7 @@ class OntologyStore:
             periods=periods,
             object_types=scope_guard_types,
             include_rejected=include_rejected,
-        ):
+        ) and not metric_profile["enabled"]:
             diagnostics = _search_diagnostics(topic, result_count=0)
             diagnostics["compact_fast_path"] = True
             diagnostics["scope_guard"] = "no_objects_for_ticker_period_scope"
@@ -894,13 +1125,6 @@ class OntologyStore:
             diagnostics = {**diagnostics, "cache_hit": True}
             return bundles, diagnostics
         search_strategy: dict[str, Any] | None = None
-        metric_profile = self._metric_query_profile(
-            topic=topic,
-            tickers=tickers,
-            periods=periods,
-            object_types=selected_types,
-            explicit_object_types=explicit_object_types,
-        )
         typed_profile = self._typed_projection_profile(
             topic=topic,
             object_types=selected_types,
@@ -911,7 +1135,7 @@ class OntologyStore:
                 metric_profile["topic"],
                 tickers=tickers,
                 document_types=document_types,
-                periods=periods,
+                periods=metric_periods,
                 object_types=selected_types,
                 include_rejected=include_rejected,
                 limit=limit,
@@ -927,7 +1151,7 @@ class OntologyStore:
                         metric_profile["topic"],
                         tickers=tickers,
                         document_types=document_types,
-                        periods=periods,
+                        periods=metric_periods,
                         object_types=fallback_types,
                         include_rejected=include_rejected,
                         limit=min(limit, 10),
@@ -2553,7 +2777,8 @@ class OntologyStore:
         object_types: Sequence[str],
         explicit_object_types: bool,
     ) -> dict[str, Any]:
-        if not topic or not tickers or not periods:
+        metric_periods = _metric_lookup_period_filters(topic, periods)
+        if not topic or not tickers or not metric_periods:
             return {"enabled": False, "topic": topic, "normalization": {}}
         if not explicit_object_types and not _metric_lookup_topic_is_metric_like(topic):
             return {"enabled": False, "topic": topic, "normalization": {}}
@@ -2561,10 +2786,13 @@ class OntologyStore:
             return {"enabled": False, "topic": topic, "normalization": {}}
         if not _table_exists(self.conn, "metric_lookup"):
             return {"enabled": False, "topic": topic, "normalization": {"warning": "metric_lookup_unavailable"}}
-        normalized_topic, normalization = _normalize_metric_lookup_topic(topic, periods)
+        normalized_topic, normalization = _normalize_metric_lookup_topic(topic, metric_periods)
+        if not periods and metric_periods:
+            normalization["inferred_period_filters"] = list(metric_periods)
         return {
             "enabled": True,
             "topic": normalized_topic,
+            "periods": list(metric_periods),
             "normalization": normalization,
         }
 
@@ -2587,6 +2815,7 @@ class OntologyStore:
             if term not in ticker_terms
         ]
         metric_terms = [term for term in terms if term not in set(dimension_anchors)] or terms
+        metric_terms = _metric_lookup_base_metric_terms(metric_terms)
         period_values = _metric_lookup_period_values(periods)
         years = _metric_lookup_years(periods)
         selected_types = _metric_lookup_selected_types(object_types, include_xbrl=bool(dimension_anchors))
@@ -2977,10 +3206,37 @@ class OntologyStore:
                 [*total_score_params, *total_params, max(1, min(limit * 4, 120))],
             ).fetchall()
         role_by_object_id = {row["id"]: "target_dimension_metric" for row in rows if row["id"]}
+        dimension_by_object_id = {
+            row["id"]: {
+                "dimension_key": row["metric_dimension_key"],
+                "dimension_label": row["metric_dimension_label"],
+                "dimension_display_label": _metric_dimension_display_label(
+                    row["metric_dimension_label"],
+                    row["metric_dimension_key"],
+                    dimension_anchors,
+                ),
+                "dimension_kind": row["metric_dimension_kind"],
+            }
+            for row in rows
+            if row["id"]
+        }
         for row in denominator_rows:
             if row["id"]:
                 role_by_object_id[row["id"]] = "denominator_metric"
-        rows = _dedupe_metric_lookup_rows([*rows, *denominator_rows], limit=limit)
+                dimension_by_object_id[row["id"]] = {
+                    "dimension_key": row["metric_dimension_key"],
+                    "dimension_label": row["metric_dimension_label"],
+                    "dimension_display_label": "Company total",
+                    "dimension_kind": row["metric_dimension_kind"],
+                }
+        if denominator_rows:
+            denominator_limit = max(1, min(len(denominator_rows), max(1, int(limit) // 3)))
+            target_limit = max(1, int(limit) - denominator_limit)
+            target_rows = _dedupe_metric_lookup_rows(rows, limit=target_limit)
+            denominator_rows = _dedupe_metric_lookup_rows(denominator_rows, limit=denominator_limit)
+            rows = _dedupe_metric_lookup_rows([*target_rows, *denominator_rows], limit=limit)
+        else:
+            rows = _dedupe_metric_lookup_rows(rows, limit=limit)
         dimension_metric_not_found = not found_keys
         strategy = {
             "mode": "metric_dimension_lookup",
@@ -2995,6 +3251,7 @@ class OntologyStore:
             "company_total_role": "denominator_or_support",
             "denominator_needed": denominator_needed,
             "metric_roles_by_object_id": role_by_object_id,
+            "metric_dimensions_by_object_id": dimension_by_object_id,
             "period_values": period_values,
             "period_years": years,
             "object_types": selected_types,
@@ -3788,11 +4045,37 @@ def _answerability_from_candidates(query_frame: Mapping[str, Any], candidates: S
 
 def _compact_comparison_context(context: Mapping[str, Any]) -> dict[str, Any]:
     candidates = list(context.get("ticker_candidates") or [])
+    research_pack = context.get("research_pack") or {}
+    metric_pack = research_pack.get("metric_series_pack") if isinstance(research_pack, Mapping) else None
+    projection_pack = research_pack.get("projection_pack") if isinstance(research_pack, Mapping) else None
+    chain_pack = research_pack.get("chain_pack") if isinstance(research_pack, Mapping) else None
+    directness_guard = research_pack.get("directness_guard") if isinstance(research_pack, Mapping) else None
+    metric_calculations = metric_pack.get("calculations") if isinstance(metric_pack, Mapping) else {}
+    metric_quality = metric_pack.get("quality") if isinstance(metric_pack, Mapping) else {}
     return {
         "answerability": context.get("answerability") or {},
         "query_frame": context.get("query_frame") or {},
         "top_candidate": _comparison_candidate_summary(candidates[0]) if candidates else None,
         "recommended_tools": list(context.get("recommended_tools") or [])[:3],
+        "research_status": context.get("research_status"),
+        "agent_autonomy": context.get("agent_autonomy") or {},
+        "missing_parts": context.get("missing_parts") or [],
+        "do_not_call": context.get("do_not_call") or [],
+        "directness_guard": directness_guard or {},
+        "research_pack_summary": {
+            "metric_mode": metric_pack.get("mode") if isinstance(metric_pack, Mapping) else None,
+            "metric_result_count": metric_pack.get("result_count") if isinstance(metric_pack, Mapping) else 0,
+            "metric_roles": metric_pack.get("roles") if isinstance(metric_pack, Mapping) else [],
+            "metric_series_count": len(metric_pack.get("series") or []) if isinstance(metric_pack, Mapping) else 0,
+            "metric_share_of_total_count": len(metric_calculations.get("share_of_total") or []) if isinstance(metric_calculations, Mapping) else 0,
+            "metric_growth_rate_count": len(metric_calculations.get("growth_rate") or []) if isinstance(metric_calculations, Mapping) else 0,
+            "metric_growth_difference_count": len(metric_calculations.get("growth_difference") or []) if isinstance(metric_calculations, Mapping) else 0,
+            "metric_period_alignment": metric_quality.get("period_alignment") if isinstance(metric_quality, Mapping) else None,
+            "metric_unit_consistency": metric_quality.get("unit_consistency") if isinstance(metric_quality, Mapping) else None,
+            "projection_mode": projection_pack.get("mode") if isinstance(projection_pack, Mapping) else None,
+            "projection_result_count": projection_pack.get("result_count") if isinstance(projection_pack, Mapping) else 0,
+            "chain_preview_count": len(chain_pack.get("primary_chains") or []) if isinstance(chain_pack, Mapping) else 0,
+        },
     }
 
 
@@ -3877,6 +4160,569 @@ def _object_ids_from_query_context(context: Mapping[str, Any]) -> list[str]:
             seen.add(object_id)
             deduped.append(object_id)
     return deduped
+
+
+def _research_context_valuation_guard(question: str) -> dict[str, Any] | None:
+    text = str(question or "").lower()
+    if not any(
+        term in text
+        for term in (
+            "target price",
+            "price target",
+            "12-month target",
+            "12 month target",
+            "fair value",
+            "valuation",
+            "목표가",
+            "목표 주가",
+            "목표치",
+            "12개월 목표",
+            "적정가치",
+            "밸류에이션",
+        )
+    ):
+        return None
+    return {
+        "question_type": "valuation_or_price_target",
+        "cannot_answer_reason": (
+            "12-month target price or valuation output requires market price, "
+            "valuation model inputs, or external analyst assumptions that are not "
+            "contained in the filing ontology."
+        ),
+        "allowed_answer": (
+            "공시자료만으로 12개월 목표치나 목표주가를 직접 산출하지 말고, "
+            "공시자료에서 확인되는 매출 성장 지속성 가정, 마진/수요 리스크, "
+            "추적 가능한 사업 근거만 제한적으로 설명합니다."
+        ),
+        "allowed_filing_based_support": [
+            "revenue_growth_durability",
+            "margin_risk",
+            "demand_or_order_backlog_context",
+            "capex_or_cost_pressure",
+        ],
+    }
+
+
+def _research_metric_topic(question: str, search_topic: str | None) -> str | None:
+    raw = str(question or "")
+    raw_lower = raw.lower()
+    base = str(search_topic or raw).strip()
+    seed_terms = _unique([term for term in (raw.strip(), base) if term])
+    metric_terms: list[str] = []
+    if _metric_lookup_topic_is_metric_like(raw) or _metric_lookup_topic_is_metric_like(base):
+        metric_terms.extend(seed_terms)
+    elif any(term in raw_lower for term in ("매출", "수익", "revenue", "sales")):
+        metric_terms.extend(seed_terms)
+        metric_terms.append("revenue net sales")
+    elif any(term in raw_lower for term in ("마진", "margin", "영업이익률", "gross margin", "operating margin")):
+        metric_terms.extend(seed_terms)
+        metric_terms.append("margin gross margin operating margin")
+    elif any(term in raw_lower for term in ("비용", "원가", "cost", "expense", "영업비용")):
+        metric_terms.extend(seed_terms)
+        metric_terms.append("cost expense operating expense")
+    elif any(term in raw_lower for term in ("대손", "신용", "credit", "charge-off", "provision", "allowance")):
+        metric_terms.extend(seed_terms)
+        metric_terms.append("credit loss provision allowance charge off")
+    elif any(term in raw_lower for term in ("nii", "net interest", "순이자")):
+        metric_terms.extend(seed_terms)
+        metric_terms.append("net interest income")
+    if any(term in raw_lower for term in ("비중", "share", "대비")):
+        metric_terms.append("share total revenue net sales")
+    if any(term in raw_lower for term in ("성장률", "증가율", "성장", "growth")):
+        metric_terms.append("growth")
+    topic = " ".join(term for term in _unique(metric_terms) if term).strip()
+    return topic or None
+
+
+def _metric_series_research_pack(results: Sequence[Mapping[str, Any]], diagnostics: Mapping[str, Any]) -> dict[str, Any]:
+    strategy = diagnostics.get("search_strategy") or diagnostics.get("projection") or {}
+    role_by_id = strategy.get("metric_roles_by_object_id") or {}
+    dimension_by_id = strategy.get("metric_dimensions_by_object_id") or {}
+    observations: list[dict[str, Any]] = []
+    for item in results:
+        obj = item.get("object") if isinstance(item.get("object"), Mapping) else {}
+        object_id = str(item.get("id") or obj.get("id") or "")
+        role = role_by_id.get(object_id)
+        if not role:
+            role = "denominator_metric" if obj.get("is_company_total") else "metric"
+        dimension_info = dimension_by_id.get(object_id) if isinstance(dimension_by_id, Mapping) else None
+        dimensions = obj.get("dimensions") or obj.get("dimension") or {}
+        if dimension_info and role == "target_dimension_metric" and not dimensions:
+            dimension_key = str(dimension_info.get("dimension_key") or "")
+            dimension_label = str(
+                dimension_info.get("dimension_display_label")
+                or dimension_info.get("dimension_label")
+                or dimension_key
+            )
+            dimension_kind = str(dimension_info.get("dimension_kind") or "unknown")
+            dimensions = {dimension_kind: dimension_label} if dimension_label else {}
+        observation = {
+            "id": object_id,
+            "ticker": item.get("ticker") or obj.get("ticker"),
+            "period": item.get("period") or obj.get("period"),
+            "document_type": item.get("document_type") or obj.get("document_type"),
+            "metric_name": obj.get("metric_name") or obj.get("metric_term_id") or obj.get("name"),
+            "canonical_metric": obj.get("canonical_metric") or obj.get("metric_term_id") or obj.get("metric_name"),
+            "value": obj.get("value"),
+            "unit": obj.get("unit"),
+            "dimensions": dimensions,
+            "dimension_key": dimension_info.get("dimension_key") if isinstance(dimension_info, Mapping) else None,
+            "dimension_label": dimension_info.get("dimension_label") if isinstance(dimension_info, Mapping) else None,
+            "dimension_display_label": dimension_info.get("dimension_display_label") if isinstance(dimension_info, Mapping) else None,
+            "dimension_kind": dimension_info.get("dimension_kind") if isinstance(dimension_info, Mapping) else None,
+            "metric_role": role,
+            "trace_status": item.get("trace_status"),
+            "metric_lineage_status": item.get("metric_lineage_status"),
+        }
+        if obj:
+            observation["formatted_value"] = format_metric_compact(dict(obj))
+        observations.append(observation)
+    series = _metric_series_from_observations(observations)
+    calculations = _metric_series_calculations(
+        series,
+        denominator_needed=bool(strategy.get("denominator_needed")),
+    )
+    missing_parts: list[str] = []
+    for key in strategy.get("missing_dimension_keys") or []:
+        missing_parts.append(f"dimension:{key}")
+    if strategy.get("dimension_metric_not_found"):
+        missing_parts.append("dimension_metric_not_found")
+    if not observations and diagnostics.get("metric_fast_path"):
+        missing_parts.append("metric_series_not_found")
+    return {
+        "mode": strategy.get("mode") or ("metric_lookup" if diagnostics.get("metric_fast_path") else None),
+        "result_count": len(observations),
+        "observations": observations,
+        "series": series,
+        "calculations": calculations,
+        "roles": sorted({str(obs.get("metric_role")) for obs in observations if obs.get("metric_role")}),
+        "dimension_anchors": strategy.get("dimension_anchors") or [],
+        "resolved_dimensions": strategy.get("resolved_dimensions") or [],
+        "denominator_needed": bool(strategy.get("denominator_needed")),
+        "company_total_role": strategy.get("company_total_role"),
+        "period_years": strategy.get("period_years") or [],
+        "period_values": strategy.get("period_values") or [],
+        "quality": {
+            "missing_parts": sorted(set(missing_parts)),
+            "dimension_metric_not_found": bool(strategy.get("dimension_metric_not_found")),
+            "fallback_used": bool(strategy.get("fallback_used")),
+            "period_alignment": calculations.get("period_alignment"),
+            "unit_consistency": calculations.get("unit_consistency"),
+        },
+        "diagnostics": {
+            "metric_fast_path": bool(diagnostics.get("metric_fast_path")),
+            "compact_fast_path": bool(diagnostics.get("compact_fast_path")),
+            "search_mode": strategy.get("mode"),
+        },
+    }
+
+
+def _metric_series_from_observations(observations: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[str, dict[str, Any]] = {}
+    for observation in observations:
+        value = _metric_observation_number(observation.get("value"))
+        period = str(observation.get("period") or "")
+        if value is None or not period:
+            continue
+        key, label = _metric_observation_series_key(observation)
+        series = grouped.setdefault(
+            key,
+            {
+                "series_key": key,
+                "label": label,
+                "ticker": observation.get("ticker"),
+                "metric_role": observation.get("metric_role"),
+                "metric_name": observation.get("metric_name"),
+                "canonical_metric": observation.get("canonical_metric"),
+                "unit": observation.get("unit"),
+                "dimensions": observation.get("dimensions") or {},
+                "points": [],
+            },
+        )
+        if any(str(point.get("period") or "") == period for point in series["points"]):
+            continue
+        series["points"].append(
+            {
+                "period": period,
+                "value": value,
+                "formatted_value": observation.get("formatted_value"),
+                "object_id": observation.get("id"),
+            }
+        )
+    for series in grouped.values():
+        series["points"].sort(key=lambda point: _period_sort_key(str(point.get("period") or "")))
+        series["periods"] = [point["period"] for point in series["points"]]
+        series["point_count"] = len(series["points"])
+    return sorted(
+        grouped.values(),
+        key=lambda item: (
+            0 if item.get("metric_role") == "target_dimension_metric" else 1,
+            str(item.get("label") or item.get("series_key") or ""),
+        ),
+    )
+
+
+def _metric_observation_series_key(observation: Mapping[str, Any]) -> tuple[str, str]:
+    role = str(observation.get("metric_role") or "metric")
+    metric = str(observation.get("canonical_metric") or observation.get("metric_name") or "metric")
+    dimensions = observation.get("dimensions") if isinstance(observation.get("dimensions"), Mapping) else {}
+    dimension_bits = [f"{key}:{value}" for key, value in sorted(dimensions.items()) if value]
+    if dimension_bits:
+        dimension_label = " / ".join(str(value) for _key, value in sorted(dimensions.items()) if value)
+    elif role == "denominator_metric":
+        dimension_label = "Company total"
+    else:
+        object_id = str(observation.get("id") or "")
+        dimension_label = object_id.rsplit(":", 1)[-1] if object_id else role
+    key = "|".join([role, metric, *dimension_bits]) if dimension_bits else "|".join([role, metric, dimension_label])
+    return key, dimension_label
+
+
+def _metric_dimension_display_label(label: Any, dimension_key: Any, dimension_anchors: Sequence[Any] | None = None) -> str:
+    text = str(label or "").strip() or str(dimension_key or "").replace("_", " ").strip()
+    if not text:
+        return ""
+    text = re.sub(r"\s+", " ", text).strip()
+    single_letter_match = re.match(r"^([A-Za-z]) ([A-Z][A-Za-z0-9]+)(\\b.*)?$", text)
+    if single_letter_match:
+        suffix = single_letter_match.group(3) or ""
+        text = f"{single_letter_match.group(1).lower()}{single_letter_match.group(2)}{suffix}"
+    text_key = _metric_dimension_key(text)
+    key = str(dimension_key or "").strip()
+    for anchor in dimension_anchors or []:
+        anchor_text = str(anchor or "").strip()
+        anchor_key = _metric_dimension_key(anchor_text)
+        if not anchor_key:
+            continue
+        if anchor_key == f"{text_key}s" and not text.lower().endswith("s"):
+            return _metric_dimension_title(anchor_text)
+        if anchor_key == key and "_" in anchor_text:
+            return _metric_dimension_title(anchor_text)
+    return text
+
+
+def _metric_dimension_title(value: Any) -> str:
+    text = str(value or "").replace("_", " ").strip()
+    if not text:
+        return ""
+    return " ".join(part[:1].upper() + part[1:] for part in text.split())
+
+
+def _metric_observation_number(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip().replace(",", "")
+    if not text:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def _period_sort_key(period: str) -> tuple[int, int, str]:
+    match = re.search(r"(?:CY|FY)?(20\d{2}|19\d{2})(?:Q([1-4]))?", period.upper())
+    if not match:
+        return (0, 0, period)
+    return (int(match.group(1)), int(match.group(2) or 0), period)
+
+
+def _metric_series_calculations(
+    series: Sequence[Mapping[str, Any]],
+    *,
+    denominator_needed: bool,
+) -> dict[str, Any]:
+    units = {str(item.get("unit") or "").lower() for item in series if item.get("unit")}
+    unit_consistency = len(units) <= 1
+    denominator_series = [item for item in series if item.get("metric_role") == "denominator_metric"]
+    target_series = [item for item in series if item.get("metric_role") == "target_dimension_metric"]
+    denominator_by_period: dict[str, float] = {}
+    if denominator_series:
+        for point in denominator_series[0].get("points") or []:
+            value = _metric_observation_number(point.get("value"))
+            period = str(point.get("period") or "")
+            if period and value not in (None, 0.0):
+                denominator_by_period[period] = float(value)
+
+    share_of_total: list[dict[str, Any]] = []
+    if denominator_needed and denominator_by_period:
+        for item in target_series:
+            for point in item.get("points") or []:
+                period = str(point.get("period") or "")
+                numerator = _metric_observation_number(point.get("value"))
+                denominator = denominator_by_period.get(period)
+                if not period or numerator is None or not denominator:
+                    continue
+                share_of_total.append(
+                    {
+                        "series_key": item.get("series_key"),
+                        "label": item.get("label"),
+                        "period": period,
+                        "numerator": numerator,
+                        "denominator": denominator,
+                        "share": numerator / denominator,
+                    }
+                )
+
+    growth_rate: list[dict[str, Any]] = []
+    growth_by_series: dict[str, dict[str, dict[str, Any]]] = {}
+    for item in series:
+        previous: Mapping[str, Any] | None = None
+        for point in item.get("points") or []:
+            current_value = _metric_observation_number(point.get("value"))
+            previous_value = _metric_observation_number(previous.get("value")) if previous else None
+            if current_value is not None and previous_value not in (None, 0.0):
+                growth_entry = {
+                    "series_key": item.get("series_key"),
+                    "label": item.get("label"),
+                    "from_period": previous.get("period"),
+                    "to_period": point.get("period"),
+                    "growth": (current_value - float(previous_value)) / float(previous_value),
+                }
+                growth_rate.append(growth_entry)
+                series_key = str(item.get("series_key") or "")
+                to_period = str(point.get("period") or "")
+                if series_key and to_period:
+                    growth_by_series.setdefault(series_key, {})[to_period] = growth_entry
+            previous = point
+
+    growth_difference: list[dict[str, Any]] = []
+    for left_index, left in enumerate(target_series):
+        left_key = str(left.get("series_key") or "")
+        if not left_key:
+            continue
+        for right in target_series[left_index + 1 :]:
+            right_key = str(right.get("series_key") or "")
+            if not right_key:
+                continue
+            common_periods = sorted(
+                set(growth_by_series.get(left_key, {})).intersection(growth_by_series.get(right_key, {})),
+                key=_period_sort_key,
+            )
+            for period in common_periods:
+                left_growth = growth_by_series[left_key][period]
+                right_growth = growth_by_series[right_key][period]
+                growth_difference.append(
+                    {
+                        "left_series_key": left_key,
+                        "left_label": left.get("label"),
+                        "right_series_key": right_key,
+                        "right_label": right.get("label"),
+                        "from_period": left_growth.get("from_period"),
+                        "to_period": period,
+                        "left_growth": left_growth.get("growth"),
+                        "right_growth": right_growth.get("growth"),
+                        "difference": float(left_growth.get("growth")) - float(right_growth.get("growth")),
+                    }
+                )
+
+    period_sets = [set(item.get("periods") or []) for item in series if item.get("periods")]
+    period_alignment = len({tuple(sorted(periods)) for periods in period_sets}) <= 1 if period_sets else None
+    return {
+        "share_of_total": share_of_total,
+        "growth_rate": growth_rate,
+        "growth_difference": growth_difference,
+        "period_alignment": period_alignment,
+        "unit_consistency": unit_consistency,
+    }
+
+
+def _projection_research_pack(
+    results: Sequence[Mapping[str, Any]],
+    diagnostics: Mapping[str, Any],
+    *,
+    query_frame: Mapping[str, Any],
+    answerability: Mapping[str, Any],
+) -> dict[str, Any]:
+    strategy = diagnostics.get("search_strategy") or diagnostics.get("projection") or {}
+    candidates: list[dict[str, Any]] = []
+    for item in results[:10]:
+        obj = item.get("object") if isinstance(item.get("object"), Mapping) else {}
+        candidates.append(
+            {
+                "id": item.get("id") or obj.get("id"),
+                "ticker": item.get("ticker") or obj.get("ticker"),
+                "period": item.get("period") or obj.get("period"),
+                "type": item.get("type") or obj.get("type"),
+                "summary": item.get("text") or _display_text(dict(obj)),
+                "trace_status": item.get("trace_status"),
+            }
+        )
+    directness_guard = _research_directness_guard(query_frame, answerability)
+    return {
+        "mode": strategy.get("mode"),
+        "table": strategy.get("table"),
+        "matched_terms": strategy.get("matched_terms") or [],
+        "result_count": len(candidates),
+        "candidates": candidates,
+        "directness": {**directness_guard, "projection_candidates_are_search_candidates_only": True},
+        "quality": {
+            "fallback_used": bool(strategy.get("fallback_used")),
+            "missing_parts": [] if candidates else ["projection_candidates_not_found"],
+        },
+    }
+
+
+def _company_topic_research_pack(candidates: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    top_candidates: list[dict[str, Any]] = []
+    for candidate in candidates[:8]:
+        top_candidates.append(
+            {
+                "ticker": candidate.get("ticker"),
+                "tier": candidate.get("tier"),
+                "trace_status": candidate.get("trace_status"),
+                "topic_label": candidate.get("topic_label"),
+                "topic_summary": candidate.get("topic_summary"),
+                "score": candidate.get("score"),
+            }
+        )
+    return {
+        "top_candidates": top_candidates,
+        "candidate_count": len(candidates),
+    }
+
+
+def _research_directness_guard(query_frame: Mapping[str, Any], answerability: Mapping[str, Any]) -> dict[str, Any]:
+    direct_answerable = bool(answerability.get("direct_answerable"))
+    return {
+        "requires_direct_match": bool(query_frame.get("question_requires_direct_match") or query_frame.get("requires_direct_match")),
+        "direct_answerable": direct_answerable,
+        "related_context_available": bool(answerability.get("related_context_available")),
+        "negative_answer_supported": bool(answerability.get("negative_answer_supported")),
+        "recommended_answer_mode": answerability.get("recommended_answer_mode"),
+        "strong_claim_allowed": direct_answerable,
+        "strong_claim_requires": ["traceable_direct", "traceable_metric_lineage"],
+    }
+
+
+def _research_chain_roots(
+    *,
+    selected_candidates: Sequence[Mapping[str, Any]],
+    recommended_tools: Sequence[Mapping[str, Any]],
+    metric_series_pack: Mapping[str, Any] | None,
+    projection_pack: Mapping[str, Any] | None,
+    limit: int,
+) -> list[str]:
+    ids: list[str] = []
+    for tool in recommended_tools:
+        if tool.get("object_id"):
+            ids.append(str(tool["object_id"]))
+    ids.extend(_object_ids_from_query_context({"ticker_candidates": list(selected_candidates)}))
+    for pack in (metric_series_pack, projection_pack):
+        if not pack:
+            continue
+        for item in pack.get("observations") or pack.get("candidates") or []:
+            if item.get("id"):
+                ids.append(str(item["id"]))
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for object_id in ids:
+        if object_id and object_id not in seen:
+            seen.add(object_id)
+            deduped.append(object_id)
+        if len(deduped) >= max(1, int(limit)):
+            break
+    return deduped
+
+
+def _research_missing_parts(research_pack: Mapping[str, Any]) -> list[str]:
+    missing: list[str] = []
+    metric_pack = research_pack.get("metric_series_pack") or {}
+    projection_pack = research_pack.get("projection_pack") or {}
+    metric_quality = metric_pack.get("quality") if isinstance(metric_pack, Mapping) else {}
+    projection_quality = projection_pack.get("quality") if isinstance(projection_pack, Mapping) else {}
+    for part in (metric_quality or {}).get("missing_parts") or []:
+        missing.append(str(part))
+    for part in (projection_quality or {}).get("missing_parts") or []:
+        missing.append(str(part))
+    return sorted(set(missing))
+
+
+def _research_status_from_pack(
+    *,
+    answerability: Mapping[str, Any],
+    candidates: Sequence[Mapping[str, Any]],
+    research_pack: Mapping[str, Any],
+) -> str:
+    metric_pack = research_pack.get("metric_series_pack")
+    if isinstance(metric_pack, Mapping) and metric_pack.get("result_count"):
+        if not (metric_pack.get("quality") or {}).get("missing_parts"):
+            return "sufficient_for_default_answer"
+        return "partial_answer_possible"
+    if answerability.get("direct_answerable"):
+        return "sufficient_but_trace_recommended"
+    if answerability.get("recommended_answer_mode") == "no_direct_evidence_with_related_context":
+        return "sufficient_but_trace_recommended"
+    if candidates:
+        return "partial_answer_possible" if not answerability.get("related_context_available") else "sufficient_but_trace_recommended"
+    return "needs_targeted_followup"
+
+
+def _research_agent_autonomy(
+    research_status: str,
+    *,
+    needs_trace: bool,
+    missing_parts: Sequence[str] | None = None,
+) -> dict[str, Any]:
+    missing = list(missing_parts or [])
+    if research_status == "out_of_scope_for_filing_ontology":
+        return {
+            "mode": "bounded",
+            "may_continue_research": False,
+            "allowed_next_tools": [],
+            "disallowed_next_tools": [
+                "krw_ontology_query",
+                "krw_ontology_retrieve",
+                "krw_ontology_compare",
+                "krw_ontology_trace",
+                "krw_ontology_chain",
+            ],
+            "max_additional_tool_calls": 0,
+        }
+    if research_status == "sufficient_for_default_answer":
+        return {
+            "mode": "bounded",
+            "may_continue_research": True,
+            "allowed_next_tools": ["krw_ontology_chain"] if not needs_trace else ["krw_ontology_trace", "krw_ontology_chain"],
+            "disallowed_next_tools": ["krw_ontology_retrieve", "unscoped_krw_ontology_query"],
+            "max_additional_tool_calls": 2 if needs_trace else 1,
+            "purpose": "Only deepen mechanism or verify top trace candidates; do not restart broad search.",
+        }
+    if research_status == "sufficient_but_trace_recommended":
+        return {
+            "mode": "bounded",
+            "may_continue_research": True,
+            "allowed_next_tools": ["krw_ontology_trace", "krw_ontology_chain"],
+            "disallowed_next_tools": ["krw_ontology_retrieve", "unscoped_krw_ontology_query"],
+            "max_additional_tool_calls": 3,
+            "purpose": "Verify selected roots and use bounded chain expansion only.",
+        }
+    return {
+        "mode": "bounded",
+        "may_continue_research": True,
+        "allowed_next_tools": ["krw_ontology_query", "krw_ontology_trace", "krw_ontology_chain"],
+        "disallowed_next_tools": ["broad_unscoped_retrieve"],
+        "max_additional_tool_calls": 3 if missing else 2,
+        "purpose": "Fill only listed missing parts with targeted searches.",
+    }
+
+
+def _research_do_not_call(research_status: str) -> list[str]:
+    if research_status == "out_of_scope_for_filing_ontology":
+        return [
+            "krw_ontology_query",
+            "krw_ontology_retrieve",
+            "krw_ontology_compare",
+            "krw_ontology_trace",
+            "krw_ontology_chain",
+        ]
+    if research_status == "sufficient_for_default_answer":
+        return ["krw_ontology_retrieve", "unscoped_krw_ontology_query"]
+    if research_status == "sufficient_but_trace_recommended":
+        return ["krw_ontology_retrieve", "unscoped_krw_ontology_query"]
+    return ["broad_unscoped_retrieve"]
 
 
 def _merge_bundle_lists(*bundle_lists: Sequence[Mapping[str, Any]], limit: int) -> list[dict[str, Any]]:
@@ -4421,6 +5267,49 @@ def _normalize_metric_lookup_topic(
             diagnostics["warning"] = "topic_years_differ_from_period_filters"
             diagnostics["topic_only_years"] = topic_only_years
     return normalized or topic, diagnostics
+
+
+def _metric_lookup_period_filters(topic: str | None, periods: Iterable[str] | None) -> list[str]:
+    explicit_periods = [str(period) for period in periods or [] if str(period or "").strip()]
+    if explicit_periods:
+        return _unique(explicit_periods)
+    years = _metric_lookup_topic_years(topic)
+    return [str(year) for year in years]
+
+
+def _metric_lookup_research_period_filters(topic: str | None, periods: Iterable[str] | None) -> list[str]:
+    explicit_periods = _metric_lookup_period_filters(None, periods)
+    topic_periods = _metric_lookup_period_filters(topic, None)
+    if topic_periods and len(topic_periods) > len(explicit_periods):
+        return topic_periods
+    return explicit_periods or topic_periods
+
+
+def _metric_lookup_period_filters_are_annual(periods: Iterable[str] | None) -> bool:
+    values = [str(period or "").upper() for period in periods or [] if str(period or "").strip()]
+    return bool(values) and all("Q" not in value for value in values)
+
+
+def _metric_lookup_topic_years(topic: str | None) -> list[int]:
+    text = str(topic or "")
+    years = {int(year) for year in re.findall(r"(?<!\d)((?:19|20)\d{2})(?!\d)", text)}
+    range_pattern = re.compile(
+        r"(?<!\d)((?:19|20)\d{2})\s*(?:[-~]|to|through)\s*((?:19|20)\d{2})(?!\d)",
+        re.IGNORECASE,
+    )
+    for match in range_pattern.finditer(text):
+        start = int(match.group(1))
+        end = int(match.group(2))
+        if start > end:
+            start, end = end, start
+        if end - start <= 20:
+            years.update(range(start, end + 1))
+    return sorted(years)
+
+
+def _metric_lookup_base_metric_terms(terms: Sequence[str]) -> list[str]:
+    base_terms = [term for term in terms if term not in _METRIC_LOOKUP_CALCULATION_TERMS]
+    return base_terms or list(terms)
 
 
 def _metric_lookup_topic_is_metric_like(topic: str | None) -> bool:

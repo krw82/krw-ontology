@@ -65,6 +65,62 @@ For product two-pass workflows, produce internal research synthesis with complet
 9. Call `krw_ontology_compare` for multi-company, multi-period, topic, factor, or metric comparisons.
 10. For large multi-ticker questions, do not loop over every ticker with full responses. First run global compact discovery or company-topic discovery, narrow candidate tickers, then run focused per-ticker queries and trace only final objects.
 
+## Research Pack And Bounded Autonomy
+
+Treat `krw_ontology_query_context` as the default research workbench for natural-language questions, not just a pre-search hint. When it returns `research_status`, `research_pack`, `agent_autonomy`, `missing_parts`, `do_not_call`, or `allowed_next_tools`, use those fields to control further tool use.
+
+The goal is bounded autonomy:
+
+- Preserve analyst judgment: interpret the user's nuance, choose the important caveats, explain business mechanisms, compare tradeoffs, and write the final Korean answer naturally.
+- Limit unstable exploration: do not repeat broad `query`, `retrieve`, `trace`, `chain`, or `compare` calls after the context already says the default answer is sufficiently supported.
+- Use chain actively, but only on selected roots. Prefer the `chain_pack` preview and recommended roots from `query_context`; call additional `krw_ontology_chain` only when `agent_autonomy.allowed_next_tools` permits it.
+
+Tool budget rules:
+
+```text
+For every natural-language research question, call query_context first unless the user explicitly asks for a raw tool/debug operation.
+
+If research_status is sufficient_for_default_answer:
+- Do not call broad retrieve.
+- Do not restart unscoped query.
+- Use at most the allowed next tools, normally trace/chain, and stay within max_additional_tool_calls.
+
+If research_status is sufficient_but_trace_recommended:
+- Trace or chain only the recommended top objects.
+- Do not broaden into a new search unless missing_parts explicitly requires it.
+
+If research_status is partial_answer_possible or needs_targeted_followup:
+- Use only missing_parts and allowed_next_tools to fill gaps.
+- Do not run open-ended fallback searches.
+
+If research_status is out_of_scope_for_filing_ontology:
+- Do not keep searching.
+- Answer with the filing-based limitation and any allowed filing support.
+```
+
+Metric and segment rules:
+
+- For growth, share, ratio, margin, segment, product, geography, or period-series questions, use `research_pack.metric_series_pack` when present.
+- Do not issue separate metric queries for every segment unless `missing_parts` says a specific metric or dimension is missing.
+- Treat company total metrics as denominator/support when the pack marks them that way; do not turn a company total into a segment/product answer.
+- When `metric_series_pack.calculations` includes `share_of_total`, `growth_rate`, or `growth_difference`, use those deterministic calculations instead of recalculating from retrieved rows.
+- If `metric_series_pack.quality.unit_consistency` or `period_alignment` is false, mention the limitation and do not overstate the numeric comparison.
+
+Directness guard rules:
+
+- Always inspect `research_pack.directness_guard` when present, including inside retrieve and compare responses.
+- If `directness_guard.strong_claim_allowed` is false, do not state that the company is directly exposed or directly affected. Phrase the answer as no direct filing evidence, with related context only if available.
+- Strong claims require the tiers listed in `directness_guard.strong_claim_requires`. Projection candidates, topic candidates, and related context are not enough by themselves.
+- In compare responses, apply `comparison_contexts[ticker].directness_guard` per ticker. Do not copy a direct conclusion from one ticker to another.
+- If a projection pack says candidates are search candidates only, treat them as routes for trace/chain, not as final proof.
+
+Chain rules:
+
+- Chain is for selected candidate expansion, not search replacement.
+- Default chain budget is the roots and depth provided by `chain_pack`.
+- If additional chain is needed, use no more than the remaining `agent_autonomy.max_additional_tool_calls`.
+- Do not chain every candidate in a discovery result.
+
 ## Two-Pass Product Boundary
 
 In product runtimes, this skill is pass 1: research, evidence validation, chain inspection, analytical judgment, and canonical answer content. It should not choose visual blocks, plan layout, or emit `display_plan`/`answer_blocks`.

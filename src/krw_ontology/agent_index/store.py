@@ -175,6 +175,124 @@ _METRIC_FAST_PATH_GENERIC_TERMS = frozenset(
         "years",
     }
 )
+_TYPED_PROJECTION_SPECS: dict[str, dict[str, Any]] = {
+    "exposure_lookup": {
+        "object_types": {"ExternalFactorExposure"},
+        "terms": {
+            "exposure",
+            "exposed",
+            "commodity",
+            "price",
+            "oil",
+            "crude",
+            "lng",
+            "henry",
+            "hub",
+            "hbm",
+            "export",
+            "control",
+            "restriction",
+            "china",
+            "rate",
+            "fx",
+            "currency",
+            "scenario",
+        },
+        "text_columns": ("factor", "benchmark", "impact_channel", "mechanism", "scenario_terms", "lookup_text"),
+    },
+    "agreement_lookup": {
+        "object_types": {"AgreementTerm"},
+        "terms": {
+            "agreement",
+            "contract",
+            "spa",
+            "termination",
+            "terminate",
+            "debt",
+            "acceleration",
+            "covenant",
+            "lease",
+            "maturity",
+            "commitment",
+            "collateral",
+            "facility",
+        },
+        "text_columns": (
+            "agreement_type",
+            "agreement_subtype",
+            "counterparty",
+            "maturity_date",
+            "termination_terms",
+            "covenant_terms",
+            "collateral_terms",
+            "affected_channels",
+            "lookup_text",
+        ),
+    },
+    "event_lookup": {
+        "object_types": {"BusinessEvent", "ChangeEvent", "TrendObservation", "TemporalLink"},
+        "terms": {
+            "event",
+            "timeline",
+            "approval",
+            "delay",
+            "delayed",
+            "milestone",
+            "launch",
+            "completion",
+            "completed",
+            "regulatory",
+            "date",
+            "when",
+            "schedule",
+        },
+        "text_columns": (
+            "event_type",
+            "event_status",
+            "event_date",
+            "date_expression",
+            "project_or_product",
+            "regulatory_body",
+            "affected_channels",
+            "lookup_text",
+        ),
+    },
+    "factor_lookup": {
+        "object_types": {"BusinessFactor"},
+        "terms": {
+            "risk",
+            "driver",
+            "margin",
+            "cost",
+            "pressure",
+            "consumer",
+            "slowdown",
+            "supply",
+            "chain",
+            "pricing",
+            "demand",
+            "fuel",
+            "shipping",
+            "capex",
+            "ai",
+            "raw",
+            "material",
+            "fx",
+            "capital",
+            "allocation",
+        },
+        "text_columns": (
+            "factor_type",
+            "topic_family",
+            "impact_channel",
+            "business_area",
+            "risk_or_driver",
+            "topic_label",
+            "topic_summary",
+            "lookup_text",
+        ),
+    },
+}
 
 
 class OntologyStore:
@@ -311,6 +429,10 @@ class OntologyStore:
                 "objects": _table_count(self.conn, "objects"),
                 "object_search_text": _table_count(self.conn, "object_search_text"),
                 "metric_lookup": _table_count(self.conn, "metric_lookup"),
+                "exposure_lookup": _table_count(self.conn, "exposure_lookup"),
+                "agreement_lookup": _table_count(self.conn, "agreement_lookup"),
+                "event_lookup": _table_count(self.conn, "event_lookup"),
+                "factor_lookup": _table_count(self.conn, "factor_lookup"),
                 "object_fts": _table_count(self.conn, "object_fts"),
                 "object_traceability": _table_count(self.conn, "object_traceability"),
                 "company_topic_index": _table_count(self.conn, "company_topic_index"),
@@ -328,6 +450,14 @@ class OntologyStore:
                 "company_topic_index": _table_exists(self.conn, "company_topic_index"),
                 "object_search_text": _table_exists(self.conn, "object_search_text"),
                 "metric_lookup": _table_exists(self.conn, "metric_lookup"),
+                "exposure_lookup": _table_exists(self.conn, "exposure_lookup"),
+                "agreement_lookup": _table_exists(self.conn, "agreement_lookup"),
+                "event_lookup": _table_exists(self.conn, "event_lookup"),
+                "factor_lookup": _table_exists(self.conn, "factor_lookup"),
+                "typed_projection_lookup": all(
+                    _table_exists(self.conn, table_name)
+                    for table_name in _TYPED_PROJECTION_SPECS
+                ),
                 "company_context": _table_exists(self.conn, "company_topic_index"),
                 "query_context": _table_exists(self.conn, "company_topic_index"),
                 "answerability_tiers": True,
@@ -560,6 +690,11 @@ class OntologyStore:
             object_types=selected_types,
             explicit_object_types=explicit_object_types,
         )
+        typed_profile = self._typed_projection_profile(
+            topic=topic,
+            object_types=selected_types,
+            explicit_object_types=explicit_object_types,
+        )
         if metric_profile["enabled"]:
             rows, search_strategy = self._query_metric_lookup_with_strategy(
                 metric_profile["topic"],
@@ -574,6 +709,28 @@ class OntologyStore:
             if not rows and topic:
                 rows, fallback_strategy = self._query_fts_with_strategy(
                     metric_profile["topic"],
+                    tickers=tickers,
+                    document_types=document_types,
+                    periods=periods,
+                    object_types=selected_types,
+                    include_rejected=include_rejected,
+                    limit=min(limit, 10),
+                )
+                search_strategy["fallback"] = fallback_strategy
+                search_strategy["fallback_used"] = True
+        elif typed_profile["enabled"]:
+            rows, search_strategy = self._query_typed_projection_with_strategy(
+                typed_profile,
+                tickers=tickers,
+                document_types=document_types,
+                periods=periods,
+                object_types=selected_types,
+                include_rejected=include_rejected,
+                limit=limit,
+            )
+            if not rows and topic:
+                rows, fallback_strategy = self._query_fts_with_strategy(
+                    topic,
                     tickers=tickers,
                     document_types=document_types,
                     periods=periods,
@@ -611,6 +768,9 @@ class OntologyStore:
         if metric_profile["enabled"]:
             diagnostics["metric_fast_path"] = True
             diagnostics["topic_normalization"] = metric_profile["normalization"]
+        if typed_profile["enabled"]:
+            diagnostics["typed_projection_fast_path"] = True
+            diagnostics["projection"] = search_strategy
         if unavailable_tickers:
             diagnostics.setdefault("warnings", [])
             diagnostics["warnings"].append("ticker_not_available")
@@ -673,6 +833,11 @@ class OntologyStore:
             object_types=selected_types,
             explicit_object_types=explicit_object_types,
         )
+        typed_profile = self._typed_projection_profile(
+            topic=topic,
+            object_types=selected_types,
+            explicit_object_types=explicit_object_types,
+        )
         if metric_profile["enabled"]:
             rows, search_strategy = self._query_metric_lookup_with_strategy(
                 metric_profile["topic"],
@@ -687,6 +852,28 @@ class OntologyStore:
             if not rows and topic:
                 rows, fallback_strategy = self._query_fts_with_strategy(
                     metric_profile["topic"],
+                    tickers=tickers,
+                    document_types=document_types,
+                    periods=periods,
+                    object_types=selected_types,
+                    include_rejected=include_rejected,
+                    limit=min(limit, 10),
+                )
+                search_strategy["fallback"] = fallback_strategy
+                search_strategy["fallback_used"] = True
+        elif typed_profile["enabled"]:
+            rows, search_strategy = self._query_typed_projection_with_strategy(
+                typed_profile,
+                tickers=tickers,
+                document_types=document_types,
+                periods=periods,
+                object_types=selected_types,
+                include_rejected=include_rejected,
+                limit=limit,
+            )
+            if not rows and topic:
+                rows, fallback_strategy = self._query_fts_with_strategy(
+                    topic,
                     tickers=tickers,
                     document_types=document_types,
                     periods=periods,
@@ -725,6 +912,9 @@ class OntologyStore:
         if metric_profile["enabled"]:
             diagnostics["metric_fast_path"] = True
             diagnostics["topic_normalization"] = metric_profile["normalization"]
+        if typed_profile["enabled"]:
+            diagnostics["typed_projection_fast_path"] = True
+            diagnostics["projection"] = search_strategy
         if unavailable_tickers:
             diagnostics.setdefault("warnings", [])
             diagnostics["warnings"].append("ticker_not_available")
@@ -1007,6 +1197,36 @@ class OntologyStore:
                 "match": match,
             }
             grouped.setdefault(str(topic.get("ticker") or "UNKNOWN"), []).append(topic_payload)
+        projection_diagnostics: dict[str, Any] | None = None
+        projection_elapsed_ms = 0
+        projection_profile = self._typed_projection_profile(
+            topic=question,
+            object_types=DEFAULT_QUERY_TYPES,
+            explicit_object_types=False,
+        )
+        if projection_profile["enabled"]:
+            projection_started_at = time.perf_counter()
+            projection_rows, projection_strategy = self._query_typed_projection_with_strategy(
+                projection_profile,
+                tickers=[str(ticker).upper() for ticker in tickers] if tickers else None,
+                document_types=document_types,
+                periods=periods,
+                object_types=DEFAULT_QUERY_TYPES,
+                include_rejected=False,
+                limit=min(max(int(limit_groups) * int(limit_per_group), 10), int(limit)),
+            )
+            projection_bundles = self._compact_bundles_from_rows(projection_rows)
+            for bundle in projection_bundles:
+                topic_payload = _topic_payload_from_compact_bundle(
+                    bundle,
+                    query_frame=query_frame,
+                    source="typed_projection",
+                )
+                if topic_payload is None:
+                    continue
+                grouped.setdefault(str(topic_payload.get("ticker") or "UNKNOWN"), []).append(topic_payload)
+            projection_elapsed_ms = int((time.perf_counter() - projection_started_at) * 1000)
+            projection_diagnostics = projection_strategy
         classify_elapsed_ms = int((time.perf_counter() - classify_started_at) * 1000)
 
         candidates: list[dict[str, Any]] = []
@@ -1103,11 +1323,13 @@ class OntologyStore:
                 "timing_ms": {
                     "query_frame": query_frame_elapsed_ms,
                     "company_topic_query": topic_query_elapsed_ms,
+                    "typed_projection_query": projection_elapsed_ms,
                     "classify_topics": classify_elapsed_ms,
                     "group_rank_candidates": grouping_elapsed_ms,
                     "object_fallback": fallback_elapsed_ms,
                     "discover_total": int((time.perf_counter() - discovery_started_at) * 1000),
                 },
+                **({"typed_projection": projection_diagnostics} if projection_diagnostics else {}),
                 **({"object_fallback": fallback_diagnostics} if fallback_diagnostics else {}),
             },
         }
@@ -2383,6 +2605,123 @@ class OntologyStore:
         }
         return rows, strategy
 
+    def _typed_projection_profile(
+        self,
+        *,
+        topic: str | None,
+        object_types: Sequence[str],
+        explicit_object_types: bool,
+    ) -> dict[str, Any]:
+        if not topic:
+            return {"enabled": False}
+        topic_terms = set(_query_terms(topic))
+        selected_types = set(object_types)
+        for table_name, spec in _TYPED_PROJECTION_SPECS.items():
+            projection_types = set(spec["object_types"])
+            if not selected_types.intersection(projection_types):
+                continue
+            if not _table_exists(self.conn, table_name):
+                continue
+            term_match = topic_terms.intersection(set(spec["terms"]))
+            type_is_narrow = explicit_object_types and selected_types.issubset(projection_types)
+            if term_match or type_is_narrow:
+                return {
+                    "enabled": True,
+                    "table": table_name,
+                    "topic": topic,
+                    "terms": sorted(topic_terms),
+                    "matched_terms": sorted(term_match),
+                    "object_types": sorted(projection_types.intersection(selected_types)),
+                    "reason": "explicit_object_type" if type_is_narrow else "topic_terms",
+                }
+        return {"enabled": False}
+
+    def _query_typed_projection_with_strategy(
+        self,
+        profile: Mapping[str, Any],
+        *,
+        tickers: Sequence[str] | None,
+        document_types: Iterable[str] | None,
+        periods: Iterable[str] | None,
+        object_types: Iterable[str],
+        include_rejected: bool,
+        limit: int,
+    ) -> tuple[list[sqlite3.Row], dict[str, Any]]:
+        table_name = str(profile["table"])
+        spec = _TYPED_PROJECTION_SPECS[table_name]
+        selected_types = [object_type for object_type in object_types if object_type in set(spec["object_types"])]
+        terms = [
+            term
+            for term in _query_terms(str(profile.get("topic") or ""))
+            if term not in _SPLIT_TOPIC_STOP_TERMS and len(term) > 1
+        ][:10]
+        where_parts = ["1 = 1"]
+        where_params: list[Any] = []
+        _add_in_filter(where_parts, where_params, f"{table_name}.ticker", [ticker.upper() for ticker in tickers or []])
+        _add_in_filter(where_parts, where_params, f"{table_name}.document_type", list(document_types or []))
+        _add_in_filter(where_parts, where_params, f"{table_name}.period", list(periods or []))
+        _add_in_filter(where_parts, where_params, f"{table_name}.object_type", selected_types)
+        if not include_rejected:
+            where_parts.append("(objects.review_status IS NULL OR objects.review_status != 'rejected')")
+
+        text_columns = tuple(spec["text_columns"])
+        term_clauses: list[str] = []
+        term_params: list[Any] = []
+        score_parts: list[str] = []
+        score_params: list[Any] = []
+        for term in terms:
+            per_term = []
+            like = f"%{term}%"
+            for column in text_columns:
+                per_term.append(f"lower(COALESCE({table_name}.{column}, '')) LIKE ?")
+                term_params.append(like)
+                score_parts.append(f"CASE WHEN lower(COALESCE({table_name}.{column}, '')) LIKE ? THEN 1 ELSE 0 END")
+                score_params.append(like)
+            if per_term:
+                term_clauses.append("(" + " OR ".join(per_term) + ")")
+        if term_clauses:
+            where_parts.append("(" + " OR ".join(term_clauses) + ")")
+            where_params.extend(term_params)
+        score_expr = " + ".join(score_parts) if score_parts else "0"
+        where = "WHERE " + " AND ".join(where_parts)
+        rows = self.conn.execute(
+            f"""
+            SELECT
+                objects.*,
+                ({score_expr}) AS projection_match_score
+            FROM {table_name}
+            JOIN objects ON objects.id = {table_name}.object_id
+            {where}
+            ORDER BY
+                projection_match_score DESC,
+                CASE {table_name}.trace_status
+                    WHEN 'traceable' THEN 3
+                    WHEN 'traceable_metric_lineage' THEN 3
+                    WHEN 'related' THEN 2
+                    ELSE 1
+                END DESC,
+                COALESCE({table_name}.specificity_score, 0) DESC,
+                COALESCE({table_name}.generic_score, 0) ASC,
+                COALESCE({table_name}.boilerplate_score, 0) ASC,
+                COALESCE({table_name}.evidence_chain_count, 0) DESC,
+                {table_name}.object_id ASC
+            LIMIT ?
+            """,
+            [*score_params, *where_params, max(1, min(limit * 4, 120))],
+        ).fetchall()
+        rows = _dedupe_object_rows(rows, limit=limit)
+        return rows, {
+            "mode": "typed_projection",
+            "projection_used": table_name,
+            "projection_candidate_count": len(rows),
+            "projection_sufficient": bool(rows),
+            "projection_fallback_reason": None if rows else "no_projection_candidates",
+            "terms": terms,
+            "matched_terms": list(profile.get("matched_terms") or []),
+            "object_types": selected_types,
+            "fallback_used": False,
+        }
+
     def _query_metric(
         self,
         metric: str,
@@ -3488,6 +3827,83 @@ def _topic_reason(topic: Mapping[str, Any]) -> dict[str, Any]:
     return reason
 
 
+def _topic_payload_from_compact_bundle(
+    bundle: Mapping[str, Any],
+    *,
+    query_frame: Any,
+    source: str,
+) -> dict[str, Any] | None:
+    trace_status = str(bundle.get("trace_status") or "unknown")
+    topic_like = {
+        "topic_id": f"{source}:{bundle.get('id')}",
+        "topic_label": str(bundle.get("type") or "Object evidence"),
+        "topic_summary": str(bundle.get("text") or "")[:500],
+        "topic_text": str(bundle.get("text") or ""),
+        "facet_text": str(bundle.get("text") or ""),
+        "impact_channels": [],
+        "primary_object_id": bundle.get("id"),
+        "primary_object_type": bundle.get("type"),
+        "ticker": bundle.get("ticker"),
+        "evidence_strength": (bundle.get("quality") or {}).get("evidence_grade") or source,
+        "support_quote_count": bundle.get("support_quote_count") or 0,
+        "support_claim_count": bundle.get("support_claim_count") or 0,
+        "specificity_score": 0.6,
+    }
+    match = classify_topic_match(query_frame, build_evidence_frame(topic_like))
+    if match["tier"] == "insufficient":
+        return None
+    semantic_relevance = str(match.get("tier") or "insufficient")
+    final_tier = _combined_discovery_tier(semantic_relevance, trace_status)
+    traceable = _is_traceable_status(trace_status)
+    match = {
+        **match,
+        "semantic_relevance": semantic_relevance,
+        "trace_status": trace_status,
+        "tier": final_tier,
+        "why_tier": _why_discovery_tier(semantic_relevance, trace_status, final_tier),
+        "projection_source": source,
+    }
+    object_id = bundle.get("id")
+    return {
+        "topic_id": topic_like["topic_id"],
+        "ticker": bundle.get("ticker"),
+        "period": bundle.get("period"),
+        "document_type": bundle.get("document_type"),
+        "topic_label": topic_like["topic_label"],
+        "topic_summary": topic_like["topic_summary"],
+        "primary_object_id": object_id,
+        "primary_object_type": bundle.get("type"),
+        "source_object_ids": [object_id] if object_id else [],
+        "dominant_object_types": [bundle.get("type")] if bundle.get("type") else [],
+        "impact_channels": [],
+        "evidence_strength": source,
+        "support_quote_count": bundle.get("support_quote_count") or 0,
+        "support_claim_count": bundle.get("support_claim_count") or 0,
+        "trace_status": trace_status,
+        "evidence_chain_count": bundle.get("evidence_chain_count") or 0,
+        "support_depth": bundle.get("support_depth"),
+        "support_link_count": bundle.get("support_link_count") or 0,
+        "trace_method": source,
+        "metric_lineage_status": bundle.get("metric_lineage_status"),
+        "answer_candidate": bool(bundle.get("answer_candidate")),
+        "specificity_score": 0.6,
+        "generic_score": 0.0,
+        "boilerplate_score": 0.0,
+        "materiality_hint": None,
+        "materiality_score": None,
+        "topic_type": source,
+        "topic_family": source,
+        "factor_terms": [],
+        "metric_terms": [],
+        "entity_terms": [],
+        "mechanism_terms": [],
+        "scenario_terms": [],
+        "top_traceable_object_ids": [object_id] if traceable and object_id else [],
+        "untraced_object_ids": [] if traceable or not object_id else [object_id],
+        "match": match,
+    }
+
+
 def _scope_where(
     *,
     ticker: str | None,
@@ -3696,6 +4112,20 @@ def _dedupe_metric_lookup_rows(rows: Sequence[sqlite3.Row], *, limit: int) -> li
         if key in seen:
             continue
         seen.add(key)
+        deduped.append(row)
+        if len(deduped) >= limit:
+            break
+    return deduped
+
+
+def _dedupe_object_rows(rows: Sequence[sqlite3.Row], *, limit: int) -> list[sqlite3.Row]:
+    seen: set[str] = set()
+    deduped: list[sqlite3.Row] = []
+    for row in rows:
+        object_id = str(row["id"] or "")
+        if not object_id or object_id in seen:
+            continue
+        seen.add(object_id)
         deduped.append(row)
         if len(deduped) >= limit:
             break

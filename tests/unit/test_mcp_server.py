@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from krw_ontology.agent_index import build_agent_index
+from krw_ontology.agent_index import OntologyStore, build_agent_index
 from krw_ontology.mcp_server.server import health_payload, mcp
 from krw_ontology.mcp_server.tools import (
     _normalize_object_types,
@@ -42,7 +42,7 @@ def test_mcp_tools_query_trace_quality_and_compare(tmp_path: Path, monkeypatch):
     )
     assert query["results"]
     assert query["results"][0]["ticker"] == "VG"
-    assert query["results"][0]["evidence"]["quotes"]
+    assert query["results"][0]["evidence"]["quotes"] == []
     assert "events" in query["results"][0]["quality"]
     assert "evidence_grade" in query["results"][0]["quality"]
     assert query["search_diagnostics"]["normalized_terms"] == ["revenue", "growth"]
@@ -113,7 +113,7 @@ def test_mcp_query_normalizes_object_type_aliases(tmp_path: Path, monkeypatch):
     assert query["query"]["object_types_requested"] == ["Risk"]
     assert query["query"]["object_types"] == ["BusinessFactor"]
     assert query["results"][0]["type"] == "BusinessFactor"
-    assert query["results"][0]["evidence"]["quotes"]
+    assert query["results"][0]["evidence"]["quotes"] == []
 
     metric_query = json.loads(
         query_tool(
@@ -390,6 +390,7 @@ def _write_fixture(
     unsupported_risk_id = f"business_factor:VG:{period}:10K:unsupported-risk"
     activity_id = f"business_activity:VG:{period}:10K:lng-sales"
     exposure_id = f"external_factor_exposure:VG:{period}:10K:natural-gas-price-operating-margin"
+    agreement_id = f"agreement:VG:{period}:10K:spa-termination"
     span = {
         "id": span_id,
         "type": "SourceSpan",
@@ -515,6 +516,23 @@ def _write_fixture(
         "supported_by_claims": [claim_id],
         "review_status": "accepted",
     }
+    agreement = {
+        "id": agreement_id,
+        "type": "AgreementTerm",
+        "ticker": "VG",
+        "source_document_id": source_document_id,
+        "document_type": "10-K",
+        "period": period,
+        "name": "SPA termination and debt acceleration",
+        "agreement_type": "sale and purchase agreement",
+        "agreement_subtype": "SPA",
+        "counterparty": "LNG customer",
+        "termination_terms": "Termination of the SPA may create project financing or debt acceleration risk.",
+        "covenant_terms": "Project financing covenants may be affected by contract termination.",
+        "affected_channels": ["liquidity", "project_timing"],
+        "supported_by_claims": [risk_claim_id],
+        "review_status": "accepted",
+    }
     edges = [
         {
             "id": "edge:quote-claim",
@@ -563,6 +581,7 @@ def _write_fixture(
     write_jsonl(ontology_dir / "business_factors.jsonl", [risk, unsupported_risk, driver])
     write_jsonl(ontology_dir / "business_activities.jsonl", [activity])
     write_jsonl(ontology_dir / "external_factor_exposures.jsonl", [exposure])
+    write_jsonl(ontology_dir / "agreement_terms.jsonl", [agreement])
     write_jsonl(ontology_dir / "edges.jsonl", edges)
     atomic_write_json(
         ontology_dir / "section_quality.json",
@@ -582,6 +601,7 @@ def _write_fixture(
                 "business_factors": f"companies/VG/ontology/10K/{period}/business_factors.jsonl",
                 "business_activities": f"companies/VG/ontology/10K/{period}/business_activities.jsonl",
                 "external_factor_exposures": f"companies/VG/ontology/10K/{period}/external_factor_exposures.jsonl",
+                "agreement_terms": f"companies/VG/ontology/10K/{period}/agreement_terms.jsonl",
                 "edges": f"companies/VG/ontology/10K/{period}/edges.jsonl",
             },
             "counts": {
@@ -591,6 +611,7 @@ def _write_fixture(
                 "business_factors": 3,
                 "business_activities": 1,
                 "external_factor_exposures": 1,
+                "agreement_terms": 1,
                 "edges": 3,
             },
         },
@@ -863,3 +884,49 @@ def test_ticker_summary_demotes_untraced_direct_candidate(tmp_path: Path) -> Non
     assert candidate["top_reasons"][0]["semantic_relevance"] == "direct"
     assert candidate["top_reasons"][0]["trace_status"] == "orphan"
     assert candidate["untraced_object_ids"]
+
+
+def test_typed_projection_lookup_tables_and_query_routing(tmp_path: Path) -> None:
+    _write_fixture(tmp_path)
+    index = build_agent_index(tmp_path)
+
+    with OntologyStore(index["index_path"]) as store:
+        context = store.index_context()
+        serving_counts = context["serving_counts"]
+        assert serving_counts["exposure_lookup"] == 1
+        assert serving_counts["agreement_lookup"] == 1
+        assert serving_counts["event_lookup"] >= 1
+        assert serving_counts["factor_lookup"] >= 2
+        assert context["capabilities"]["typed_projection_lookup"] is True
+
+        agreement_results, agreement_diagnostics = store.query_compact_with_diagnostics(
+            topic="SPA termination debt acceleration covenant",
+            tickers=["VG"],
+            object_types=["AgreementTerm"],
+            limit=5,
+        )
+        assert agreement_results
+        assert agreement_results[0]["type"] == "AgreementTerm"
+        assert agreement_diagnostics["typed_projection_fast_path"] is True
+        assert agreement_diagnostics["projection"]["projection_used"] == "agreement_lookup"
+        assert agreement_diagnostics["projection"]["fallback_used"] is False
+
+        exposure_results, exposure_diagnostics = store.query_compact_with_diagnostics(
+            topic="Henry Hub natural gas price exposure operating margin",
+            tickers=["VG"],
+            object_types=["ExternalFactorExposure"],
+            limit=5,
+        )
+        assert exposure_results
+        assert exposure_results[0]["type"] == "ExternalFactorExposure"
+        assert exposure_diagnostics["projection"]["projection_used"] == "exposure_lookup"
+
+        event_context = store.query_context(
+            question="VG regulatory approval delay timeline",
+            ticker="VG",
+            limit_results=5,
+            limit_tickers=3,
+        )
+        typed_projection = event_context["search_diagnostics"].get("typed_projection")
+        assert typed_projection is not None
+        assert typed_projection["projection_used"] == "event_lookup"

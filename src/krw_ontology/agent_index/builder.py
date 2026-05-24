@@ -203,6 +203,19 @@ COMPANY_TOPIC_TEXT_CHAR_LIMIT = 2_500
 COMPANY_TOPIC_FIELD_CHAR_LIMIT = 700
 COMPANY_TOPIC_FTS_CHAR_LIMIT = 1_800
 COMPANY_TOPIC_BUILDER_VERSION = "0.3.0-rich-hardened"
+TYPED_PROJECTION_BUILDER_VERSION = "0.1.0-serving-projections"
+TYPED_PROJECTION_TABLES = (
+    "exposure_lookup",
+    "agreement_lookup",
+    "event_lookup",
+    "factor_lookup",
+)
+TYPED_PROJECTION_OBJECT_TYPES = {
+    "exposure_lookup": ("ExternalFactorExposure",),
+    "agreement_lookup": ("AgreementTerm",),
+    "event_lookup": ("BusinessEvent", "ChangeEvent", "TrendObservation", "TemporalLink"),
+    "factor_lookup": ("BusinessFactor",),
+}
 
 
 def _elapsed(started_at: float) -> float:
@@ -255,6 +268,10 @@ def build_agent_index(
             "quality_events": 0,
             "object_traceability": 0,
             "metric_lookup": 0,
+            "exposure_lookup": 0,
+            "agreement_lookup": 0,
+            "event_lookup": 0,
+            "factor_lookup": 0,
             "company_topics": 0,
         }
 
@@ -320,6 +337,21 @@ def build_agent_index(
             metric_lookup=totals["metric_lookup"],
         )
 
+        projection_started_at = time.perf_counter()
+        _log_build_phase("typed_projection_lookup_start", objects=totals["objects"])
+        with conn:
+            for table_name in TYPED_PROJECTION_TABLES:
+                totals[table_name] = _rebuild_typed_projection_lookup(conn, table_name)
+        _checkpoint_wal(conn)
+        _log_build_phase(
+            "typed_projection_lookup_done",
+            elapsed_seconds=_elapsed(projection_started_at),
+            exposure_lookup=totals["exposure_lookup"],
+            agreement_lookup=totals["agreement_lookup"],
+            event_lookup=totals["event_lookup"],
+            factor_lookup=totals["factor_lookup"],
+        )
+
         topic_started_at = time.perf_counter()
         _log_build_phase("company_topic_index_start", objects=totals["objects"])
         totals["company_topics"] = _rebuild_company_topic_index(conn)
@@ -357,6 +389,8 @@ def build_agent_index(
                             "company_topic_profile_mode": "rich_materialized",
                             "object_search_text_enabled": True,
                             "metric_lookup_enabled": True,
+                            "typed_projection_builder_version": TYPED_PROJECTION_BUILDER_VERSION,
+                            "typed_projection_lookup_enabled": True,
                             "company_topic_fts_enabled": True,
                             "totals": totals,
                         },
@@ -516,6 +550,10 @@ def _create_schema(conn: sqlite3.Connection) -> None:
         DROP TABLE IF EXISTS object_search_text;
         DROP TABLE IF EXISTS object_traceability;
         DROP TABLE IF EXISTS metric_lookup;
+        DROP TABLE IF EXISTS exposure_lookup;
+        DROP TABLE IF EXISTS agreement_lookup;
+        DROP TABLE IF EXISTS event_lookup;
+        DROP TABLE IF EXISTS factor_lookup;
         DROP TABLE IF EXISTS company_topic_source_objects;
         DROP TABLE IF EXISTS company_topic_fts;
         DROP TABLE IF EXISTS company_topic_index;
@@ -603,6 +641,114 @@ def _create_schema(conn: sqlite3.Connection) -> None:
             trace_status TEXT,
             metric_lineage_status TEXT,
             text TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS exposure_lookup (
+            object_id TEXT PRIMARY KEY,
+            object_type TEXT NOT NULL,
+            ticker TEXT NOT NULL,
+            document_type TEXT NOT NULL,
+            doc_type_key TEXT NOT NULL,
+            period TEXT NOT NULL,
+            factor TEXT,
+            benchmark TEXT,
+            impact_channel TEXT,
+            mechanism TEXT,
+            scenario_terms TEXT,
+            direct_anchor_text TEXT,
+            related_context_text TEXT,
+            negative_guard_terms TEXT,
+            trace_status TEXT,
+            evidence_strength TEXT,
+            specificity_score REAL,
+            generic_score REAL,
+            boilerplate_score REAL,
+            support_quote_count INTEGER DEFAULT 0,
+            support_claim_count INTEGER DEFAULT 0,
+            evidence_chain_count INTEGER DEFAULT 0,
+            lookup_text TEXT NOT NULL,
+            source_text TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS agreement_lookup (
+            object_id TEXT PRIMARY KEY,
+            object_type TEXT NOT NULL,
+            ticker TEXT NOT NULL,
+            document_type TEXT NOT NULL,
+            doc_type_key TEXT NOT NULL,
+            period TEXT NOT NULL,
+            agreement_type TEXT,
+            agreement_subtype TEXT,
+            counterparty TEXT,
+            amount TEXT,
+            maturity_date TEXT,
+            termination_terms TEXT,
+            covenant_terms TEXT,
+            collateral_terms TEXT,
+            affected_channels TEXT,
+            trace_status TEXT,
+            evidence_strength TEXT,
+            specificity_score REAL,
+            generic_score REAL,
+            boilerplate_score REAL,
+            support_quote_count INTEGER DEFAULT 0,
+            support_claim_count INTEGER DEFAULT 0,
+            evidence_chain_count INTEGER DEFAULT 0,
+            lookup_text TEXT NOT NULL,
+            source_text TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS event_lookup (
+            object_id TEXT PRIMARY KEY,
+            object_type TEXT NOT NULL,
+            ticker TEXT NOT NULL,
+            document_type TEXT NOT NULL,
+            doc_type_key TEXT NOT NULL,
+            period TEXT NOT NULL,
+            event_type TEXT,
+            event_status TEXT,
+            event_date TEXT,
+            date_expression TEXT,
+            date_sort_key TEXT,
+            project_or_product TEXT,
+            regulatory_body TEXT,
+            affected_channels TEXT,
+            trace_status TEXT,
+            evidence_strength TEXT,
+            specificity_score REAL,
+            generic_score REAL,
+            boilerplate_score REAL,
+            support_quote_count INTEGER DEFAULT 0,
+            support_claim_count INTEGER DEFAULT 0,
+            evidence_chain_count INTEGER DEFAULT 0,
+            lookup_text TEXT NOT NULL,
+            source_text TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS factor_lookup (
+            object_id TEXT PRIMARY KEY,
+            object_type TEXT NOT NULL,
+            ticker TEXT NOT NULL,
+            document_type TEXT NOT NULL,
+            doc_type_key TEXT NOT NULL,
+            period TEXT NOT NULL,
+            factor_type TEXT,
+            topic_family TEXT,
+            impact_channel TEXT,
+            business_area TEXT,
+            risk_or_driver TEXT,
+            topic_label TEXT,
+            topic_summary TEXT,
+            trace_status TEXT,
+            evidence_strength TEXT,
+            specificity_score REAL,
+            generic_score REAL,
+            boilerplate_score REAL,
+            support_quote_count INTEGER DEFAULT 0,
+            support_claim_count INTEGER DEFAULT 0,
+            evidence_chain_count INTEGER DEFAULT 0,
+            lookup_text TEXT NOT NULL,
+            source_text TEXT
         );
 
         CREATE TABLE IF NOT EXISTS company_topic_index (
@@ -720,6 +866,22 @@ def _create_serving_secondary_indexes(conn: sqlite3.Connection) -> None:
             ON metric_lookup(ticker, object_type, period);
         CREATE INDEX IF NOT EXISTS idx_metric_lookup_total
             ON metric_lookup(ticker, is_company_total, canonical_metric);
+        CREATE INDEX IF NOT EXISTS idx_exposure_lookup_scope
+            ON exposure_lookup(ticker, period, object_type);
+        CREATE INDEX IF NOT EXISTS idx_exposure_lookup_factor
+            ON exposure_lookup(ticker, factor, benchmark);
+        CREATE INDEX IF NOT EXISTS idx_agreement_lookup_scope
+            ON agreement_lookup(ticker, period, object_type);
+        CREATE INDEX IF NOT EXISTS idx_agreement_lookup_type
+            ON agreement_lookup(ticker, agreement_type, maturity_date);
+        CREATE INDEX IF NOT EXISTS idx_event_lookup_scope
+            ON event_lookup(ticker, period, object_type);
+        CREATE INDEX IF NOT EXISTS idx_event_lookup_type
+            ON event_lookup(ticker, event_type, event_status, date_sort_key);
+        CREATE INDEX IF NOT EXISTS idx_factor_lookup_scope
+            ON factor_lookup(ticker, period, object_type);
+        CREATE INDEX IF NOT EXISTS idx_factor_lookup_family
+            ON factor_lookup(ticker, topic_family, risk_or_driver);
         CREATE INDEX IF NOT EXISTS idx_company_topic_ticker
             ON company_topic_index(ticker);
         CREATE INDEX IF NOT EXISTS idx_company_topic_scope
@@ -1653,6 +1815,317 @@ def _metric_lookup_alias_text(
         if value:
             pieces.append(str(value))
     return " ".join(piece for piece in pieces if piece)[:4000]
+
+
+def _rebuild_typed_projection_lookup(conn: sqlite3.Connection, table_name: str) -> int:
+    """Materialize typed serving projections for cheap candidate lookup."""
+    object_types = TYPED_PROJECTION_OBJECT_TYPES[table_name]
+    conn.execute(f"DELETE FROM {table_name}")
+    placeholders = ",".join("?" for _ in object_types)
+    rows = conn.execute(
+        f"""
+        SELECT
+            objects.id,
+            objects.type,
+            objects.ticker,
+            objects.document_type,
+            objects.doc_type_key,
+            objects.period,
+            objects.text,
+            objects.json,
+            object_traceability.trace_status,
+            object_traceability.evidence_chain_count,
+            object_traceability.support_quote_count,
+            object_traceability.support_claim_count
+        FROM objects
+        LEFT JOIN object_traceability
+          ON object_traceability.object_id = objects.id
+        WHERE objects.type IN ({placeholders})
+          AND (objects.review_status IS NULL OR objects.review_status != 'rejected')
+        """,
+        object_types,
+    ).fetchall()
+    projection_rows: list[tuple[Any, ...]] = []
+    for row in rows:
+        try:
+            obj = json.loads(row["json"] or "{}")
+        except json.JSONDecodeError:
+            obj = {}
+        topic = build_company_topic_profile(dict(row), obj, str(row["text"] or "")) or {}
+        common = _typed_projection_common(row, obj, topic)
+        if table_name == "exposure_lookup":
+            projection_rows.append(_exposure_lookup_row(row, obj, common))
+        elif table_name == "agreement_lookup":
+            projection_rows.append(_agreement_lookup_row(row, obj, common))
+        elif table_name == "event_lookup":
+            projection_rows.append(_event_lookup_row(row, obj, common))
+        elif table_name == "factor_lookup":
+            projection_rows.append(_factor_lookup_row(row, obj, common))
+        if len(projection_rows) >= BULK_INSERT_CHUNK_SIZE:
+            _flush_typed_projection_batch(conn, table_name, projection_rows)
+    _flush_typed_projection_batch(conn, table_name, projection_rows)
+    return len(rows)
+
+
+def _typed_projection_common(
+    row: sqlite3.Row,
+    obj: Mapping[str, Any],
+    topic: Mapping[str, Any],
+) -> dict[str, Any]:
+    source_text = str(row["text"] or _projection_object_values_text(obj) or "")
+    lookup_text = _compact_space(
+        " ".join(
+            str(value or "")
+            for value in (
+                source_text,
+                topic.get("topic_label"),
+                topic.get("topic_summary"),
+                topic.get("facet_text"),
+                _projection_object_values_text(obj),
+            )
+        )
+    )[:4000]
+    return {
+        "object_id": row["id"],
+        "object_type": row["type"],
+        "ticker": row["ticker"],
+        "document_type": row["document_type"],
+        "doc_type_key": row["doc_type_key"],
+        "period": row["period"],
+        "trace_status": row["trace_status"],
+        "evidence_strength": topic.get("evidence_strength") or obj.get("evidence_grade"),
+        "specificity_score": topic.get("specificity_score"),
+        "generic_score": topic.get("generic_score"),
+        "boilerplate_score": topic.get("boilerplate_score"),
+        "support_quote_count": max(int(topic.get("support_quote_count") or 0), int(row["support_quote_count"] or 0)),
+        "support_claim_count": max(int(topic.get("support_claim_count") or 0), int(row["support_claim_count"] or 0)),
+        "evidence_chain_count": int(row["evidence_chain_count"] or 0),
+        "lookup_text": lookup_text,
+        "source_text": source_text[:2000],
+        "topic_family": topic.get("topic_family"),
+        "topic_label": topic.get("topic_label"),
+        "topic_summary": topic.get("topic_summary"),
+        "impact_channels": " ".join(topic.get("impact_channels") or []),
+    }
+
+
+def _exposure_lookup_row(row: sqlite3.Row, obj: Mapping[str, Any], common: Mapping[str, Any]) -> tuple[Any, ...]:
+    factor = _typed_projection_text(obj, ("factor", "external_factor", "factor_category", "name"))
+    benchmark = _typed_projection_text(obj, ("benchmark", "benchmark_hint", "index", "price_benchmark"))
+    impact_channel = _typed_projection_text(obj, ("impact_channel", "affected_channel", "affected_channels"))
+    mechanism = _typed_projection_text(obj, ("mechanism", "description", "scenario_effects"))
+    scenario_terms = _typed_projection_text(obj, ("scenario_terms", "scenario_effects", "effect_direction", "direction"))
+    return (
+        *(_common_projection_values(common)),
+        factor,
+        benchmark,
+        impact_channel,
+        mechanism,
+        scenario_terms,
+        _join_projection_parts(factor, benchmark, mechanism),
+        _join_projection_parts(impact_channel, scenario_terms, common["lookup_text"]),
+        _join_projection_parts(factor, benchmark),
+        common["trace_status"],
+        common["evidence_strength"],
+        common["specificity_score"],
+        common["generic_score"],
+        common["boilerplate_score"],
+        common["support_quote_count"],
+        common["support_claim_count"],
+        common["evidence_chain_count"],
+        common["lookup_text"],
+        common["source_text"],
+    )
+
+
+def _agreement_lookup_row(row: sqlite3.Row, obj: Mapping[str, Any], common: Mapping[str, Any]) -> tuple[Any, ...]:
+    return (
+        *(_common_projection_values(common)),
+        _typed_projection_text(obj, ("agreement_type", "contract_type", "type_name")),
+        _typed_projection_text(obj, ("agreement_subtype", "economic_role", "role")),
+        _typed_projection_text(obj, ("counterparty", "counterparties", "customer", "supplier", "lender")),
+        _typed_projection_text(obj, ("amount", "value", "notional_amount", "commitment_amount")),
+        _typed_projection_text(obj, ("maturity_date", "expiration_date", "end_date", "termination_date")),
+        _typed_projection_text(obj, ("termination_terms", "termination", "default_terms", "termination_rights")),
+        _typed_projection_text(obj, ("covenant_terms", "covenants", "financial_covenants")),
+        _typed_projection_text(obj, ("collateral_terms", "collateral", "security", "lien")),
+        _typed_projection_text(obj, ("affected_channels", "impact_channel", "economic_role")),
+        common["trace_status"],
+        common["evidence_strength"],
+        common["specificity_score"],
+        common["generic_score"],
+        common["boilerplate_score"],
+        common["support_quote_count"],
+        common["support_claim_count"],
+        common["evidence_chain_count"],
+        common["lookup_text"],
+        common["source_text"],
+    )
+
+
+def _event_lookup_row(row: sqlite3.Row, obj: Mapping[str, Any], common: Mapping[str, Any]) -> tuple[Any, ...]:
+    event_date = _typed_projection_text(obj, ("event_date", "date", "actual_date"))
+    date_expression = _typed_projection_text(obj, ("date_expression", "target_date", "expected_date", "timing"))
+    return (
+        *(_common_projection_values(common)),
+        _typed_projection_text(obj, ("event_type", "event_subtype", "change_type")),
+        _typed_projection_text(obj, ("event_status", "status", "completion_status")),
+        event_date,
+        date_expression,
+        _typed_projection_date_sort_key(event_date or date_expression or row["period"]),
+        _typed_projection_text(obj, ("project_or_product", "project", "product", "asset", "subject")),
+        _typed_projection_text(obj, ("regulatory_body", "agency", "regulator", "authority")),
+        _typed_projection_text(obj, ("affected_channels", "impact_channel", "affected_objects")),
+        common["trace_status"],
+        common["evidence_strength"],
+        common["specificity_score"],
+        common["generic_score"],
+        common["boilerplate_score"],
+        common["support_quote_count"],
+        common["support_claim_count"],
+        common["evidence_chain_count"],
+        common["lookup_text"],
+        common["source_text"],
+    )
+
+
+def _factor_lookup_row(row: sqlite3.Row, obj: Mapping[str, Any], common: Mapping[str, Any]) -> tuple[Any, ...]:
+    return (
+        *(_common_projection_values(common)),
+        _typed_projection_text(obj, ("factor_type", "factor_roles", "category")),
+        common["topic_family"],
+        _typed_projection_text(obj, ("impact_channel", "affected_channels", "primary_channel")),
+        _typed_projection_text(obj, ("business_area", "segment", "product", "activity")),
+        _typed_projection_text(obj, ("risk_or_driver", "factor_roles", "category", "name")),
+        common["topic_label"],
+        common["topic_summary"],
+        common["trace_status"],
+        common["evidence_strength"],
+        common["specificity_score"],
+        common["generic_score"],
+        common["boilerplate_score"],
+        common["support_quote_count"],
+        common["support_claim_count"],
+        common["evidence_chain_count"],
+        common["lookup_text"],
+        common["source_text"],
+    )
+
+
+def _common_projection_values(common: Mapping[str, Any]) -> tuple[Any, ...]:
+    return (
+        common["object_id"],
+        common["object_type"],
+        common["ticker"],
+        common["document_type"],
+        common["doc_type_key"],
+        common["period"],
+    )
+
+
+def _flush_typed_projection_batch(
+    conn: sqlite3.Connection,
+    table_name: str,
+    rows: list[tuple[Any, ...]],
+) -> None:
+    if not rows:
+        return
+    insert_sql = {
+        "exposure_lookup": """
+            INSERT OR REPLACE INTO exposure_lookup(
+                object_id, object_type, ticker, document_type, doc_type_key, period,
+                factor, benchmark, impact_channel, mechanism, scenario_terms,
+                direct_anchor_text, related_context_text, negative_guard_terms,
+                trace_status, evidence_strength, specificity_score, generic_score,
+                boilerplate_score, support_quote_count, support_claim_count,
+                evidence_chain_count, lookup_text, source_text
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        "agreement_lookup": """
+            INSERT OR REPLACE INTO agreement_lookup(
+                object_id, object_type, ticker, document_type, doc_type_key, period,
+                agreement_type, agreement_subtype, counterparty, amount, maturity_date,
+                termination_terms, covenant_terms, collateral_terms, affected_channels,
+                trace_status, evidence_strength, specificity_score, generic_score,
+                boilerplate_score, support_quote_count, support_claim_count,
+                evidence_chain_count, lookup_text, source_text
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        "event_lookup": """
+            INSERT OR REPLACE INTO event_lookup(
+                object_id, object_type, ticker, document_type, doc_type_key, period,
+                event_type, event_status, event_date, date_expression, date_sort_key,
+                project_or_product, regulatory_body, affected_channels,
+                trace_status, evidence_strength, specificity_score, generic_score,
+                boilerplate_score, support_quote_count, support_claim_count,
+                evidence_chain_count, lookup_text, source_text
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        "factor_lookup": """
+            INSERT OR REPLACE INTO factor_lookup(
+                object_id, object_type, ticker, document_type, doc_type_key, period,
+                factor_type, topic_family, impact_channel, business_area, risk_or_driver,
+                topic_label, topic_summary, trace_status, evidence_strength,
+                specificity_score, generic_score, boilerplate_score,
+                support_quote_count, support_claim_count, evidence_chain_count,
+                lookup_text, source_text
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+    }[table_name]
+    conn.executemany(insert_sql, rows)
+    rows.clear()
+
+
+def _typed_projection_text(obj: Mapping[str, Any], keys: Sequence[str]) -> str | None:
+    values: list[str] = []
+    for key in keys:
+        value = obj.get(key)
+        if value is None:
+            continue
+        if isinstance(value, str):
+            values.append(value)
+        elif isinstance(value, Mapping):
+            values.extend(str(item) for item in value.values() if item)
+        elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+            values.extend(str(item) for item in value if item)
+        else:
+            values.append(str(value))
+    text = _compact_space(" ".join(values))
+    return text[:1000] if text else None
+
+
+def _join_projection_parts(*values: Any) -> str:
+    return _compact_space(" ".join(str(value) for value in values if value))
+
+
+def _projection_object_values_text(obj: Mapping[str, Any]) -> str:
+    values: list[str] = []
+    for key, value in obj.items():
+        if key in {"id", "type", "json"}:
+            continue
+        if isinstance(value, str):
+            values.append(value)
+        elif isinstance(value, Mapping):
+            values.extend(str(item) for item in value.values() if isinstance(item, (str, int, float)))
+        elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+            values.extend(str(item) for item in value if isinstance(item, (str, int, float)))
+        elif isinstance(value, (int, float)):
+            values.append(str(value))
+    return _compact_space(" ".join(values))
+
+
+def _typed_projection_date_sort_key(value: Any) -> str | None:
+    text = str(value or "")
+    match = re.search(r"(20\d{2}|19\d{2})(?:[-/ ]?(0[1-9]|1[0-2]))?(?:[-/ ]?([0-3]\d))?", text)
+    if not match:
+        return None
+    year, month, day = match.group(1), match.group(2) or "00", match.group(3) or "00"
+    return f"{year}-{month}-{day}"
+
 
 
 def _rebuild_company_topic_index(conn: sqlite3.Connection) -> int:

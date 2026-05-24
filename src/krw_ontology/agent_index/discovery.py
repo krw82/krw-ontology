@@ -46,9 +46,9 @@ _IMPACT_CHANNEL_PATTERNS: dict[str, tuple[str, ...]] = {
 
 _CORE_DOMAIN_PATTERNS: dict[str, tuple[str, ...]] = {
     "commodity_price": ("commodity price", "commodity prices", "commodities", "commodity"),
-    "lng_market_price": ("lng", "liquefied natural gas", "lng market", "lng price", "lng prices", "lng sales"),
-    "natural_gas_price": ("natural gas", "gas price", "gas prices", "feed gas", "henry hub", "ttf"),
-    "crude_oil_price": ("crude oil", "oil price", "oil prices", "brent", "wti"),
+    "lng_market_price": ("lng", "liquefied natural gas", "lng market", "lng price", "lng prices", "lng sales", "액화천연가스"),
+    "natural_gas_price": ("natural gas", "gas price", "gas prices", "feed gas", "henry hub", "ttf", "천연가스"),
+    "crude_oil_price": ("crude oil", "oil price", "oil prices", "brent", "wti", "원유", "유가"),
     "refined_product_price": ("refined product", "refining margin", "diesel", "gasoline"),
     "shipping_chokepoint": (
         "shipping chokepoint",
@@ -59,6 +59,8 @@ _CORE_DOMAIN_PATTERNS: dict[str, tuple[str, ...]] = {
         "red sea",
         "strait of hormuz",
         "hormuz",
+        "호르무즈",
+        "해협",
         "canal",
         "shipping route",
         "vessel",
@@ -317,7 +319,21 @@ def classify_topic_match(query: QueryFrame, evidence: EvidenceFrame) -> dict[str
         | set(evidence.sector_terms)
         | set(evidence.predicate_terms)
     )
-    matched_required_facets = _matched_required(query.must_for_direct, evidence_required_pool)
+    direct_check_requires_exact_anchors = bool(
+        query.query_type == "direct_exposure_check" and query.must_for_direct
+    )
+    matched_required_facets = _matched_required(
+        query.must_for_direct,
+        evidence_required_pool,
+        strict=direct_check_requires_exact_anchors,
+        raw_evidence_terms=(
+            set(evidence.anchor_terms)
+            | set(evidence.core_domain_terms)
+            | set(evidence.mechanism_terms)
+            | set(evidence.sector_terms)
+            | set(evidence.predicate_terms)
+        ),
+    )
     matched_core = query_core_expanded & evidence_core_expanded
     matched_mechanisms = set(query.mechanism_terms) & set(evidence.mechanism_terms)
     matched_sectors = set(query.sector_terms) & set(evidence.sector_terms)
@@ -339,6 +355,7 @@ def classify_topic_match(query: QueryFrame, evidence: EvidenceFrame) -> dict[str
         evidence.mechanism_terms,
         evidence.sector_terms,
         evidence.predicate_terms,
+        strict=direct_check_requires_exact_anchors,
     )
     anchor_score = _ratio_score(matched_required_facets, query.must_for_direct, default=1.0)
     predicate_score = _ratio_score(matched_predicates, query.predicate_terms, default=0.0)
@@ -367,8 +384,14 @@ def classify_topic_match(query: QueryFrame, evidence: EvidenceFrame) -> dict[str
         or matched_predicates
         or matched_channels
     )
+    direct_required_complete = not (
+        query.query_type == "direct_exposure_check"
+        and query.must_for_direct
+        and missing_required
+    )
     if (
         anchor_requirement_met
+        and direct_required_complete
         and direct_evidence
         and not generic_only
         and has_semantic_signal
@@ -678,7 +701,16 @@ def _must_for_direct(
     return set(core_terms)
 
 
-def _matched_required(required: frozenset[str], evidence_pool: set[str]) -> set[str]:
+def _matched_required(
+    required: frozenset[str],
+    evidence_pool: set[str],
+    *,
+    strict: bool = False,
+    raw_evidence_terms: set[str] | None = None,
+) -> set[str]:
+    if strict:
+        raw_terms = raw_evidence_terms or evidence_pool
+        return {term for term in required if term in raw_terms}
     return {term for term in required if _facet_matches(term, evidence_pool)}
 
 
@@ -709,7 +741,7 @@ def _contains_phrase(text: str, phrase: str) -> bool:
 
 def _normalize(value: str) -> str:
     lowered = str(value or "").lower().replace("_", " ").replace("-", " ")
-    lowered = re.sub(r"[^a-z0-9%.$]+", " ", lowered)
+    lowered = re.sub(r"[^a-z0-9가-힣%.$]+", " ", lowered)
     return _compact_space(lowered)
 
 
@@ -736,9 +768,20 @@ def _missing_required(
     evidence_mechanisms: frozenset[str],
     evidence_sectors: frozenset[str],
     evidence_predicates: frozenset[str],
+    *,
+    strict: bool = False,
 ) -> set[str]:
     if not required:
         return set()
+    if strict:
+        evidence_terms = (
+            set(evidence_anchors)
+            | set(evidence_core)
+            | set(evidence_mechanisms)
+            | set(evidence_sectors)
+            | set(evidence_predicates)
+        )
+        return {term for term in required if term not in evidence_terms}
     evidence_expanded = (
         set(evidence_anchors)
         | _expand_core_terms(evidence_core)

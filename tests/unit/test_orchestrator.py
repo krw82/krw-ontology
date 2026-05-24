@@ -74,7 +74,7 @@ class TestPeriodOverride:
             }
             _execute_stage("discover_source_document", ctx)
 
-        assert ctx["period"] == "FY2024"
+        assert ctx["period"] == "CY2024"
 
     def test_period_derived_from_filing_date(self, tmp_path: Path):
         ctx = _make_ctx(tmp_path, period=None)
@@ -89,7 +89,7 @@ class TestPeriodOverride:
             }
             _execute_stage("discover_source_document", ctx)
 
-        assert ctx["period"] == "FY2023"
+        assert ctx["period"] == "CY2023"
 
     def test_ten_q_period_and_paths_use_10q_key(self, tmp_path: Path):
         ctx = _make_ctx(
@@ -109,10 +109,10 @@ class TestPeriodOverride:
             }
             _execute_stage("discover_source_document", ctx)
 
-        assert ctx["period"] == "FY2025Q2"
-        assert ctx["source_document_id"] == "source:AAPL:FY2025Q2:10Q"
+        assert ctx["period"] == "CY2025Q2"
+        assert ctx["source_document_id"] == "source:AAPL:CY2025Q2:10Q"
         assert ctx["ontology_dir"] == (
-            tmp_path / "companies" / "AAPL" / "ontology" / "10Q" / "FY2025Q2"
+            tmp_path / "companies" / "AAPL" / "ontology" / "10Q" / "CY2025Q2"
         )
 
 
@@ -130,7 +130,7 @@ class TestCheckpointSync:
             }
             _execute_stage("discover_source_document", ctx)
 
-        expected_cp = tmp_path / "companies" / "AAPL" / "ontology" / "10K" / "FY2024" / ".checkpoint.json"
+        expected_cp = tmp_path / "companies" / "AAPL" / "ontology" / "10K" / "CY2024" / ".checkpoint.json"
         assert ctx.get("checkpoint_path") == expected_cp
         assert ctx["checkpoint_path"].exists()
 

@@ -3,6 +3,7 @@ from krw_ontology.agent_index.retriever import (
     _annotate_retrieval_answerability,
     _split_retrieval_context,
 )
+from krw_ontology.agent_index.discovery import build_evidence_frame, build_query_frame, classify_topic_match
 
 
 def test_direct_exposure_negative_demotes_broad_commodity_context():
@@ -52,6 +53,107 @@ def test_direct_exposure_negative_demotes_broad_commodity_context():
     assert answerability["recommended_answer_mode"] == "no_direct_evidence_with_related_context"
     assert annotated[0]["tier"] == "broad_related_candidate"
     assert "technology_hardware" in annotated[0]["missing_required_facets"]
+
+
+def test_direct_exposure_requires_all_requested_direct_facets():
+    query = build_query_frame("MSFT가 HBM spot price 또는 GPU 가격에 직접 노출되어 있나?")
+    evidence = build_evidence_frame(
+        {
+            "topic_id": "topic:msft:ai-capex",
+            "ticker": "MSFT",
+            "topic_label": "AI infrastructure and GPU capacity",
+            "topic_summary": "AI infrastructure and GPU supply can increase data center capital expenditures.",
+            "topic_text": "AI infrastructure GPU supply data center capex hardware supply chain",
+            "facet_text": "GPU data center capex",
+            "impact_channels": ["capex"],
+            "primary_object_id": "factor:MSFT:ai-capex",
+            "primary_object_type": "BusinessFactor",
+            "evidence_strength": "direct",
+            "support_quote_count": 1,
+            "support_claim_count": 1,
+            "specificity_score": 0.8,
+        }
+    )
+
+    match = classify_topic_match(query, evidence)
+
+    assert match["tier"] != "direct"
+    assert "hbm" in match["missing_required_facets"]
+
+
+def test_direct_exposure_release_gate_examples_remain_related_not_direct():
+    cases = [
+        (
+            "AAPL이 LNG 가격이나 Henry Hub 가격에 직접 노출되어 있나?",
+            "Apple supply chain component costs and freight costs may pressure gross margin.",
+            {"lng", "henry_hub"},
+        ),
+        (
+            "V가 원유 가격에 직접 노출되어 있나?",
+            "Consumer spending and cross-border payment volume may change with macro conditions.",
+            {"crude_oil_price"},
+        ),
+        (
+            "MSFT가 HBM spot price에 직접 노출되어 있나?",
+            "AI infrastructure and data center capital expenditures may increase hardware costs.",
+            {"hbm"},
+        ),
+        (
+            "AMZN은 Hormuz Strait 봉쇄에 직접 노출되어 있나?",
+            "Fuel costs, shipping cost and supply chain disruption may pressure fulfillment costs.",
+            {"shipping_chokepoint"},
+        ),
+    ]
+
+    for question, evidence_text, expected_missing in cases:
+        query = build_query_frame(question)
+        evidence = build_evidence_frame(
+            {
+                "topic_id": "topic:test",
+                "ticker": "TEST",
+                "topic_label": evidence_text,
+                "topic_summary": evidence_text,
+                "topic_text": evidence_text,
+                "facet_text": evidence_text,
+                "impact_channels": [],
+                "primary_object_id": "factor:test",
+                "primary_object_type": "BusinessFactor",
+                "evidence_strength": "direct",
+                "support_quote_count": 1,
+                "support_claim_count": 1,
+                "specificity_score": 0.8,
+            }
+        )
+        match = classify_topic_match(query, evidence)
+
+        assert match["tier"] != "direct", question
+        assert expected_missing & set(match["missing_required_facets"]), question
+
+
+def test_direct_exposure_does_not_treat_lng_project_as_henry_hub_price_exposure():
+    query = build_query_frame("AAPL이 LNG 가격이나 Henry Hub 가격에 직접 노출되어 있나?")
+    evidence = build_evidence_frame(
+        {
+            "topic_id": "topic:aapl:liquefaction-project",
+            "ticker": "AAPL",
+            "topic_label": "Project Execution",
+            "topic_summary": "liquefaction project development may affect operating expense and segment revenue",
+            "topic_text": "project_execution liquefaction_project_development operating_expense revenue",
+            "facet_text": "liquefaction project development operating expense revenue",
+            "impact_channels": ["operating_expense", "revenue"],
+            "primary_object_id": "external_factor_exposure:AAPL:project-execution",
+            "primary_object_type": "ExternalFactorExposure",
+            "evidence_strength": "direct",
+            "support_quote_count": 1,
+            "support_claim_count": 1,
+            "specificity_score": 0.9,
+        }
+    )
+
+    match = classify_topic_match(query, evidence)
+
+    assert match["tier"] != "direct"
+    assert "henry_hub" in match["missing_required_facets"]
 
 
 def test_direct_exposure_positive_promotes_traceable_direct_evidence():

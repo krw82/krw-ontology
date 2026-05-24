@@ -20,6 +20,20 @@ from krw_ontology.pipeline.research_plan import ResearchFilingTarget
 runner = CliRunner()
 
 
+def _write_company_context_artifact(root: Path, ticker: str) -> Path:
+    artifact_payload = (
+        '{"artifacts":[],"counts":{"company_business_profiles":1,'
+        '"trend_observations":1,"change_events":1,"temporal_links":1,"edges":1}}'
+    )
+    artifact_index_path = root / "companies" / ticker / "context" / "artifact_index.json"
+    artifact_index_path.parent.mkdir(parents=True, exist_ok=True)
+    artifact_index_path.write_text(artifact_payload, encoding="utf-8")
+    compatibility_path = root / "companies" / ticker / "company_context" / "artifact_index.json"
+    compatibility_path.parent.mkdir(parents=True, exist_ok=True)
+    compatibility_path.write_text(artifact_payload, encoding="utf-8")
+    return artifact_index_path
+
+
 @pytest.fixture(autouse=True)
 def _clear_ontology_root_env(monkeypatch, tmp_path):
     monkeypatch.delenv("KRW_ONTOLOGY_ROOT", raising=False)
@@ -301,7 +315,7 @@ class TestBuildResearchPipelineCommand:
         def fake_build_company_context(root, ticker):
             events.append(("context", ticker))
             return {
-                "artifact_index_path": root / "companies" / ticker / "company_context" / "artifact_index.json",
+                "artifact_index_path": _write_company_context_artifact(root, ticker),
                 "counts": {"company_business_profiles": 1},
             }
 
@@ -375,7 +389,7 @@ class TestBuildResearchPipelineCommand:
 
         def fake_build_company_context(root, ticker):
             return {
-                "artifact_index_path": root / "companies" / ticker / "company_context" / "artifact_index.json",
+                "artifact_index_path": _write_company_context_artifact(root, ticker),
                 "counts": {"company_business_profiles": 1},
             }
 
@@ -432,7 +446,7 @@ class TestUpdateTickerCommand:
         def fake_build_company_context(root, ticker):
             events.append(("context", root, ticker))
             return {
-                "artifact_index_path": root / "companies" / ticker / "company_context" / "artifact_index.json",
+                "artifact_index_path": _write_company_context_artifact(root, ticker),
                 "counts": {"company_business_profiles": 1},
             }
 
@@ -493,7 +507,7 @@ class TestUpdateTickerCommand:
         def fake_build_company_context(root, ticker):
             events.append(("context", root, ticker))
             return {
-                "artifact_index_path": root / "companies" / ticker / "company_context" / "artifact_index.json",
+                "artifact_index_path": _write_company_context_artifact(root, ticker),
                 "counts": {"company_business_profiles": 1},
             }
 
@@ -548,7 +562,7 @@ class TestUpdateTickerCommand:
 
         def fake_build_company_context(root, ticker):
             return {
-                "artifact_index_path": root / "companies" / ticker / "company_context" / "artifact_index.json",
+                "artifact_index_path": _write_company_context_artifact(root, ticker),
                 "counts": {},
             }
 
@@ -1093,7 +1107,7 @@ class TestQueueCommands:
         def fake_build_company_context(root, ticker):
             events.append(("context", ticker))
             return {
-                "artifact_index_path": root / "companies" / ticker / "company_context" / "artifact_index.json",
+                "artifact_index_path": _write_company_context_artifact(root, ticker),
                 "counts": {"company_business_profiles": 1},
             }
 
@@ -1211,7 +1225,7 @@ class TestQueueCommands:
 
         def fake_build_company_context(root, ticker):
             return {
-                "artifact_index_path": root / "companies" / ticker / "company_context" / "artifact_index.json",
+                "artifact_index_path": _write_company_context_artifact(root, ticker),
                 "counts": {"company_business_profiles": 1},
             }
 
@@ -1315,7 +1329,7 @@ class TestQueueCommands:
         def fake_build_company_context(root, ticker):
             events.append(("context", ticker))
             return {
-                "artifact_index_path": root / "companies" / ticker / "company_context" / "artifact_index.json",
+                "artifact_index_path": _write_company_context_artifact(root, ticker),
                 "counts": {"company_business_profiles": 1},
             }
 
@@ -1677,6 +1691,7 @@ class TestPublishTickerCommand:
         source.mkdir(parents=True)
         target.mkdir(parents=True)
         (source / "new.txt").write_text("new")
+        _write_company_context_artifact(running, "CVX")
         (target / "old.txt").write_text("old")
         index_calls = []
 
@@ -1711,6 +1726,7 @@ class TestPublishTickerCommand:
         running = tmp_path / "running"
         stable = tmp_path / "stable"
         (running / "companies" / "OXY").mkdir(parents=True)
+        _write_company_context_artifact(running, "OXY")
         index_calls = []
 
         def fake_build_agent_index(root, *, index_path=None, force=True):

@@ -46,7 +46,7 @@ def select_research_filing_targets(
     *,
     years: int,
 ) -> list[ResearchFilingTarget]:
-    """Select latest N 10-K periods plus 10-Q periods in the current calendar year."""
+    """Select current-year 10-Q/10-K filings plus past-year annual filings."""
     if years < 1:
         raise ValueError("years must be at least 1")
 
@@ -54,12 +54,12 @@ def select_research_filing_targets(
     normalized_filings = list(filings)
     annuals = _latest_unique_periods(
         (filing for filing in normalized_filings if filing.get("document_type") == "10-K"),
-        limit=years,
+        limit=None,
     )
     if not annuals:
         raise PipelineStageError(f"research_plan: no 10-K filings found for {ticker}")
 
-    all_quarterlies = _latest_unique_periods(
+    quarterlies = _latest_unique_periods(
         (
             filing
             for filing in normalized_filings
@@ -68,15 +68,26 @@ def select_research_filing_targets(
         limit=None,
     )
     current_calendar_year = date.today().year
-    quarterlies = [
+    current_year_filings = [
         filing
-        for filing in all_quarterlies
+        for filing in [*quarterlies, *annuals]
         if _period_year(filing.get("period")) == current_calendar_year
     ]
+    if current_year_filings:
+        selected_filings = [
+            *current_year_filings,
+            *[
+                filing
+                for filing in annuals
+                if (_period_year(filing.get("period")) or 0) < current_calendar_year
+            ][: max(0, years - 1)],
+        ]
+    else:
+        selected_filings = annuals[:years]
 
     targets = [
         _to_target(ticker, filing)
-        for filing in [*annuals, *quarterlies]
+        for filing in selected_filings
         if filing.get("period")
     ]
     return sorted(targets, key=_target_sort_key)

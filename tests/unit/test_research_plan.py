@@ -20,6 +20,7 @@ def _filing(document_type: str, period: str) -> dict:
 
 def test_select_research_targets_uses_latest_annual_years_and_matching_quarters():
     filings = [
+        _filing("10-K", "FY2026"),
         _filing("10-Q", "FY2026Q1"),
         _filing("10-K", "FY2025"),
         _filing("10-Q", "FY2025Q3"),
@@ -36,14 +37,9 @@ def test_select_research_targets_uses_latest_annual_years_and_matching_quarters(
     targets = select_research_filing_targets("acme", filings, years=2)
 
     assert [(target.document_type, target.period) for target in targets] == [
-        ("10-Q", "FY2024Q1"),
-        ("10-Q", "FY2024Q2"),
-        ("10-Q", "FY2024Q3"),
-        ("10-K", "FY2024"),
-        ("10-Q", "FY2025Q1"),
-        ("10-Q", "FY2025Q2"),
-        ("10-Q", "FY2025Q3"),
         ("10-K", "FY2025"),
+        ("10-Q", "FY2026Q1"),
+        ("10-K", "FY2026"),
     ]
 
 
@@ -58,7 +54,6 @@ def test_select_research_targets_deduplicates_periods():
     targets = select_research_filing_targets("acme", filings, years=1)
 
     assert [(target.document_type, target.period) for target in targets] == [
-        ("10-Q", "FY2025Q3"),
         ("10-K", "FY2025"),
     ]
 

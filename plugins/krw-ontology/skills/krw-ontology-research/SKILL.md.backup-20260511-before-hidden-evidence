@@ -64,7 +64,7 @@ For open-ended prompts such as "What are the key risks for VG?" or "compare dema
 5. Refine with follow-up `krw_ontology_query` calls by topic/category/period. For key risks, prefer latest 10-K first, then use 10-Q only if the question asks for current or recent changes.
 6. Trace the most important returned IDs with `krw_ontology_trace`. Trace accepts exact IDs and unique ID prefixes returned by query.
 7. Check `krw_ontology_quality` before making a reliability statement.
-8. Only use `response_detail="full"` when compact output lacks necessary fields; full output can be very large.
+8. Do not use `response_detail="full"` in V1 web chat; use compact output plus selected trace/chain instead.
 
 ## Factual Lookup Questions
 

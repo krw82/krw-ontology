@@ -1,4 +1,4 @@
 interface:
   display_name: "KRW Ontology Research"
-  short_description: "Query source-grounded 10-K and 10-Q ontology evidence"
-  default_prompt: "Use $krw-ontology-research to build ResearchSynthesis with complete canonical_answer units from retrieved filing evidence. Before returning, run the final response sanitizer: remove progress narration and internal terms such as MCP, plugin, skill, ontology, agent, tool, query_context, retrieve, trace, chain, research_pack, metric_series_pack, projection_pack, diagnostics, and object type from normal visible answer text. The product runner should pass that synthesis to $krw-ontology-answer-composer for display_plan only."
+  short_description: "Answer filing-grounded equity research questions with bounded MCP evidence"
+  default_prompt: "Use $krw-ontology-research for KRW ontology filing research. Default output is Korean Markdown only. Start with query_context, respect research mode/tool budgets, use selected trace/chain only when allowed, do not expose mode/tool/pack/internal terms, use CY labels, avoid generic limitation sections, and end normal answers with exactly 3 Korean follow-up questions under '다음으로 파고들 질문'."

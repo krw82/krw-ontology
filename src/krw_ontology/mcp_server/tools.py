@@ -339,6 +339,7 @@ def query_tool(
     limit = _bounded_limit(limit)
     offset = _bounded_offset(offset)
     detail = _coerce_response_detail(response_detail)
+    detail_policy = _response_detail_policy(response_detail, detail)
     normalized_group_by = _coerce_group_by(group_by)
     limit_groups = _bounded_limit_groups(limit_groups)
     limit_per_group = _bounded_limit_per_group(limit_per_group)
@@ -361,6 +362,8 @@ def query_tool(
             "Use canonical types or aliases. Supported canonical types: "
             + ", ".join(sorted(_ALLOWED_OBJECT_TYPES)),
         )
+        payload["response_detail"] = detail.value
+        payload["response_detail_policy"] = detail_policy
         return _format_response(payload, response_format, _markdown_error)
     if answer_candidate_only:
         normalized_object_types = _answer_candidate_object_types(normalized_object_types)
@@ -400,6 +403,7 @@ def query_tool(
                 "answer_candidate_only": answer_candidate_only,
             },
             "response_detail": detail.value,
+            "response_detail_policy": detail_policy,
             **discovery,
         }
         if input_warnings:
@@ -494,6 +498,7 @@ def query_tool(
             "answer_candidate_only": answer_candidate_only,
         },
         "response_detail": detail.value,
+        "response_detail_policy": detail_policy,
         "search_diagnostics": search_diagnostics,
         "results": results,
         "pagination": _pagination(len(bundles), offset, len(page), limit),
@@ -601,6 +606,7 @@ def retrieve_tool(
     index = _index(root, index_path)
     limit = _bounded_limit(limit)
     detail = _coerce_response_detail(response_detail)
+    detail_policy = _response_detail_policy(response_detail, detail)
     normalized_group_by = _coerce_group_by(group_by)
     limit_groups = _bounded_limit_groups(limit_groups)
     limit_per_group = _bounded_limit_per_group(limit_per_group)
@@ -659,6 +665,7 @@ def retrieve_tool(
                 "answer_candidate_only": answer_candidate_only,
             },
             "response_detail": detail.value,
+            "response_detail_policy": detail_policy,
             **discovery,
         }
         if input_warnings:
@@ -719,6 +726,7 @@ def retrieve_tool(
                 "related_context": [],
                 "rejected_context": [],
                 "response_detail": detail.value,
+                "response_detail_policy": detail_policy,
             }
             if input_warnings:
                 payload["input_warnings"] = input_warnings
@@ -762,6 +770,7 @@ def retrieve_tool(
                 "related_context": [],
                 "rejected_context": [],
                 "response_detail": detail.value,
+                "response_detail_policy": detail_policy,
             }
             if input_warnings:
                 payload["input_warnings"] = input_warnings
@@ -833,6 +842,7 @@ def retrieve_tool(
     if input_warnings:
         payload["input_warnings"] = input_warnings
     payload["response_detail"] = detail.value
+    payload["response_detail_policy"] = detail_policy
     return _format_response(payload, response_format, _markdown_retrieve)
 
 
@@ -996,6 +1006,8 @@ def compare_tool(
         ticker_b=ticker_b,
     )
     input_warnings = _input_warnings(extra_args)
+    detail = _coerce_response_detail(response_detail)
+    detail_policy = _response_detail_policy(response_detail, detail)
     period_compare = len(normalized_tickers) == 1 and len(periods or []) >= 2
     if len(normalized_tickers) < 2 and not period_compare:
         payload = _error_payload(
@@ -1009,6 +1021,8 @@ def compare_tool(
             "ticker_a_alias": ticker_a,
             "ticker_b_alias": ticker_b,
         }
+        payload["response_detail"] = detail.value
+        payload["response_detail_policy"] = detail_policy
         if input_warnings:
             payload["input_warnings"] = input_warnings
         return _format_response(payload, response_format, _markdown_error)
@@ -1019,13 +1033,14 @@ def compare_tool(
             "Split the comparison into smaller batches.",
         )
         payload["query"] = {"tickers": normalized_tickers}
+        payload["response_detail"] = detail.value
+        payload["response_detail_policy"] = detail_policy
         if input_warnings:
             payload["input_warnings"] = input_warnings
         return _format_response(payload, response_format, _markdown_error)
 
     index = _index(root, index_path)
     limit_per_ticker = max(1, min(int(limit_per_ticker), 10))
-    detail = _coerce_response_detail(response_detail)
     with _store(index) as store:
         if period_compare:
             result = _compare_periods(
@@ -1094,6 +1109,7 @@ def compare_tool(
     if input_warnings:
         payload["input_warnings"] = input_warnings
     payload["response_detail"] = detail.value
+    payload["response_detail_policy"] = detail_policy
     return _format_response(payload, response_format, _markdown_compare)
 
 
@@ -1393,9 +1409,34 @@ def _store(index_path: Path) -> OntologyStore:
 
 def _coerce_response_detail(response_detail: ResponseDetail | str) -> ResponseDetail:
     try:
-        return ResponseDetail(response_detail)
+        detail = ResponseDetail(response_detail)
     except ValueError:
         return ResponseDetail.COMPACT
+    if detail == ResponseDetail.FULL:
+        return ResponseDetail.COMPACT
+    return detail
+
+
+def _response_detail_value(response_detail: ResponseDetail | str) -> str:
+    return response_detail.value if isinstance(response_detail, ResponseDetail) else str(response_detail)
+
+
+def _response_detail_policy(
+    requested_response_detail: ResponseDetail | str,
+    effective_response_detail: ResponseDetail,
+) -> dict[str, str]:
+    requested = _response_detail_value(requested_response_detail)
+    if requested == ResponseDetail.FULL.value and effective_response_detail == ResponseDetail.COMPACT:
+        action = "downgraded_full_disabled"
+    elif requested == effective_response_detail.value:
+        action = "as_requested"
+    else:
+        action = "defaulted_to_compact"
+    return {
+        "requested": requested,
+        "effective": effective_response_detail.value,
+        "action": action,
+    }
 
 
 def _normalize_metric_query_topic_for_tool(

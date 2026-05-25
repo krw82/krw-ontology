@@ -1,7 +1,7 @@
 {
   "name": "krw-ontology",
   "version": "0.1.0",
-  "description": "Source-grounded equity research ontology workflow for 10-K and 10-Q evidence, canonical answer synthesis, and frontend display planning.",
+  "description": "Filing-grounded equity research workflow with bounded MCP research, ResearchState packs, selected trace/chain expansion, and Korean Markdown synthesis.",
   "author": {
     "name": "Jeong Woncheol",
     "email": "local@example.com",
@@ -20,8 +20,8 @@
   "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "KRW Ontology",
-    "shortDescription": "Create source-grounded canonical answers and display plans from 10-K and 10-Q evidence.",
-    "longDescription": "Provides read-only MCP tools and two product skills for KRW ontology research: the runner first calls the research skill to build validated ResearchSynthesis with canonical_answer units from filing evidence, then calls the answer-composer skill to produce a frontend display_plan without rewriting the content.",
+    "shortDescription": "Answer filing-grounded equity research questions from 10-K and 10-Q evidence.",
+    "longDescription": "Provides read-only MCP tools and research skills for KRW ontology web chat. The default path uses bounded query_context-first research, ResearchState packs, selected trace/chain verification, and Korean Markdown synthesis. Structured display planning is optional and only used when explicitly requested.",
     "developerName": "Jeong Woncheol",
     "category": "Productivity",
     "capabilities": [
@@ -29,9 +29,9 @@
       "Read"
     ],
     "defaultPrompt": [
-      "Summarize AMZN from filing evidence.",
-      "Analyze VG's key risks with canonical answer units.",
-      "Compare VG and XOM capex evidence for the web UI."
+      "Apple의 최근 매출 동인과 사업 구조를 공시자료 기준으로 정리해줘.",
+      "AMZN의 AWS와 리테일 매출 구조를 비교해줘.",
+      "AAPL이 특정 원자재 가격에 직접 노출되어 있는지 확인해줘."
     ],
     "brandColor": "#2563EB"
   }

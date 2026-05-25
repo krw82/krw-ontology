@@ -1,0 +1,28 @@
+- generic [active] [ref=e1]:
+  - link "메인 콘텐츠로 이동" [ref=e2] [cursor=pointer]:
+    - /url: "#main-content"
+  - alert [ref=e3]
+  - generic [ref=e5]:
+    - banner [ref=e7]:
+      - link "KRW Ontology 홈" [ref=e9] [cursor=pointer]:
+        - /url: /
+        - generic [ref=e12]: KRW Ontology
+    - main [ref=e13]:
+      - img
+      - generic [ref=e14]:
+        - heading "무료 베타로 기업 분석 시작" [level=1] [ref=e15]
+        - paragraph [ref=e16]: 카드 등록 없이 Google 계정으로 시작합니다. 선택한 회사, 질문 기록, 무료 베타 사용량을 안전하게 이어서 확인할 수 있습니다.
+        - generic [ref=e17]:
+          - button "Google로 무료 시작" [ref=e18]:
+            - generic:
+              - generic:
+                - img
+            - text: Google로 무료 시작
+          - paragraph [ref=e19]: 무료 베타 · 카드 불필요 · 로그인 후 이전 화면으로 돌아갑니다.
+    - contentinfo [ref=e20]:
+      - generic [ref=e21]:
+        - generic [ref=e22]: © 2026 KRW Ontology. 모든 권리 보유.
+        - link "개인정보처리방침" [ref=e23] [cursor=pointer]:
+          - /url: /privacy
+        - link "서비스 약관" [ref=e24] [cursor=pointer]:
+          - /url: /terms

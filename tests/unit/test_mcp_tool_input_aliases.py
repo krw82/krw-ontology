@@ -169,3 +169,45 @@ def test_compare_tool_accepts_single_ticker_alias_for_period_compare(tmp_path: P
     assert payload["mode"] == "period_topic"
     assert payload["kernel"]["intent"] == "comparison"
     assert {row["comparison_key"] for row in payload["comparison_rows"]} == {"FY2024", "FY2025"}
+
+
+def test_full_response_detail_is_globally_downgraded(tmp_path: Path) -> None:
+    _write_fixture(tmp_path)
+    build_agent_index(tmp_path)
+
+    query_payload = json.loads(
+        query_tool(
+            root=str(tmp_path),
+            topic="revenue growth",
+            ticker="VG",
+            response_detail="full",
+            limit=3,
+        )
+    )
+    retrieve_payload = json.loads(
+        retrieve_tool(
+            root=str(tmp_path),
+            question="VG revenue growth evidence",
+            ticker="VG",
+            response_detail="full",
+            limit=3,
+        )
+    )
+    compare_payload = json.loads(
+        compare_tool(
+            root=str(tmp_path),
+            ticker="VG",
+            periods=["FY2024", "FY2025"],
+            topic="revenue growth",
+            response_detail="full",
+            limit_per_ticker=1,
+        )
+    )
+
+    for payload in (query_payload, retrieve_payload, compare_payload):
+        assert payload["response_detail"] == "compact"
+        assert payload["response_detail_policy"] == {
+            "requested": "full",
+            "effective": "compact",
+            "action": "downgraded_full_disabled",
+        }

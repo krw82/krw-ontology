@@ -500,6 +500,9 @@ The display planner may ignore `recommended_blocks` when a simpler markdown layo
 - Do not expose ontology object type names such as `ResearchClaim`, `EvidenceQuote`, `BusinessFactor`, `BusinessActivity`, `ExternalFactorExposure`, `MetricObservation`, `Calculation`, `XBRLFact`, `AgreementTerm`, `BusinessEvent`, `SupportLink`, `Edge`, `CompanyBusinessProfile`, `RiskFactor`, `GrowthDriver`, `Headwind`, `FinancialMetricValue`, `DerivedMetricValue`, `NumericEvidence`, `객체`, or `온톨로지 객체` in visible canonical units unless the user explicitly asks for audit/debug output.
 - Do not paste original filing quote text into visible canonical units. Use reader-facing source labels only, and keep quote text inside evidence refs or hidden/internal units by default.
 - Do not add customer-facing sections named "quality note", "품질 노트", "coverage note", "debug note", "데이터 커버리지", or similar operational footers unless the user explicitly asks for them.
+- Do not leak progress narration such as "진행 중입니다", "확인 중입니다", "분석 중입니다", "검색해보겠습니다", "tool call", "progress", "step 1", or "I will search" into visible canonical units.
+- Do not expose implementation vocabulary such as `MCP`, `plugin`, `skill`, `ontology`, `온톨로지`, `agent`, `tool`, `query_context`, `retrieve`, `trace`, `chain`, `research_pack`, `metric_series_pack`, `projection_pack`, `chain_pack`, `diagnostics`, or `object type` in normal visible units.
+- Before finalizing visible units, run a final response sanitizer pass and rewrite internal wording into filing-facing language such as "공시자료에서 확인되는 내용", "공시된 수치 기준", "관련 맥락", or "직접 확인되는 내용은 아닙니다".
 - Do not let numeric values pass through unless they are validated.
 - Do not leave the display planner to infer missing content.
 - Do not answer a direct exposure question with broad related evidence as if it were direct.

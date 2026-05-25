@@ -129,12 +129,29 @@ Return the compact index capability card. Use this instead of trying to infer cu
 
 Useful parameters:
 
-- `include_counts`: include object and serving-table counts
+- `include_counts`: request object and serving-table counts
 - `include_capabilities`: include available context/retrieval capabilities
-- `include_quality_summary`: include compact quality counters
+- `include_quality_summary`: request compact quality counters
+- `allow_expensive`: must be `true` to return expensive counts or quality summary scans
 - `response_format`: `json` or `markdown`
 
-Use this early when the current index coverage, schema version, topic-index availability, or answerability behavior is unclear.
+Use this only when the current index coverage, schema version, topic-index availability, or answerability behavior is unclear. Do not call it in normal research answers.
+
+Current MCP behavior:
+
+```text
+No-args index_context is lightweight by default.
+Expensive counts and quality summary scans are disabled unless allow_expensive=true.
+Normal research should use krw_ontology_query_context instead.
+```
+
+Bad normal research usage:
+
+```text
+Question: AAPL iPhone 매출 비중 알려줘.
+Bad: call krw_ontology_index_context.
+Good: call krw_ontology_query_context.
+```
 
 ## `krw_ontology_company_context`
 
@@ -165,17 +182,46 @@ Useful parameters:
 - `include_internal_ids`: default `true`; IDs are internal trace inputs only
 - `response_format`: `json` or `markdown`
 
-Use this for broad, multi-ticker, direct-exposure, scenario, and ambiguous natural-language questions before writing the answer. Inspect:
+Use this for broad, multi-ticker, direct-exposure, scenario, metric-series, projection-routed, and ambiguous natural-language questions before writing the answer. Inspect the current research context envelope:
 
 ```text
+research_context_version
+research_status
+research_pack.metric_series_pack
+research_pack.projection_pack
+research_pack.chain_pack
+research_pack.company_topic_pack
+research_pack.directness_guard
+research_pack.stop_guard
+research_pack.valuation_guard
+agent_autonomy.mode
+agent_autonomy.allowed_next_tools
+agent_autonomy.max_additional_tool_calls
+missing_parts
+do_not_call
 query_frame
 answerability
 ticker_candidates
 recommended_tools
 final_answer_guidance
+search_diagnostics
 ```
 
 If `answerability.direct_answerable=false` and `related_context_available=true`, do not promote related context into a direct answer. Trace only the recommended final or related-context objects.
+
+Current high-value `research_status` values:
+
+```text
+sufficient_for_default_answer
+sufficient_but_trace_recommended
+partial_answer_possible
+needs_targeted_followup
+no_direct_evidence_with_related_context
+out_of_scope_for_filing_ontology
+not_answerable
+```
+
+When `research_pack.metric_series_pack.mode = "metric_dimension_lookup"`, use the returned series, roles, denominator, and calculations instead of launching separate broad metric searches. When `research_pack.projection_pack` is present, treat it as candidate routing unless trace/tier metadata supports a strong claim. When `research_pack.chain_pack.mode = "lazy_root_candidates"`, use those roots for bounded chain expansion.
 
 ## `krw_ontology_query`
 
@@ -213,7 +259,7 @@ Common warnings:
 
 ## `krw_ontology_retrieve`
 
-Use the deterministic local planner for natural-language questions. This is convenient but less controllable than `krw_ontology_query`.
+Use the deterministic local planner for natural-language questions. It now calls the research context path first and may skip legacy retrieval when the research context is already sufficient.
 
 Important rule:
 
@@ -221,6 +267,25 @@ Important rule:
 The retrieve contract is answerability-aware, not a flat result list.
 Use answerability, direct_evidence, related_context, rejected_context, tier, trace_status, and why_tier.
 ```
+
+If `research_context.research_status` is sufficient and `research_context.do_not_call` includes `krw_ontology_retrieve`, the tool may return:
+
+```json
+{
+  "legacy_retrieve_skipped": true,
+  "research_status": "sufficient_for_default_answer",
+  "research_pack": {
+    "metric_series_pack": {},
+    "projection_pack": {},
+    "chain_pack": {}
+  },
+  "agent_autonomy": {},
+  "missing_parts": [],
+  "do_not_call": []
+}
+```
+
+In that case, do not issue another broad retrieve. Use the research context or make only the targeted follow-up allowed by `agent_autonomy.allowed_next_tools`.
 
 Expected high-quality response shape:
 
@@ -435,6 +500,8 @@ Returns:
 - `quality`: evidence grade and warnings such as missing support, rejected object status, stale artifact status, or weak evidence
 
 Use `trace` for one object's source evidence. Use `chain` when connected business meaning matters. Keep `max_depth` bounded to avoid flooding the model with low-value graph neighbors.
+
+When `query_context` already returns `research_pack.chain_pack.mode = "lazy_root_candidates"`, prefer those roots before calling `chain` manually. Chain is selected-candidate expansion, not search replacement.
 
 ## `krw_ontology_quality`
 

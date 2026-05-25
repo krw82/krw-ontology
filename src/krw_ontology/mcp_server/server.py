@@ -114,9 +114,10 @@ async def krw_ontology_catalog(
 async def krw_ontology_index_context(
     root: str | None = None,
     index_path: str | None = None,
-    include_counts: bool = True,
+    include_counts: bool = False,
     include_capabilities: bool = True,
-    include_quality_summary: bool = True,
+    include_quality_summary: bool = False,
+    allow_expensive: bool = False,
     response_format: ResponseFormat = ResponseFormat.JSON,
 ) -> str:
     """Return index schema, capabilities, coverage, and answerability policy."""
@@ -126,6 +127,7 @@ async def krw_ontology_index_context(
         include_counts=include_counts,
         include_capabilities=include_capabilities,
         include_quality_summary=include_quality_summary,
+        allow_expensive=allow_expensive,
         response_format=response_format,
     )
 

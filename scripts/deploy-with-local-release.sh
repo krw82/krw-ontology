@@ -213,6 +213,11 @@ fi
 run mkdir -p "$RELEASE_TMP"
 run rsync -a --delete \
   --exclude '.krw_pipeline/' \
+  --exclude 'indexes/*.sqlite-wal' \
+  --exclude 'indexes/*.sqlite-shm' \
+  --exclude 'indexes/*.sqlite.bak*' \
+  --exclude 'indexes/*.sqlite-wal.bak*' \
+  --exclude 'indexes/*.sqlite-shm.bak*' \
   "$DATA_DIR"/ "$RELEASE_TMP"/
 
 if [ "$DRY_RUN" = "0" ]; then
@@ -221,8 +226,10 @@ if [ "$DRY_RUN" = "0" ]; then
 fi
 
 run mv "$RELEASE_TMP" "$RELEASE_DIR"
-run ln -sfn "releases/$RELEASE_ID" "$RELEASE_ROOT/current.next"
-run mv -f "$RELEASE_ROOT/current.next" "$CURRENT_LINK"
+run rm -f "$RELEASE_ROOT/current.next"
+run ln -s "releases/$RELEASE_ID" "$RELEASE_ROOT/current.next"
+run rm -f "$CURRENT_LINK"
+run mv "$RELEASE_ROOT/current.next" "$CURRENT_LINK"
 
 echo "Local release activated: $CURRENT_LINK -> releases/$RELEASE_ID"
 

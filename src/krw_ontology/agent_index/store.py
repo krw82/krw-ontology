@@ -709,6 +709,63 @@ class OntologyStore:
             _query_context_cache_set(cache_key, payload)
             return payload
 
+        planning_started_at = time.perf_counter()
+        early_query_frame: dict[str, Any] = {"raw_query": question}
+        if _question_requires_direct_match(question):
+            early_query_frame["question_requires_direct_match"] = True
+        early_answerability = _answerability_from_candidates(early_query_frame, [])
+        if requested_tickers:
+            early_research_pack = self._research_context_pack(
+                question=question,
+                search_topic=None,
+                query_frame=early_query_frame,
+                answerability=early_answerability,
+                requested_tickers=requested_tickers,
+                document_types=document_types,
+                periods=periods,
+                selected_candidates=[],
+                recommended_tools=[],
+                limit_results=limit_results,
+                include_internal_ids=include_internal_ids,
+            )
+            early_research_status = _research_status_from_pack(
+                answerability=early_answerability,
+                candidates=[],
+                research_pack=early_research_pack,
+            )
+            early_missing_parts = _research_missing_parts(early_research_pack)
+            if _research_pack_can_skip_discovery(early_research_status, early_research_pack, question=question):
+                payload = {
+                    "question": question,
+                    "query_frame": early_query_frame,
+                    "answerability": early_answerability,
+                    "ticker_candidates": [],
+                    "recommended_tools": [],
+                    "search_diagnostics": _research_pack_search_diagnostics(
+                        early_research_pack,
+                        mode="research_context_fast_path",
+                        discovery_skipped=True,
+                        query_context_started_at=query_context_started_at,
+                        planning_started_at=planning_started_at,
+                    ),
+                    "final_answer_guidance": _final_answer_guidance(early_answerability, []),
+                    "research_context_version": "v1",
+                    "research_status": early_research_status,
+                    "research_pack": early_research_pack,
+                    "missing_parts": early_missing_parts,
+                    "agent_autonomy": _research_agent_autonomy(
+                        early_research_status,
+                        needs_trace=False,
+                        missing_parts=early_missing_parts,
+                    ),
+                    "do_not_call": _research_do_not_call(early_research_status),
+                    "internal_only_fields": ["topic_id", "primary_object_id", "source_object_ids", "top_traceable_object_ids", "recommended_tools.object_id"],
+                }
+                if include_internal_ids:
+                    payload["results_by_ticker"] = {}
+                _query_context_cache_set(cache_key, payload)
+                return payload
+
         discovery_started_at = time.perf_counter()
         discovery = self.discover_company_topics(
             question=question,
@@ -781,6 +838,17 @@ class OntologyStore:
             timing["query_context_planning"] = int((time.perf_counter() - planning_started_at) * 1000)
             timing["query_context_total"] = int((time.perf_counter() - query_context_started_at) * 1000)
             search_diagnostics["timing_ms"] = timing
+            pack_diagnostics = _research_pack_search_diagnostics(
+                research_pack,
+                mode="research_context_with_discovery",
+                discovery_skipped=False,
+                query_context_started_at=query_context_started_at,
+                planning_started_at=planning_started_at,
+            )
+            if pack_diagnostics.get("typed_projection"):
+                search_diagnostics.setdefault("typed_projection", pack_diagnostics["typed_projection"])
+            if pack_diagnostics.get("metric_series"):
+                search_diagnostics.setdefault("metric_series", pack_diagnostics["metric_series"])
         _query_context_cache_set(cache_key, payload)
         return payload
 
@@ -867,7 +935,24 @@ class OntologyStore:
         object_ids: Sequence[str],
         *,
         include_internal_ids: bool,
+        expand_chains: bool = False,
     ) -> dict[str, Any]:
+        root_candidates: list[dict[str, Any]] = []
+        for index, object_id in enumerate(object_ids[:2]):
+            candidate: dict[str, Any] = {"root_index": index}
+            if include_internal_ids:
+                candidate["root_object_id"] = object_id
+            root_candidates.append(candidate)
+        if not expand_chains:
+            return {
+                "mode": "lazy_root_candidates",
+                "chain_depth": 0,
+                "max_roots": 2,
+                "root_candidates": root_candidates,
+                "primary_chains": [],
+                "needs_additional_chain": bool(root_candidates),
+                "allowed_additional_chain_depth": 1,
+            }
         chains: list[dict[str, Any]] = []
         for object_id in object_ids[:2]:
             chain = self.chain(object_id, max_depth=1, direction="both", include_quote_text=False)
@@ -3279,6 +3364,8 @@ class OntologyStore:
                 continue
             term_match = topic_terms.intersection(set(spec["terms"]))
             type_is_narrow = explicit_object_types and selected_types.issubset(projection_types)
+            if table_name == "factor_lookup" and not type_is_narrow and len(term_match) < 2:
+                continue
             if term_match or type_is_narrow:
                 return {
                     "enabled": True,
@@ -4553,7 +4640,7 @@ def _projection_research_pack(
     directness_guard = _research_directness_guard(query_frame, answerability)
     return {
         "mode": strategy.get("mode"),
-        "table": strategy.get("table"),
+        "table": strategy.get("table") or strategy.get("projection_used"),
         "matched_terms": strategy.get("matched_terms") or [],
         "result_count": len(candidates),
         "candidates": candidates,
@@ -4651,6 +4738,11 @@ def _research_status_from_pack(
         if not (metric_pack.get("quality") or {}).get("missing_parts"):
             return "sufficient_for_default_answer"
         return "partial_answer_possible"
+    projection_pack = research_pack.get("projection_pack")
+    if isinstance(projection_pack, Mapping) and projection_pack.get("result_count"):
+        if not (projection_pack.get("quality") or {}).get("missing_parts"):
+            return "sufficient_but_trace_recommended"
+        return "partial_answer_possible"
     if answerability.get("direct_answerable"):
         return "sufficient_but_trace_recommended"
     if answerability.get("recommended_answer_mode") == "no_direct_evidence_with_related_context":
@@ -4658,6 +4750,93 @@ def _research_status_from_pack(
     if candidates:
         return "partial_answer_possible" if not answerability.get("related_context_available") else "sufficient_but_trace_recommended"
     return "needs_targeted_followup"
+
+
+def _research_pack_can_skip_discovery(
+    research_status: str,
+    research_pack: Mapping[str, Any],
+    *,
+    question: str,
+) -> bool:
+    if _research_question_needs_company_topic_context(question):
+        return False
+    if research_status == "sufficient_for_default_answer":
+        return True
+    projection_pack = research_pack.get("projection_pack")
+    if not isinstance(projection_pack, Mapping) or not projection_pack.get("result_count"):
+        return False
+    directness = projection_pack.get("directness") if isinstance(projection_pack.get("directness"), Mapping) else {}
+    if directness.get("requires_direct_match"):
+        return False
+    return research_status == "sufficient_but_trace_recommended"
+
+
+def _research_question_needs_company_topic_context(question: str | None) -> bool:
+    text = str(question or "").lower()
+    return any(
+        term in text
+        for term in (
+            "driver",
+            "drivers",
+            "factor",
+            "factors",
+            "impact",
+            "mechanism",
+            "risk",
+            "risks",
+            "regulatory",
+            "why",
+            "cause",
+            "causes",
+            "because",
+            "리스크",
+            "위험",
+            "규제",
+            "영향",
+            "요인",
+            "원인",
+            "이유",
+            "메커니즘",
+        )
+    )
+
+
+def _research_pack_search_diagnostics(
+    research_pack: Mapping[str, Any],
+    *,
+    mode: str,
+    discovery_skipped: bool,
+    query_context_started_at: float,
+    planning_started_at: float,
+) -> dict[str, Any]:
+    diagnostics: dict[str, Any] = {
+        "mode": mode,
+        "discovery_skipped": discovery_skipped,
+        "timing_ms": {
+            "query_context_planning": int((time.perf_counter() - planning_started_at) * 1000),
+            "query_context_total": int((time.perf_counter() - query_context_started_at) * 1000),
+        },
+    }
+    metric_pack = research_pack.get("metric_series_pack")
+    if isinstance(metric_pack, Mapping):
+        diagnostics["metric_series"] = {
+            "mode": metric_pack.get("mode"),
+            "result_count": metric_pack.get("result_count"),
+            "roles": metric_pack.get("roles") or [],
+            "dimension_anchors": metric_pack.get("dimension_anchors") or [],
+            "period_years": metric_pack.get("period_years") or [],
+            "quality": metric_pack.get("quality") or {},
+        }
+    projection_pack = research_pack.get("projection_pack")
+    if isinstance(projection_pack, Mapping):
+        diagnostics["typed_projection"] = {
+            "projection_used": projection_pack.get("table"),
+            "projection_candidate_count": projection_pack.get("result_count"),
+            "projection_sufficient": bool(projection_pack.get("result_count")),
+            "matched_terms": projection_pack.get("matched_terms") or [],
+            "quality": projection_pack.get("quality") or {},
+        }
+    return diagnostics
 
 
 def _research_agent_autonomy(

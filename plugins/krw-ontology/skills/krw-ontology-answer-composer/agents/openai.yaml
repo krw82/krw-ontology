@@ -1,4 +1,4 @@
 interface:
   display_name: "KRW Ontology Answer Composer"
   short_description: "Create display plans for validated KRW canonical answer units"
-  default_prompt: "Use $krw-ontology-answer-composer only after ResearchSynthesis with canonical_answer.units exists. Return display_plan only; do not rewrite content or add facts."
+  default_prompt: "Use $krw-ontology-answer-composer only after ResearchSynthesis with canonical_answer.units exists. Return display_plan only; do not rewrite content, add facts, narrate progress, or mention internal terms such as MCP, plugin, skill, ontology, agent, tool, diagnostics, object type, research_pack, metric_series_pack, projection_pack, or chain_pack."

@@ -10,12 +10,14 @@ import pytest
 from krw_ontology.agent_index import builder as agent_index_builder
 from krw_ontology.agent_index import store as agent_index_store
 from krw_ontology.agent_index import OntologyStore, build_agent_index
+from krw_ontology.mcp_server import tools as mcp_tools
 from krw_ontology.mcp_server.server import health_payload, mcp
 from krw_ontology.mcp_server.tools import (
     _normalize_object_types,
     catalog_tool,
     chain_tool,
     compare_tool,
+    index_context_tool,
     plan_query_tool,
     quality_tool,
     query_context_tool,
@@ -383,6 +385,139 @@ def test_mcp_server_registers_expected_tools():
     }.issubset(tool_names)
 
 
+def test_mcp_index_context_defaults_to_lightweight_guard(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _write_fixture(tmp_path)
+    build_agent_index(tmp_path)
+    monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
+
+    payload = json.loads(index_context_tool())
+
+    assert payload["index_status"] == "ready"
+    assert "capabilities" in payload
+    assert "object_counts" not in payload
+    assert "serving_counts" not in payload
+    assert "quality_summary" not in payload
+    assert payload["index_context_guard"] == {
+        "mode": "lightweight_by_default",
+        "diagnostic_only": True,
+        "expensive_counts_requested": False,
+        "expensive_quality_summary_requested": False,
+        "allow_expensive": False,
+        "counts_returned": False,
+        "quality_summary_returned": False,
+        "reason": (
+            "index_context is an operational/debug capability card. "
+            "Expensive table counts and quality summary scans are disabled by default; "
+            "use query_context for normal research questions."
+        ),
+        "how_to_enable_expensive": (
+            "Pass allow_expensive=true with include_counts and/or include_quality_summary "
+            "only for explicit audit/debug operations."
+        ),
+        "recommended_normal_research_tool": "krw_ontology_query_context",
+    }
+
+
+def test_mcp_index_context_requires_explicit_allow_expensive_for_counts(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _write_fixture(tmp_path)
+    build_agent_index(tmp_path)
+    monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
+
+    guarded = json.loads(
+        index_context_tool(
+            include_counts=True,
+            include_quality_summary=True,
+        )
+    )
+    assert "serving_counts" not in guarded
+    assert "quality_summary" not in guarded
+    assert guarded["index_context_guard"]["expensive_counts_requested"] is True
+    assert guarded["index_context_guard"]["expensive_quality_summary_requested"] is True
+    assert guarded["index_context_guard"]["counts_returned"] is False
+    assert guarded["index_context_guard"]["quality_summary_returned"] is False
+
+    audit = json.loads(
+        index_context_tool(
+            include_counts=True,
+            include_quality_summary=True,
+            allow_expensive=True,
+        )
+    )
+    assert audit["serving_counts"]["objects"] > 0
+    assert audit["quality_summary"]["critical_errors"] == 0
+    assert audit["index_context_guard"]["counts_returned"] is True
+    assert audit["index_context_guard"]["quality_summary_returned"] is True
+
+
+def test_mcp_index_context_logs_guard_timing(
+    tmp_path: Path,
+    monkeypatch,
+    caplog,
+):
+    _write_fixture(tmp_path)
+    build_agent_index(tmp_path)
+    monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
+
+    with caplog.at_level("INFO", logger=mcp_tools.LOGGER.name):
+        index_context_tool(include_counts=True)
+
+    messages = "\n".join(record.getMessage() for record in caplog.records)
+    assert "[krw-ontology:mcp-slow-path]" in messages
+    assert '"tool_name": "krw_ontology_index_context"' in messages
+    assert '"include_counts_requested": true' in messages
+    assert '"counts_returned": false' in messages
+
+
+def test_mcp_query_logs_slow_timing_without_raw_topic(
+    tmp_path: Path,
+    monkeypatch,
+    caplog,
+):
+    _write_fixture(tmp_path)
+    build_agent_index(tmp_path)
+    monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
+    monkeypatch.setattr(mcp_tools, "SLOW_MCP_TOOL_LOG_THRESHOLD_MS", 0)
+
+    raw_topic = "revenue growth"
+    with caplog.at_level("INFO", logger=mcp_tools.LOGGER.name):
+        query_tool(topic=raw_topic, ticker="VG", limit=5)
+
+    messages = "\n".join(record.getMessage() for record in caplog.records)
+    assert "[krw-ontology:mcp-slow-path]" in messages
+    assert '"tool_name": "krw_ontology_query"' in messages
+    assert '"topic_chars": 14' in messages
+    assert '"response_detail": "compact"' in messages
+    assert raw_topic not in messages
+
+
+def test_mcp_query_context_logs_slow_timing_without_raw_question(
+    tmp_path: Path,
+    monkeypatch,
+    caplog,
+):
+    _write_fixture(tmp_path)
+    build_agent_index(tmp_path)
+    monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
+    monkeypatch.setattr(mcp_tools, "SLOW_MCP_TOOL_LOG_THRESHOLD_MS", 0)
+
+    raw_question = "VG revenue growth and regulatory risk mechanism"
+    with caplog.at_level("INFO", logger=mcp_tools.LOGGER.name):
+        query_context_tool(question=raw_question, ticker="VG", limit_results=5)
+
+    messages = "\n".join(record.getMessage() for record in caplog.records)
+    assert "[krw-ontology:mcp-slow-path]" in messages
+    assert '"tool_name": "krw_ontology_query_context"' in messages
+    assert '"question_chars": 47' in messages
+    assert '"ticker_count": 1' in messages
+    assert raw_question not in messages
+
+
 def test_mcp_query_context_returns_research_pack_and_bounded_chain(
     tmp_path: Path,
     monkeypatch,
@@ -467,6 +602,8 @@ def test_mcp_query_context_includes_metric_series_research_pack(
     metric_pack = payload["research_pack"]["metric_series_pack"]
     assert payload["research_context_version"] == "v1"
     assert payload["research_status"] == "sufficient_for_default_answer"
+    assert payload["search_diagnostics"]["discovery_skipped"] is True
+    assert payload["search_diagnostics"]["metric_series"]["mode"] == "metric_dimension_lookup"
     assert metric_pack["mode"] == "metric_dimension_lookup"
     assert metric_pack["result_count"] > 0
     assert "target_dimension_metric" in metric_pack["roles"]
@@ -483,6 +620,7 @@ def test_mcp_query_context_includes_metric_series_research_pack(
     assert metric_pack["quality"]["period_alignment"] is True
     assert metric_pack["quality"]["unit_consistency"] is True
     assert metric_pack["quality"]["dimension_metric_not_found"] is False
+    assert payload["research_pack"]["chain_pack"]["mode"] == "lazy_root_candidates"
 
 
 def test_mcp_query_context_projection_pack_marks_candidates_search_only_for_direct_question(
@@ -698,6 +836,31 @@ def test_mcp_retrieve_attaches_research_context_for_normal_question(
     assert "krw_ontology_retrieve" in payload["research_context"]["do_not_call"]
     assert "strong_claim_allowed" in payload["directness_guard"]
     assert payload["research_context"]["directness_guard"] == payload["directness_guard"]
+
+
+def test_mcp_retrieve_skips_legacy_when_research_context_is_sufficient(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _write_metric_dimension_fixture(tmp_path)
+    build_agent_index(tmp_path)
+    monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
+
+    payload = json.loads(
+        retrieve_tool(
+            question="AAPL의 iPhone과 Services 매출 비중은 2021~2025년에 어떻게 달라졌는지 비교해줘.",
+            ticker="AAPL",
+            periods=["CY2021", "CY2022", "CY2023", "CY2024", "CY2025"],
+            limit=5,
+        )
+    )
+
+    assert payload["research_status"] == "sufficient_for_default_answer"
+    assert payload["legacy_retrieve_skipped"] is True
+    assert payload["research_pack"]["metric_series_pack"]["mode"] == "metric_dimension_lookup"
+    assert payload["direct_evidence"] == []
+    assert payload["related_context"] == []
+    assert "krw_ontology_retrieve" in payload["do_not_call"]
 
 
 def test_mcp_retrieve_exposes_directness_guard_for_direct_question(
@@ -1923,6 +2086,27 @@ def test_typed_projection_lookup_tables_and_query_routing(tmp_path: Path) -> Non
         assert exposure_results[0]["type"] == "ExternalFactorExposure"
         assert exposure_diagnostics["projection"]["projection_used"] == "exposure_lookup"
 
+        broad_factor_profile = store._typed_projection_profile(
+            topic="risk",
+            object_types=["BusinessFactor"],
+            explicit_object_types=False,
+        )
+        assert broad_factor_profile["enabled"] is False
+        routed_factor_profile = store._typed_projection_profile(
+            topic="margin pressure risk",
+            object_types=["BusinessFactor"],
+            explicit_object_types=False,
+        )
+        assert routed_factor_profile["enabled"] is True
+        assert routed_factor_profile["table"] == "factor_lookup"
+        explicit_factor_profile = store._typed_projection_profile(
+            topic="risk",
+            object_types=["BusinessFactor"],
+            explicit_object_types=True,
+        )
+        assert explicit_factor_profile["enabled"] is True
+        assert explicit_factor_profile["table"] == "factor_lookup"
+
         event_context = store.query_context(
             question="VG regulatory approval delay timeline",
             ticker="VG",
@@ -1932,3 +2116,16 @@ def test_typed_projection_lookup_tables_and_query_routing(tmp_path: Path) -> Non
         typed_projection = event_context["search_diagnostics"].get("typed_projection")
         assert typed_projection is not None
         assert typed_projection["projection_used"] == "event_lookup"
+        assert event_context["research_status"] == "sufficient_but_trace_recommended"
+
+        agreement_context = store.query_context(
+            question="VG SPA termination covenant",
+            ticker="VG",
+            limit_results=5,
+            limit_tickers=3,
+        )
+        agreement_projection = agreement_context["search_diagnostics"].get("typed_projection")
+        assert agreement_projection is not None
+        assert agreement_projection["projection_used"] == "agreement_lookup"
+        assert agreement_context["search_diagnostics"]["discovery_skipped"] is True
+        assert agreement_context["research_status"] == "sufficient_but_trace_recommended"

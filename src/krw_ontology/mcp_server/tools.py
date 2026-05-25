@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from enum import Enum
 import json
+import logging
 import re
+import time
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -28,6 +30,75 @@ class ResponseDetail(str, Enum):
     COMPACT = "compact"
     TICKER_SUMMARY = "ticker_summary"
     FULL = "full"
+
+
+LOGGER = logging.getLogger(__name__)
+SLOW_MCP_TOOL_LOG_THRESHOLD_MS = 5_000
+_SLOW_MCP_TOOL_LOG_MARKER = "[krw-ontology:mcp-slow-path]"
+
+
+def _elapsed_ms(started_at: float) -> int:
+    return int((time.perf_counter() - started_at) * 1000)
+
+
+def _count_items(value: Any) -> int:
+    if value is None:
+        return 0
+    if isinstance(value, str):
+        return 1 if value else 0
+    try:
+        return len(value)
+    except TypeError:
+        return 1
+
+
+def _safe_text_length(value: Any) -> int:
+    return len(value) if isinstance(value, str) else 0
+
+
+def _safe_payload_dict(payload: Any) -> Mapping[str, Any]:
+    return payload if isinstance(payload, Mapping) else {}
+
+
+def _log_mcp_tool_timing(
+    tool_name: str,
+    *,
+    duration_ms: int,
+    force: bool = False,
+    **fields: Any,
+) -> None:
+    if not force and duration_ms < SLOW_MCP_TOOL_LOG_THRESHOLD_MS:
+        return
+    safe_fields = {
+        key: value
+        for key, value in fields.items()
+        if value is not None
+    }
+    LOGGER.warning(
+        "%s %s",
+        _SLOW_MCP_TOOL_LOG_MARKER,
+        json.dumps(
+            {
+                "tool_name": tool_name,
+                "duration_ms": duration_ms,
+                **safe_fields,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        ),
+    )
+
+
+def _diagnostic_timing_ms(payload: Mapping[str, Any]) -> Any:
+    diagnostics = _safe_payload_dict(payload.get("search_diagnostics"))
+    timing_ms = diagnostics.get("timing_ms")
+    return timing_ms if isinstance(timing_ms, Mapping) else None
+
+
+def _diagnostic_keys(payload: Mapping[str, Any]) -> list[str]:
+    diagnostics = _safe_payload_dict(payload.get("search_diagnostics"))
+    return sorted(str(key) for key in diagnostics.keys()) if diagnostics else []
 
 
 DEFAULT_LIMIT = 10
@@ -256,6 +327,7 @@ def query_tool(
     **extra_args: Any,
 ) -> str:
     """Search accepted ontology objects and return evidence bundles."""
+    started_at = time.perf_counter()
     index = _index(root, index_path)
     limit = _bounded_limit(limit)
     offset = _bounded_offset(offset)
@@ -337,6 +409,22 @@ def query_tool(
             len(payload.get("ticker_candidates") or []),
             limit_groups,
         )
+        _log_mcp_tool_timing(
+            "krw_ontology_query",
+            duration_ms=_elapsed_ms(started_at),
+            topic_chars=_safe_text_length(topic),
+            ticker_count=_count_items(normalized_tickers),
+            document_type_count=_count_items(normalized_document_types),
+            period_count=_count_items(normalized_periods),
+            object_type_count=_count_items(normalized_object_types),
+            response_detail=detail.value,
+            summary_mode=True,
+            group_by=normalized_group_by,
+            limit=limit,
+            offset=offset,
+            result_count=len(payload.get("ticker_candidates") or []),
+            input_warning_count=len(input_warnings),
+        )
         return _format_response(payload, response_format, _markdown_bundles)
 
     with _store(index) as store:
@@ -415,6 +503,26 @@ def query_tool(
             len(payload.get("ticker_candidates") or []),
             limit_groups,
         )
+    _log_mcp_tool_timing(
+        "krw_ontology_query",
+        duration_ms=_elapsed_ms(started_at),
+        topic_chars=_safe_text_length(topic),
+        ticker_count=_count_items(normalized_tickers),
+        document_type_count=_count_items(normalized_document_types),
+        period_count=_count_items(normalized_periods),
+        object_type_count=_count_items(normalized_object_types),
+        response_detail=detail.value,
+        summary_mode=summary_mode,
+        group_by=normalized_group_by,
+        limit=limit,
+        offset=offset,
+        result_count=len(results) if "results" in payload else len(payload.get("ticker_candidates") or []),
+        bundle_count=len(bundles),
+        topic_normalized=bool(topic_normalization),
+        input_warning_count=len(input_warnings),
+        search_diagnostics_keys=_diagnostic_keys(payload),
+        timing_ms=_diagnostic_timing_ms(payload),
+    )
     return _format_response(payload, response_format, _markdown_bundles)
 
 
@@ -577,6 +685,47 @@ def retrieve_tool(
                 "agent_autonomy": research_context.get("agent_autonomy"),
                 "missing_parts": research_context.get("missing_parts") or [],
                 "do_not_call": research_context.get("do_not_call") or [],
+                "direct_evidence": [],
+                "related_context": [],
+                "rejected_context": [],
+                "response_detail": detail.value,
+            }
+            if input_warnings:
+                payload["input_warnings"] = input_warnings
+            return _format_response(payload, response_format, _markdown_retrieve)
+        if _should_skip_legacy_retrieve(research_context, detail=detail):
+            payload = {
+                "question": question,
+                "query": {
+                    "question": question,
+                    "tickers": _upper_list(normalized_tickers),
+                    "ticker_alias": ticker,
+                    "document_types": document_types or [],
+                    "periods": _upper_list(periods),
+                    "group_by": normalized_group_by,
+                    "limit_groups": limit_groups,
+                    "limit_per_group": limit_per_group,
+                    "answer_candidate_only": answer_candidate_only,
+                },
+                "answerability": research_context.get("answerability") or {},
+                "recommended_answer_mode": (research_context.get("answerability") or {}).get("recommended_answer_mode"),
+                "directness_guard": _directness_guard_from_research_context(research_context),
+                "research_context_version": research_context.get("research_context_version"),
+                "research_status": research_context.get("research_status"),
+                "research_context": {
+                    "research_context_version": research_context.get("research_context_version"),
+                    "research_status": research_context.get("research_status"),
+                    "agent_autonomy": research_context.get("agent_autonomy"),
+                    "missing_parts": research_context.get("missing_parts") or [],
+                    "do_not_call": research_context.get("do_not_call") or [],
+                    "directness_guard": _directness_guard_from_research_context(research_context),
+                    "research_pack": research_context.get("research_pack"),
+                },
+                "research_pack": research_context.get("research_pack"),
+                "agent_autonomy": research_context.get("agent_autonomy"),
+                "missing_parts": research_context.get("missing_parts") or [],
+                "do_not_call": research_context.get("do_not_call") or [],
+                "legacy_retrieve_skipped": True,
                 "direct_evidence": [],
                 "related_context": [],
                 "rejected_context": [],
@@ -899,19 +1048,57 @@ def index_context_tool(
     *,
     root: str | None = None,
     index_path: str | None = None,
-    include_counts: bool = True,
+    include_counts: bool = False,
     include_capabilities: bool = True,
-    include_quality_summary: bool = True,
+    include_quality_summary: bool = False,
+    allow_expensive: bool = False,
     response_format: ResponseFormat = ResponseFormat.JSON,
 ) -> str:
     """Return a compact AI capability card for the current agent index."""
+    started_at = time.perf_counter()
     index = _index(root, index_path)
+    counts_requested = bool(include_counts)
+    quality_requested = bool(include_quality_summary)
+    effective_include_counts = counts_requested and allow_expensive
+    effective_include_quality_summary = quality_requested and allow_expensive
     with _store(index) as store:
         payload = store.index_context(
-            include_counts=include_counts,
+            include_counts=effective_include_counts,
             include_capabilities=include_capabilities,
-            include_quality_summary=include_quality_summary,
+            include_quality_summary=effective_include_quality_summary,
         )
+    payload["index_context_guard"] = {
+        "mode": "lightweight_by_default",
+        "diagnostic_only": True,
+        "expensive_counts_requested": counts_requested,
+        "expensive_quality_summary_requested": quality_requested,
+        "allow_expensive": bool(allow_expensive),
+        "counts_returned": effective_include_counts,
+        "quality_summary_returned": effective_include_quality_summary,
+        "reason": (
+            "index_context is an operational/debug capability card. "
+            "Expensive table counts and quality summary scans are disabled by default; "
+            "use query_context for normal research questions."
+        ),
+        "how_to_enable_expensive": (
+            "Pass allow_expensive=true with include_counts and/or include_quality_summary "
+            "only for explicit audit/debug operations."
+        ),
+        "recommended_normal_research_tool": "krw_ontology_query_context",
+    }
+    guard = payload["index_context_guard"]
+    _log_mcp_tool_timing(
+        "krw_ontology_index_context",
+        duration_ms=_elapsed_ms(started_at),
+        force=counts_requested or quality_requested or bool(allow_expensive),
+        include_counts_requested=counts_requested,
+        include_quality_summary_requested=quality_requested,
+        allow_expensive=bool(allow_expensive),
+        counts_returned=guard.get("counts_returned"),
+        quality_summary_returned=guard.get("quality_summary_returned"),
+        include_capabilities=bool(include_capabilities),
+        guard_mode=guard.get("mode"),
+    )
     return _format_response(payload, response_format, _markdown_index_context)
 
 
@@ -955,6 +1142,7 @@ def query_context_tool(
     response_format: ResponseFormat = ResponseFormat.JSON,
 ) -> str:
     """Return a compact answer-planning pack with answerability guidance."""
+    started_at = time.perf_counter()
     index = _index(root, index_path)
     with _store(index) as store:
         payload = store.query_context(
@@ -968,16 +1156,43 @@ def query_context_tool(
             limit_tickers=limit_tickers,
             include_internal_ids=include_internal_ids,
         )
+    payload_dict = _safe_payload_dict(payload)
+    answerability = _safe_payload_dict(payload_dict.get("answerability"))
+    research_pack = _safe_payload_dict(payload_dict.get("research_pack"))
+    _log_mcp_tool_timing(
+        "krw_ontology_query_context",
+        duration_ms=_elapsed_ms(started_at),
+        question_chars=_safe_text_length(question),
+        ticker_count=_count_items(tickers) + (1 if ticker else 0),
+        document_type_count=_count_items(document_types),
+        period_count=_count_items(periods),
+        has_universe=bool(universe),
+        limit_results=limit_results,
+        limit_tickers=limit_tickers,
+        include_internal_ids=bool(include_internal_ids),
+        research_status=payload_dict.get("research_status"),
+        recommended_answer_mode=answerability.get("recommended_answer_mode"),
+        ticker_candidate_count=_count_items(payload_dict.get("ticker_candidates")),
+        missing_part_count=_count_items(payload_dict.get("missing_parts")),
+        research_pack_keys=sorted(str(key) for key in research_pack.keys()) if research_pack else [],
+        search_diagnostics_keys=_diagnostic_keys(payload_dict),
+        timing_ms=_diagnostic_timing_ms(payload_dict),
+    )
     return _format_response(payload, response_format, _markdown_query_context)
 
 
 def _markdown_index_context(payload: Mapping[str, Any]) -> str:
+    guard = payload.get("index_context_guard") or {}
     return "\n".join(
         [
             "# KRW Ontology Index Context",
             f"- status: {payload.get('index_status')}",
             f"- schema: {payload.get('agent_index_schema_version')}",
             f"- tickers: {', '.join(payload.get('available_tickers') or [])}",
+            f"- guard_mode: {guard.get('mode')}",
+            f"- counts_returned: {guard.get('counts_returned')}",
+            f"- quality_summary_returned: {guard.get('quality_summary_returned')}",
+            f"- recommended_normal_research_tool: {guard.get('recommended_normal_research_tool')}",
         ]
     )
 
@@ -1403,6 +1618,16 @@ def _stop_guard_from_research_context(context: Mapping[str, Any]) -> dict[str, A
             if isinstance(research_pack.get(key), Mapping):
                 return dict(research_pack[key])
     return {}
+
+
+def _should_skip_legacy_retrieve(context: Mapping[str, Any], *, detail: ResponseDetail) -> bool:
+    if detail == ResponseDetail.FULL:
+        return False
+    status = str(context.get("research_status") or "")
+    if status not in {"sufficient_for_default_answer", "sufficient_but_trace_recommended"}:
+        return False
+    do_not_call = {str(value) for value in context.get("do_not_call") or []}
+    return "krw_ontology_retrieve" in do_not_call
 
 
 def _directness_guard_from_summary_payload(payload: Mapping[str, Any], *, topic: str | None) -> dict[str, Any]:

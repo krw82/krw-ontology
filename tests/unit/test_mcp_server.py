@@ -601,6 +601,10 @@ def test_mcp_query_context_includes_metric_series_research_pack(
 
     metric_pack = payload["research_pack"]["metric_series_pack"]
     assert payload["research_context_version"] == "v1"
+    assert payload["kernel"]["version"] == "research_kernel_v0.1"
+    assert payload["kernel"]["contract_version"] == "kernel.v1alpha"
+    assert payload["kernel"]["intent"] == "metric_series"
+    assert payload["kernel"]["primary_context"] == "metric_context"
     assert payload["research_pack"]["intent_router"]["intent"] == "metric_series"
     assert payload["research_pack"]["context_policy"]["run_metric_series"] is True
     assert payload["research_status"] == "sufficient_for_default_answer"
@@ -643,6 +647,9 @@ def test_mcp_query_context_risk_thesis_router_skips_metric_deep_path(
     )
 
     research_pack = payload["research_pack"]
+    assert payload["kernel"]["intent"] == "risk_thesis"
+    assert payload["kernel"]["primary_context"] == "risk_context"
+    assert "deep_metric_series" in payload["kernel"]["do_not_call"]
     assert research_pack["intent_router"]["intent"] == "risk_thesis"
     assert research_pack["intent_router"]["primary_context"] == "risk_context"
     assert research_pack["context_policy"]["run_metric_series"] is False
@@ -668,6 +675,8 @@ def test_mcp_query_context_company_overview_router_avoids_metric_first(
     )
 
     research_pack = payload["research_pack"]
+    assert payload["kernel"]["intent"] == "company_overview"
+    assert payload["kernel"]["primary_context"] == "company_overview_context"
     assert research_pack["intent_router"]["intent"] == "company_overview"
     assert research_pack["intent_router"]["primary_context"] == "company_overview_context"
     assert research_pack["context_policy"]["run_metric_series"] is False
@@ -691,6 +700,7 @@ def test_mcp_query_context_projection_pack_marks_candidates_search_only_for_dire
     )
 
     projection_pack = payload["research_pack"]["projection_pack"]
+    assert payload["kernel"]["intent"] == "direct_exposure"
     assert payload["research_pack"]["intent_router"]["intent"] == "direct_exposure"
     assert payload["research_pack"]["metric_series_pack"] is None
     top_level_guard = payload["research_pack"]["directness_guard"]
@@ -909,6 +919,7 @@ def test_mcp_retrieve_skips_legacy_when_research_context_is_sufficient(
     )
 
     assert payload["research_status"] == "sufficient_for_default_answer"
+    assert payload["kernel"]["intent"] == "metric_series"
     assert payload["legacy_retrieve_skipped"] is True
     assert payload["research_pack"]["metric_series_pack"]["mode"] == "metric_dimension_lookup"
     assert payload["direct_evidence"] == []

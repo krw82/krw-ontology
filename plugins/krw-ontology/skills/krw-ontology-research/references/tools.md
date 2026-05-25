@@ -209,6 +209,29 @@ search_diagnostics
 
 If `answerability.direct_answerable=false` and `related_context_available=true`, do not promote related context into a direct answer. Trace only the recommended final or related-context objects.
 
+Newer builds may also include an additive `kernel` envelope:
+
+```text
+kernel.version
+kernel.contract_version
+kernel.intent
+kernel.primary_context
+kernel.status
+kernel.answer_mode
+kernel.route_confidence
+kernel.allowed_next_tools
+kernel.do_not_call
+kernel.max_additional_tool_calls
+kernel.missing_parts
+kernel.context_policy
+kernel.budget
+kernel.timing_ms
+```
+
+`kernel` is a deterministic research-state and tool-control layer. It is not a final answer generator. Consumers should prefer `kernel` for routing/budget/allowed-tool decisions when present and fall back to the v1 envelope when absent.
+
+`kernel` may also appear on `query`, `retrieve`, and `compare` responses. For `query`, treat it as targeted-search state only; do not infer that `query` performed full natural-language answerability planning.
+
 Current high-value `research_status` values:
 
 ```text

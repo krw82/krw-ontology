@@ -126,7 +126,35 @@ Rules:
 7. Use `krw_ontology_trace` and `krw_ontology_chain` only on selected top objects. Do not trace or chain every candidate.
 8. For multi-ticker discovery, do not loop over all tickers. Use query_context/global compact discovery/company-topic discovery first, narrow candidates, then focus.
 
-### 3.2 Raw/debug/audit mode
+### 3.2 Web chat research modes
+
+The web chat runner may provide one of three research modes. Do not infer deep mode from wording such as "자세히", "보고서", "전체", or "근거 다 추적"; mode is selected by the UI/runner policy.
+
+```text
+fast
+- Query_context first.
+- Prefer 0 trace/chain calls.
+- Do not use retrieve, company_context, index_context, catalog, quality, or broad query.
+- If one targeted query is necessary, use it once and answer with limitations.
+
+standard
+- Default mode.
+- Query_context first.
+- If research_status is sufficient_for_default_answer, stop researching and answer.
+- If sufficient_but_trace_recommended, use only selected trace/chain roots, normally 1-2 total.
+- If partial_answer_possible, use one targeted query for missing_parts only.
+- Retrieve remains disabled by default.
+
+deep
+- Query_context first.
+- Additional query/trace/chain is allowed only when it materially improves evidence quality.
+- Still avoid repeated equivalent queries and unscoped retrieve.
+- Keep chain details internal unless the user asks for audit/debug output.
+```
+
+Always respect `agent_autonomy.allowed_next_tools`, `agent_autonomy.do_not_call`, `kernel.allowed_next_tools`, `kernel.do_not_call`, and runner mode limits. If these conflict, choose the stricter rule.
+
+### 3.3 Raw/debug/audit mode
 
 Only expose raw IDs, object types, tool details, traces, chain internals, quote text, or diagnostics when the user explicitly asks for debug, audit, raw evidence, exportable citations, or implementation-level output.
 
@@ -152,6 +180,12 @@ research_context_version
 research_status
 research_pack.metric_series_pack
 research_pack.projection_pack
+research_pack.business_profile_pack
+research_pack.risk_mechanism_pack
+research_pack.comparison_view
+research_pack.direct_exposure_pack
+research_pack.scope_guard_pack
+research_pack.evidence_index
 research_pack.chain_pack
 research_pack.company_topic_pack
 research_pack.directness_guard
@@ -173,7 +207,19 @@ results_by_ticker
 search_diagnostics
 ```
 
-Do not assume `metric_series_pack`, `projection_pack`, `chain_pack`, or `allowed_next_tools` are standalone top-level fields. In normal JSON responses they are nested under `research_pack` or `agent_autonomy`.
+Do not assume `metric_series_pack`, `business_profile_pack`, `risk_mechanism_pack`, `comparison_view`, `direct_exposure_pack`, `chain_pack`, or `allowed_next_tools` are standalone top-level fields. In normal JSON responses they are nested under `research_pack` or `agent_autonomy`.
+
+Pack usage policy:
+
+```text
+metric_series_pack -> numeric tables, share/growth calculations, period/unit quality checks.
+business_profile_pack -> business segments, latest drivers, annual revenue mix, caveats.
+risk_mechanism_pack -> support summary, financial path, affected metrics, implication.
+comparison_view -> same-basis rows and conclusion hints; agent writes final comparison judgment.
+direct_exposure_pack -> direct vs related candidates and negative-answer policy.
+scope_guard_pack -> filing-only out-of-scope stop for target price/fair value/investment opinion.
+evidence_index / chain_pack -> selected trace and chain roots only; do not expand every candidate.
+```
 
 ### 4.2 Compatibility when new fields are absent
 
@@ -200,6 +246,73 @@ If the question asks for target price, fair value, final valuation, investment r
 ```
 
 Do not compensate for absent research-pack fields by launching open-ended query/retrieve loops.
+
+### 4.2.1 ResearchKernel envelope
+
+Newer MCP builds may also return a `kernel` envelope. Treat it as a deterministic research-state controller, not as a final answer. It is a routing/budget/directness/lazy-trace policy layer.
+
+If `kernel` exists, prefer it for tool-control decisions:
+
+```text
+kernel.version
+kernel.contract_version
+kernel.intent
+kernel.primary_context
+kernel.status
+kernel.answer_mode
+kernel.route_confidence
+kernel.allowed_next_tools
+kernel.do_not_call
+kernel.max_additional_tool_calls
+kernel.missing_parts
+kernel.context_policy
+kernel.period_display_policy
+kernel.preferred_answer_order
+kernel.budget
+kernel.timing_ms
+```
+
+Use the existing v1 fields as fallback when `kernel` is absent. Do not expose `kernel`, routing fields, budgets, timings, or internal tool-control terms in normal user-facing answers.
+
+Intent handling:
+
+```text
+metric_series:
+  Use research_pack.metric_series_pack when present. Do not start broad retrieve first.
+
+risk_thesis:
+  Explain business mechanism and caveats from the research state. Do not run deep metric-series searches unless kernel.allowed_next_tools explicitly permits a targeted follow-up.
+
+company_overview:
+  Use company/business topic context. Do not treat missing exact metrics as not-answerable by default.
+
+direct_exposure:
+  Respect directness_guard. Do not promote related context into direct evidence.
+
+valuation_or_price_target:
+  Stop if kernel.status or research_status is out_of_scope_for_filing_ontology.
+```
+
+Period and recentness handling:
+
+```text
+User-facing period labels:
+  Use CY-style ontology period labels in final answers, such as "CY2026Q1 10-Q 기준" or "CY2025 10-K 기준".
+  Do not use FY labels as the primary user-facing period label.
+  If the issuer fiscal calendar matters, mention it only as a short parenthetical note.
+
+Recent/latest questions:
+  If the user says "최근", "최신", "최근 매출 동인", "최근 분기", "latest", "recent", or "most recent", start with the latest available 10-Q evidence.
+  Use the latest 10-K as annual business mix / baseline context, not as the opening frame.
+
+Business model + recent driver questions:
+  If both business model and recent drivers are requested, answer in this order:
+  1. latest 10-Q revenue drivers
+  2. latest 10-K annual revenue mix
+  3. interpretation and caveats
+
+Follow kernel.period_display_policy and kernel.preferred_answer_order when present.
+```
 
 ### 4.3 Research status policy
 

@@ -14,6 +14,21 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 from krw_ontology.agent_index.retrieval_text import format_metric_compact
+from krw_ontology.agent_index.research_kernel import ResearchKernel, request_from_query_context_args
+from krw_ontology.agent_index.research_contexts import (
+    CompanyOverviewContext,
+    DirectExposureContext,
+    MetricContext,
+    RiskContext,
+)
+from krw_ontology.agent_index.research_router import (
+    context_policy_for_route,
+    intent_profile_from_route,
+    period_display_policy_for_question,
+    preferred_answer_order_for_question,
+    route_from_intent,
+    route_research,
+)
 from krw_ontology.agent_index.discovery import (
     build_evidence_frame,
     build_query_frame,
@@ -627,6 +642,18 @@ class OntologyStore:
             requested_tickers = [str(universe).upper()]
         else:
             requested_tickers = None
+        kernel = ResearchKernel(self)
+        kernel_request = request_from_query_context_args(
+            question=question,
+            tickers=requested_tickers,
+            document_types=document_types,
+            periods=periods,
+            universe=universe,
+            limit_results=limit_results,
+            limit_tickers=limit_tickers,
+            mode="context",
+        )
+        kernel_route = kernel.route(kernel_request)
         cache_key = _query_context_cache_key(
             self.index_path,
             question=question,
@@ -677,6 +704,13 @@ class OntologyStore:
                 "research_pack": {
                     "stop_guard": valuation_guard,
                     "valuation_guard": valuation_guard,
+                    "scope_guard_pack": {
+                        "mode": "scope_guard",
+                        "out_of_scope": True,
+                        "reason": valuation_guard["cannot_answer_reason"],
+                        "allowed_answer": valuation_guard["allowed_answer"],
+                        "allowed_filing_support": valuation_guard.get("allowed_filing_based_support") or [],
+                    },
                     "metric_series_pack": None,
                     "projection_pack": None,
                     "company_topic_pack": {"top_candidates": []},
@@ -706,6 +740,19 @@ class OntologyStore:
                     "recommended_tools.object_id",
                 ],
             }
+            payload["kernel"] = kernel.build_envelope(
+                kernel_request,
+                route=kernel_route,
+                research_status=payload["research_status"],
+                research_pack=payload["research_pack"],
+                answerability=payload["answerability"],
+                missing_parts=payload["missing_parts"],
+                recommended_tools=payload["recommended_tools"],
+                agent_autonomy=payload["agent_autonomy"],
+                do_not_call=payload["do_not_call"],
+                started_at=query_context_started_at,
+                timing_ms=(payload.get("search_diagnostics") or {}).get("timing_ms") or {},
+            )
             _query_context_cache_set(cache_key, payload)
             return payload
 
@@ -763,6 +810,19 @@ class OntologyStore:
                 }
                 if include_internal_ids:
                     payload["results_by_ticker"] = {}
+                payload["kernel"] = kernel.build_envelope(
+                    kernel_request,
+                    route=kernel_route,
+                    research_status=payload["research_status"],
+                    research_pack=payload["research_pack"],
+                    answerability=payload["answerability"],
+                    missing_parts=payload["missing_parts"],
+                    recommended_tools=payload["recommended_tools"],
+                    agent_autonomy=payload["agent_autonomy"],
+                    do_not_call=payload["do_not_call"],
+                    started_at=query_context_started_at,
+                    timing_ms=(payload.get("search_diagnostics") or {}).get("timing_ms") or {},
+                )
                 _query_context_cache_set(cache_key, payload)
                 return payload
 
@@ -849,6 +909,19 @@ class OntologyStore:
                 search_diagnostics.setdefault("typed_projection", pack_diagnostics["typed_projection"])
             if pack_diagnostics.get("metric_series"):
                 search_diagnostics.setdefault("metric_series", pack_diagnostics["metric_series"])
+        payload["kernel"] = kernel.build_envelope(
+            kernel_request,
+            route=kernel_route,
+            research_status=payload["research_status"],
+            research_pack=payload["research_pack"],
+            answerability=payload["answerability"],
+            missing_parts=payload["missing_parts"],
+            recommended_tools=payload["recommended_tools"],
+            agent_autonomy=payload["agent_autonomy"],
+            do_not_call=payload["do_not_call"],
+            started_at=query_context_started_at,
+            timing_ms=(payload.get("search_diagnostics") or {}).get("timing_ms") or {},
+        )
         _query_context_cache_set(cache_key, payload)
         return payload
 
@@ -868,48 +941,57 @@ class OntologyStore:
         include_internal_ids: bool,
     ) -> dict[str, Any]:
         """Compile a bounded research workbench for agent synthesis."""
-        intent_router = _research_intent_profile(question)
-        context_policy = _research_context_policy(intent_router.get("intent"))
+        research_route = route_research(question, tickers=requested_tickers or [])
+        intent_router = intent_profile_from_route(research_route)
+        context_policy = dict(context_policy_for_route(research_route))
+        period_display_policy = period_display_policy_for_question(question, research_route)
+        preferred_answer_order = preferred_answer_order_for_question(question, research_route)
+        context_policy["period_display_policy"] = period_display_policy
+        context_policy["preferred_answer_order"] = preferred_answer_order
         metric_series_pack: dict[str, Any] | None = None
         projection_pack: dict[str, Any] | None = None
-        compact_limit = max(3, min(int(limit_results), 12))
-        metric_topic = _research_metric_topic(question, search_topic)
-        if context_policy.get("run_metric_series") and requested_tickers and metric_topic:
-            metric_limit = max(compact_limit, 20) if _metric_lookup_needs_denominator(metric_topic) else compact_limit
-            metric_periods = _metric_lookup_research_period_filters(metric_topic, periods)
-            metric_document_types = document_types
-            if not metric_document_types and metric_periods and _metric_lookup_period_filters_are_annual(metric_periods):
-                metric_document_types = ["10-K"]
-            metric_results, metric_diagnostics = self.query_compact_with_diagnostics(
-                topic=metric_topic,
-                tickers=requested_tickers,
-                document_types=metric_document_types,
-                periods=metric_periods or periods,
-                object_types=["MetricObservation", "Calculation", "XBRLFact"],
-                limit=metric_limit,
-            )
-            metric_series_pack = _metric_series_research_pack(metric_results, metric_diagnostics)
-
-        typed_profile = self._typed_projection_profile(
-            topic=question,
-            object_types=DEFAULT_QUERY_TYPES,
-            explicit_object_types=False,
+        request = request_from_query_context_args(
+            question=question,
+            tickers=requested_tickers,
+            document_types=document_types,
+            periods=periods,
+            universe=None,
+            limit_results=limit_results,
+            limit_tickers=len(requested_tickers or []),
+            mode="context",
         )
-        if context_policy.get("run_typed_projection") and typed_profile.get("enabled"):
-            projection_results, projection_diagnostics = self.query_compact_with_diagnostics(
-                topic=question,
-                tickers=requested_tickers,
+        if context_policy.get("run_metric_series"):
+            metric_context_result = MetricContext(self).run(
+                request,
+                research_route,
+                search_topic=search_topic,
+                requested_tickers=requested_tickers,
                 document_types=document_types,
                 periods=periods,
-                object_types=typed_profile.get("object_types") or DEFAULT_QUERY_TYPES,
-                limit=compact_limit,
+                limit_results=limit_results,
+                metric_topic_builder=_research_metric_topic,
+                metric_needs_denominator=_metric_lookup_needs_denominator,
+                metric_period_filters=_metric_lookup_research_period_filters,
+                annual_period_filter_check=_metric_lookup_period_filters_are_annual,
+                metric_pack_builder=_metric_series_research_pack,
             )
-            projection_pack = _projection_research_pack(
-                projection_results,
-                projection_diagnostics,
+            metric_series_pack = metric_context_result.get("metric_series_pack")
+
+        if context_policy.get("run_typed_projection"):
+            context_executor = _research_context_executor(research_route.primary_context, self)
+            projection_context_result = context_executor.run(
+                request,
+                research_route,
+                document_types=document_types,
+                periods=periods,
+                requested_tickers=requested_tickers,
+                limit_results=limit_results,
                 query_frame=query_frame,
                 answerability=answerability,
+                default_object_types=DEFAULT_QUERY_TYPES,
+                projection_pack_builder=_projection_research_pack,
             )
+            projection_pack = projection_context_result.get("projection_pack")
 
         chain_roots = _research_chain_roots(
             selected_candidates=selected_candidates,
@@ -922,16 +1004,60 @@ class OntologyStore:
             chain_roots,
             include_internal_ids=include_internal_ids,
         )
+        company_topic_pack = _company_topic_research_pack(selected_candidates)
+        directness_guard = _research_directness_guard(query_frame, answerability)
+        business_profile_pack = _business_profile_research_pack(
+            route=research_route,
+            company_topic_pack=company_topic_pack,
+            metric_series_pack=metric_series_pack,
+            projection_pack=projection_pack,
+            selected_candidates=selected_candidates,
+            preferred_answer_order=preferred_answer_order,
+            period_display_policy=period_display_policy,
+        )
+        risk_mechanism_pack = _risk_mechanism_research_pack(
+            route=research_route,
+            projection_pack=projection_pack,
+            company_topic_pack=company_topic_pack,
+            chain_pack=chain_pack,
+        )
+        comparison_view = _comparison_research_view(
+            route=research_route,
+            metric_series_pack=metric_series_pack,
+            projection_pack=projection_pack,
+            company_topic_pack=company_topic_pack,
+        )
+        direct_exposure_pack = _direct_exposure_research_pack(
+            route=research_route,
+            directness_guard=directness_guard,
+            projection_pack=projection_pack,
+            company_topic_pack=company_topic_pack,
+        )
+        scope_guard_pack = _scope_guard_research_pack(research_route)
+        evidence_index = _research_evidence_index(
+            trace_candidates=recommended_tools,
+            chain_pack=chain_pack,
+            metric_series_pack=metric_series_pack,
+            projection_pack=projection_pack,
+        )
 
         return {
             "intent_router": intent_router,
             "context_policy": context_policy,
+            "period_display_policy": period_display_policy,
+            "preferred_answer_order": preferred_answer_order,
             "metric_series_pack": metric_series_pack,
             "projection_pack": projection_pack,
-            "company_topic_pack": _company_topic_research_pack(selected_candidates),
+            "business_profile_pack": business_profile_pack,
+            "risk_mechanism_pack": risk_mechanism_pack,
+            "comparison_view": comparison_view,
+            "direct_exposure_pack": direct_exposure_pack,
+            "scope_guard_pack": scope_guard_pack,
+            "company_topic_pack": company_topic_pack,
             "chain_pack": chain_pack,
+            "evidence_index": evidence_index,
             "trace_candidates": [dict(tool) for tool in recommended_tools[:3]],
-            "directness_guard": _research_directness_guard(query_frame, answerability),
+            "directness_guard": directness_guard,
         }
 
     def _research_chain_pack(
@@ -2074,6 +2200,55 @@ class OntologyStore:
             "document": trace["document"],
         }
 
+    def _comparison_kernel_envelope(
+        self,
+        *,
+        topic: str | None,
+        metric: str | None,
+        ticker_list: Sequence[str],
+        document_types: Iterable[str] | None,
+        periods: Iterable[str] | None,
+        limit_per_ticker: int,
+        results: Mapping[str, Sequence[Mapping[str, Any]]],
+        comparison_contexts: Mapping[str, Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        request = request_from_query_context_args(
+            question=topic or metric or "comparison",
+            tickers=ticker_list,
+            document_types=list(document_types or []),
+            periods=list(periods or []),
+            universe=None,
+            limit_results=limit_per_ticker,
+            limit_tickers=len(ticker_list),
+            mode="compare",
+        )
+        has_results = any(bool(items) for items in results.values()) or bool(comparison_contexts)
+        kernel = ResearchKernel(self)
+        return kernel.build_envelope(
+            request,
+            research_status="sufficient_for_default_answer" if has_results else "needs_targeted_followup",
+            answer_mode="comparison_research_state",
+            research_pack={"comparison_contexts": comparison_contexts},
+            answerability={
+                "direct_answerable": any(
+                    bool((context.get("answerability") or {}).get("direct_answerable"))
+                    for context in comparison_contexts.values()
+                    if isinstance(context, Mapping)
+                ),
+                "related_context_available": has_results,
+                "negative_answer_supported": False,
+                "needs_user_clarification": False,
+                "recommended_answer_mode": "comparison_research_state",
+            },
+            missing_parts=[] if has_results else ["comparison_candidates_not_found"],
+            recommended_tools=[],
+            agent_autonomy={
+                "allowed_next_tools": ["krw_ontology_trace", "krw_ontology_chain"] if has_results else ["krw_ontology_query"],
+                "max_additional_tool_calls": 2 if has_results else 1,
+            },
+            do_not_call=["raw_fts_winner_by_hit_count", "broad_retrieve"],
+        )
+
     def compare(
         self,
         *,
@@ -2132,7 +2307,7 @@ class OntologyStore:
                     limit=max(limit_per_ticker * 2, limit_per_ticker + 2),
                 )
                 _apply_comparison_evaluation(results[ticker], comparison_evaluations[ticker])
-        return {
+        payload = {
             "mode": "metric" if metric else "topic",
             "topic": topic,
             "metric": metric,
@@ -2141,6 +2316,17 @@ class OntologyStore:
             "comparison_evaluations": comparison_evaluations,
             "comparison_contexts": comparison_contexts,
         }
+        payload["kernel"] = self._comparison_kernel_envelope(
+            topic=topic,
+            metric=metric,
+            ticker_list=ticker_list,
+            document_types=document_types,
+            periods=periods,
+            limit_per_ticker=limit_per_ticker,
+            results=results,
+            comparison_contexts=comparison_contexts,
+        )
+        return payload
 
     def compare_compact(
         self,
@@ -2296,7 +2482,7 @@ class OntologyStore:
                 ticker: comparison_contexts.get(ticker, {})
                 for ticker in ticker_list
             }
-            return {
+            payload = {
                 "mode": "topic",
                 "topic": topic,
                 "metric": metric,
@@ -2307,6 +2493,17 @@ class OntologyStore:
                 "compact_fast_path": True,
                 "parallel_fast_path": True,
             }
+            payload["kernel"] = self._comparison_kernel_envelope(
+                topic=topic,
+                metric=metric,
+                ticker_list=ticker_list,
+                document_types=document_types,
+                periods=periods,
+                limit_per_ticker=limit_per_ticker,
+                results=results,
+                comparison_contexts=comparison_contexts,
+            )
+            return payload
         for ticker in ticker_list:
             if ticker not in searchable_tickers:
                 continue
@@ -2356,7 +2553,7 @@ class OntologyStore:
                     limit=max(limit_per_ticker * 2, limit_per_ticker + 2),
                 )
                 _apply_comparison_evaluation(results[ticker], comparison_evaluations[ticker])
-        return {
+        payload = {
             "mode": "metric" if metric else "topic",
             "topic": topic,
             "metric": metric,
@@ -2366,6 +2563,17 @@ class OntologyStore:
             "comparison_contexts": comparison_contexts,
             "compact_fast_path": True,
         }
+        payload["kernel"] = self._comparison_kernel_envelope(
+            topic=topic,
+            metric=metric,
+            ticker_list=ticker_list,
+            document_types=document_types,
+            periods=periods,
+            limit_per_ticker=limit_per_ticker,
+            results=results,
+            comparison_contexts=comparison_contexts,
+        )
+        return payload
 
     def quality(
         self,
@@ -4299,134 +4507,19 @@ def _contains_any(text: str, terms: Sequence[str]) -> bool:
 
 
 def _research_intent_profile(question: str) -> dict[str, Any]:
-    raw = str(question or "")
-    text = raw.casefold()
-    direct = _question_requires_direct_match(raw)
-    overview = _contains_any(
-        text,
-        (
-            "어떻게 돈",
-            "돈을 벌",
-            "사업 구조",
-            "사업모델",
-            "사업 모델",
-            "매출 동인",
-            "수익원",
-            "business model",
-            "make money",
-            "revenue driver",
-        ),
-    )
-    risk = _contains_any(
-        text,
-        (
-            "리스크",
-            "위험",
-            "흔드는",
-            "압박",
-            "충격",
-            "노출",
-            "불확실",
-            "thesis",
-            "risk",
-            "pressure",
-            "disruption",
-            "exposure",
-            "cyber",
-            "regulatory",
-            "litigation",
-            "supply chain",
-        ),
-    )
-    metric = _metric_lookup_topic_is_metric_like(raw) or _contains_any(
-        text,
-        (
-            "매출",
-            "수익",
-            "마진",
-            "영업이익",
-            "순이익",
-            "현금흐름",
-            "비중",
-            "성장률",
-            "증가율",
-            "총부채",
-            "총자산",
-            "capex",
-            "eps",
-            "nii",
-            "nim",
-            "revenue",
-            "sales",
-            "margin",
-            "cash flow",
-            "debt",
-            "asset",
-        ),
-    )
-    comparison = _contains_any(text, (" vs ", " versus ", "비교", "대비", "compare"))
-    discovery = _contains_any(text, ("어떤 기업", "찾아줘", "수혜", "피해 큰", "영향 큰", "beneficiar", "screen"))
-    explicit_calculation = _contains_any(
-        text,
-        ("계산", "산출", "추이", "시계열", "분기별", "연도별", "ratio", "calculate", "trend", "series"),
-    )
-
-    if direct:
-        intent = "direct_exposure"
-        primary_context = "direct_exposure_context"
-        confidence = 0.9
-    elif overview:
-        intent = "company_overview"
-        primary_context = "company_overview_context"
-        confidence = 0.84
-    elif risk and not explicit_calculation:
-        intent = "risk_thesis"
-        primary_context = "risk_context"
-        confidence = 0.82
-    elif metric:
-        intent = "metric_series"
-        primary_context = "metric_context"
-        confidence = 0.86
-    elif comparison:
-        intent = "comparison"
-        primary_context = "compare_context"
-        confidence = 0.78
-    elif discovery:
-        intent = "discovery"
-        primary_context = "discovery_context"
-        confidence = 0.76
-    elif risk:
-        intent = "risk_thesis"
-        primary_context = "risk_context"
-        confidence = 0.72
-    else:
-        intent = "general_research"
-        primary_context = "company_topic_context"
-        confidence = 0.55
-
-    return {
-        "intent": intent,
-        "primary_context": primary_context,
-        "confidence": confidence,
-    }
+    return intent_profile_from_route(route_research(question, tickers=[]))
 
 
 def _research_context_policy(intent: Any) -> dict[str, Any]:
-    intent_name = str(intent or "general_research")
-    policy: dict[str, Any] = {
-        "run_metric_series": True,
-        "run_typed_projection": True,
-        "allowed_next_tools": ["krw_ontology_trace", "krw_ontology_chain"],
-        "do_not_call": [],
-        "max_additional_tool_calls": 2,
-    }
-    if intent_name == "metric_series":
-        policy["run_typed_projection"] = False
-        policy["allowed_next_tools"] = ["krw_ontology_trace"]
-    elif intent_name in {"risk_thesis", "direct_exposure", "company_overview", "discovery", "comparison"}:
-        policy["run_metric_series"] = False
-        policy["do_not_call"] = ["deep_metric_series", "broad_retrieve", "unscoped_query"]
-    return policy
+    return context_policy_for_route(route_from_intent(intent))
+
+
+def _research_context_executor(primary_context: str, store: "OntologyStore") -> Any:
+    if primary_context == "direct_exposure_context":
+        return DirectExposureContext(store)
+    if primary_context == "company_overview_context":
+        return CompanyOverviewContext(store)
+    return RiskContext(store)
 
 
 def _research_metric_topic(question: str, search_topic: str | None) -> str | None:
@@ -4534,6 +4627,14 @@ def _metric_series_research_pack(results: Sequence[Mapping[str, Any]], diagnosti
             "fallback_used": bool(strategy.get("fallback_used")),
             "period_alignment": calculations.get("period_alignment"),
             "unit_consistency": calculations.get("unit_consistency"),
+        },
+        "render_hints": {
+            "prefer_table": True,
+            "include_share_of_total": bool(calculations.get("share_of_total")),
+            "include_yoy_growth": bool(calculations.get("growth_rate")),
+            "include_growth_difference": bool(calculations.get("growth_difference")),
+            "do_not_requery_per_metric": True,
+            "user_period_label_style": "CY",
         },
         "diagnostics": {
             "metric_fast_path": bool(diagnostics.get("metric_fast_path")),
@@ -4793,21 +4894,364 @@ def _projection_research_pack(
 
 def _company_topic_research_pack(candidates: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     top_candidates: list[dict[str, Any]] = []
-    for candidate in candidates[:8]:
-        top_candidates.append(
-            {
-                "ticker": candidate.get("ticker"),
-                "tier": candidate.get("tier"),
-                "trace_status": candidate.get("trace_status"),
-                "topic_label": candidate.get("topic_label"),
-                "topic_summary": candidate.get("topic_summary"),
-                "score": candidate.get("score"),
-            }
-        )
+    for candidate in candidates:
+        matched_topics = candidate.get("matched_topics") or []
+        if isinstance(matched_topics, Sequence) and not isinstance(matched_topics, (str, bytes)):
+            for topic in matched_topics:
+                if not isinstance(topic, Mapping):
+                    continue
+                top_candidates.append(
+                    {
+                        "ticker": topic.get("ticker") or candidate.get("ticker"),
+                        "period": topic.get("period"),
+                        "document_type": topic.get("document_type"),
+                        "tier": topic.get("tier") or candidate.get("tier") or (topic.get("match") or {}).get("tier"),
+                        "trace_status": topic.get("trace_status") or candidate.get("trace_status"),
+                        "topic_label": _public_topic_label(topic.get("topic_label")),
+                        "topic_summary": topic.get("topic_summary"),
+                        "topic_type": topic.get("topic_type"),
+                        "primary_object_type": topic.get("primary_object_type"),
+                        "score": topic.get("score") or candidate.get("score"),
+                    }
+                )
+                if len(top_candidates) >= 8:
+                    break
+        if len(top_candidates) >= 8:
+            break
+        if candidate.get("topic_label") or candidate.get("topic_summary"):
+            top_candidates.append(
+                {
+                    "ticker": candidate.get("ticker"),
+                    "period": candidate.get("period"),
+                    "document_type": candidate.get("document_type"),
+                    "tier": candidate.get("tier"),
+                    "trace_status": candidate.get("trace_status"),
+                    "topic_label": _public_topic_label(candidate.get("topic_label")),
+                    "topic_summary": candidate.get("topic_summary"),
+                    "topic_type": candidate.get("topic_type"),
+                    "primary_object_type": candidate.get("primary_object_type"),
+                    "score": candidate.get("score"),
+                }
+            )
+        if len(top_candidates) >= 8:
+            break
     return {
         "top_candidates": top_candidates,
         "candidate_count": len(candidates),
     }
+
+
+def _public_topic_label(value: Any) -> str | None:
+    label = str(value or "").strip()
+    if not label:
+        return None
+    if label in {"EvidenceQuote", "ResearchClaim", "MetricObservation", "BusinessActivity", "BusinessFactor"}:
+        return None
+    return label
+
+
+def _business_profile_research_pack(
+    *,
+    route: Any,
+    company_topic_pack: Mapping[str, Any],
+    metric_series_pack: Mapping[str, Any] | None,
+    projection_pack: Mapping[str, Any] | None,
+    selected_candidates: Sequence[Mapping[str, Any]],
+    preferred_answer_order: Mapping[str, Any],
+    period_display_policy: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    if str(getattr(route.intent, "value", route.intent)) not in {"company_overview", "general_research"}:
+        return None
+    topics = list(company_topic_pack.get("top_candidates") or [])
+    business_segments: list[dict[str, Any]] = []
+    for candidate in topics[:6]:
+        business_segments.append(
+            {
+                "ticker": candidate.get("ticker"),
+                "segment_or_topic": candidate.get("topic_label") or "filing business driver",
+                "driver_summary": candidate.get("topic_summary"),
+                "trace_status": candidate.get("trace_status"),
+                "tier": candidate.get("tier"),
+            }
+        )
+    representative_metrics: list[dict[str, Any]] = []
+    if isinstance(metric_series_pack, Mapping):
+        for series in metric_series_pack.get("series") or []:
+            representative_metrics.append(
+                {
+                    "label": series.get("label"),
+                    "metric_role": series.get("metric_role"),
+                    "periods": series.get("periods") or [],
+                    "point_count": series.get("point_count"),
+                }
+            )
+    if isinstance(projection_pack, Mapping):
+        for candidate in projection_pack.get("candidates") or []:
+            if len(business_segments) >= 8:
+                break
+            business_segments.append(
+                {
+                    "ticker": candidate.get("ticker"),
+                    "segment_or_topic": candidate.get("type"),
+                    "driver_summary": candidate.get("summary"),
+                    "trace_status": candidate.get("trace_status"),
+                    "tier": "projection_candidate",
+                }
+            )
+    return {
+        "mode": "ontology_business_profile",
+        "answer_order": (
+            preferred_answer_order.get("answer_order")
+            if isinstance(preferred_answer_order, Mapping)
+            else list(preferred_answer_order or [])
+        )
+        or [],
+        "period_display_policy": period_display_policy,
+        "business_segments": business_segments,
+        "annual_revenue_mix": representative_metrics,
+        "current_drivers": business_segments[:4],
+        "key_caveats": [
+            "Use filing-grounded business activity and metric lineage; avoid unsupported market-share or valuation claims."
+        ],
+        "render_hints": {
+            "structure": "current_drivers -> annual_revenue_mix -> business_segments -> caveats",
+            "latest_first_when_requested": bool(period_display_policy.get("latest_first")),
+            "do_not_requery_company_context_by_default": True,
+        },
+        "quality": {
+            "candidate_count": len(selected_candidates),
+            "missing_parts": [] if business_segments else ["business_profile_candidates_not_found"],
+        },
+    }
+
+
+def _risk_mechanism_research_pack(
+    *,
+    route: Any,
+    projection_pack: Mapping[str, Any] | None,
+    company_topic_pack: Mapping[str, Any],
+    chain_pack: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    if str(getattr(route.intent, "value", route.intent)) != "risk_thesis":
+        return None
+    source_candidates: list[Mapping[str, Any]] = []
+    if isinstance(projection_pack, Mapping):
+        source_candidates.extend(candidate for candidate in projection_pack.get("candidates") or [] if isinstance(candidate, Mapping))
+    source_candidates.extend(
+        candidate for candidate in company_topic_pack.get("top_candidates") or [] if isinstance(candidate, Mapping)
+    )
+    risk_channels: list[dict[str, Any]] = []
+    for candidate in source_candidates[:6]:
+        summary = str(candidate.get("summary") or candidate.get("topic_summary") or "")
+        risk_label = str(candidate.get("topic_label") or candidate.get("type") or "risk channel")
+        risk_channels.append(
+            {
+                "risk": risk_label,
+                "support_summary": summary[:700],
+                "financial_path": _risk_financial_path(summary),
+                "affected_metrics": _risk_affected_metrics(summary),
+                "implication": _risk_implication(summary),
+                "directness": candidate.get("tier") or "related_context",
+                "trace_status": candidate.get("trace_status"),
+            }
+        )
+    return {
+        "mode": "risk_mechanism",
+        "risk_channels": risk_channels,
+        "representative_metrics": [],
+        "metric_depth": "representative_only",
+        "chain_roots": chain_pack.get("root_candidates") if isinstance(chain_pack, Mapping) else [],
+        "render_hints": {
+            "structure": "support_summary -> financial_path -> implication",
+            "do_not_run_deep_metric_series": True,
+            "chain_is_lazy": True,
+        },
+        "quality": {
+            "missing_parts": [] if risk_channels else ["risk_mechanism_candidates_not_found"],
+        },
+    }
+
+
+def _comparison_research_view(
+    *,
+    route: Any,
+    metric_series_pack: Mapping[str, Any] | None,
+    projection_pack: Mapping[str, Any] | None,
+    company_topic_pack: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    if str(getattr(route.intent, "value", route.intent)) != "comparison":
+        return None
+    rows: list[dict[str, Any]] = []
+    if isinstance(metric_series_pack, Mapping):
+        for series in metric_series_pack.get("series") or []:
+            rows.append(
+                {
+                    "item": series.get("label"),
+                    "basis": "metric_series",
+                    "metric_role": series.get("metric_role"),
+                    "periods": series.get("periods") or [],
+                    "point_count": series.get("point_count"),
+                }
+            )
+    if isinstance(projection_pack, Mapping):
+        for candidate in projection_pack.get("candidates") or []:
+            rows.append(
+                {
+                    "item": candidate.get("ticker") or candidate.get("type"),
+                    "basis": "projection_candidate",
+                    "summary": candidate.get("summary"),
+                    "trace_status": candidate.get("trace_status"),
+                }
+            )
+    if not rows:
+        for candidate in company_topic_pack.get("top_candidates") or []:
+            rows.append(
+                {
+                    "item": candidate.get("ticker") or candidate.get("topic_label"),
+                    "basis": "company_topic",
+                    "summary": candidate.get("topic_summary"),
+                    "trace_status": candidate.get("trace_status"),
+                }
+            )
+    return {
+        "mode": "comparison_view",
+        "comparison_type": "metric_or_context_comparison",
+        "comparison_basis": "same-context evidence rows; final conclusion remains with the AI analyst",
+        "rows": rows[:8],
+        "conclusion_hint": "Compare only on rows with matching basis and period/context.",
+        "quality": {"missing_parts": [] if rows else ["comparison_candidates_not_found"]},
+    }
+
+
+def _direct_exposure_research_pack(
+    *,
+    route: Any,
+    directness_guard: Mapping[str, Any],
+    projection_pack: Mapping[str, Any] | None,
+    company_topic_pack: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    if str(getattr(route.intent, "value", route.intent)) != "direct_exposure":
+        return None
+    direct_candidates: list[dict[str, Any]] = []
+    related_candidates: list[dict[str, Any]] = []
+    if isinstance(projection_pack, Mapping):
+        for candidate in projection_pack.get("candidates") or []:
+            target = direct_candidates if directness_guard.get("direct_answerable") else related_candidates
+            target.append(dict(candidate))
+    for candidate in company_topic_pack.get("top_candidates") or []:
+        related_candidates.append(dict(candidate))
+    return {
+        "mode": "direct_exposure",
+        "strong_claim_allowed": bool(directness_guard.get("strong_claim_allowed")),
+        "negative_answer_supported": bool(directness_guard.get("negative_answer_supported")),
+        "direct_candidates": direct_candidates[:5],
+        "related_candidates": related_candidates[:5],
+        "answer_policy": (
+            "Use direct exposure wording only when strong_claim_allowed is true; otherwise answer as no direct evidence with related context."
+        ),
+        "quality": {
+            "missing_parts": [] if direct_candidates or related_candidates else ["direct_exposure_candidates_not_found"],
+        },
+    }
+
+
+def _scope_guard_research_pack(route: Any) -> dict[str, Any] | None:
+    if str(getattr(route.intent, "value", route.intent)) != "valuation_or_price_target":
+        return None
+    return {
+        "mode": "scope_guard",
+        "out_of_scope": True,
+        "reason": "Final target price, investment opinion, or fair value requires external market/valuation assumptions outside the filing ontology.",
+        "allowed_filing_support": [
+            "revenue durability assumptions",
+            "margin and capex evidence",
+            "risk factors",
+            "cash flow and balance sheet inputs",
+        ],
+    }
+
+
+def _research_evidence_index(
+    *,
+    trace_candidates: Sequence[Mapping[str, Any]],
+    chain_pack: Mapping[str, Any],
+    metric_series_pack: Mapping[str, Any] | None,
+    projection_pack: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    entries: list[dict[str, Any]] = []
+    for index, tool in enumerate(trace_candidates[:3]):
+        entries.append(
+            {
+                "role": "trace_candidate",
+                "rank": index,
+                "object_id": tool.get("object_id"),
+                "tool": tool.get("tool") or "krw_ontology_trace",
+                "purpose": tool.get("purpose"),
+            }
+        )
+    if isinstance(chain_pack, Mapping):
+        for root in chain_pack.get("root_candidates") or []:
+            entries.append(
+                {
+                    "role": "chain_root",
+                    "object_id": root.get("root_object_id"),
+                    "chain_depth": chain_pack.get("allowed_additional_chain_depth"),
+                }
+            )
+    for pack_name, pack in (("metric_series_pack", metric_series_pack), ("projection_pack", projection_pack)):
+        if not isinstance(pack, Mapping):
+            continue
+        for item in pack.get("observations") or pack.get("candidates") or []:
+            entries.append(
+                {
+                    "role": pack_name,
+                    "object_id": item.get("id"),
+                    "ticker": item.get("ticker"),
+                    "period": item.get("period"),
+                    "trace_status": item.get("trace_status"),
+                }
+            )
+    return {
+        "mode": "compact_evidence_index",
+        "entries": entries[:12],
+        "trace_policy": {
+            "fast": 0,
+            "standard": "1-2 selected trace/chain calls only when recommended",
+            "deep": "multiple selected roots allowed; no chain-all behavior",
+        },
+    }
+
+
+def _risk_financial_path(summary: str) -> list[str]:
+    text = summary.lower()
+    if any(term in text for term in ("cost", "expense", "wage", "labor", "input", "freight", "비용", "인건비")):
+        return ["cost pressure", "operating expense increase", "operating margin pressure", "weaker earnings conversion"]
+    if any(term in text for term in ("rate", "deposit", "interest", "funding", "금리", "예금")):
+        return ["rate sensitivity", "funding or yield pressure", "net interest income impact", "earnings volatility"]
+    if any(term in text for term in ("demand", "volume", "sales", "revenue", "수요", "매출")):
+        return ["demand change", "revenue growth impact", "operating leverage change", "margin implication"]
+    if any(term in text for term in ("regulation", "regulatory", "approval", "litigation", "규제", "소송")):
+        return ["regulatory or legal constraint", "timing/cost uncertainty", "revenue or margin impact", "valuation assumption risk"]
+    return ["business risk", "revenue/cost channel", "margin or cash-flow implication"]
+
+
+def _risk_affected_metrics(summary: str) -> list[str]:
+    text = summary.lower()
+    metrics: list[str] = []
+    if any(term in text for term in ("revenue", "sales", "demand", "매출", "수요")):
+        metrics.append("revenue growth")
+    if any(term in text for term in ("margin", "gross", "operating", "마진")):
+        metrics.append("margin")
+    if any(term in text for term in ("cost", "expense", "비용")):
+        metrics.append("operating expense")
+    if any(term in text for term in ("cash", "capex", "현금", "설비")):
+        metrics.append("cash flow")
+    return metrics or ["revenue", "margin", "cash flow"]
+
+
+def _risk_implication(summary: str) -> str:
+    path = _risk_financial_path(summary)
+    return f"Mechanism to evaluate: {' -> '.join(path)}."
 
 
 def _research_directness_guard(query_frame: Mapping[str, Any], answerability: Mapping[str, Any]) -> dict[str, Any]:
@@ -4872,11 +5316,30 @@ def _research_status_from_pack(
     candidates: Sequence[Mapping[str, Any]],
     research_pack: Mapping[str, Any],
 ) -> str:
+    scope_guard_pack = research_pack.get("scope_guard_pack")
+    if isinstance(scope_guard_pack, Mapping) and scope_guard_pack.get("out_of_scope"):
+        return "out_of_scope_for_filing_ontology"
     metric_pack = research_pack.get("metric_series_pack")
     if isinstance(metric_pack, Mapping) and metric_pack.get("result_count"):
         if not (metric_pack.get("quality") or {}).get("missing_parts"):
             return "sufficient_for_default_answer"
         return "partial_answer_possible"
+    business_profile_pack = research_pack.get("business_profile_pack")
+    if isinstance(business_profile_pack, Mapping) and (business_profile_pack.get("business_segments") or business_profile_pack.get("current_drivers")):
+        return "sufficient_but_trace_recommended"
+    risk_mechanism_pack = research_pack.get("risk_mechanism_pack")
+    if isinstance(risk_mechanism_pack, Mapping) and risk_mechanism_pack.get("risk_channels"):
+        return "sufficient_but_trace_recommended"
+    direct_exposure_pack = research_pack.get("direct_exposure_pack")
+    if isinstance(direct_exposure_pack, Mapping) and (
+        direct_exposure_pack.get("direct_candidates")
+        or direct_exposure_pack.get("related_candidates")
+        or direct_exposure_pack.get("negative_answer_supported")
+    ):
+        return "sufficient_but_trace_recommended"
+    comparison_view = research_pack.get("comparison_view")
+    if isinstance(comparison_view, Mapping) and comparison_view.get("rows"):
+        return "sufficient_but_trace_recommended"
     projection_pack = research_pack.get("projection_pack")
     if isinstance(projection_pack, Mapping) and projection_pack.get("result_count"):
         if not (projection_pack.get("quality") or {}).get("missing_parts"):
@@ -5002,20 +5465,25 @@ def _research_agent_autonomy(
     if research_status == "sufficient_for_default_answer":
         return {
             "mode": "bounded",
-            "may_continue_research": True,
-            "allowed_next_tools": ["krw_ontology_chain"] if not needs_trace else ["krw_ontology_trace", "krw_ontology_chain"],
-            "disallowed_next_tools": ["krw_ontology_retrieve", "unscoped_krw_ontology_query"],
-            "max_additional_tool_calls": 2 if needs_trace else 1,
-            "purpose": "Only deepen mechanism or verify top trace candidates; do not restart broad search.",
+            "may_continue_research": False,
+            "allowed_next_tools": [],
+            "disallowed_next_tools": [
+                "krw_ontology_retrieve",
+                "unscoped_krw_ontology_query",
+                "krw_ontology_trace",
+                "krw_ontology_chain",
+            ],
+            "max_additional_tool_calls": 0,
+            "purpose": "Research state is sufficient for the default answer; do not restart search.",
         }
     if research_status == "sufficient_but_trace_recommended":
         return {
             "mode": "bounded",
             "may_continue_research": True,
-            "allowed_next_tools": ["krw_ontology_trace", "krw_ontology_chain"],
+            "allowed_next_tools": ["krw_ontology_query", "krw_ontology_trace", "krw_ontology_chain"],
             "disallowed_next_tools": ["krw_ontology_retrieve", "unscoped_krw_ontology_query"],
             "max_additional_tool_calls": 3,
-            "purpose": "Verify selected roots and use bounded chain expansion only.",
+            "purpose": "Verify selected roots and use bounded chain expansion. Use one targeted query only when the selected roots miss the requested latest period or a listed missing part.",
         }
     return {
         "mode": "bounded",
@@ -5037,7 +5505,12 @@ def _research_do_not_call(research_status: str) -> list[str]:
             "krw_ontology_chain",
         ]
     if research_status == "sufficient_for_default_answer":
-        return ["krw_ontology_retrieve", "unscoped_krw_ontology_query"]
+        return [
+            "krw_ontology_retrieve",
+            "unscoped_krw_ontology_query",
+            "krw_ontology_trace",
+            "krw_ontology_chain",
+        ]
     if research_status == "sufficient_but_trace_recommended":
         return ["krw_ontology_retrieve", "unscoped_krw_ontology_query"]
     return ["broad_unscoped_retrieve"]
@@ -5145,8 +5618,7 @@ def _recommended_trace_tools(candidates: Sequence[Mapping[str, Any]], *, limit: 
     for object_id in object_ids:
         if object_id not in selected:
             selected.append(object_id)
-        if len(selected) >= limit:
-            break
+    selected = sorted(selected, key=_object_id_recency_key, reverse=True)[:limit]
     return [
         {
             "tool": "krw_ontology_trace",
@@ -5156,6 +5628,15 @@ def _recommended_trace_tools(candidates: Sequence[Mapping[str, Any]], *, limit: 
         }
         for object_id in selected
     ]
+
+
+def _object_id_recency_key(object_id: str) -> tuple[int, int, int]:
+    text = str(object_id or "").upper()
+    match = re.search(r"(?:CY|FY)?(20\d{2}|19\d{2})(?:Q([1-4]))?", text)
+    year = int(match.group(1)) if match else 0
+    quarter = int(match.group(2) or 0) if match else 0
+    doc_score = 2 if "10-Q" in text or "10Q" in text else 1 if "10-K" in text or "10K" in text else 0
+    return (year, quarter, doc_score)
 
 
 def _final_answer_guidance(answerability: Mapping[str, Any], candidates: Sequence[Mapping[str, Any]]) -> dict[str, Any]:

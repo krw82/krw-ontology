@@ -66,6 +66,8 @@ def test_query_tool_accepts_scalar_aliases_and_records_unknown_args(tmp_path: Pa
     assert payload["query"]["object_types"] == ["ResearchClaim"]
     assert payload["query"]["object_type_alias"] == "claim"
     assert payload["query"]["object_types_requested"] == ["claim"]
+    assert payload["kernel"]["version"] == "research_kernel_v0.1"
+    assert payload["kernel"]["status"] == "sufficient_for_default_answer"
     assert payload["results"]
     assert {result["ticker"] for result in payload["results"]} == {"VG"}
     assert payload["input_warnings"] == [
@@ -97,6 +99,7 @@ def test_query_tool_scalar_aliases_do_not_force_tickers_when_absent(tmp_path: Pa
     assert payload["query"]["document_types"] == ["10-K"]
     assert payload["query"]["periods"] == ["FY2025"]
     assert payload["query"]["object_types"] == ["ResearchClaim"]
+    assert payload["kernel"]["answer_mode"] == "targeted_search_results"
     assert payload["results"]
     assert {result["ticker"] for result in payload["results"]} == {"VG"}
     assert "input_warnings" not in payload
@@ -140,6 +143,8 @@ def test_compare_tool_accepts_pair_aliases_and_records_unknown_args(tmp_path: Pa
     assert payload["query"]["tickers"] == ["VG", "XOM"]
     assert payload["query"]["ticker_a_alias"] == "VG"
     assert payload["query"]["ticker_b_alias"] == "XOM"
+    assert payload["kernel"]["intent"] == "comparison"
+    assert payload["kernel"]["primary_context"] == "compare_context"
     assert payload["input_warnings"][0]["code"] == "ignored_extra_args"
     assert payload["input_warnings"][0]["args"] == ["random_agent_arg"]
     assert {row["comparison_key"] for row in payload["comparison_rows"]} == {"VG", "XOM"}
@@ -162,4 +167,5 @@ def test_compare_tool_accepts_single_ticker_alias_for_period_compare(tmp_path: P
     assert payload["query"]["tickers"] == ["VG"]
     assert payload["query"]["ticker_alias"] == "VG"
     assert payload["mode"] == "period_topic"
+    assert payload["kernel"]["intent"] == "comparison"
     assert {row["comparison_key"] for row in payload["comparison_rows"]} == {"FY2024", "FY2025"}

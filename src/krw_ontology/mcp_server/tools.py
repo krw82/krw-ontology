@@ -2,16 +2,20 @@
 
 from __future__ import annotations
 
+import copy
+from collections import OrderedDict
 from enum import Enum
 import json
 import logging
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from krw_ontology.agent_index import AgentRetriever, OntologyStore, QueryPlan
 from krw_ontology.agent_index.retrieval_text import format_metric_compact
+from krw_ontology.agent_index.research_kernel import ResearchKernel, request_from_query_context_args
 from krw_ontology.agent_index.store import DEFAULT_QUERY_TYPES
 from krw_ontology.config.paths import ONTOLOGY_ROOT_ENV, resolve_agent_index_path, resolve_ontology_root
 
@@ -35,6 +39,9 @@ class ResponseDetail(str, Enum):
 LOGGER = logging.getLogger(__name__)
 SLOW_MCP_TOOL_LOG_THRESHOLD_MS = 5_000
 _SLOW_MCP_TOOL_LOG_MARKER = "[krw-ontology:mcp-slow-path]"
+_TRACE_TOOL_CACHE_MAX = 512
+_TRACE_TOOL_CACHE: OrderedDict[tuple[str, str], dict[str, Any]] = OrderedDict()
+_TRACE_TOOL_CACHE_LOCK = threading.Lock()
 
 
 def _elapsed_ms(started_at: float) -> int:
@@ -409,6 +416,17 @@ def query_tool(
             len(payload.get("ticker_candidates") or []),
             limit_groups,
         )
+        payload["kernel"] = _query_kernel_envelope(
+            topic=search_topic or topic,
+            tickers=normalized_tickers,
+            document_types=normalized_document_types,
+            periods=normalized_periods,
+            limit_results=limit,
+            result_count=len(payload.get("ticker_candidates") or []),
+            research_pack={"company_topic_pack": {"top_candidates": payload.get("ticker_candidates") or []}},
+            agent_autonomy={"allowed_next_tools": ["krw_ontology_trace"], "max_additional_tool_calls": 1},
+            do_not_call=["broad_retrieve", "unscoped_query"],
+        )
         _log_mcp_tool_timing(
             "krw_ontology_query",
             duration_ms=_elapsed_ms(started_at),
@@ -503,6 +521,17 @@ def query_tool(
             len(payload.get("ticker_candidates") or []),
             limit_groups,
         )
+    payload["kernel"] = _query_kernel_envelope(
+        topic=search_topic or topic,
+        tickers=normalized_tickers,
+        document_types=normalized_document_types,
+        periods=normalized_periods,
+        limit_results=limit,
+        result_count=len(results) if "results" in payload else len(payload.get("ticker_candidates") or []),
+        research_pack={"query_results": results if "results" in payload else payload.get("ticker_candidates") or []},
+        agent_autonomy={"allowed_next_tools": ["krw_ontology_trace"], "max_additional_tool_calls": 1},
+        do_not_call=["broad_retrieve"],
+    )
     _log_mcp_tool_timing(
         "krw_ontology_query",
         duration_ms=_elapsed_ms(started_at),
@@ -680,6 +709,7 @@ def retrieve_tool(
                 "directness_guard": _directness_guard_from_research_context(research_context),
                 "research_context_version": research_context.get("research_context_version"),
                 "research_status": research_context.get("research_status"),
+                "kernel": research_context.get("kernel"),
                 "stop_guard": _stop_guard_from_research_context(research_context),
                 "research_pack": research_context.get("research_pack"),
                 "agent_autonomy": research_context.get("agent_autonomy"),
@@ -715,6 +745,7 @@ def retrieve_tool(
                 "research_context": {
                     "research_context_version": research_context.get("research_context_version"),
                     "research_status": research_context.get("research_status"),
+                    "kernel": research_context.get("kernel"),
                     "agent_autonomy": research_context.get("agent_autonomy"),
                     "missing_parts": research_context.get("missing_parts") or [],
                     "do_not_call": research_context.get("do_not_call") or [],
@@ -722,6 +753,7 @@ def retrieve_tool(
                     "research_pack": research_context.get("research_pack"),
                 },
                 "research_pack": research_context.get("research_pack"),
+                "kernel": research_context.get("kernel"),
                 "agent_autonomy": research_context.get("agent_autonomy"),
                 "missing_parts": research_context.get("missing_parts") or [],
                 "do_not_call": research_context.get("do_not_call") or [],
@@ -747,6 +779,7 @@ def retrieve_tool(
     result["research_context"] = {
         "research_context_version": research_context.get("research_context_version"),
         "research_status": research_context.get("research_status"),
+        "kernel": research_context.get("kernel"),
         "agent_autonomy": research_context.get("agent_autonomy"),
         "missing_parts": research_context.get("missing_parts") or [],
         "do_not_call": research_context.get("do_not_call") or [],
@@ -754,6 +787,7 @@ def retrieve_tool(
         "research_pack": research_context.get("research_pack"),
     }
     result["directness_guard"] = _directness_guard_from_research_context(research_context)
+    result["kernel"] = research_context.get("kernel")
     result.setdefault("answerability", research_context.get("answerability") or {})
     result.setdefault("recommended_answer_mode", (research_context.get("answerability") or {}).get("recommended_answer_mode"))
     if answer_candidate_only:
@@ -811,6 +845,12 @@ def trace_tool(
 ) -> str:
     """Trace one ontology object to its source document, quotes, spans, and quality."""
     index = _index(root, index_path)
+    cache_key = (str(index), object_id)
+    with _TRACE_TOOL_CACHE_LOCK:
+        cached = _TRACE_TOOL_CACHE.get(cache_key)
+        if cached is not None:
+            _TRACE_TOOL_CACHE.move_to_end(cache_key)
+            return _format_response(copy.deepcopy(cached), response_format, _markdown_trace)
     with _store(index) as store:
         trace = store.trace(object_id)
         resolved_from_prefix = None
@@ -839,6 +879,12 @@ def trace_tool(
         payload = trace
         if resolved_from_prefix:
             payload["resolved_from_prefix"] = resolved_from_prefix
+        if not resolved_from_prefix:
+            with _TRACE_TOOL_CACHE_LOCK:
+                _TRACE_TOOL_CACHE[cache_key] = copy.deepcopy(payload)
+                _TRACE_TOOL_CACHE.move_to_end(cache_key)
+                while len(_TRACE_TOOL_CACHE) > _TRACE_TOOL_CACHE_MAX:
+                    _TRACE_TOOL_CACHE.popitem(last=False)
     return _format_response(payload, response_format, _markdown_trace)
 
 
@@ -1010,6 +1056,28 @@ def compare_tool(
                 periods=periods,
                 limit_per_ticker=limit_per_ticker,
             )
+    if "kernel" not in result:
+        request = request_from_query_context_args(
+            question=f"compare {topic or metric or 'comparison'}",
+            tickers=normalized_tickers,
+            document_types=document_types or [],
+            periods=periods or [],
+            universe=None,
+            limit_results=limit_per_ticker,
+            limit_tickers=len(normalized_tickers),
+            mode="compare",
+        )
+        result["kernel"] = ResearchKernel().build_envelope(
+            request,
+            research_status="sufficient_for_default_answer" if result.get("results") else "needs_targeted_followup",
+            answer_mode="comparison_research_state",
+            research_pack={"comparison_contexts": result.get("comparison_contexts") or {}},
+            answerability={"related_context_available": bool(result.get("results"))},
+            missing_parts=[] if result.get("results") else ["comparison_candidates_not_found"],
+            recommended_tools=[],
+            agent_autonomy={"allowed_next_tools": ["krw_ontology_trace"], "max_additional_tool_calls": 1},
+            do_not_call=["raw_fts_winner_by_hit_count", "broad_retrieve"],
+        )
     result["comparison_rows"] = _comparison_rows(result)
     payload = result if detail == ResponseDetail.FULL else _compact_compare(result)
     payload["query"] = {
@@ -1159,6 +1227,7 @@ def query_context_tool(
     payload_dict = _safe_payload_dict(payload)
     answerability = _safe_payload_dict(payload_dict.get("answerability"))
     research_pack = _safe_payload_dict(payload_dict.get("research_pack"))
+    kernel = _safe_payload_dict(payload_dict.get("kernel"))
     _log_mcp_tool_timing(
         "krw_ontology_query_context",
         duration_ms=_elapsed_ms(started_at),
@@ -1172,6 +1241,9 @@ def query_context_tool(
         include_internal_ids=bool(include_internal_ids),
         research_status=payload_dict.get("research_status"),
         recommended_answer_mode=answerability.get("recommended_answer_mode"),
+        kernel_intent=kernel.get("intent"),
+        kernel_primary_context=kernel.get("primary_context"),
+        kernel_status=kernel.get("status"),
         ticker_candidate_count=_count_items(payload_dict.get("ticker_candidates")),
         missing_part_count=_count_items(payload_dict.get("missing_parts")),
         research_pack_keys=sorted(str(key) for key in research_pack.keys()) if research_pack else [],
@@ -1592,12 +1664,54 @@ def _compact_research_context(context: Mapping[str, Any]) -> dict[str, Any]:
         "top_candidate": context.get("top_candidate"),
         "recommended_tools": list(context.get("recommended_tools") or [])[:3],
         "research_status": context.get("research_status"),
+        "kernel": context.get("kernel") or {},
         "agent_autonomy": context.get("agent_autonomy") or {},
         "missing_parts": context.get("missing_parts") or [],
         "do_not_call": context.get("do_not_call") or [],
         "directness_guard": context.get("directness_guard") or {},
         "research_pack_summary": context.get("research_pack_summary") or {},
     }
+
+
+def _query_kernel_envelope(
+    *,
+    topic: str | None,
+    tickers: Sequence[str] | None,
+    document_types: Sequence[str] | None,
+    periods: Sequence[str] | None,
+    limit_results: int,
+    result_count: int,
+    research_pack: Mapping[str, Any],
+    agent_autonomy: Mapping[str, Any],
+    do_not_call: Sequence[str],
+) -> dict[str, Any]:
+    request = request_from_query_context_args(
+        question=topic or "structured query",
+        tickers=tickers or [],
+        document_types=document_types or [],
+        periods=periods or [],
+        universe=None,
+        limit_results=limit_results,
+        limit_tickers=len(tickers or []),
+        mode="query",
+    )
+    return ResearchKernel().build_envelope(
+        request,
+        research_status="sufficient_for_default_answer" if result_count else "needs_targeted_followup",
+        answer_mode="targeted_search_results",
+        research_pack=research_pack,
+        answerability={
+            "direct_answerable": False,
+            "related_context_available": bool(result_count),
+            "negative_answer_supported": False,
+            "needs_user_clarification": False,
+            "recommended_answer_mode": "targeted_search_results" if result_count else "needs_targeted_followup",
+        },
+        missing_parts=[] if result_count else ["query_results_not_found"],
+        recommended_tools=[],
+        agent_autonomy=agent_autonomy,
+        do_not_call=do_not_call,
+    )
 
 
 def _directness_guard_from_research_context(context: Mapping[str, Any]) -> dict[str, Any]:

@@ -10,6 +10,7 @@ from krw_ontology.utils.logging import setup_logging
 def test_setup_logging_is_idempotent():
     logger = logging.getLogger("krw_ontology")
     original_handlers = list(logger.handlers)
+    original_propagate = logger.propagate
     logger.handlers = []
     try:
         setup_logging()
@@ -24,3 +25,4 @@ def test_setup_logging_is_idempotent():
         assert logger.propagate is False
     finally:
         logger.handlers = original_handlers
+        logger.propagate = original_propagate

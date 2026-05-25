@@ -601,6 +601,8 @@ def test_mcp_query_context_includes_metric_series_research_pack(
 
     metric_pack = payload["research_pack"]["metric_series_pack"]
     assert payload["research_context_version"] == "v1"
+    assert payload["research_pack"]["intent_router"]["intent"] == "metric_series"
+    assert payload["research_pack"]["context_policy"]["run_metric_series"] is True
     assert payload["research_status"] == "sufficient_for_default_answer"
     assert payload["search_diagnostics"]["discovery_skipped"] is True
     assert payload["search_diagnostics"]["metric_series"]["mode"] == "metric_dimension_lookup"
@@ -623,6 +625,55 @@ def test_mcp_query_context_includes_metric_series_research_pack(
     assert payload["research_pack"]["chain_pack"]["mode"] == "lazy_root_candidates"
 
 
+def test_mcp_query_context_risk_thesis_router_skips_metric_deep_path(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _write_metric_dimension_fixture(tmp_path)
+    build_agent_index(tmp_path)
+    monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
+
+    payload = json.loads(
+        query_context_tool(
+            question="AAPL의 사이버 보안 리스크가 매출 성장률을 갉아먹는지 점검해줘.",
+            ticker="AAPL",
+            periods=["CY2024", "CY2025"],
+            limit_results=10,
+        )
+    )
+
+    research_pack = payload["research_pack"]
+    assert research_pack["intent_router"]["intent"] == "risk_thesis"
+    assert research_pack["intent_router"]["primary_context"] == "risk_context"
+    assert research_pack["context_policy"]["run_metric_series"] is False
+    assert research_pack["metric_series_pack"] is None
+    assert "deep_metric_series" in research_pack["context_policy"]["do_not_call"]
+
+
+def test_mcp_query_context_company_overview_router_avoids_metric_first(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _write_metric_dimension_fixture(tmp_path)
+    build_agent_index(tmp_path)
+    monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
+
+    payload = json.loads(
+        query_context_tool(
+            question="AAPL은 iPhone, Services, Mac으로 어떻게 돈을 벌고 최근 매출 동인은 무엇인지 정리해줘.",
+            ticker="AAPL",
+            periods=["CY2024", "CY2025"],
+            limit_results=10,
+        )
+    )
+
+    research_pack = payload["research_pack"]
+    assert research_pack["intent_router"]["intent"] == "company_overview"
+    assert research_pack["intent_router"]["primary_context"] == "company_overview_context"
+    assert research_pack["context_policy"]["run_metric_series"] is False
+    assert research_pack["metric_series_pack"] is None
+
+
 def test_mcp_query_context_projection_pack_marks_candidates_search_only_for_direct_question(
     tmp_path: Path,
     monkeypatch,
@@ -640,6 +691,8 @@ def test_mcp_query_context_projection_pack_marks_candidates_search_only_for_dire
     )
 
     projection_pack = payload["research_pack"]["projection_pack"]
+    assert payload["research_pack"]["intent_router"]["intent"] == "direct_exposure"
+    assert payload["research_pack"]["metric_series_pack"] is None
     top_level_guard = payload["research_pack"]["directness_guard"]
     directness = projection_pack["directness"]
     assert top_level_guard["requires_direct_match"] is True

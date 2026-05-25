@@ -868,11 +868,13 @@ class OntologyStore:
         include_internal_ids: bool,
     ) -> dict[str, Any]:
         """Compile a bounded research workbench for agent synthesis."""
+        intent_router = _research_intent_profile(question)
+        context_policy = _research_context_policy(intent_router.get("intent"))
         metric_series_pack: dict[str, Any] | None = None
         projection_pack: dict[str, Any] | None = None
         compact_limit = max(3, min(int(limit_results), 12))
         metric_topic = _research_metric_topic(question, search_topic)
-        if requested_tickers and metric_topic:
+        if context_policy.get("run_metric_series") and requested_tickers and metric_topic:
             metric_limit = max(compact_limit, 20) if _metric_lookup_needs_denominator(metric_topic) else compact_limit
             metric_periods = _metric_lookup_research_period_filters(metric_topic, periods)
             metric_document_types = document_types
@@ -893,7 +895,7 @@ class OntologyStore:
             object_types=DEFAULT_QUERY_TYPES,
             explicit_object_types=False,
         )
-        if typed_profile.get("enabled"):
+        if context_policy.get("run_typed_projection") and typed_profile.get("enabled"):
             projection_results, projection_diagnostics = self.query_compact_with_diagnostics(
                 topic=question,
                 tickers=requested_tickers,
@@ -922,6 +924,8 @@ class OntologyStore:
         )
 
         return {
+            "intent_router": intent_router,
+            "context_policy": context_policy,
             "metric_series_pack": metric_series_pack,
             "projection_pack": projection_pack,
             "company_topic_pack": _company_topic_research_pack(selected_candidates),
@@ -4288,6 +4292,141 @@ def _research_context_valuation_guard(question: str) -> dict[str, Any] | None:
             "capex_or_cost_pressure",
         ],
     }
+
+
+def _contains_any(text: str, terms: Sequence[str]) -> bool:
+    return any(term in text for term in terms)
+
+
+def _research_intent_profile(question: str) -> dict[str, Any]:
+    raw = str(question or "")
+    text = raw.casefold()
+    direct = _question_requires_direct_match(raw)
+    overview = _contains_any(
+        text,
+        (
+            "어떻게 돈",
+            "돈을 벌",
+            "사업 구조",
+            "사업모델",
+            "사업 모델",
+            "매출 동인",
+            "수익원",
+            "business model",
+            "make money",
+            "revenue driver",
+        ),
+    )
+    risk = _contains_any(
+        text,
+        (
+            "리스크",
+            "위험",
+            "흔드는",
+            "압박",
+            "충격",
+            "노출",
+            "불확실",
+            "thesis",
+            "risk",
+            "pressure",
+            "disruption",
+            "exposure",
+            "cyber",
+            "regulatory",
+            "litigation",
+            "supply chain",
+        ),
+    )
+    metric = _metric_lookup_topic_is_metric_like(raw) or _contains_any(
+        text,
+        (
+            "매출",
+            "수익",
+            "마진",
+            "영업이익",
+            "순이익",
+            "현금흐름",
+            "비중",
+            "성장률",
+            "증가율",
+            "총부채",
+            "총자산",
+            "capex",
+            "eps",
+            "nii",
+            "nim",
+            "revenue",
+            "sales",
+            "margin",
+            "cash flow",
+            "debt",
+            "asset",
+        ),
+    )
+    comparison = _contains_any(text, (" vs ", " versus ", "비교", "대비", "compare"))
+    discovery = _contains_any(text, ("어떤 기업", "찾아줘", "수혜", "피해 큰", "영향 큰", "beneficiar", "screen"))
+    explicit_calculation = _contains_any(
+        text,
+        ("계산", "산출", "추이", "시계열", "분기별", "연도별", "ratio", "calculate", "trend", "series"),
+    )
+
+    if direct:
+        intent = "direct_exposure"
+        primary_context = "direct_exposure_context"
+        confidence = 0.9
+    elif overview:
+        intent = "company_overview"
+        primary_context = "company_overview_context"
+        confidence = 0.84
+    elif risk and not explicit_calculation:
+        intent = "risk_thesis"
+        primary_context = "risk_context"
+        confidence = 0.82
+    elif metric:
+        intent = "metric_series"
+        primary_context = "metric_context"
+        confidence = 0.86
+    elif comparison:
+        intent = "comparison"
+        primary_context = "compare_context"
+        confidence = 0.78
+    elif discovery:
+        intent = "discovery"
+        primary_context = "discovery_context"
+        confidence = 0.76
+    elif risk:
+        intent = "risk_thesis"
+        primary_context = "risk_context"
+        confidence = 0.72
+    else:
+        intent = "general_research"
+        primary_context = "company_topic_context"
+        confidence = 0.55
+
+    return {
+        "intent": intent,
+        "primary_context": primary_context,
+        "confidence": confidence,
+    }
+
+
+def _research_context_policy(intent: Any) -> dict[str, Any]:
+    intent_name = str(intent or "general_research")
+    policy: dict[str, Any] = {
+        "run_metric_series": True,
+        "run_typed_projection": True,
+        "allowed_next_tools": ["krw_ontology_trace", "krw_ontology_chain"],
+        "do_not_call": [],
+        "max_additional_tool_calls": 2,
+    }
+    if intent_name == "metric_series":
+        policy["run_typed_projection"] = False
+        policy["allowed_next_tools"] = ["krw_ontology_trace"]
+    elif intent_name in {"risk_thesis", "direct_exposure", "company_overview", "discovery", "comparison"}:
+        policy["run_metric_series"] = False
+        policy["do_not_call"] = ["deep_metric_series", "broad_retrieve", "unscoped_query"]
+    return policy
 
 
 def _research_metric_topic(question: str, search_topic: str | None) -> str | None:

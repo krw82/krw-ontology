@@ -548,6 +548,55 @@ def test_mcp_query_context_returns_research_pack_and_bounded_chain(
     assert len(payload["research_pack"]["chain_pack"]["primary_chains"]) <= 2
 
 
+def test_mcp_query_context_includes_cross_company_signal_pack(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _write_fixture(tmp_path)
+    build_agent_index(tmp_path)
+    monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
+
+    payload = json.loads(
+        query_context_tool(
+            question=(
+                "Across VG and XOM, what do latest company filing commentary and metrics say "
+                "about revenue growth, demand, natural gas pricing, and operating margin?"
+            ),
+            tickers=["VG", "XOM"],
+            limit_results=5,
+        )
+    )
+
+    signal_pack = payload["research_pack"]["cross_company_signal_pack"]
+    assert signal_pack["mode"] == "cross_company_signal_synthesis"
+    assert signal_pack["answer_policy"].startswith("Use this as compact cross-company evidence")
+    assert signal_pack["ticker_basket"][:2] == ["VG", "XOM"]
+    assert signal_pack["company_evidence_rows"]
+    assert signal_pack["signals"]
+    assert signal_pack["quality"]["missing_parts"] == []
+    assert {
+        row["evidence_strength"] for row in signal_pack["company_evidence_rows"]
+    } <= {"strong", "medium", "weak"}
+    assert any(
+        "revenue" in row["commentary_summary"].lower()
+        or "margin" in row["commentary_summary"].lower()
+        for row in signal_pack["company_evidence_rows"]
+    )
+
+    markdown = query_context_tool(
+        question=(
+            "Across VG and XOM, what do latest company filing commentary and metrics say "
+            "about revenue growth, demand, natural gas pricing, and operating margin?"
+        ),
+        tickers=["VG", "XOM"],
+        limit_results=5,
+        response_format=ResponseFormat.MARKDOWN,
+    )
+    assert "cross_company_signal_pack: available" in markdown
+    assert "signal:" in markdown
+    assert "evidence:" in markdown
+
+
 def test_mcp_query_context_stops_out_of_scope_valuation(
     tmp_path: Path,
     monkeypatch,

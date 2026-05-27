@@ -21,7 +21,7 @@ The exact headings may vary, but the answer must be directly useful and filing-a
 ## Normal answer must not include
 
 ```text
-mode names
+runtime setting names
 tool names
 pack names
 object IDs

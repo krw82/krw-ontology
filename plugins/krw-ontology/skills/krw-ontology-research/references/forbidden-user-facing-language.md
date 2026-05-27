@@ -10,9 +10,10 @@ Do not write:
 공시자료 기반 한계
 공시자료 기준 한계
 분석 한계
-이번 분석은 fast research mode로 진행되어
-이번 분석은 standard mode로 진행되어
-이번 분석은 deep mode로 진행되어
+참고: 위 분석은
+수치 기반의 정량적 매크로 지표보다는
+질적 리스크 요인을 중심으로
+이번 분석은 내부 실행 설정에 따라 진행되어
 현재 조회 범위에서는
 현재 도구 조회 범위에서는
 근거 탐색 범위
@@ -65,10 +66,8 @@ allowed_next_tools
 do_not_call
 ResearchKernel
 kernel
-research mode
-deep mode
-standard mode
-fast mode
+runtime setting
+execution mode
 EvidenceQuote
 ResearchClaim
 MetricObservation

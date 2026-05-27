@@ -1310,6 +1310,33 @@ def _markdown_query_context(payload: Mapping[str, Any]) -> str:
     ]
     if stop_guard:
         lines.append(f"- cannot_answer_reason: {stop_guard.get('cannot_answer_reason')}")
+    research_pack = payload.get("research_pack") if isinstance(payload.get("research_pack"), Mapping) else {}
+    cross_company_pack = (
+        research_pack.get("cross_company_signal_pack")
+        if isinstance(research_pack, Mapping)
+        else None
+    )
+    if isinstance(cross_company_pack, Mapping):
+        lines.append("- cross_company_signal_pack: available")
+        if cross_company_pack.get("latest_period_anchor"):
+            lines.append(f"- latest_period_anchor: {cross_company_pack.get('latest_period_anchor')}")
+        for signal in (cross_company_pack.get("signals") or [])[:4]:
+            if not isinstance(signal, Mapping):
+                continue
+            companies = ", ".join(str(value) for value in signal.get("companies_supporting") or [])
+            lines.append(
+                f"- signal: {signal.get('signal')} | companies: {companies} | strength: {signal.get('strength')}"
+            )
+        for row in (cross_company_pack.get("company_evidence_rows") or [])[:6]:
+            if not isinstance(row, Mapping):
+                continue
+            summary = str(row.get("commentary_summary") or "").replace("\n", " ").strip()
+            if len(summary) > 180:
+                summary = summary[:177] + "..."
+            lines.append(
+                f"- evidence: {row.get('ticker')} {row.get('period')} {row.get('document_type')} "
+                f"{row.get('signal')} ({row.get('evidence_strength')}): {summary}"
+            )
     for candidate in payload.get("ticker_candidates") or []:
         lines.append(f"- {candidate.get('ticker')}: {candidate.get('tier') or candidate.get('top_tier')}")
     return "\n".join(lines)

@@ -21,24 +21,20 @@ direct vs related context separated
 
 ```text
 query_context first
-V1 public path uses Deep by default
-retrieve count = 0 in Fast/Standard unless explicit fallback condition
-Fast trace/chain = 0 normally
-Standard trace/chain = 1-2 normally
-Deep can use more selected trace/chain, but must not brute-force every candidate
+retrieve is legacy fallback only; do not use after sufficient query_context
+trace/chain selected roots only; never brute-force every candidate
 no repeated equivalent query
 no broad full-response first pass
-tool_budget_exceeded user-visible failure = 0
-composer fallback user-visible wording = 0
+open tool result missing completed runs = 0
+tool budget / fallback / retry wording visible to user = 0
+overflow or oversized tool result becomes split-and-continue behavior, not a final-answer failure
 ```
 
 ## Latency and quality targets
 
 ```text
-standard internal smoke p95 around 10-12 seconds
-deep V1 prioritizes completed answer quality over shallow latency
 internal leak cases = 0
-mode violation cases = 0
-budget/error/fallback wording cases = 0
+runtime setting leak cases = 0
+budget/error/fallback/overflow wording cases = 0
 B-grade cases <= 1 in 30Q smoke
 ```

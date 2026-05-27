@@ -32,6 +32,6 @@ semantic neighbors are useful
 
 Trace/chain only selected roots. Do not trace or chain every candidate.
 
-Fast mode normally uses no trace/chain. Standard mode normally uses 1-2 total selected trace/chain calls. Deep mode can use more, but still no chain-all behavior.
+Follow runner budget, `agent_autonomy`, and `kernel` guidance. If no explicit guidance is present, use the smallest number of selected roots that materially improves the answer.
 
 Keep chain/trace internals out of normal answers.

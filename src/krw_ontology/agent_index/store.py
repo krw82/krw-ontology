@@ -1033,6 +1033,16 @@ class OntologyStore:
             projection_pack=projection_pack,
             company_topic_pack=company_topic_pack,
         )
+        cross_company_signal_pack = _cross_company_signal_research_pack(
+            question=question,
+            route=research_route,
+            requested_tickers=requested_tickers,
+            company_topic_pack=company_topic_pack,
+            projection_pack=projection_pack,
+            chain_pack=chain_pack,
+            recommended_tools=recommended_tools,
+            period_display_policy=period_display_policy,
+        )
         scope_guard_pack = _scope_guard_research_pack(research_route)
         evidence_index = _research_evidence_index(
             trace_candidates=recommended_tools,
@@ -1052,6 +1062,7 @@ class OntologyStore:
             "risk_mechanism_pack": risk_mechanism_pack,
             "comparison_view": comparison_view,
             "direct_exposure_pack": direct_exposure_pack,
+            "cross_company_signal_pack": cross_company_signal_pack,
             "scope_guard_pack": scope_guard_pack,
             "company_topic_pack": company_topic_pack,
             "chain_pack": chain_pack,
@@ -5153,6 +5164,315 @@ def _direct_exposure_research_pack(
             "missing_parts": [] if direct_candidates or related_candidates else ["direct_exposure_candidates_not_found"],
         },
     }
+
+
+def _cross_company_signal_research_pack(
+    *,
+    question: str,
+    route: Any,
+    requested_tickers: Sequence[str] | None,
+    company_topic_pack: Mapping[str, Any],
+    projection_pack: Mapping[str, Any] | None,
+    chain_pack: Mapping[str, Any],
+    recommended_tools: Sequence[Mapping[str, Any]],
+    period_display_policy: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    topic_rows = [row for row in company_topic_pack.get("top_candidates") or [] if isinstance(row, Mapping)]
+    projection_rows = [
+        row
+        for row in ((projection_pack or {}).get("candidates") if isinstance(projection_pack, Mapping) else []) or []
+        if isinstance(row, Mapping)
+    ]
+    ticker_basket = _cross_company_ticker_basket(requested_tickers, topic_rows, projection_rows)
+    if not _is_cross_company_signal_question(question, route=route, ticker_basket=ticker_basket):
+        return None
+
+    evidence_rows: list[dict[str, Any]] = []
+    for row in projection_rows[:8]:
+        evidence_rows.append(_cross_company_evidence_row(row, source="projection_candidate"))
+    for row in topic_rows[:10]:
+        evidence_rows.append(_cross_company_evidence_row(row, source="company_topic"))
+
+    deduped_rows: list[dict[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
+    for row in evidence_rows:
+        key = (
+            row.get("ticker"),
+            row.get("period"),
+            row.get("signal"),
+            row.get("commentary_summary"),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped_rows.append(row)
+        if len(deduped_rows) >= 12:
+            break
+
+    signals = _cross_company_signal_rows(deduped_rows)
+    trace_roots = [
+        str(tool.get("object_id"))
+        for tool in recommended_tools[:3]
+        if tool.get("object_id")
+    ]
+    chain_roots = [
+        str(root.get("root_object_id"))
+        for root in (chain_pack.get("root_candidates") or [])
+        if isinstance(root, Mapping) and root.get("root_object_id")
+    ]
+    quality = _cross_company_signal_quality(deduped_rows)
+    missing_parts = []
+    if not deduped_rows:
+        missing_parts.append("cross_company_evidence_rows_not_found")
+    if len(ticker_basket) < 2:
+        missing_parts.append("multi_company_ticker_basket_not_found")
+    quality["missing_parts"] = missing_parts
+
+    return {
+        "mode": "cross_company_signal_synthesis",
+        "question_focus": _cross_company_question_focus(question),
+        "ticker_basket": ticker_basket,
+        "latest_period_anchor": _latest_period_anchor(deduped_rows, period_display_policy),
+        "signals": signals,
+        "company_evidence_rows": deduped_rows,
+        "recommended_trace_roots": trace_roots,
+        "recommended_chain_roots": chain_roots,
+        "answer_policy": (
+            "Use this as compact cross-company evidence. Final macro/sector/thesis judgment remains with the AI analyst."
+        ),
+        "quality": quality,
+    }
+
+
+def _is_cross_company_signal_question(question: str, *, route: Any, ticker_basket: Sequence[str]) -> bool:
+    text = str(question or "").lower()
+    intent = str(getattr(getattr(route, "intent", None), "value", getattr(route, "intent", "")))
+    if len(set(ticker_basket)) >= 2 and intent in {"comparison", "risk_thesis", "discovery", "general_research", "company_overview"}:
+        return True
+    return any(
+        term in text
+        for term in (
+            "sector",
+            "macro",
+            "read-through",
+            "read through",
+            "industry",
+            "cycle",
+            "cross-company",
+            "companies",
+            "consumer",
+            "semiconductor",
+            "credit environment",
+            "섹터",
+            "업종",
+            "매크로",
+            "기업들",
+            "소비재",
+            "반도체",
+            "신용 환경",
+            "사이클",
+        )
+    )
+
+
+def _cross_company_ticker_basket(
+    requested_tickers: Sequence[str] | None,
+    topic_rows: Sequence[Mapping[str, Any]],
+    projection_rows: Sequence[Mapping[str, Any]],
+) -> list[str]:
+    tickers: list[str] = []
+    for ticker in requested_tickers or []:
+        if ticker:
+            tickers.append(str(ticker).upper())
+    for row in list(projection_rows) + list(topic_rows):
+        ticker = row.get("ticker")
+        if ticker:
+            tickers.append(str(ticker).upper())
+    return [str(value) for value in _unique(tickers)[:12]]
+
+
+def _cross_company_evidence_row(row: Mapping[str, Any], *, source: str) -> dict[str, Any]:
+    summary = str(row.get("summary") or row.get("topic_summary") or row.get("topic_label") or "").strip()
+    object_type = row.get("type") or row.get("primary_object_type") or row.get("topic_type")
+    signal = _cross_company_signal_name(summary, object_type=object_type)
+    evidence_strength = _cross_company_evidence_strength(row, summary=summary)
+    return {
+        "ticker": row.get("ticker"),
+        "period": row.get("period"),
+        "document_type": row.get("document_type"),
+        "signal": signal,
+        "evidence_type": _cross_company_evidence_type(row, source=source),
+        "commentary_summary": summary[:700],
+        "financial_channel": _cross_company_financial_channels(summary),
+        "evidence_strength": evidence_strength,
+        "specificity_score": row.get("specificity_score"),
+        "boilerplate_score": row.get("boilerplate_score"),
+        "trace_status": row.get("trace_status"),
+        "tier": row.get("tier"),
+        "source": source,
+        "trace_root": row.get("id") or row.get("primary_object_id"),
+        "chain_root": row.get("id") or row.get("primary_object_id"),
+    }
+
+
+def _cross_company_evidence_type(row: Mapping[str, Any], *, source: str) -> str:
+    object_type = str(row.get("type") or row.get("primary_object_type") or row.get("topic_type") or "")
+    if object_type in {"MetricObservation", "Calculation", "XBRLFact"}:
+        return "numeric_metric"
+    if object_type in {"ResearchClaim", "EvidenceQuote"}:
+        return "company_filing_commentary"
+    if object_type in {"ExternalFactorExposure", "BusinessFactor", "Headwind", "RiskFactor"}:
+        return "risk_or_factor_channel"
+    if source == "projection_candidate":
+        return "typed_projection_candidate"
+    return "company_topic"
+
+
+def _cross_company_evidence_strength(row: Mapping[str, Any], *, summary: str) -> str:
+    tier = str(row.get("tier") or "").lower()
+    trace_status = str(row.get("trace_status") or "").lower()
+    evidence_grade = str(row.get("evidence_grade") or row.get("evidence_strength") or "").lower()
+    specificity = _metric_observation_number(row.get("specificity_score"))
+    boilerplate = _metric_observation_number(row.get("boilerplate_score"))
+    if tier in {"traceable_direct", "traceable_metric_lineage"} or evidence_grade == "direct" or trace_status == "traceable":
+        return "strong"
+    if specificity is not None and specificity >= 0.65 and (boilerplate is None or boilerplate <= 0.45):
+        return "strong"
+    if _looks_like_generic_boilerplate(summary) or (boilerplate is not None and boilerplate >= 0.65):
+        return "weak"
+    if tier in {"traceable_related", "untraced_direct_candidate"} or evidence_grade in {"indirect", "derived"}:
+        return "medium"
+    return "medium"
+
+
+def _looks_like_generic_boilerplate(text: str) -> bool:
+    lowered = text.lower()
+    generic_patterns = (
+        "may change",
+        "may adversely affect",
+        "could adversely affect",
+        "competition may",
+        "costs may increase",
+        "consumer demand may",
+        "uncertain",
+        "subject to",
+    )
+    return any(pattern in lowered for pattern in generic_patterns)
+
+
+def _cross_company_signal_name(summary: str, *, object_type: Any) -> str:
+    text = summary.lower()
+    if any(term in text for term in ("price", "pricing", "pass through", "가격", "전가")):
+        return "pricing_power"
+    if any(term in text for term in ("volume", "traffic", "comparable sales", "unit", "demand", "수요", "판매량", "트래픽")):
+        return "demand_or_volume"
+    if any(term in text for term in ("cost", "input", "commodity", "freight", "cogs", "원가", "비용", "운임")):
+        return "input_cost_pressure"
+    if any(term in text for term in ("margin", "gross", "operating income", "마진", "이익률")):
+        return "margin_pressure"
+    if any(term in text for term in ("rate", "credit", "interest", "funding", "금리", "신용")):
+        return "rates_or_credit"
+    if any(term in text for term in ("regulation", "tariff", "geopolitical", "관세", "규제", "지정학")):
+        return "policy_or_geopolitical"
+    if str(object_type or "") in {"MetricObservation", "Calculation", "XBRLFact"}:
+        return "numeric_operating_signal"
+    return "business_or_macro_signal"
+
+
+def _cross_company_financial_channels(summary: str) -> list[str]:
+    text = summary.lower()
+    channels: list[str] = []
+    if any(term in text for term in ("revenue", "sales", "demand", "volume", "traffic", "매출", "수요", "판매량")):
+        channels.append("revenue_or_volume")
+    if any(term in text for term in ("gross margin", "margin", "operating income", "마진", "영업이익")):
+        channels.append("margin")
+    if any(term in text for term in ("cost", "expense", "cogs", "input", "원가", "비용")):
+        channels.append("cost")
+    if any(term in text for term in ("cash", "working capital", "현금")):
+        channels.append("cash_flow")
+    return channels or ["business_performance"]
+
+
+def _cross_company_signal_rows(evidence_rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[str, list[Mapping[str, Any]]] = {}
+    for row in evidence_rows:
+        grouped.setdefault(str(row.get("signal") or "business_or_macro_signal"), []).append(row)
+    signal_rows: list[dict[str, Any]] = []
+    for signal, rows in grouped.items():
+        strengths = [str(row.get("evidence_strength") or "medium") for row in rows]
+        companies = [str(value) for value in _unique(str(row.get("ticker")) for row in rows if row.get("ticker"))]
+        channels: list[str] = []
+        for row in rows:
+            channels.extend(str(channel) for channel in row.get("financial_channel") or [])
+        signal_rows.append(
+            {
+                "signal": signal,
+                "companies_supporting": companies,
+                "evidence_count": len(rows),
+                "strength": _combined_evidence_strength(strengths),
+                "financial_channel": [str(value) for value in _unique(channels)],
+                "interpretation_hint": _cross_company_interpretation_hint(signal),
+            }
+        )
+    signal_rows.sort(key=lambda row: (-int(row.get("evidence_count") or 0), str(row.get("signal") or "")))
+    return signal_rows[:8]
+
+
+def _combined_evidence_strength(strengths: Sequence[str]) -> str:
+    if "strong" in strengths:
+        return "strong"
+    if "medium" in strengths:
+        return "medium"
+    return "weak"
+
+
+def _cross_company_interpretation_hint(signal: str) -> str:
+    hints = {
+        "pricing_power": "Evaluate whether companies can still pass costs through without losing volume.",
+        "demand_or_volume": "Separate broad demand uncertainty from actual volume, traffic, or comparable-sales evidence.",
+        "input_cost_pressure": "Connect input-cost commentary to gross margin and operating margin before making a macro claim.",
+        "margin_pressure": "Check whether margin pressure is from cost, pricing, volume, or mix.",
+        "rates_or_credit": "Treat rate or credit comments as macro sensitivity unless linked to current operating metrics.",
+        "policy_or_geopolitical": "Use as a risk channel unless latest commentary or numbers show current impact.",
+        "numeric_operating_signal": "Use same-period, same-unit numeric comparisons before drawing cross-company conclusions.",
+    }
+    return hints.get(signal, "Use multiple company signals and current filing commentary before making a broad conclusion.")
+
+
+def _cross_company_signal_quality(evidence_rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    strengths = [str(row.get("evidence_strength") or "medium") for row in evidence_rows]
+    return {
+        "strong_evidence_count": sum(1 for strength in strengths if strength == "strong"),
+        "medium_evidence_count": sum(1 for strength in strengths if strength == "medium"),
+        "weak_evidence_count": sum(1 for strength in strengths if strength == "weak"),
+        "generic_boilerplate_count": sum(
+            1 for row in evidence_rows if _looks_like_generic_boilerplate(str(row.get("commentary_summary") or ""))
+        ),
+        "latest_evidence_count": sum(1 for row in evidence_rows if _is_latestish_period(row.get("period"))),
+        "numeric_support_count": sum(1 for row in evidence_rows if row.get("evidence_type") == "numeric_metric"),
+    }
+
+
+def _latest_period_anchor(
+    evidence_rows: Sequence[Mapping[str, Any]],
+    period_display_policy: Mapping[str, Any],
+) -> str | None:
+    periods = [str(row.get("period")) for row in evidence_rows if row.get("period")]
+    if periods:
+        return sorted(set(periods))[-1]
+    if period_display_policy.get("latest_first"):
+        return "latest_available_filing"
+    return None
+
+
+def _is_latestish_period(period: Any) -> bool:
+    text = str(period or "").upper()
+    return "CY2026" in text or "CY2025" in text or text == "ALL"
+
+
+def _cross_company_question_focus(question: str) -> str:
+    normalized = " ".join(str(question or "").split())
+    return normalized[:180] or "cross-company signal synthesis"
 
 
 def _scope_guard_research_pack(route: Any) -> dict[str, Any] | None:

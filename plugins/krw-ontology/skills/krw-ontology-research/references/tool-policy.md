@@ -21,7 +21,7 @@ krw_ontology_chain
 Business/semantic/temporal mechanism around one selected object.
 
 krw_ontology_retrieve
-Legacy fallback only. Do not use after sufficient query_context in Fast or Standard mode.
+Legacy fallback only. Do not use after sufficient query_context.
 
 krw_ontology_company_context
 Company orientation only when query_context lacks company-specific vocabulary or the user asks broad company profile context.
@@ -44,7 +44,7 @@ query_context -> optional targeted query/compare -> selected trace/chain -> answ
 
 Do not issue repeated equivalent queries. Do not use `full` response detail for broad first-pass exploration.
 
-For V1 web chat, never request `response_detail="full"` in any research mode. Use compact or ticker-summary query output, then selected trace/chain when stronger verification is needed.
+Never request `response_detail="full"` in normal web chat. Use compact or ticker-summary query output, then selected trace/chain when stronger verification is needed.
 
 ## Strong claim rule
 

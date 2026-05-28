@@ -27,6 +27,7 @@ from krw_ontology.mcp_server.tools import (
     topic_map_tool,
     ResponseFormat,
 )
+from krw_ontology.release import write_release_manifest
 from krw_ontology.utils.io import atomic_write_json, write_jsonl
 
 
@@ -114,6 +115,25 @@ def test_mcp_tools_query_trace_quality_and_compare(tmp_path: Path, monkeypatch):
     plan = json.loads(plan_query_tool(question="VG 최근 10-K revenue growth 근거 찾아줘"))
     assert plan["plan"]["tickers"] == ["VG"]
     assert plan["plan"]["document_types"] == ["10-K"]
+
+
+def test_mcp_health_reports_release_manifest(tmp_path: Path, monkeypatch):
+    _write_fixture(tmp_path)
+    build_agent_index(tmp_path)
+    write_release_manifest(tmp_path, release_id="20260528_010000", env="prod")
+    monkeypatch.setenv("KRW_ONTOLOGY_ENV", "prod")
+    monkeypatch.setenv("KRW_ONTOLOGY_RELEASE_ROOT", str(tmp_path))
+    monkeypatch.delenv("KRW_ONTOLOGY_INDEX_PATH", raising=False)
+
+    payload, status_code = health_payload()
+
+    assert status_code == 200
+    assert payload["ok"] is True
+    assert payload["env"] == "prod"
+    assert payload["release_id"] == "20260528_010000"
+    assert payload["manifest_valid"] is True
+    assert payload["manifest_path"] == str(tmp_path / "manifest.json")
+    assert payload["documents"] == 2
 
 
 def test_mcp_query_normalizes_object_type_aliases(tmp_path: Path, monkeypatch):

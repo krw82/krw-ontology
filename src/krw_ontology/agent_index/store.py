@@ -6,6 +6,7 @@ from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import copy
 import json
+import os
 import re
 import sqlite3
 import time
@@ -59,6 +60,8 @@ _STRICT_TOPIC_WARNING_TERM_COUNT = 5
 _CHAIN_MAX_DEPTH = 4
 _CHAIN_MAX_PATHS = 40
 _CHAIN_MAX_TEMPORAL_CONTEXT = 12
+_DEFAULT_READ_CACHE_MIB = 128
+_DEFAULT_READ_MMAP_MIB = 512
 _QUERY_EXPANSION_RULES = (
     ("유럽", "europe european"),
     ("가스", "natural_gas_price natural gas feed gas lng"),
@@ -374,6 +377,19 @@ def _metric_lookup_selected_types(object_types: Iterable[str], *, include_xbrl: 
     return selected
 
 
+def _read_int_env(name: str, default: int, *, min_value: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    if value < min_value:
+        return default
+    return value
+
+
 class OntologyStore:
     """Read-only SDK over an agent index SQLite database."""
 
@@ -385,11 +401,21 @@ class OntologyStore:
 
     def _configure_read_connection(self) -> None:
         """Apply per-connection read-heavy SQLite settings."""
+        cache_mib = _read_int_env(
+            "KRW_SQLITE_READ_CACHE_MIB",
+            _DEFAULT_READ_CACHE_MIB,
+            min_value=1,
+        )
+        mmap_mib = _read_int_env(
+            "KRW_SQLITE_READ_MMAP_MIB",
+            _DEFAULT_READ_MMAP_MIB,
+            min_value=0,
+        )
         pragmas = (
             "PRAGMA query_only = ON",
             "PRAGMA temp_store = MEMORY",
-            "PRAGMA cache_size = -131072",
-            "PRAGMA mmap_size = 536870912",
+            f"PRAGMA cache_size = -{cache_mib * 1024}",
+            f"PRAGMA mmap_size = {mmap_mib * 1024 * 1024}",
             "PRAGMA busy_timeout = 5000",
         )
         for statement in pragmas:

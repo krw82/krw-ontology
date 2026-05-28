@@ -26,6 +26,20 @@ from krw_ontology.utils.io import atomic_write_json, write_jsonl
 runner = CliRunner()
 
 
+def test_ontology_store_read_cache_pragmas_from_env(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    index_path = tmp_path / "agent_index.sqlite"
+    sqlite3.connect(index_path).close()
+    monkeypatch.setenv("KRW_SQLITE_READ_CACHE_MIB", "256")
+    monkeypatch.setenv("KRW_SQLITE_READ_MMAP_MIB", "1024")
+
+    with OntologyStore(index_path) as store:
+        assert store.conn.execute("PRAGMA cache_size").fetchone()[0] == -262144
+        assert store.conn.execute("PRAGMA mmap_size").fetchone()[0] == 1024 * 1024 * 1024
+
+
 def test_build_agent_index_and_query_trace_quality(tmp_path: Path):
     _write_document_fixture(
         tmp_path,

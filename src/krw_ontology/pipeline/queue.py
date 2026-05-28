@@ -194,6 +194,7 @@ class PipelineQueue:
         self.locks_dir = self.queue_dir / "locks"
         self.queue_log_path = self.queue_dir / "queue.jsonl"
         self.worker_pid_path = self.queue_dir / "worker.pid"
+        self.worker_state_path = self.queue_dir / "worker_state.json"
         self.stop_requested_path = self.queue_dir / "stop_requested"
         self.worker_log_path = self.logs_dir / "worker.log"
         self.worker_lock_path = self.locks_dir / "worker.lock"
@@ -357,12 +358,35 @@ class PipelineQueue:
         self.ensure_dirs()
         self.worker_pid_path.write_text(str(pid), encoding="utf-8")
 
+    def write_worker_state(self, pid: int, *, mode: dict) -> None:
+        self.ensure_dirs()
+        payload = {
+            "pid": pid,
+            "started_at": utc_now(),
+            "mode": mode,
+        }
+        tmp_path = self.worker_state_path.with_suffix(".json.tmp")
+        tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        tmp_path.replace(self.worker_state_path)
+
     def clear_worker_pid(self, pid: int | None = None) -> None:
         if not self.worker_pid_path.exists():
             return
         if pid is not None and self.worker_pid() != pid:
             return
         self.worker_pid_path.unlink(missing_ok=True)
+
+    def clear_worker_state(self, pid: int | None = None) -> None:
+        if not self.worker_state_path.exists():
+            return
+        try:
+            payload = json.loads(self.worker_state_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            payload = None
+        state_pid = payload.get("pid") if isinstance(payload, dict) else None
+        if pid is not None and state_pid != pid:
+            return
+        self.worker_state_path.unlink(missing_ok=True)
 
     def worker_pid(self) -> int | None:
         try:
@@ -373,6 +397,16 @@ class PipelineQueue:
             return int(text)
         except ValueError:
             return None
+
+    def worker_state(self) -> dict | None:
+        try:
+            payload = json.loads(self.worker_state_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return None
+        pid = payload.get("pid")
+        if isinstance(pid, int) and not is_pid_running(pid):
+            return None
+        return payload if isinstance(payload, dict) else None
 
     def worker_is_running(self) -> bool:
         pid = self.worker_pid()

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import json
 from pathlib import Path
 
 import pytest
@@ -14,7 +15,9 @@ import krw_ontology.pipeline.orchestrator as orchestrator
 import krw_ontology.pipeline.queue as pipeline_queue
 import krw_ontology.pipeline.research_plan as research_plan
 import krw_ontology.pipeline.stages.build_company_context as company_context_stage
+from krw_ontology.cli.config import load_cli_config
 from krw_ontology.cli.main import app
+from krw_ontology.release import write_release_manifest
 from krw_ontology.pipeline.research_plan import ResearchFilingTarget
 
 runner = CliRunner()
@@ -799,6 +802,8 @@ class TestProdCommand:
         assert "RELEASE_ID=20260515-000000" in activation_script
         assert "RELOAD_COMMAND='sudo systemctl restart krw-ontology-mcp'" in activation_script
         assert "HEALTH_URL=http://127.0.0.1:8000/health" in activation_script
+        assert "Release manifest env is not prod" in activation_script
+        assert "agent_index.sqlite missing" in activation_script
 
     def test_prod_publish_dry_run_skips_subprocess(self, tmp_path: Path, monkeypatch):
         stable = tmp_path / "stable"
@@ -918,7 +923,370 @@ class TestProdCommand:
         assert [call[0][0] for call in calls] == ["ssh", "ssh"]
 
 
+class TestReleaseCommand:
+    def test_release_manifest_verify_promote_and_rollback(self, tmp_path: Path):
+        releases_root = tmp_path / "releases"
+        first = releases_root / "prod" / "20260528_010000"
+        second = releases_root / "prod" / "20260528_020000"
+        for release_dir in (first, second):
+            (release_dir / "indexes").mkdir(parents=True)
+            (release_dir / "indexes" / "agent_index.sqlite").write_text("not-a-real-db")
+
+        first_manifest = runner.invoke(
+            app,
+            [
+                "release",
+                "write-manifest",
+                "--root",
+                str(first),
+                "--env",
+                "prod",
+                "--release-id",
+                "20260528_010000",
+            ],
+        )
+        second_manifest = runner.invoke(
+            app,
+            [
+                "release",
+                "write-manifest",
+                "--root",
+                str(second),
+                "--env",
+                "prod",
+                "--release-id",
+                "20260528_020000",
+            ],
+        )
+
+        assert first_manifest.exit_code == 0
+        assert second_manifest.exit_code == 0
+        manifest = json.loads((first / "manifest.json").read_text(encoding="utf-8"))
+        assert manifest["env"] == "prod"
+        assert manifest["release_id"] == "20260528_010000"
+        assert manifest["index_present"] is True
+
+        verify_result = runner.invoke(
+            app,
+            ["release", "verify", "--root", str(first), "--env", "prod"],
+        )
+        assert verify_result.exit_code == 0
+        assert "Release verify: ok" in verify_result.output
+
+        promote_first = runner.invoke(
+            app,
+            [
+                "release",
+                "promote",
+                "20260528_010000",
+                "--releases-root",
+                str(releases_root),
+                "--env",
+                "prod",
+            ],
+        )
+        assert promote_first.exit_code == 0
+        assert (releases_root / "prod" / "current").is_symlink()
+        assert os.readlink(releases_root / "prod" / "current") == "20260528_010000"
+
+        verify_current = runner.invoke(
+            app,
+            [
+                "release",
+                "verify",
+                "--root",
+                str(releases_root / "prod" / "current"),
+                "--env",
+                "prod",
+                "--require-current-symlink",
+            ],
+        )
+        assert verify_current.exit_code == 0
+
+        promote_second = runner.invoke(
+            app,
+            [
+                "release",
+                "promote",
+                "20260528_020000",
+                "--releases-root",
+                str(releases_root),
+                "--env",
+                "prod",
+            ],
+        )
+        assert promote_second.exit_code == 0
+        assert os.readlink(releases_root / "prod" / "current") == "20260528_020000"
+
+        rollback = runner.invoke(
+            app,
+            ["release", "rollback", "--releases-root", str(releases_root), "--env", "prod"],
+        )
+        assert rollback.exit_code == 0
+        assert "release_id=20260528_010000" in rollback.output
+        assert os.readlink(releases_root / "prod" / "current") == "20260528_010000"
+
+    def test_release_export_web_catalog_is_read_only_and_compact(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        from tests.unit.test_mcp_server import _write_fixture
+
+        _write_fixture(tmp_path)
+        agent_index.build_agent_index(tmp_path)
+        manifest_result = runner.invoke(
+            app,
+            [
+                "release",
+                "write-manifest",
+                "--root",
+                str(tmp_path),
+                "--env",
+                "prod",
+                "--release-id",
+                "20260528_030000",
+            ],
+        )
+        assert manifest_result.exit_code == 0
+
+        def fail_if_rebuilt(*args, **kwargs):
+            raise AssertionError("export-web-catalog must not rebuild agent index")
+
+        monkeypatch.setattr(agent_index, "build_agent_index", fail_if_rebuilt)
+        out_path = tmp_path / "web_catalog.json"
+
+        result = runner.invoke(
+            app,
+            [
+                "release",
+                "export-web-catalog",
+                "--root",
+                str(tmp_path),
+                "--env",
+                "prod",
+                "--out",
+                str(out_path),
+            ],
+        )
+
+        assert result.exit_code == 0
+        assert "Web catalog exported" in result.output
+        payload = json.loads(out_path.read_text(encoding="utf-8"))
+        assert payload["format"] == "krw-ontology-web-catalog/v1"
+        assert payload["env"] == "prod"
+        assert payload["release_id"] == "20260528_030000"
+        assert payload["summary"]["company_count"] == 1
+        assert payload["summary"]["document_count"] == 1
+        assert payload["summary"]["index_document_count"] == 2
+        assert payload["summary"]["object_count"] > 0
+
+        company = payload["companies"][0]
+        assert company["ticker"] == "VG"
+        assert company["latest_period"] == "FY2025"
+        assert company["sector"] == "energy_lng"
+        assert company["description"] == "Primary activities: LNG sales. Key external factors: natural_gas_price."
+        assert company["coverage"]["document_count"] == 1
+        assert company["coverage"]["document_types"] == ["10-K"]
+        assert company["coverage"]["periods"] == ["FY2025"]
+        assert company["coverage"]["object_counts"]["CompanyBusinessProfile"] == 1
+        assert len(company["documents"]) == 1
+
+    def test_release_export_web_catalog_fails_on_env_mismatch(self, tmp_path: Path):
+        from tests.unit.test_mcp_server import _write_fixture
+
+        _write_fixture(tmp_path)
+        agent_index.build_agent_index(tmp_path)
+        runner.invoke(
+            app,
+            [
+                "release",
+                "write-manifest",
+                "--root",
+                str(tmp_path),
+                "--env",
+                "staging",
+                "--release-id",
+                "20260528_040000",
+            ],
+        )
+        out_path = tmp_path / "web_catalog.json"
+
+        result = runner.invoke(
+            app,
+            [
+                "release",
+                "export-web-catalog",
+                "--root",
+                str(tmp_path),
+                "--env",
+                "prod",
+                "--out",
+                str(out_path),
+            ],
+        )
+
+        assert result.exit_code == 1
+        assert "manifest_env_mismatch" in result.output
+        assert not out_path.exists()
+
+    def test_release_prepare_dev_sets_config_and_retargets_pending_queue(self, tmp_path: Path):
+        releases_root = tmp_path / "releases"
+        base = releases_root / "dev" / "base"
+        (base / "indexes").mkdir(parents=True)
+        (base / "indexes" / "agent_index.sqlite").write_text("base-index")
+        (base / "companies" / "VG").mkdir(parents=True)
+        (base / "companies" / "VG" / "artifact.txt").write_text("base")
+        write_release_manifest(base, release_id="base", env="dev", write_legacy=True)
+        os.symlink("base", releases_root / "dev" / "current")
+
+        queue_root = tmp_path / "running"
+        legacy = tmp_path / "legacy"
+        store = pipeline_queue.PipelineQueue(queue_root)
+        job = store.add_job(
+            "nflx",
+            years=1,
+            force=False,
+            publish_root=legacy,
+            publish_index_path=legacy / "indexes" / "agent_index.sqlite",
+        )
+
+        result = runner.invoke(
+            app,
+            [
+                "release",
+                "prepare-dev",
+                "20260528_050000",
+                "--releases-root",
+                str(releases_root),
+                "--queue-root",
+                str(queue_root),
+            ],
+        )
+
+        assert result.exit_code == 0
+        release_root = releases_root / "dev" / "20260528_050000"
+        assert (release_root / "companies" / "VG" / "artifact.txt").read_text() == "base"
+        assert (release_root / "manifest.json").exists()
+        config = load_cli_config()
+        assert config.publish_root == str(release_root.resolve())
+        assert config.publish_index_path == str((release_root / "indexes" / "agent_index.sqlite").resolve())
+        retargeted = store.load_job(job.job_id)
+        assert retargeted.publish_root == str(release_root.resolve())
+        assert retargeted.publish_index_path == str((release_root / "indexes" / "agent_index.sqlite").resolve())
+        assert "queue_jobs_changed: 1" in result.output
+
+    def test_release_prepare_dev_refuses_running_queue_without_override(self, tmp_path: Path, monkeypatch):
+        releases_root = tmp_path / "releases"
+        queue_root = tmp_path / "running"
+        store = pipeline_queue.PipelineQueue(queue_root)
+        store.write_worker_pid(12345)
+        monkeypatch.setattr(pipeline_queue, "is_pid_running", lambda pid: pid == 12345)
+
+        result = runner.invoke(
+            app,
+            [
+                "release",
+                "prepare-dev",
+                "20260528_060000",
+                "--releases-root",
+                str(releases_root),
+                "--queue-root",
+                str(queue_root),
+                "--empty",
+            ],
+        )
+
+        assert result.exit_code == 1
+        assert "Queue worker is running" in result.output
+        assert not (releases_root / "dev" / "20260528_060000").exists()
+        assert load_cli_config().publish_root is None
+
+    def test_release_finalize_dev_rebuilds_manifest_promotes_and_clears_config(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+    ):
+        releases_root = tmp_path / "releases"
+        release_root = releases_root / "dev" / "20260528_070000"
+        release_root.mkdir(parents=True)
+        runner.invoke(app, ["config", "set", "publish-root", str(release_root)])
+        runner.invoke(
+            app,
+            [
+                "config",
+                "set",
+                "publish-index-path",
+                str(release_root / "indexes" / "agent_index.sqlite"),
+            ],
+        )
+
+        def fake_build_agent_index(root, *, index_path=None, force=True):
+            assert root == release_root.resolve()
+            assert force is True
+            assert index_path == release_root / "indexes" / "agent_index.sqlite"
+            index_path.parent.mkdir(parents=True)
+            index_path.write_text("index")
+            return {
+                "index_path": index_path,
+                "totals": {"documents": 1, "objects": 2, "edges": 3, "quality_events": 0},
+            }
+
+        monkeypatch.setattr(agent_index, "build_agent_index", fake_build_agent_index)
+
+        result = runner.invoke(
+            app,
+            ["release", "finalize-dev", "--releases-root", str(releases_root)],
+        )
+
+        assert result.exit_code == 0
+        assert os.readlink(releases_root / "dev" / "current") == "20260528_070000"
+        manifest = json.loads((release_root / "manifest.json").read_text(encoding="utf-8"))
+        assert manifest["release_id"] == "20260528_070000"
+        assert manifest["env"] == "dev"
+        config = load_cli_config()
+        assert config.publish_root is None
+        assert config.publish_index_path is None
+        assert "Dev release finalized: 20260528_070000" in result.output
+
+    def test_release_materialize_prod_copies_dev_release_and_rewrites_manifest(self, tmp_path: Path):
+        releases_root = tmp_path / "releases"
+        source = releases_root / "dev" / "20260528_080000"
+        (source / "indexes").mkdir(parents=True)
+        (source / "indexes" / "agent_index.sqlite").write_text("index")
+        (source / "companies" / "VG").mkdir(parents=True)
+        write_release_manifest(source, release_id="20260528_080000", env="dev", write_legacy=True)
+
+        result = runner.invoke(
+            app,
+            [
+                "release",
+                "materialize-prod",
+                "20260528_080000",
+                "--releases-root",
+                str(releases_root),
+            ],
+        )
+
+        assert result.exit_code == 0
+        prod = releases_root / "prod" / "20260528_080000"
+        manifest = json.loads((prod / "manifest.json").read_text(encoding="utf-8"))
+        assert manifest["release_id"] == "20260528_080000"
+        assert manifest["env"] == "prod"
+        assert (prod / "indexes" / "agent_index.sqlite").read_text() == "index"
+        assert not (releases_root / "prod" / "current").exists()
+        assert "npm run deploy:data -- --release-id 20260528_080000" in result.output
+
+
 class TestQueueCommands:
+    def _prod_current(self, tmp_path: Path) -> Path:
+        prod_root = tmp_path / "releases" / "prod"
+        release = prod_root / "20260528_150000"
+        release.mkdir(parents=True)
+        current = prod_root / "current"
+        os.symlink(release.name, current)
+        return current
+
     def test_queue_add_creates_ticker_jobs(self, tmp_path: Path):
         stable = tmp_path / "stable"
 
@@ -945,6 +1313,44 @@ class TestQueueCommands:
         assert all(job.publish_root == str(stable.resolve()) for job in jobs)
         assert "Added 2 job(s)" in result.output
 
+    def test_queue_add_rejects_prod_current_root(self, tmp_path: Path):
+        current = self._prod_current(tmp_path)
+
+        result = runner.invoke(app, ["queue-add", "cvx", "--root", str(current)])
+
+        assert result.exit_code == 1
+        assert "prod/current is an immutable release pointer" in result.output
+        assert not (current / ".krw_pipeline").exists()
+
+    def test_queue_add_rejects_prod_current_publish_root(self, tmp_path: Path):
+        current = self._prod_current(tmp_path)
+
+        result = runner.invoke(
+            app,
+            [
+                "queue-add",
+                "cvx",
+                "--root",
+                str(tmp_path / "running"),
+                "--publish-root",
+                str(current),
+            ],
+        )
+
+        assert result.exit_code == 1
+        assert "prod/current is an immutable release pointer" in result.output
+
+    def test_queue_rebuild_rejects_active_prod_release_target(self, tmp_path: Path):
+        current = self._prod_current(tmp_path)
+        release_target = current.resolve()
+
+        with pytest.raises(ValueError, match="prod/current is an immutable release pointer"):
+            cli_main._queue_rebuild_pending_indexes(
+                rebuild_targets={"prod": (release_target, None)},
+                publish_prod=False,
+                build_agent_index=lambda *args, **kwargs: None,
+            )
+
     def test_queue_group_add_uses_configured_roots(self, tmp_path: Path):
         running = tmp_path / "running"
         stable = tmp_path / "stable"
@@ -958,6 +1364,47 @@ class TestQueueCommands:
         assert [job.ticker for job in jobs] == ["CVX"]
         assert jobs[0].publish_root == str(stable.resolve())
         assert "Queued CVX" in result.output
+
+    def test_queue_retarget_publish_updates_pending_jobs_only(self, tmp_path: Path):
+        queue_root = tmp_path / "running"
+        legacy = tmp_path / "legacy"
+        release_root = tmp_path / "releases" / "dev" / "20260528_090000"
+        store = pipeline_queue.PipelineQueue(queue_root)
+        pending = store.add_job(
+            "cvx",
+            years=1,
+            force=False,
+            publish_root=legacy,
+            publish_index_path=legacy / "indexes" / "agent_index.sqlite",
+        )
+        running = store.add_job(
+            "xom",
+            years=1,
+            force=False,
+            publish_root=legacy,
+            publish_index_path=legacy / "indexes" / "agent_index.sqlite",
+        )
+        store.mark_running(running)
+
+        result = runner.invoke(
+            app,
+            [
+                "queue",
+                "retarget-publish",
+                "--root",
+                str(queue_root),
+                "--publish-root",
+                str(release_root),
+            ],
+        )
+
+        assert result.exit_code == 0
+        assert store.load_job(pending.job_id).publish_root == str(release_root.resolve())
+        assert store.load_job(pending.job_id).publish_index_path == str(
+            (release_root / "indexes" / "agent_index.sqlite").resolve()
+        )
+        assert store.load_job(running.job_id).publish_root == str(legacy)
+        assert "changed=1 scanned=1" in result.output
 
     def test_queue_add_skips_active_duplicate(self, tmp_path: Path):
         store = pipeline_queue.PipelineQueue(tmp_path)
@@ -1135,9 +1582,70 @@ class TestQueueCommands:
             ("plan", "CVX", 1),
             ("pipeline", "CVX", "FY2025"),
             ("context", "CVX"),
-            ("index", stable.resolve(), None, True),
         ]
         assert "SUCCEEDED" in result.output
+        assert "agent index rebuild skipped by default" in result.output
+
+    def test_queue_run_rebuilds_agent_index_when_explicit(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+    ):
+        stable = tmp_path / "stable"
+        store = pipeline_queue.PipelineQueue(tmp_path)
+        job = store.add_job(
+            "cvx",
+            years=1,
+            force=False,
+            publish_root=stable,
+            publish_index_path=None,
+        )
+        events = []
+
+        def fake_discover(ticker, *, years, config):
+            return [
+                ResearchFilingTarget(
+                    ticker=ticker,
+                    document_type="10-K",
+                    period="FY2025",
+                    accession_number="k",
+                    filing_date="2026-02-01",
+                    report_date="2025-12-31",
+                )
+            ]
+
+        def fake_run_pipeline(**kwargs):
+            ticker_dir = kwargs["output_dir"] / "companies" / kwargs["ticker"]
+            ticker_dir.mkdir(parents=True, exist_ok=True)
+            (ticker_dir / "artifact.txt").write_text(kwargs["period"])
+
+        def fake_build_company_context(root, ticker):
+            return {
+                "artifact_index_path": _write_company_context_artifact(root, ticker),
+                "counts": {"company_business_profiles": 1},
+            }
+
+        def fake_build_agent_index(root, *, index_path=None, force=True):
+            events.append(("index", root, index_path, force))
+            return {
+                "index_path": root / "indexes" / "agent_index.sqlite",
+                "totals": {"documents": 1, "objects": 2, "edges": 0, "quality_events": 0},
+            }
+
+        monkeypatch.setattr(research_plan, "discover_research_filing_targets", fake_discover)
+        monkeypatch.setattr(orchestrator, "run_pipeline", fake_run_pipeline)
+        monkeypatch.setattr(company_context_stage, "build_company_context", fake_build_company_context)
+        monkeypatch.setattr(agent_index, "build_agent_index", fake_build_agent_index)
+
+        result = runner.invoke(
+            app,
+            ["queue-run", "--root", str(tmp_path), "--max-jobs", "1", "--rebuild-agent-index"],
+        )
+
+        assert result.exit_code == 0
+        assert store.load_job(job.job_id).status == pipeline_queue.SUCCEEDED
+        assert events == [("index", stable.resolve(), None, True)]
+        assert "Rebuilding 1 pending queue index root(s)" in result.output
 
     def test_queue_run_marks_failed_job_without_publish(
         self,
@@ -1356,10 +1864,10 @@ class TestQueueCommands:
         assert events == [
             ("pipeline", "VG", "10-Q", "FY2026Q1", False, True),
             ("context", "VG"),
-            ("index", stable.resolve(), None, True),
         ]
         assert "START update VG 10-Q FY2026Q1" in result.output
         assert "SUCCEEDED" in result.output
+        assert "agent index rebuild skipped by default" in result.output
 
     def test_queue_start_launches_detached_worker(self, tmp_path: Path, monkeypatch):
         calls = []
@@ -1409,6 +1917,26 @@ class TestQueueCommands:
 
         assert result.exit_code == 0
         assert "--publish-prod" in calls[0]
+
+    def test_queue_start_can_enable_index_rebuild(self, tmp_path: Path, monkeypatch):
+        calls = []
+
+        class FakeProcess:
+            pid = 12345
+
+        def fake_popen(command, *, stdout, stderr, start_new_session):
+            calls.append(command)
+            return FakeProcess()
+
+        monkeypatch.setattr(cli_main.subprocess, "Popen", fake_popen)
+
+        result = runner.invoke(
+            app,
+            ["queue-start", "--root", str(tmp_path), "--rebuild-agent-index"],
+        )
+
+        assert result.exit_code == 0
+        assert "--rebuild-agent-index" in calls[0]
 
     def test_queue_stop_requests_graceful_worker_stop(self, tmp_path: Path, monkeypatch):
         store = pipeline_queue.PipelineQueue(tmp_path)
@@ -1614,6 +2142,48 @@ class TestQueueCommands:
         assert "1 invalid ticker(s) with trailing comma: `AAPL,`" in result.output
         assert "1 ticker not found in SEC company_tickers.json: `APPL`" in result.output
 
+    def test_queue_status_json_reports_worker_mode_and_active_publish_roots(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+    ):
+        stable = tmp_path / "stable"
+        index_path = stable / "indexes" / "agent_index.sqlite"
+        store = pipeline_queue.PipelineQueue(tmp_path)
+        pending = store.add_job(
+            "nflx",
+            years=1,
+            force=False,
+            publish_root=stable,
+            publish_index_path=index_path,
+        )
+        running = store.mark_running(pending)
+        store.write_worker_pid(12345)
+        store.write_worker_state(
+            12345,
+            mode={
+                "watch": True,
+                "poll_interval": 15.0,
+                "max_jobs": None,
+                "publish_prod": False,
+                "rebuild_agent_index": False,
+            },
+        )
+        monkeypatch.setattr(pipeline_queue, "is_pid_running", lambda pid: pid == 12345)
+        result = runner.invoke(app, ["queue", "status", "--root", str(tmp_path), "--json"])
+
+        assert result.exit_code == 0
+        payload = json.loads(result.output)
+        assert payload["root"] == str(tmp_path.resolve())
+        assert payload["worker"]["state"] == "running"
+        assert payload["worker"]["pid"] == 12345
+        assert payload["worker"]["mode"]["publish_prod"] is False
+        assert payload["worker"]["mode"]["rebuild_agent_index"] is False
+        assert payload["counts"]["running"] == 1
+        assert payload["active_publish_roots"] == [str(stable)]
+        assert payload["active_publish_index_paths"] == [str(index_path)]
+        assert store.load_job(running.job_id).status == pipeline_queue.RUNNING
+
     def test_queue_cancel_marks_pending_job_cancelled(self, tmp_path: Path):
         store = pipeline_queue.PipelineQueue(tmp_path)
         job = store.add_job(
@@ -1817,6 +2387,7 @@ class TestHelpOutput:
         assert "queue" in result.output
         assert "config" in result.output
         assert "prod" in result.output
+        assert "release" in result.output
         assert "publish-ticker" in result.output
         assert "validate" in result.output
         assert "build-report" in result.output

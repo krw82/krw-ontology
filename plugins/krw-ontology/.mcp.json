@@ -9,7 +9,11 @@
         "krw-ontology-mcp"
       ],
       "env": {
-        "KRW_ONTOLOGY_ROOT": "~/krw-ontology-data"
+        "KRW_ONTOLOGY_ENV": "prod",
+        "KRW_ONTOLOGY_RELEASE_ROOT": "~/krw-ontology-data/releases/prod/current",
+        "KRW_ONTOLOGY_ROOT": "~/krw-ontology-data/releases/prod/current",
+        "KRW_ONTOLOGY_MANIFEST_PATH": "~/krw-ontology-data/releases/prod/current/manifest.json",
+        "KRW_ONTOLOGY_INDEX_PATH": "~/krw-ontology-data/releases/prod/current/indexes/agent_index.sqlite"
       }
     }
   }

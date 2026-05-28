@@ -46,6 +46,19 @@ from krw_ontology.pipeline.queue import (
     QueueJob,
     is_pid_running,
 )
+from krw_ontology.release import (
+    RELEASE_MANIFEST_FILENAME,
+    build_release_manifest,
+    current_release_id,
+    list_release_ids,
+    normalize_ontology_env,
+    promote_local_release,
+    release_env_root,
+    rollback_local_release,
+    verify_release_root,
+    write_release_manifest,
+)
+from krw_ontology.web_catalog import write_web_catalog
 
 app = typer.Typer(
     name="krw-ontology",
@@ -128,9 +141,28 @@ prod_app = typer.Typer(
     ),
     no_args_is_help=True,
 )
+release_app = typer.Typer(
+    name="release",
+    help=(
+        "Manage local immutable ontology releases for dev/staging/prod. "
+        "Use this for Mac worker release roots and local promote/rollback."
+    ),
+    epilog=(
+        "Typical local worker flow:\n"
+        "  krw-ontology release write-manifest --root /data/releases/prod/20260529_020000 --env prod\n"
+        "  krw-ontology release verify --root /data/releases/prod/20260529_020000 --env prod\n"
+        "  krw-ontology release promote 20260529_020000 --releases-root /data/releases --env prod\n"
+        "  krw-ontology release prepare-dev\n"
+        "  krw-ontology release finalize-dev 20260529_020000\n"
+        "  krw-ontology release materialize-prod 20260529_020000\n"
+        "  export KRW_ONTOLOGY_RELEASE_ROOT=/data/releases/prod/current"
+    ),
+    no_args_is_help=True,
+)
 app.add_typer(queue_app, name="queue")
 app.add_typer(config_app, name="config")
 app.add_typer(prod_app, name="prod")
+app.add_typer(release_app, name="release")
 
 ACCEPTED_DOC_TYPES = {"10-K", "10-Q"}
 DEFAULT_E2E_TICKERS = ["AAPL", "NVDA", "JPM", "XOM"]
@@ -480,6 +512,550 @@ def prod_rollback_cmd(
     typer.echo(f"Prod rollback activated release={result['release_id']} host={result['host']}")
 
 
+def _default_releases_root() -> Path:
+    return Path.home() / "krw-ontology-data" / "releases"
+
+
+def _default_release_id() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+
+
+def _default_release_index_path(root: Path) -> Path:
+    return root / "indexes" / "agent_index.sqlite"
+
+
+def _copy_release_tree(source_root: Path, target_root: Path) -> None:
+    if target_root.exists():
+        raise FileExistsError(f"Release directory already exists: {target_root}")
+    target_root.parent.mkdir(parents=True, exist_ok=True)
+    target_root.mkdir()
+    try:
+        result = subprocess.run(
+            ["cp", "-cR", f"{source_root}/.", str(target_root)],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except OSError:
+        result = None
+    if result is not None and result.returncode == 0:
+        return
+    shutil.rmtree(target_root)
+    shutil.copytree(source_root, target_root, ignore=shutil.ignore_patterns(".krw_pipeline"))
+
+
+def _retarget_queue_publish_jobs(
+    *,
+    store: PipelineQueue,
+    publish_root: Path,
+    publish_index_path: Path | None,
+    statuses: set[str],
+    dry_run: bool = False,
+) -> dict[str, int]:
+    jobs = store.list_jobs(statuses=statuses)
+    changed = 0
+    for job in jobs:
+        next_publish_root = str(publish_root)
+        next_publish_index_path = str(publish_index_path) if publish_index_path is not None else None
+        if job.publish_root == next_publish_root and job.publish_index_path == next_publish_index_path:
+            continue
+        changed += 1
+        if dry_run:
+            continue
+        job.publish_root = next_publish_root
+        job.publish_index_path = next_publish_index_path
+        store.save_job(job)
+        store.append_event(
+            "publish_retargeted",
+            job,
+            {
+                "publish_root": next_publish_root,
+                "publish_index_path": next_publish_index_path,
+            },
+        )
+    return {"scanned": len(jobs), "changed": changed}
+
+
+def _resolve_release_id_from_publish_config(env: str, releases_root: Path) -> str | None:
+    config = load_cli_config()
+    if not config.publish_root:
+        return None
+    publish_root = Path(config.publish_root).expanduser().resolve()
+    env_root = release_env_root(releases_root, env).expanduser().resolve()
+    if publish_root.parent == env_root:
+        return publish_root.name
+    return None
+
+
+def _release_prepare_dev(
+    *,
+    releases_root: Path,
+    release_id: str,
+    source_root: Path | None,
+    empty: bool,
+    set_config: bool,
+    retarget_queue: bool,
+    queue_root: Path | None,
+    allow_running_queue: bool,
+    dry_run: bool,
+) -> dict[str, str | int | bool | None]:
+    env = "dev"
+    env_root = release_env_root(releases_root, env).expanduser().resolve()
+    release_root = env_root / release_id
+    if release_root.exists():
+        raise FileExistsError(f"Release directory already exists: {release_root}")
+    if empty and source_root is not None:
+        raise ValueError("Use either --empty or --from-root, not both.")
+
+    resolved_source_root: Path | None = None
+    if source_root is not None:
+        resolved_source_root = source_root.expanduser().resolve()
+    elif not empty:
+        current = env_root / "current"
+        if current.exists():
+            resolved_source_root = current.resolve()
+
+    retarget_store: PipelineQueue | None = None
+    if retarget_queue and not dry_run:
+        resolved_queue_root = resolve_running_root(queue_root, fallback_to_cwd=False)
+        retarget_store = PipelineQueue(resolved_queue_root)
+        retarget_store.ensure_dirs()
+        if retarget_store.worker_is_running() and not allow_running_queue:
+            raise RuntimeError(
+                "Queue worker is running. Stop it first, or pass --allow-running-queue."
+            )
+
+    if dry_run:
+        return {
+            "release_id": release_id,
+            "release_root": str(release_root),
+            "source_root": str(resolved_source_root) if resolved_source_root else None,
+            "config_updated": set_config,
+            "queue_retargeted": retarget_queue,
+            "queue_jobs_changed": 0,
+        }
+
+    if resolved_source_root is not None:
+        if not resolved_source_root.is_dir():
+            raise FileNotFoundError(f"Source release root not found: {resolved_source_root}")
+        _copy_release_tree(resolved_source_root, release_root)
+    else:
+        release_root.mkdir(parents=True)
+    shutil.rmtree(release_root / ".krw_pipeline", ignore_errors=True)
+
+    index_path = _default_release_index_path(release_root)
+    write_release_manifest(
+        release_root,
+        release_id=release_id,
+        env=env,
+        source_root=resolved_source_root or release_root,
+        index_path=index_path,
+        write_legacy=True,
+    )
+
+    if set_config:
+        set_config_value("publish-root", str(release_root))
+        set_config_value("publish-index-path", str(index_path))
+
+    queue_jobs_changed = 0
+    queue_retargeted = False
+    if retarget_queue:
+        assert retarget_store is not None
+        retarget_result = _retarget_queue_publish_jobs(
+            store=retarget_store,
+            publish_root=release_root,
+            publish_index_path=index_path,
+            statuses={PENDING},
+        )
+        queue_jobs_changed = retarget_result["changed"]
+        queue_retargeted = True
+
+    return {
+        "release_id": release_id,
+        "release_root": str(release_root),
+        "source_root": str(resolved_source_root) if resolved_source_root else None,
+        "config_updated": set_config,
+        "queue_retargeted": queue_retargeted,
+        "queue_jobs_changed": queue_jobs_changed,
+    }
+
+
+@release_app.command("prepare-dev")
+def release_prepare_dev_cmd(
+    release_id: Optional[str] = typer.Argument(
+        None,
+        help="Dev release id to create. Defaults to a timestamp id.",
+    ),
+    releases_root: Path = typer.Option(
+        _default_releases_root(),
+        "--releases-root",
+        help="Local releases root.",
+    ),
+    source_root: Optional[Path] = typer.Option(
+        None,
+        "--from-root",
+        help="Seed the new dev release from this root. Defaults to releases/dev/current.",
+    ),
+    empty: bool = typer.Option(
+        False,
+        "--empty",
+        help="Create an empty dev release instead of seeding from dev/current.",
+    ),
+    set_config: bool = typer.Option(
+        True,
+        "--set-config/--no-set-config",
+        help="Point CLI publish-root and publish-index-path at the new dev release.",
+    ),
+    retarget_queue: bool = typer.Option(
+        True,
+        "--retarget-queue/--no-retarget-queue",
+        help="Retarget pending queue jobs to the new dev release publish root.",
+    ),
+    queue_root: Optional[Path] = typer.Option(
+        None,
+        "--queue-root",
+        help="Queue root to retarget. Defaults to configured running-root.",
+    ),
+    allow_running_queue: bool = typer.Option(
+        False,
+        "--allow-running-queue",
+        help="Allow retargeting pending jobs while the queue worker is running.",
+    ),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show the release that would be prepared."),
+) -> None:
+    """Create a mutable dev release workspace and point queue publishing at it."""
+    resolved_release_id = release_id or _default_release_id()
+    try:
+        result = _release_prepare_dev(
+            releases_root=releases_root,
+            release_id=resolved_release_id,
+            source_root=source_root,
+            empty=empty,
+            set_config=set_config,
+            retarget_queue=retarget_queue,
+            queue_root=queue_root,
+            allow_running_queue=allow_running_queue,
+            dry_run=dry_run,
+        )
+    except Exception as exc:
+        typer.echo(f"FAILED prepare dev release: {exc}")
+        raise typer.Exit(1) from exc
+
+    prefix = "Dry run: would prepare" if dry_run else "Prepared"
+    typer.echo(f"{prefix} dev release: {result['release_id']}")
+    typer.echo(f"release_root: {result['release_root']}")
+    typer.echo(f"source_root: {result['source_root'] or '<empty>'}")
+    typer.echo(f"config_updated: {result['config_updated']}")
+    typer.echo(f"queue_retargeted: {result['queue_retargeted']}")
+    typer.echo(f"queue_jobs_changed: {result['queue_jobs_changed']}")
+    typer.echo("Next: krw-ontology queue start --no-rebuild-agent-index")
+
+
+@release_app.command("finalize-dev")
+def release_finalize_dev_cmd(
+    release_id: Optional[str] = typer.Argument(
+        None,
+        help="Dev release id to finalize. Defaults to the configured publish-root release id.",
+    ),
+    releases_root: Path = typer.Option(
+        _default_releases_root(),
+        "--releases-root",
+        help="Local releases root.",
+    ),
+    build_index: bool = typer.Option(
+        True,
+        "--build-index/--no-build-index",
+        help="Rebuild agent_index.sqlite before writing the manifest.",
+    ),
+    promote: bool = typer.Option(
+        True,
+        "--promote/--no-promote",
+        help="Promote dev/current to this release after verification.",
+    ),
+    clear_config: bool = typer.Option(
+        True,
+        "--clear-config/--keep-config",
+        help="Clear publish-root config after finalizing to avoid mutating the immutable release.",
+    ),
+) -> None:
+    """Rebuild, verify, and promote a completed dev release."""
+    env = "dev"
+    release_id = release_id or _resolve_release_id_from_publish_config(env, releases_root)
+    if release_id is None:
+        typer.echo("Missing release id. Pass one or run prepare-dev first.")
+        raise typer.Exit(1)
+    release_root = release_env_root(releases_root, env).expanduser().resolve() / release_id
+    index_path = _default_release_index_path(release_root)
+    if not release_root.is_dir():
+        typer.echo(f"Release directory not found: {release_root}")
+        raise typer.Exit(1)
+
+    if build_index:
+        from krw_ontology.agent_index import build_agent_index
+
+        index_result = build_agent_index(release_root, index_path=index_path, force=True)
+        totals = index_result["totals"]
+        typer.echo(
+            "Agent index built: "
+            f"{index_result['index_path']} "
+            f"documents={totals['documents']} "
+            f"objects={totals['objects']} "
+            f"edges={totals['edges']} "
+            f"quality_events={totals['quality_events']}"
+        )
+
+    manifest = write_release_manifest(
+        release_root,
+        release_id=release_id,
+        env=env,
+        index_path=index_path,
+        write_legacy=True,
+    )
+    verification = verify_release_root(release_root, env=env, index_path=index_path)
+    if not verification["ok"]:
+        typer.echo(f"Release verify failed: {', '.join(verification['errors'])}")
+        raise typer.Exit(1)
+
+    if promote:
+        promote_local_release(releases_root, env=env, release_id=release_id)
+        typer.echo(f"Release promoted: env=dev release_id={release_id}")
+
+    if clear_config:
+        config = load_cli_config()
+        if config.publish_root == str(release_root):
+            unset_config_value("publish-root")
+        if config.publish_index_path == str(index_path):
+            unset_config_value("publish-index-path")
+
+    typer.echo(f"Dev release finalized: {release_id}")
+    typer.echo(f"release_root: {release_root}")
+    typer.echo(f"manifest: {release_root / RELEASE_MANIFEST_FILENAME}")
+    typer.echo(f"index_present: {manifest['index_present']}")
+    typer.echo("Next: krw-ontology release materialize-prod " + release_id)
+
+
+@release_app.command("materialize-prod")
+def release_materialize_prod_cmd(
+    release_id: str = typer.Argument(..., help="Source dev/staging release id to copy."),
+    releases_root: Path = typer.Option(
+        _default_releases_root(),
+        "--releases-root",
+        help="Local releases root.",
+    ),
+    from_env: str = typer.Option(
+        "dev",
+        "--from-env",
+        help="Source env to copy from: dev or staging.",
+    ),
+    prod_release_id: Optional[str] = typer.Option(
+        None,
+        "--prod-release-id",
+        help="Prod release id to create. Defaults to the source release id.",
+    ),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show the prod release that would be created."),
+) -> None:
+    """Copy a verified dev/staging release into prod release space without activating it."""
+    source_env = normalize_ontology_env(from_env)
+    if source_env == "prod":
+        typer.echo("--from-env must be dev or staging.")
+        raise typer.Exit(1)
+    target_id = prod_release_id or release_id
+    source_root = release_env_root(releases_root, source_env).expanduser().resolve() / release_id
+    prod_root = release_env_root(releases_root, "prod").expanduser().resolve() / target_id
+    source_verification = verify_release_root(source_root, env=source_env)
+    if not source_verification["ok"]:
+        typer.echo(f"Source release verify failed: {', '.join(source_verification['errors'])}")
+        raise typer.Exit(1)
+    if prod_root.exists():
+        typer.echo(f"Prod release already exists: {prod_root}")
+        raise typer.Exit(1)
+    if dry_run:
+        typer.echo(f"Dry run: would materialize prod release {target_id}")
+        typer.echo(f"source_root: {source_root}")
+        typer.echo(f"prod_root: {prod_root}")
+        return
+
+    _copy_release_tree(source_root, prod_root)
+    shutil.rmtree(prod_root / ".krw_pipeline", ignore_errors=True)
+    index_path = _default_release_index_path(prod_root)
+    write_release_manifest(
+        prod_root,
+        release_id=target_id,
+        env="prod",
+        source_root=source_root,
+        index_path=index_path,
+        write_legacy=True,
+    )
+    prod_verification = verify_release_root(prod_root, env="prod", index_path=index_path)
+    if not prod_verification["ok"]:
+        typer.echo(f"Prod release verify failed: {', '.join(prod_verification['errors'])}")
+        raise typer.Exit(1)
+
+    typer.echo(f"Prod release materialized: {target_id}")
+    typer.echo(f"prod_root: {prod_root}")
+    typer.echo(f"Next: npm run deploy:data -- --release-id {target_id}")
+
+
+@release_app.command("write-manifest")
+def release_write_manifest_cmd(
+    root: Path = typer.Option(..., "--root", help="Immutable release root to describe."),
+    env: str = typer.Option(
+        "dev",
+        "--env",
+        help="Ontology environment: dev, staging, or prod.",
+    ),
+    release_id: Optional[str] = typer.Option(
+        None,
+        "--release-id",
+        help="Release id. Defaults to a timestamp id.",
+    ),
+    index_path: Optional[Path] = typer.Option(
+        None,
+        "--index-path",
+        help="Optional explicit agent_index.sqlite path.",
+    ),
+) -> None:
+    """Write canonical manifest.json for a local immutable release root."""
+    resolved_release_id = release_id or _new_release_id()
+    manifest = write_release_manifest(
+        root,
+        release_id=resolved_release_id,
+        env=env,
+        index_path=index_path,
+        write_legacy=True,
+    )
+    typer.echo(f"Release manifest written: {Path(root).expanduser().resolve() / RELEASE_MANIFEST_FILENAME}")
+    typer.echo(f"env: {manifest['env']}")
+    typer.echo(f"release_id: {manifest['release_id']}")
+    typer.echo(f"index_present: {manifest['index_present']}")
+
+
+@release_app.command("verify")
+def release_verify_cmd(
+    root: Path = typer.Option(..., "--root", help="Release root or env/current symlink to verify."),
+    env: Optional[str] = typer.Option(None, "--env", help="Expected ontology environment."),
+    require_current_symlink: bool = typer.Option(
+        False,
+        "--require-current-symlink",
+        help="Require --root to be the env current symlink.",
+    ),
+    index_path: Optional[Path] = typer.Option(
+        None,
+        "--index-path",
+        help="Optional explicit agent_index.sqlite path.",
+    ),
+) -> None:
+    """Verify release manifest, env, release id, and index presence."""
+    verification = verify_release_root(
+        root,
+        env=env,
+        index_path=index_path,
+        require_current_symlink=require_current_symlink,
+    )
+    typer.echo(f"Release verify: {'ok' if verification['ok'] else 'failed'}")
+    typer.echo(f"root: {verification['root']}")
+    typer.echo(f"env: {verification.get('env') or '<missing>'}")
+    typer.echo(f"release_id: {verification.get('release_id') or '<missing>'}")
+    typer.echo(f"manifest: {verification.get('manifest_path') or '<missing>'}")
+    typer.echo(f"index: {'present' if verification.get('index_present') else 'missing'}")
+    if verification["errors"]:
+        for error in verification["errors"]:
+            typer.echo(f"FAIL {error}")
+        raise typer.Exit(1)
+
+
+@release_app.command("status")
+def release_status_cmd(
+    releases_root: Path = typer.Option(
+        ...,
+        "--releases-root",
+        help="Path to releases root. Accepts either /data/releases or /data/releases/<env>.",
+    ),
+    env: str = typer.Option("dev", "--env", help="Ontology environment: dev, staging, or prod."),
+) -> None:
+    """Show local env release current pointer and release list."""
+    resolved_env = normalize_ontology_env(env)
+    env_root = release_env_root(releases_root, resolved_env)
+    current_id = current_release_id(env_root)
+    typer.echo("Release status")
+    typer.echo(f"env: {resolved_env}")
+    typer.echo(f"env_root: {env_root.expanduser().resolve()}")
+    typer.echo(f"current: {current_id or '<missing>'}")
+    releases = list_release_ids(env_root)
+    if releases:
+        typer.echo("releases:")
+        for release_id in releases[:10]:
+            marker = " current" if release_id == current_id else ""
+            typer.echo(f"  - {release_id}{marker}")
+    else:
+        typer.echo("releases: <none>")
+
+
+@release_app.command("promote")
+def release_promote_cmd(
+    release_id: str = typer.Argument(..., help="Release id to promote to env current."),
+    releases_root: Path = typer.Option(
+        ...,
+        "--releases-root",
+        help="Path to releases root. Accepts either /data/releases or /data/releases/<env>.",
+    ),
+    env: str = typer.Option("dev", "--env", help="Ontology environment: dev, staging, or prod."),
+) -> None:
+    """Atomically point env current to a verified release."""
+    result = promote_local_release(releases_root, env=env, release_id=release_id)
+    typer.echo(f"Release promoted: env={result['env']} release_id={result['release_id']}")
+    typer.echo(f"current: {result['current']}")
+
+
+@release_app.command("rollback")
+def release_rollback_cmd(
+    release_id: Optional[str] = typer.Argument(
+        None,
+        help="Release id to activate. If omitted, activate the newest non-current release.",
+    ),
+    releases_root: Path = typer.Option(
+        ...,
+        "--releases-root",
+        help="Path to releases root. Accepts either /data/releases or /data/releases/<env>.",
+    ),
+    env: str = typer.Option("dev", "--env", help="Ontology environment: dev, staging, or prod."),
+) -> None:
+    """Rollback local env current to a requested or previous release."""
+    result = rollback_local_release(releases_root, env=env, release_id=release_id)
+    typer.echo(f"Release rollback activated: env={result['env']} release_id={result['release_id']}")
+    typer.echo(f"current: {result['current']}")
+
+
+@release_app.command("export-web-catalog")
+def release_export_web_catalog_cmd(
+    root: Path = typer.Option(..., "--root", help="Existing release root to export from."),
+    env: Optional[str] = typer.Option(None, "--env", help="Expected ontology environment."),
+    out: Path = typer.Option(..., "--out", help="Output web_catalog.json path."),
+    index_path: Optional[Path] = typer.Option(
+        None,
+        "--index-path",
+        help="Optional explicit agent_index.sqlite path.",
+    ),
+) -> None:
+    """Export a read-only compact web catalog JSON from an existing release."""
+    try:
+        catalog = write_web_catalog(root, out, env=env, index_path=index_path)
+    except Exception as exc:
+        typer.echo(f"FAILED export web catalog: {exc}")
+        raise typer.Exit(1) from exc
+    summary = catalog["summary"]
+    typer.echo(f"Web catalog exported: {Path(out).expanduser().resolve()}")
+    typer.echo(f"env: {catalog['env']}")
+    typer.echo(f"release_id: {catalog['release_id']}")
+    typer.echo(
+        "Catalog contains "
+        f"{summary['company_count']} companies, "
+        f"{summary['document_count']} documents, "
+        f"{summary['object_count']} objects"
+    )
+
+
 @app.command("init-workspace")
 def init_workspace_cmd() -> None:
     """Create ontology schema directory with starter YAML configs."""
@@ -820,19 +1396,73 @@ def _queue_emit(store: PipelineQueue, job: QueueJob, message: str) -> None:
     store.append_job_log(job.job_id, line)
 
 
+def _path_points_at_prod_current(path: Path) -> bool:
+    expanded = path.expanduser()
+    candidates = [expanded, *expanded.parents]
+    for candidate in candidates:
+        parts = candidate.parts
+        for index in range(0, max(len(parts) - 2, 0)):
+            if parts[index : index + 3] == ("releases", "prod", "current"):
+                return True
+
+        if (
+            candidate.parent.name == "prod"
+            and candidate.parent.parent.name == "releases"
+            and candidate.exists()
+        ):
+            current = candidate.parent / "current"
+            try:
+                if current.is_symlink() and candidate.resolve() == current.resolve():
+                    return True
+            except OSError:
+                pass
+
+    return False
+
+
+def _assert_queue_path_not_prod_current(path: Path | None, label: str) -> None:
+    if path is None:
+        return
+    if not _path_points_at_prod_current(path):
+        return
+    raise ValueError(
+        f"Refusing queue {label}={path}: prod/current is an immutable release pointer. "
+        "Build in a dev/staging release directory and promote the verified release instead."
+    )
+
+
+def _exit_if_queue_path_mutates_prod_current(path: Path | None, label: str) -> None:
+    try:
+        _assert_queue_path_not_prod_current(path, label)
+    except ValueError as exc:
+        typer.echo(str(exc))
+        raise typer.Exit(1) from exc
+
+
 def _queue_publish_and_defer_index(
     *,
     store: PipelineQueue,
     job: QueueJob,
     output_root: Path,
+    rebuild_agent_index: bool,
 ) -> tuple[Path, Path | None] | None:
+    _assert_queue_path_not_prod_current(output_root, "--root")
     if job.publish_root:
         stable_root = resolve_ontology_root(Path(job.publish_root), fallback_to_cwd=False)
+        _assert_queue_path_not_prod_current(stable_root, "--publish-root")
         stable_root.mkdir(parents=True, exist_ok=True)
         publish_index_path = Path(job.publish_index_path) if job.publish_index_path is not None else None
+        _assert_queue_path_not_prod_current(publish_index_path, "--publish-index-path")
         _queue_emit(store, job, f"Publishing {job.ticker} to stable root {stable_root}")
         with FileProcessLock(PipelineQueue(stable_root).publish_lock_path):
             _publish_ticker_tree(output_root, stable_root, job.ticker)
+        if not rebuild_agent_index:
+            _queue_emit(
+                store,
+                job,
+                f"Published {job.ticker} to stable root; agent index rebuild skipped by default",
+            )
+            return None
         _queue_emit(
             store,
             job,
@@ -843,9 +1473,13 @@ def _queue_publish_and_defer_index(
     _queue_emit(
         store,
         job,
-        "No publish root configured; staging agent index rebuild deferred until batch completion",
+        (
+            "No publish root configured; staging agent index rebuild deferred until batch completion"
+            if rebuild_agent_index
+            else "No publish root configured; staging agent index rebuild skipped by default"
+        ),
     )
-    return output_root, None
+    return (output_root, None) if rebuild_agent_index else None
 
 
 def _queue_rebuild_pending_indexes(
@@ -858,6 +1492,8 @@ def _queue_rebuild_pending_indexes(
         return
     typer.echo(f"[{_now_label()}] Rebuilding {len(rebuild_targets)} pending queue index root(s)")
     for root, index_path in list(rebuild_targets.values()):
+        _assert_queue_path_not_prod_current(root, "index root")
+        _assert_queue_path_not_prod_current(index_path, "index path")
         typer.echo(f"[{_now_label()}] Rebuilding agent index root={root}")
         with FileProcessLock(PipelineQueue(root).publish_lock_path):
             index_result = build_agent_index(root, index_path=index_path, force=True)
@@ -905,6 +1541,7 @@ def _process_queue_job(
     output_root: Path,
     *,
     publish_prod: bool = False,
+    rebuild_agent_index: bool = False,
 ) -> tuple[Path, Path | None] | None:
     from krw_ontology.config.settings import PipelineConfig
     from krw_ontology.pipeline.orchestrator import run_pipeline
@@ -915,6 +1552,7 @@ def _process_queue_job(
     _queue_emit(store, job, f"START job={job.job_id} type={job.job_type} ticker={job.ticker}")
     rebuild_target: tuple[Path, Path | None] | None = None
     try:
+        _assert_queue_path_not_prod_current(output_root, "--root")
         if publish_prod and not job.publish_root:
             raise ValueError(
                 "--publish-prod requires jobs with a stable publish root. "
@@ -967,6 +1605,7 @@ def _process_queue_job(
             store=store,
             job=job,
             output_root=output_root,
+            rebuild_agent_index=rebuild_agent_index,
         )
     except Exception as exc:
         store.mark_failed(job, str(exc))
@@ -1029,6 +1668,9 @@ def queue_add_cmd(
     output_root = resolve_running_root(root, fallback_to_cwd=False)
     stable_root = resolve_publish_root(publish_root)
     resolved_publish_index_path = resolve_publish_index_path(publish_index_path)
+    _exit_if_queue_path_mutates_prod_current(output_root, "--root")
+    _exit_if_queue_path_mutates_prod_current(stable_root, "--publish-root")
+    _exit_if_queue_path_mutates_prod_current(resolved_publish_index_path, "--publish-index-path")
     store = PipelineQueue(output_root)
     store.ensure_dirs()
 
@@ -1128,6 +1770,9 @@ def queue_update_cmd(
     output_root = resolve_running_root(root, fallback_to_cwd=False)
     stable_root = resolve_publish_root(publish_root)
     resolved_publish_index_path = resolve_publish_index_path(publish_index_path)
+    _exit_if_queue_path_mutates_prod_current(output_root, "--root")
+    _exit_if_queue_path_mutates_prod_current(stable_root, "--publish-root")
+    _exit_if_queue_path_mutates_prod_current(resolved_publish_index_path, "--publish-index-path")
     store = PipelineQueue(output_root)
     store.ensure_dirs()
 
@@ -1160,11 +1805,90 @@ def queue_update_cmd(
 
 
 @queue_app.command(
+    "retarget-publish",
+    epilog=(
+        "Examples:\n"
+        "  krw-ontology queue retarget-publish --publish-root /data/releases/dev/20260529_010000\n"
+        "  krw-ontology queue retarget-publish --dry-run\n\n"
+        "By default this rewrites pending jobs only. It is intended for moving old queue jobs "
+        "from a legacy stable root onto a new dev release directory."
+    ),
+)
+def queue_retarget_publish_cmd(
+    root: Optional[Path] = typer.Option(
+        None,
+        "--root",
+        "--output-dir",
+        help="Queue/running root. Defaults to configured running-root.",
+    ),
+    publish_root: Optional[Path] = typer.Option(
+        None,
+        "--publish-root",
+        help="New publish root. Defaults to configured publish-root.",
+    ),
+    publish_index_path: Optional[Path] = typer.Option(
+        None,
+        "--publish-index-path",
+        help="New publish index path. Defaults to configured publish-index-path or <publish-root>/indexes/agent_index.sqlite.",
+    ),
+    statuses: Optional[list[str]] = typer.Option(
+        None,
+        "--status",
+        help="Job status to retarget. Repeatable. Defaults to pending.",
+    ),
+    allow_running_queue: bool = typer.Option(
+        False,
+        "--allow-running-queue",
+        help="Allow retargeting while the queue worker is running.",
+    ),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show changes without rewriting job files."),
+) -> None:
+    """Retarget queued job publish paths to a release directory."""
+    output_root = resolve_running_root(root, fallback_to_cwd=False)
+    stable_root = resolve_publish_root(publish_root)
+    if stable_root is None:
+        typer.echo("Set publish-root or pass --publish-root.")
+        raise typer.Exit(1)
+    resolved_publish_index_path = resolve_publish_index_path(publish_index_path)
+    if resolved_publish_index_path is None:
+        resolved_publish_index_path = _default_release_index_path(stable_root)
+    _exit_if_queue_path_mutates_prod_current(output_root, "--root")
+    _exit_if_queue_path_mutates_prod_current(stable_root, "--publish-root")
+    _exit_if_queue_path_mutates_prod_current(resolved_publish_index_path, "--publish-index-path")
+
+    wanted_statuses = set(statuses or [PENDING])
+    supported_statuses = {PENDING, RUNNING, SUCCEEDED, FAILED, CANCELLED}
+    unknown_statuses = sorted(wanted_statuses - supported_statuses)
+    if unknown_statuses:
+        typer.echo(f"Unknown status value(s): {', '.join(unknown_statuses)}")
+        raise typer.Exit(1)
+
+    store = PipelineQueue(output_root)
+    store.ensure_dirs()
+    if store.worker_is_running() and not allow_running_queue:
+        typer.echo("Queue worker is running. Stop it first, or pass --allow-running-queue.")
+        raise typer.Exit(1)
+
+    result = _retarget_queue_publish_jobs(
+        store=store,
+        publish_root=stable_root,
+        publish_index_path=resolved_publish_index_path,
+        statuses=wanted_statuses,
+        dry_run=dry_run,
+    )
+    action = "would retarget" if dry_run else "retargeted"
+    typer.echo(f"Queue publish paths {action}: changed={result['changed']} scanned={result['scanned']}")
+    typer.echo(f"publish_root: {stable_root}")
+    typer.echo(f"publish_index_path: {resolved_publish_index_path}")
+
+
+@queue_app.command(
     "run",
     epilog=(
         "Examples:\n"
         "  krw-ontology queue run\n"
         "  krw-ontology queue run --watch\n"
+        "  krw-ontology queue run --watch --rebuild-agent-index\n"
         "  krw-ontology queue run --watch --publish-prod\n"
         "  krw-ontology queue run --max-jobs 1\n\n"
         "This runs in the foreground. Use `queue start` for a detached background worker."
@@ -1203,18 +1927,39 @@ def queue_run_cmd(
             "to prod and atomically activate a release."
         ),
     ),
+    rebuild_agent_index: bool = typer.Option(
+        False,
+        "--rebuild-agent-index/--no-rebuild-agent-index",
+        help=(
+            "Rebuild pending agent indexes after a drained/stopped queue batch. Disabled by "
+            "default so queue processing only updates artifacts; use build-agent-index or release "
+            "publish explicitly when ready."
+        ),
+    ),
 ) -> None:
     """Run queued ticker jobs in the foreground."""
     output_root = resolve_running_root(root, fallback_to_cwd=False)
+    _exit_if_queue_path_mutates_prod_current(output_root, "--root")
     output_root.mkdir(parents=True, exist_ok=True)
     store = PipelineQueue(output_root)
     store.ensure_dirs()
     from krw_ontology.agent_index import build_agent_index
+    effective_rebuild_agent_index = rebuild_agent_index or publish_prod
 
     try:
         with FileProcessLock(store.worker_lock_path):
             store.clear_stop_request()
             store.write_worker_pid(os.getpid())
+            store.write_worker_state(
+                os.getpid(),
+                mode={
+                    "watch": watch,
+                    "poll_interval": poll_interval,
+                    "max_jobs": max_jobs,
+                    "publish_prod": publish_prod,
+                    "rebuild_agent_index": effective_rebuild_agent_index,
+                },
+            )
             typer.echo(f"[{_now_label()}] Queue worker started root={output_root}")
             processed = 0
             pending_rebuild_targets: dict[str, tuple[Path, Path | None]] = {}
@@ -1240,7 +1985,13 @@ def queue_run_cmd(
                     time.sleep(poll_interval)
                     continue
 
-                rebuild_target = _process_queue_job(store, job, output_root, publish_prod=publish_prod)
+                rebuild_target = _process_queue_job(
+                    store,
+                    job,
+                    output_root,
+                    publish_prod=publish_prod,
+                    rebuild_agent_index=effective_rebuild_agent_index,
+                )
                 if rebuild_target is not None:
                     pending_rebuild_targets[str(rebuild_target[0])] = rebuild_target
                 processed += 1
@@ -1256,6 +2007,7 @@ def queue_run_cmd(
         typer.echo(str(exc))
         raise typer.Exit(1) from exc
     finally:
+        store.clear_worker_state(os.getpid())
         store.clear_worker_pid(os.getpid())
 
 
@@ -1265,6 +2017,7 @@ def queue_run_cmd(
         "Examples:\n"
         "  krw-ontology queue start\n"
         "  krw-ontology queue start --poll-interval 5\n"
+        "  krw-ontology queue start --rebuild-agent-index\n"
         "  krw-ontology queue start --publish-prod\n\n"
         "The worker logs to <running-root>/.krw_pipeline/logs/worker.log. "
         "Use `queue watch` to follow that log."
@@ -1291,9 +2044,18 @@ def queue_start_cmd(
             "Start the worker in mode that publishes prod after batch stable publish/index rebuild."
         ),
     ),
+    rebuild_agent_index: bool = typer.Option(
+        False,
+        "--rebuild-agent-index/--no-rebuild-agent-index",
+        help=(
+            "Start the worker in mode that rebuilds pending agent indexes after each drained "
+            "batch. Disabled by default."
+        ),
+    ),
 ) -> None:
     """Start a detached background queue worker."""
     output_root = resolve_running_root(root, fallback_to_cwd=False)
+    _exit_if_queue_path_mutates_prod_current(output_root, "--root")
     output_root.mkdir(parents=True, exist_ok=True)
     store = PipelineQueue(output_root)
     store.ensure_dirs()
@@ -1314,6 +2076,8 @@ def queue_start_cmd(
     ]
     if publish_prod:
         command.append("--publish-prod")
+    if rebuild_agent_index:
+        command.append("--rebuild-agent-index")
     with store.worker_log_path.open("a", encoding="utf-8") as log_handle:
         log_handle.write(f"\n[{_now_label()}] queue-start launching background worker\n")
         log_handle.flush()
@@ -1360,6 +2124,7 @@ def queue_stop_cmd(
 ) -> None:
     """Safely stop the worker after the current ticker job finishes."""
     output_root = resolve_running_root(root, fallback_to_cwd=False)
+    _exit_if_queue_path_mutates_prod_current(output_root, "--root")
     store = PipelineQueue(output_root)
     store.request_stop()
     pid = store.worker_pid()
@@ -1420,6 +2185,7 @@ def queue_kill_cmd(
 ) -> None:
     """Immediately terminate the background worker process."""
     output_root = resolve_running_root(root, fallback_to_cwd=False)
+    _exit_if_queue_path_mutates_prod_current(output_root, "--root")
     store = PipelineQueue(output_root)
     pid = store.worker_pid()
     if pid is None:
@@ -1496,6 +2262,7 @@ def queue_recover_stale_cmd(
 ) -> None:
     """Requeue or fail jobs left running after kill, crash, or reboot."""
     output_root = resolve_running_root(root, fallback_to_cwd=False)
+    _exit_if_queue_path_mutates_prod_current(output_root, "--root")
     store = PipelineQueue(output_root)
     store.ensure_dirs()
 
@@ -1564,6 +2331,7 @@ def queue_cancel_cmd(
 ) -> None:
     """Cancel pending queue jobs."""
     output_root = resolve_running_root(root, fallback_to_cwd=False)
+    _exit_if_queue_path_mutates_prod_current(output_root, "--root")
     store = PipelineQueue(output_root)
     cancelled = 0
     for job_id in job_ids:
@@ -1688,6 +2456,11 @@ def queue_status_cmd(
         "--compact/--details",
         help="Show a compact operator summary instead of detailed recent jobs.",
     ),
+    json_output: bool = typer.Option(
+        False,
+        "--json",
+        help="Emit machine-readable queue status for deploy/preflight scripts.",
+    ),
 ) -> None:
     """Show queue worker and job status."""
     output_root = resolve_running_root(root, fallback_to_cwd=False)
@@ -1700,6 +2473,28 @@ def queue_status_cmd(
     counts = {PENDING: 0, RUNNING: 0, SUCCEEDED: 0, FAILED: 0, CANCELLED: 0}
     for job in jobs:
         counts[job.status] = counts.get(job.status, 0) + 1
+
+    if json_output:
+        active_jobs = [job for job in jobs if job.status in {PENDING, RUNNING}]
+        payload = {
+            "root": str(output_root),
+            "queue_root": str(store.queue_dir),
+            "worker": {
+                "state": worker_state,
+                "pid": pid,
+                "mode": (store.worker_state() or {}).get("mode"),
+            },
+            "stop_requested": store.stop_requested(),
+            "counts": counts,
+            "active_publish_roots": sorted(
+                {job.publish_root for job in active_jobs if job.publish_root}
+            ),
+            "active_publish_index_paths": sorted(
+                {job.publish_index_path for job in active_jobs if job.publish_index_path}
+            ),
+        }
+        typer.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        return
 
     if compact:
         _show_queue_status_compact(
@@ -2220,6 +3015,8 @@ def _bundle_filter(path: Path) -> bool:
         "current",
         "current.next",
         "current.rollback",
+        "manifest.json",
+        "release_manifest.json",
     }
     if path.name in ignored_names:
         return False
@@ -2232,22 +3029,18 @@ def _build_prod_release_bundle(stable_root: Path, bundle_path: Path, release_id:
     if not stable_root.exists() or not stable_root.is_dir():
         raise FileNotFoundError(f"Stable publish root not found: {stable_root}")
     bundle_path.parent.mkdir(parents=True, exist_ok=True)
-    manifest = {
-        "release_id": release_id,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "source_root": str(stable_root),
-        "format": "krw-ontology-prod-release/v1",
-    }
+    manifest = build_release_manifest(stable_root, release_id=release_id, env="prod", source_root=stable_root)
     with tarfile.open(bundle_path, "w:gz") as archive:
         for child in sorted(stable_root.iterdir()):
             if not _bundle_filter(child):
                 continue
             archive.add(child, arcname=child.name, recursive=True)
         manifest_bytes = json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8")
-        info = tarfile.TarInfo("release_manifest.json")
-        info.size = len(manifest_bytes)
-        info.mtime = time.time()
-        archive.addfile(info, io.BytesIO(manifest_bytes))
+        for manifest_name in (RELEASE_MANIFEST_FILENAME, "release_manifest.json"):
+            info = tarfile.TarInfo(manifest_name)
+            info.size = len(manifest_bytes)
+            info.mtime = time.time()
+            archive.addfile(info, io.BytesIO(manifest_bytes))
 
 
 def _run_checked(command: list[str], *, input_text: str | None = None) -> subprocess.CompletedProcess:
@@ -2310,10 +3103,15 @@ if [ -f "$ROOT/current/indexes/agent_index.sqlite" ]; then
 else
   printf 'index_present=no\\n'
 fi
-if [ -f "$ROOT/current/release_manifest.json" ]; then
+if [ -f "$ROOT/current/manifest.json" ]; then
   printf 'manifest_present=yes\\n'
+  printf 'manifest_file=manifest.json\\n'
+elif [ -f "$ROOT/current/release_manifest.json" ]; then
+  printf 'manifest_present=yes\\n'
+  printf 'manifest_file=release_manifest.json\\n'
 else
   printf 'manifest_present=no\\n'
+  printf 'manifest_file=\\n'
 fi
 if [ -d "$ROOT/releases" ]; then
   for release_dir in $(cd "$ROOT/releases" && ls -1dt */ 2>/dev/null || true); do
@@ -2325,7 +3123,7 @@ fi
 
 def _prod_doctor_script(*, remote_root: str, need_curl: bool) -> str:
     root_q = shlex.quote(remote_root)
-    required = "tar ln mv rm mkdir ls readlink xargs" + (" curl" if need_curl else "")
+    required = "tar ln mv rm mkdir ls readlink xargs grep" + (" curl" if need_curl else "")
     return f"""set -eu
 ROOT={root_q}
 REQUIRED={shlex.quote(required)}
@@ -2497,6 +3295,12 @@ rm -rf "$ROOT/releases/$RELEASE_ID.tmp" "$ROOT/releases/$RELEASE_ID"
 mkdir -p "$ROOT/releases/$RELEASE_ID.tmp"
 tar -xzf "$BUNDLE" -C "$ROOT/releases/$RELEASE_ID.tmp"
 mv "$ROOT/releases/$RELEASE_ID.tmp" "$ROOT/releases/$RELEASE_ID"
+MANIFEST="$ROOT/releases/$RELEASE_ID/manifest.json"
+if [ ! -f "$MANIFEST" ]; then MANIFEST="$ROOT/releases/$RELEASE_ID/release_manifest.json"; fi
+if [ ! -f "$MANIFEST" ]; then echo "Release manifest missing" >&2; exit 1; fi
+if ! grep -q '"env": "prod"' "$MANIFEST"; then echo "Release manifest env is not prod" >&2; exit 1; fi
+if ! grep -q '"release_id": "'"$RELEASE_ID"'"' "$MANIFEST"; then echo "Release manifest release_id mismatch" >&2; exit 1; fi
+if [ ! -f "$ROOT/releases/$RELEASE_ID/indexes/agent_index.sqlite" ]; then echo "agent_index.sqlite missing" >&2; exit 1; fi
 PREV=""
 if [ -L "$ROOT/current" ]; then
   PREV="$(readlink "$ROOT/current" 2>/dev/null || true)"

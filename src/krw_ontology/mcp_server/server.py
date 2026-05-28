@@ -26,6 +26,7 @@ from krw_ontology.mcp_server.tools import (
     topic_map_tool,
     trace_tool,
 )
+from krw_ontology.release import load_release_manifest, resolve_manifest_index_path
 
 mcp = FastMCP("krw_ontology_mcp")
 
@@ -44,15 +45,22 @@ def health_payload(
 ) -> tuple[dict, int]:
     """Return health metadata for the configured read-only ontology index."""
     root_path = resolve_ontology_root(root, fallback_to_cwd=False)
-    resolved_index_path = resolve_agent_index_path(
-        root_path,
-        index_path,
-        fallback_to_cwd=False,
+    release_manifest, release_manifest_path = load_release_manifest(root_path)
+    resolved_index_path = (
+        resolve_agent_index_path(root_path, index_path, fallback_to_cwd=False)
+        if index_path is not None
+        else resolve_manifest_index_path(root_path, release_manifest)
     )
     payload = {
         "ok": False,
         "root": str(root_path),
         "index_path": str(resolved_index_path),
+        "release_id": release_manifest.get("release_id"),
+        "env": release_manifest.get("env"),
+        "manifest_path": str(release_manifest_path) if release_manifest_path else None,
+        "manifest_valid": bool(release_manifest),
+        "agent_index_schema_version": release_manifest.get("agent_index_schema_version"),
+        "index_generated_at": release_manifest.get("index_generated_at"),
         "documents": 0,
         "objects": 0,
         "tools": sorted(tool.name for tool in mcp._tool_manager.list_tools()),

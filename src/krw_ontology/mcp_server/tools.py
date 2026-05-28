@@ -7,6 +7,7 @@ from collections import OrderedDict
 from enum import Enum
 import json
 import logging
+import os
 import re
 import threading
 import time
@@ -16,7 +17,7 @@ from typing import Any, Mapping, Sequence
 from krw_ontology.agent_index import AgentRetriever, OntologyStore, QueryPlan
 from krw_ontology.agent_index.retrieval_text import format_metric_compact
 from krw_ontology.agent_index.research_kernel import ResearchKernel, request_from_query_context_args
-from krw_ontology.agent_index.store import DEFAULT_QUERY_TYPES
+from krw_ontology.agent_index.store import DEFAULT_QUERY_TYPES, agent_index_cache_status
 from krw_ontology.config.paths import ONTOLOGY_ROOT_ENV, resolve_agent_index_path, resolve_ontology_root
 
 
@@ -40,8 +41,212 @@ LOGGER = logging.getLogger(__name__)
 SLOW_MCP_TOOL_LOG_THRESHOLD_MS = 5_000
 _SLOW_MCP_TOOL_LOG_MARKER = "[krw-ontology:mcp-slow-path]"
 _TRACE_TOOL_CACHE_MAX = 512
-_TRACE_TOOL_CACHE: OrderedDict[tuple[str, str], dict[str, Any]] = OrderedDict()
+_TRACE_TOOL_CACHE: OrderedDict[tuple[str, int | None, str], dict[str, Any]] = OrderedDict()
 _TRACE_TOOL_CACHE_LOCK = threading.Lock()
+_MCP_STORE_MODE_ENV = "KRW_MCP_STORE_MODE"
+_MCP_STORE_POOL_MAX_ENV = "KRW_MCP_STORE_POOL_MAX"
+_MCP_STORE_MODE_PERSISTENT = "persistent"
+_DEFAULT_MCP_STORE_POOL_MAX = 8
+
+
+def _read_int_env(name: str, default: int, *, min_value: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value >= min_value else default
+
+
+def _store_mode() -> str:
+    return os.getenv(_MCP_STORE_MODE_ENV, "per_call").strip().lower() or "per_call"
+
+
+def _persistent_store_enabled() -> bool:
+    return _store_mode() == _MCP_STORE_MODE_PERSISTENT
+
+
+def _index_signature(index_path: Path) -> tuple[str, int | None, int | None]:
+    resolved_path = index_path.expanduser().resolve()
+    try:
+        stat = resolved_path.stat()
+    except OSError:
+        return (str(resolved_path), None, None)
+    return (str(resolved_path), stat.st_mtime_ns, stat.st_size)
+
+
+def _trace_cache_key(index_path: Path, object_id: str) -> tuple[str, int | None, str]:
+    signature = _index_signature(index_path)
+    return (signature[0], signature[1], object_id)
+
+
+class _StoreBucket:
+    def __init__(self, signature: tuple[str, int | None, int | None]):
+        self.signature = signature
+        self.idle: list[OntologyStore] = []
+        self.leased = 0
+
+
+class _PersistentStoreLease:
+    def __init__(
+        self,
+        pool: "_PersistentStorePool",
+        logical_path: str,
+        signature: tuple[str, int | None, int | None],
+        store: OntologyStore,
+    ):
+        self._pool = pool
+        self._logical_path = logical_path
+        self._signature = signature
+        self._store = store
+
+    def __enter__(self) -> OntologyStore:
+        return self._store
+
+    def __exit__(self, *_exc: object) -> None:
+        self._pool.release(self._logical_path, self._signature, self._store)
+
+
+class _PersistentStorePool:
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._buckets: dict[str, _StoreBucket] = {}
+        self._hits = 0
+        self._misses = 0
+        self._opened = 0
+        self._closed = 0
+        self._rotations = 0
+
+    def acquire(self, index_path: Path) -> _PersistentStoreLease:
+        logical_path = str(index_path.expanduser().absolute())
+        signature = _index_signature(index_path)
+        max_idle = _read_int_env(
+            _MCP_STORE_POOL_MAX_ENV,
+            _DEFAULT_MCP_STORE_POOL_MAX,
+            min_value=1,
+        )
+        with self._lock:
+            bucket = self._buckets.get(logical_path)
+            if bucket is not None and bucket.signature != signature:
+                self._close_bucket(bucket)
+                self._buckets.pop(logical_path, None)
+                bucket = None
+                self._rotations += 1
+            if bucket is None:
+                bucket = _StoreBucket(signature)
+                self._buckets[logical_path] = bucket
+            if bucket.idle:
+                store = bucket.idle.pop()
+                self._hits += 1
+                reused = True
+            else:
+                store = OntologyStore(index_path, check_same_thread=False)
+                self._misses += 1
+                self._opened += 1
+                reused = False
+            bucket.leased += 1
+            while len(bucket.idle) > max_idle:
+                stale = bucket.idle.pop(0)
+                self._close_store(stale)
+        LOGGER.debug(
+            "mcp_store_acquire %s",
+            json.dumps(
+                {
+                    "index_path": str(index_path),
+                    "resolved_index_path": signature[0],
+                    "reused": reused,
+                },
+                sort_keys=True,
+            ),
+        )
+        return _PersistentStoreLease(self, logical_path, signature, store)
+
+    def release(
+        self,
+        logical_path: str,
+        signature: tuple[str, int | None, int | None],
+        store: OntologyStore,
+    ) -> None:
+        max_idle = _read_int_env(
+            _MCP_STORE_POOL_MAX_ENV,
+            _DEFAULT_MCP_STORE_POOL_MAX,
+            min_value=1,
+        )
+        with self._lock:
+            bucket = self._buckets.get(logical_path)
+            if bucket is None or bucket.signature != signature:
+                self._close_store(store)
+                return
+            bucket.leased = max(0, bucket.leased - 1)
+            if len(bucket.idle) < max_idle:
+                bucket.idle.append(store)
+                return
+            self._close_store(store)
+
+    def ensure_open(self, index_path: Path) -> None:
+        with self.acquire(index_path):
+            return
+
+    def status(self) -> dict[str, Any]:
+        with self._lock:
+            stores = sum(bucket.leased + len(bucket.idle) for bucket in self._buckets.values())
+            idle = sum(len(bucket.idle) for bucket in self._buckets.values())
+            leased = sum(bucket.leased for bucket in self._buckets.values())
+            indexes = [
+                {
+                    "logical_path": logical_path,
+                    "resolved_index_path": bucket.signature[0],
+                    "mtime_ns": bucket.signature[1],
+                    "size": bucket.signature[2],
+                    "idle": len(bucket.idle),
+                    "leased": bucket.leased,
+                }
+                for logical_path, bucket in sorted(self._buckets.items())
+            ]
+            return {
+                "mode": _store_mode(),
+                "pool_max": _read_int_env(
+                    _MCP_STORE_POOL_MAX_ENV,
+                    _DEFAULT_MCP_STORE_POOL_MAX,
+                    min_value=1,
+                ),
+                "stores": stores,
+                "idle": idle,
+                "leased": leased,
+                "hits": self._hits,
+                "misses": self._misses,
+                "opened": self._opened,
+                "closed": self._closed,
+                "rotations": self._rotations,
+                "indexes": indexes,
+            }
+
+    def reset(self) -> None:
+        with self._lock:
+            for bucket in self._buckets.values():
+                self._close_bucket(bucket)
+            self._buckets.clear()
+            self._hits = 0
+            self._misses = 0
+            self._opened = 0
+            self._closed = 0
+            self._rotations = 0
+
+    def _close_bucket(self, bucket: _StoreBucket) -> None:
+        while bucket.idle:
+            self._close_store(bucket.idle.pop())
+        bucket.leased = 0
+
+    def _close_store(self, store: OntologyStore) -> None:
+        try:
+            store.close()
+        finally:
+            self._closed += 1
+
+
+_STORE_POOL = _PersistentStorePool()
 
 
 def _elapsed_ms(started_at: float) -> int:
@@ -855,7 +1060,7 @@ def trace_tool(
 ) -> str:
     """Trace one ontology object to its source document, quotes, spans, and quality."""
     index = _index(root, index_path)
-    cache_key = (str(index), object_id)
+    cache_key = _trace_cache_key(index, object_id)
     with _TRACE_TOOL_CACHE_LOCK:
         cached = _TRACE_TOOL_CACHE.get(cache_key)
         if cached is not None:
@@ -1424,14 +1629,46 @@ def _index(root: str | None, index_path: str | None) -> Path:
     return resolve_agent_index_path(root, index_path, fallback_to_cwd=False)
 
 
-def _store(index_path: Path) -> OntologyStore:
+def _store(index_path: Path) -> Any:
     if not index_path.exists():
         raise FileNotFoundError(
             "Ontology agent index not found at "
             f"{index_path}. Build it with: uv run krw-ontology build-agent-index "
             f"--root ${ONTOLOGY_ROOT_ENV}"
         )
+    if _persistent_store_enabled():
+        return _STORE_POOL.acquire(index_path)
     return OntologyStore(index_path)
+
+
+def ensure_persistent_store_open(index_path: Path) -> None:
+    """Open and retain a pooled SQLite store when MCP persistent mode is enabled."""
+    if _persistent_store_enabled():
+        _STORE_POOL.ensure_open(index_path)
+
+
+def reset_mcp_runtime_caches() -> None:
+    """Reset MCP process-local caches. Intended for tests and release restarts."""
+    _STORE_POOL.reset()
+    with _TRACE_TOOL_CACHE_LOCK:
+        _TRACE_TOOL_CACHE.clear()
+
+
+def mcp_runtime_cache_status() -> dict[str, Any]:
+    """Return MCP process-local cache and persistent SQLite store status."""
+    from krw_ontology.agent_index.retriever import retriever_cache_status
+
+    with _TRACE_TOOL_CACHE_LOCK:
+        trace_cache = {
+            "size": len(_TRACE_TOOL_CACHE),
+            "max": _TRACE_TOOL_CACHE_MAX,
+        }
+    return {
+        "store": _STORE_POOL.status(),
+        "trace": trace_cache,
+        "agent_index": agent_index_cache_status(),
+        "retriever": retriever_cache_status(),
+    }
 
 
 def _coerce_response_detail(response_detail: ResponseDetail | str) -> ResponseDetail:

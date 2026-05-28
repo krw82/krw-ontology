@@ -26,8 +26,8 @@ dev = [
 
 [project.scripts]
 krw-ontology = "krw_ontology.cli.main:app"
-krw-ontology-mcp = "krw_ontology.mcp_server.server:main"
-krw-ontology-mcp-http = "krw_ontology.mcp_server.http_server:main"
+krw-ontology-mcp = "krw_ontology.mcp_server.http_server:main"
+krw-ontology-mcp-stdio = "krw_ontology.mcp_server.server:main"
 
 [build-system]
 requires = ["hatchling"]

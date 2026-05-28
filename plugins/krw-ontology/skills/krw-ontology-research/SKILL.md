@@ -603,6 +603,17 @@ Write dense, useful Korean Markdown.
 
 Do not force a fixed answer template. Choose the structure that best fits the user's question, the available evidence, and the natural reading flow.
 
+Mobile readability matters. Write Korean Markdown that is easy to read on a phone:
+
+```text
+Avoid long paragraphs.
+Put a blank line between distinct thought units.
+Use headings and bullets only when they improve readability.
+Do not force a fixed answer template.
+For long answers, start with a short conclusion summary before explaining evidence.
+Keep filing-evidence density, but make the answer easy to skim.
+```
+
 A strong answer should usually do some of the following when relevant:
 
 ```text

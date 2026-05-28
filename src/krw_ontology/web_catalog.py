@@ -6,6 +6,7 @@ import json
 import re
 import sqlite3
 from collections import Counter
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -33,7 +34,7 @@ def export_web_catalog(
     root_path = Path(verification["root"])
     resolved_index_path = Path(str(verification["index_path"]))
     manifest = verification["manifest"]
-    with _connect_readonly(resolved_index_path) as conn:
+    with closing(_connect_readonly(resolved_index_path)) as conn:
         conn.row_factory = sqlite3.Row
         companies = _export_companies(conn)
         summary = _export_summary(conn, companies=companies)

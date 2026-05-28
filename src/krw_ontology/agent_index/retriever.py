@@ -1698,3 +1698,14 @@ def _retrieve_compact_cache_set(key: tuple[Any, ...], value: dict[str, Any]) -> 
         _RETRIEVE_COMPACT_CACHE.move_to_end(key)
         while len(_RETRIEVE_COMPACT_CACHE) > _RETRIEVE_COMPACT_CACHE_MAX:
             _RETRIEVE_COMPACT_CACHE.popitem(last=False)
+
+
+def retriever_cache_status() -> dict[str, dict[str, int]]:
+    """Return in-process retriever cache sizes for MCP health/debugging."""
+    with _RETRIEVE_COMPACT_CACHE_LOCK:
+        return {
+            "retrieve_compact": {
+                "size": len(_RETRIEVE_COMPACT_CACHE),
+                "max": _RETRIEVE_COMPACT_CACHE_MAX,
+            }
+        }

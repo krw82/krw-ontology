@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -10,6 +11,7 @@ import pytest
 from krw_ontology.agent_index import builder as agent_index_builder
 from krw_ontology.agent_index import store as agent_index_store
 from krw_ontology.agent_index import OntologyStore, build_agent_index
+from krw_ontology.mcp_server.http_server import prepare_mcp_runtime
 from krw_ontology.mcp_server import tools as mcp_tools
 from krw_ontology.mcp_server.server import health_payload, mcp
 from krw_ontology.mcp_server.tools import (
@@ -134,6 +136,77 @@ def test_mcp_health_reports_release_manifest(tmp_path: Path, monkeypatch):
     assert payload["manifest_valid"] is True
     assert payload["manifest_path"] == str(tmp_path / "manifest.json")
     assert payload["documents"] == 2
+
+
+def test_mcp_prepare_runtime_requires_prod_current_symlink(tmp_path: Path):
+    release = tmp_path / "releases" / "prod" / "20260529_010000"
+    release.mkdir(parents=True)
+    _write_fixture(release)
+    build_agent_index(release)
+    write_release_manifest(release, release_id="20260529_010000", env="prod")
+    current = release.parent / "current"
+    current.symlink_to(release.name)
+    env_names = (
+        "KRW_ONTOLOGY_ENV",
+        "KRW_ONTOLOGY_RELEASE_ROOT",
+        "KRW_ONTOLOGY_ROOT",
+        "KRW_ONTOLOGY_MANIFEST_PATH",
+        "KRW_ONTOLOGY_INDEX_PATH",
+        "KRW_MCP_STORE_MODE",
+    )
+    old_env = {name: os.environ.get(name) for name in env_names}
+    for name in env_names:
+        os.environ.pop(name, None)
+
+    mcp_tools.reset_mcp_runtime_caches()
+    try:
+        verification = prepare_mcp_runtime(root=current, env="prod")
+        status = mcp_tools.mcp_runtime_cache_status()
+    finally:
+        mcp_tools.reset_mcp_runtime_caches()
+        for name, value in old_env.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+    assert verification["ok"] is True
+    assert verification["release_id"] == "20260529_010000"
+    assert verification["current_symlink"] is True
+    assert status["store"]["mode"] == "persistent"
+    assert status["store"]["stores"] == 1
+    assert status["store"]["idle"] == 1
+
+
+def test_mcp_prepare_runtime_rejects_non_symlink_prod_root(tmp_path: Path):
+    release = tmp_path / "releases" / "prod" / "20260529_010000"
+    release.mkdir(parents=True)
+    _write_fixture(release)
+    build_agent_index(release)
+    write_release_manifest(release, release_id="20260529_010000", env="prod")
+
+    with pytest.raises(RuntimeError, match="current_symlink_required"):
+        prepare_mcp_runtime(root=release, env="prod")
+
+
+def test_mcp_persistent_store_reuses_sqlite_connection(tmp_path: Path, monkeypatch):
+    _write_fixture(tmp_path)
+    index = build_agent_index(tmp_path)
+    monkeypatch.setenv("KRW_MCP_STORE_MODE", "persistent")
+    mcp_tools.reset_mcp_runtime_caches()
+
+    try:
+        with mcp_tools._store(index["index_path"]) as first:
+            first_conn = first.conn
+        with mcp_tools._store(index["index_path"]) as second:
+            assert second.conn is first_conn
+        status = mcp_tools.mcp_runtime_cache_status()
+    finally:
+        mcp_tools.reset_mcp_runtime_caches()
+
+    assert status["store"]["stores"] == 1
+    assert status["store"]["hits"] == 1
+    assert status["store"]["misses"] == 1
 
 
 def test_mcp_query_normalizes_object_type_aliases(tmp_path: Path, monkeypatch):

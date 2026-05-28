@@ -393,9 +393,13 @@ def _read_int_env(name: str, default: int, *, min_value: int) -> int:
 class OntologyStore:
     """Read-only SDK over an agent index SQLite database."""
 
-    def __init__(self, index_path: Path | str):
+    def __init__(self, index_path: Path | str, *, check_same_thread: bool = True):
         self.index_path = Path(index_path)
-        self.conn = sqlite3.connect(self.index_path, cached_statements=512)
+        self.conn = sqlite3.connect(
+            self.index_path,
+            cached_statements=512,
+            check_same_thread=check_same_thread,
+        )
         self.conn.row_factory = sqlite3.Row
         self._configure_read_connection()
 
@@ -7058,6 +7062,36 @@ def _compare_ticker_cache_set(
         _COMPARE_TICKER_CACHE.move_to_end(key)
         while len(_COMPARE_TICKER_CACHE) > _COMPARE_TICKER_CACHE_MAX:
             _COMPARE_TICKER_CACHE.popitem(last=False)
+
+
+def agent_index_cache_status() -> dict[str, dict[str, int]]:
+    """Return in-process retrieval cache sizes for MCP health/debugging."""
+    with _COMPARE_TICKER_CACHE_LOCK:
+        compare_size = len(_COMPARE_TICKER_CACHE)
+    with _DISCOVERY_CACHE_LOCK:
+        discovery_size = len(_DISCOVERY_CACHE)
+    with _QUERY_COMPACT_CACHE_LOCK:
+        query_compact_size = len(_QUERY_COMPACT_CACHE)
+    with _QUERY_CONTEXT_CACHE_LOCK:
+        query_context_size = len(_QUERY_CONTEXT_CACHE)
+    return {
+        "compare_ticker": {
+            "size": compare_size,
+            "max": _COMPARE_TICKER_CACHE_MAX,
+        },
+        "discovery": {
+            "size": discovery_size,
+            "max": _DISCOVERY_CACHE_MAX,
+        },
+        "query_compact": {
+            "size": query_compact_size,
+            "max": _QUERY_COMPACT_CACHE_MAX,
+        },
+        "query_context": {
+            "size": query_context_size,
+            "max": _QUERY_CONTEXT_CACHE_MAX,
+        },
+    }
 
 
 def _discovery_cache_key(

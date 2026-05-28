@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -88,7 +89,7 @@ def _read_index_metadata(index_path: Path) -> dict[str, Any]:
         tz=timezone.utc,
     ).isoformat()
     try:
-        with sqlite3.connect(index_path) as conn:
+        with closing(sqlite3.connect(index_path)) as conn:
             metadata["document_count"] = conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
             metadata["object_count"] = conn.execute("SELECT COUNT(*) FROM objects").fetchone()[0]
             try:

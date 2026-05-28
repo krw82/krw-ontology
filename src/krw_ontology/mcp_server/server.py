@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+from contextlib import closing
 
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
@@ -23,6 +24,7 @@ from krw_ontology.mcp_server.tools import (
     query_context_tool,
     query_tool,
     retrieve_tool,
+    mcp_runtime_cache_status,
     topic_map_tool,
     trace_tool,
 )
@@ -61,6 +63,7 @@ def health_payload(
         "manifest_valid": bool(release_manifest),
         "agent_index_schema_version": release_manifest.get("agent_index_schema_version"),
         "index_generated_at": release_manifest.get("index_generated_at"),
+        "cache": mcp_runtime_cache_status(),
         "documents": 0,
         "objects": 0,
         "tools": sorted(tool.name for tool in mcp._tool_manager.list_tools()),
@@ -70,7 +73,7 @@ def health_payload(
         return payload, 503
 
     try:
-        with sqlite3.connect(resolved_index_path) as conn:
+        with closing(sqlite3.connect(resolved_index_path)) as conn:
             payload["documents"] = conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
             payload["objects"] = conn.execute("SELECT COUNT(*) FROM objects").fetchone()[0]
     except sqlite3.Error as exc:

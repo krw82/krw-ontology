@@ -1210,6 +1210,8 @@ class TestReleaseCommand:
         releases_root = tmp_path / "releases"
         release_root = releases_root / "dev" / "20260528_070000"
         release_root.mkdir(parents=True)
+        (release_root / "companies" / "CVX" / "ontology").mkdir(parents=True)
+        (release_root / "companies" / "CVX" / "ontology" / "artifact.jsonl").write_text("{}\n")
         runner.invoke(app, ["config", "set", "publish-root", str(release_root)])
         runner.invoke(
             app,
@@ -2415,3 +2417,167 @@ class TestHelpOutput:
         assert result.exit_code == 0
         assert "--compact" in result.output
         assert "operator summary" in result.output
+
+
+def test_release_finalize_dev_defaults_to_current_when_publish_root_unset(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("KRW_ONTOLOGY_CLI_CONFIG", str(tmp_path / "config.json"))
+    releases_root = tmp_path / "releases"
+    release_id = "20260528_090000"
+    release_root = releases_root / "dev" / release_id
+    (release_root / "companies" / "CVX" / "ontology").mkdir(parents=True)
+    (release_root / "companies" / "CVX" / "ontology" / "artifact.jsonl").write_text("{}\n")
+    write_release_manifest(release_root, release_id=release_id, env="dev", write_legacy=True)
+    (releases_root / "dev" / "current").symlink_to(release_id)
+    calls = []
+
+    def fake_build_agent_index(root, *, index_path=None, force=True):
+        calls.append((root, index_path, force))
+        resolved_index_path = index_path or root / "indexes" / "agent_index.sqlite"
+        resolved_index_path.parent.mkdir(parents=True, exist_ok=True)
+        resolved_index_path.write_bytes(b"sqlite")
+        return {
+            "index_path": resolved_index_path,
+            "totals": {"documents": 1, "objects": 2, "edges": 0, "quality_events": 0},
+        }
+
+    monkeypatch.setattr(agent_index, "build_agent_index", fake_build_agent_index)
+
+    result = runner.invoke(app, ["release", "finalize-dev", "--releases-root", str(releases_root)])
+
+    assert result.exit_code == 0, result.output
+    assert calls == [(release_root.resolve(), release_root / "indexes" / "agent_index.sqlite", True)]
+    assert f"Dev release finalized: {release_id}" in result.output
+    assert f"Release promoted: env=dev release_id={release_id}" in result.output
+
+
+def test_release_finalize_dev_refuses_empty_release_root_before_index_build(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("KRW_ONTOLOGY_CLI_CONFIG", str(tmp_path / "config.json"))
+    releases_root = tmp_path / "releases"
+    release_id = "20260528_100000"
+    release_root = releases_root / "dev" / release_id
+    release_root.mkdir(parents=True)
+    write_release_manifest(release_root, release_id=release_id, env="dev", write_legacy=True)
+    calls = []
+
+    def fake_build_agent_index(root, *, index_path=None, force=True):
+        calls.append((root, index_path, force))
+        return {
+            "index_path": index_path or root / "indexes" / "agent_index.sqlite",
+            "totals": {"documents": 0, "objects": 0, "edges": 0, "quality_events": 0},
+        }
+
+    monkeypatch.setattr(agent_index, "build_agent_index", fake_build_agent_index)
+
+    result = runner.invoke(
+        app,
+        ["release", "finalize-dev", release_id, "--releases-root", str(releases_root)],
+    )
+
+    assert result.exit_code == 1
+    assert calls == []
+    assert "Release has no ontology artifacts under companies/" in result.output
+    assert "Refusing to finalize an empty index" in result.output
+
+
+def test_release_publish_dev_builds_running_index_into_dev_release(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("KRW_ONTOLOGY_CLI_CONFIG", str(tmp_path / "config.json"))
+    monkeypatch.setattr(cli_main, "_default_release_id", lambda: "20260603_110000")
+    running_root = tmp_path / "running"
+    releases_root = tmp_path / "releases"
+    artifact = running_root / "companies" / "CVX" / "ontology" / "artifact.jsonl"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_text("{}\n")
+    (running_root / ".krw_pipeline" / "jobs").mkdir(parents=True)
+    (running_root / ".krw_pipeline" / "jobs" / "job.json").write_text("{}")
+    runner.invoke(app, ["config", "set", "running-root", str(running_root)])
+    calls = []
+
+    def fake_build_agent_index(root, *, index_path=None, force=True):
+        calls.append((root, index_path, force))
+        resolved_index_path = index_path or root / "indexes" / "agent_index.sqlite"
+        resolved_index_path.parent.mkdir(parents=True, exist_ok=True)
+        resolved_index_path.write_bytes(b"sqlite")
+        return {
+            "index_path": resolved_index_path,
+            "totals": {"documents": 7, "objects": 11, "edges": 3, "quality_events": 2},
+        }
+
+    monkeypatch.setattr(agent_index, "build_agent_index", fake_build_agent_index)
+
+    result = runner.invoke(app, ["release", "publish-dev", "--foreground", "--releases-root", str(releases_root)])
+
+    release_root = releases_root / "dev" / "20260603_110000"
+    assert result.exit_code == 0, result.output
+    assert calls == [(running_root.resolve(), release_root / "indexes" / "agent_index.sqlite", True)]
+    assert not (release_root / "companies" / "CVX" / "ontology" / "artifact.jsonl").exists()
+    assert not (release_root / ".krw_pipeline").exists()
+    assert (release_root / "manifest.json").exists()
+    assert (releases_root / "dev" / "current").readlink() == Path("20260603_110000")
+    assert "Dev release published: 20260603_110000" in result.output
+    assert "Agent index built: documents=7 objects=11 edges=3 quality_events=2" in result.output
+    assert "promoted: True" in result.output
+
+
+def test_release_publish_dev_refuses_empty_running_root(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("KRW_ONTOLOGY_CLI_CONFIG", str(tmp_path / "config.json"))
+    running_root = tmp_path / "running"
+    running_root.mkdir()
+    releases_root = tmp_path / "releases"
+    runner.invoke(app, ["config", "set", "running-root", str(running_root)])
+    calls = []
+
+    def fake_build_agent_index(root, *, index_path=None, force=True):
+        calls.append((root, index_path, force))
+        return {
+            "index_path": index_path or root / "indexes" / "agent_index.sqlite",
+            "totals": {"documents": 0, "objects": 0, "edges": 0, "quality_events": 0},
+        }
+
+    monkeypatch.setattr(agent_index, "build_agent_index", fake_build_agent_index)
+
+    result = runner.invoke(app, ["release", "publish-dev", "--releases-root", str(releases_root)])
+
+    assert result.exit_code == 1
+    assert calls == []
+    assert "Source root has no ontology artifacts under companies/" in result.output
+    assert not (releases_root / "dev").exists()
+
+
+def test_release_publish_dev_defaults_to_background_worker(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("KRW_ONTOLOGY_CLI_CONFIG", str(tmp_path / "config.json"))
+    monkeypatch.setattr(cli_main, "_default_release_id", lambda: "20260603_120000")
+    running_root = tmp_path / "running"
+    releases_root = tmp_path / "releases"
+    artifact = running_root / "companies" / "CVX" / "ontology" / "artifact.jsonl"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_text("{}\n")
+    runner.invoke(app, ["config", "set", "running-root", str(running_root)])
+    calls = []
+
+    class FakeProcess:
+        pid = 23456
+
+    def fake_popen(command, *, stdout, stderr, start_new_session):
+        calls.append((command, stderr, start_new_session))
+        stdout.write("fake publish worker\n")
+        stdout.flush()
+        return FakeProcess()
+
+    monkeypatch.setattr(cli_main.subprocess, "Popen", fake_popen)
+
+    result = runner.invoke(app, ["release", "publish-dev", "--releases-root", str(releases_root)])
+
+    release_root = releases_root / "dev" / "20260603_120000"
+    assert result.exit_code == 0, result.output
+    assert calls
+    command = calls[0][0]
+    assert "release-publish-dev-worker" in command
+    assert "--release-id" in command
+    assert "20260603_120000" in command
+    assert "--from-root" in command
+    assert str(running_root.resolve()) in command
+    assert calls[0][1] is cli_main.subprocess.STDOUT
+    assert calls[0][2] is True
+    assert (release_root / "logs" / "publish-dev.log").exists()
+    assert "Started dev publish worker pid=23456" in result.output
+    assert "watch: krw-ontology release publish-dev-watch 20260603_120000" in result.output

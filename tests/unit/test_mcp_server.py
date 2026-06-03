@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -13,7 +14,7 @@ from krw_ontology.agent_index import store as agent_index_store
 from krw_ontology.agent_index import OntologyStore, build_agent_index
 from krw_ontology.mcp_server.http_server import prepare_mcp_runtime
 from krw_ontology.mcp_server import tools as mcp_tools
-from krw_ontology.mcp_server.server import health_payload, mcp
+from krw_ontology.mcp_server.server import diagnostics_payload, health_payload, mcp
 from krw_ontology.mcp_server.tools import (
     _normalize_object_types,
     catalog_tool,
@@ -1043,6 +1044,81 @@ def test_mcp_retrieve_attaches_research_context_for_normal_question(
     assert payload["research_context"]["directness_guard"] == payload["directness_guard"]
 
 
+def test_mcp_retrieve_adds_soft_guidance_for_repeated_retrieve_context(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _write_fixture(tmp_path)
+    build_agent_index(tmp_path)
+    monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
+
+    payload = json.loads(
+        retrieve_tool(
+            question="VG revenue growth evidence",
+            ticker="VG",
+            limit=3,
+            agent_context={
+                "tool_usage": {
+                    "total": 9,
+                    "krw_ontology_retrieve": 2,
+                },
+            },
+        )
+    )
+
+    guidance = payload["agent_guidance"]
+    assert guidance["severity"] == "soft"
+    assert guidance["reason"] == "repeated_retrieve"
+    assert "already used krw_ontology_retrieve multiple times" in guidance["message"]
+    assert "Do not repeat broad retrieve calls" in guidance["message"]
+    assert guidance["tool_usage"] == {
+        "total": 9,
+        "krw_ontology_retrieve": 2,
+    }
+    if "research_context" in payload:
+        assert payload["research_context"]["agent_guidance"] == guidance
+
+    markdown = retrieve_tool(
+        question="VG revenue growth evidence",
+        ticker="VG",
+        limit=3,
+        response_format=ResponseFormat.MARKDOWN,
+        agent_context={
+            "tool_usage": {
+                "total": 9,
+                "krw_ontology_retrieve": 2,
+            },
+        },
+    )
+    assert "Agent guidance:" in markdown
+    assert "Prefer query_context, targeted query, trace, or chain" in markdown
+
+
+def test_mcp_retrieve_omits_soft_guidance_before_retrieve_repeats(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _write_fixture(tmp_path)
+    build_agent_index(tmp_path)
+    monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
+
+    payload = json.loads(
+        retrieve_tool(
+            question="VG revenue growth evidence",
+            ticker="VG",
+            limit=3,
+            agent_context={
+                "tool_usage": {
+                    "total": 4,
+                    "krw_ontology_retrieve": 1,
+                },
+            },
+        )
+    )
+
+    assert "agent_guidance" not in payload
+
+
 def test_mcp_retrieve_skips_legacy_when_research_context_is_sufficient(
     tmp_path: Path,
     monkeypatch,
@@ -1117,9 +1193,18 @@ def test_mcp_markdown_outputs_include_directness_guard(
     assert "traceable_direct, traceable_metric_lineage" in retrieve_markdown
 
 
-def test_mcp_health_payload_reports_index_counts(tmp_path: Path):
+def test_mcp_health_payload_reports_manifest_counts_without_sqlite_count(
+    tmp_path: Path,
+    monkeypatch,
+):
     _write_fixture(tmp_path)
     build_agent_index(tmp_path)
+    write_release_manifest(tmp_path, release_id="20260528_020000", env="prod")
+
+    def fail_connect(*_args, **_kwargs):
+        raise AssertionError("health_payload must not open SQLite")
+
+    monkeypatch.setattr("krw_ontology.mcp_server.server.sqlite3.connect", fail_connect)
 
     payload, status_code = health_payload(root=str(tmp_path))
 
@@ -1128,7 +1213,22 @@ def test_mcp_health_payload_reports_index_counts(tmp_path: Path):
     assert payload["root"] == str(tmp_path.resolve())
     assert payload["documents"] == 2
     assert payload["objects"] >= 1
+    assert payload["sqlite_checked"] is False
     assert "krw_ontology_topic_map" in payload["tools"]
+
+
+def test_mcp_diagnostics_payload_reports_live_index_counts(tmp_path: Path):
+    _write_fixture(tmp_path)
+    build_agent_index(tmp_path)
+    write_release_manifest(tmp_path, release_id="20260528_020000", env="prod")
+
+    payload, status_code = diagnostics_payload(root=str(tmp_path))
+
+    assert status_code == 200
+    assert payload["ok"] is True
+    assert payload["documents"] == 2
+    assert payload["objects"] >= 1
+    assert payload["sqlite_checked"] is True
 
 
 def test_mcp_health_payload_reports_missing_index(tmp_path: Path):

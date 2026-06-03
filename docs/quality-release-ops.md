@@ -1,0 +1,602 @@
+# KRW Ontology 품질 repair 및 dev release 운영 문서
+
+이 문서는 `krw-ontology`의 품질 repair, 일반 queue, dev index publish 흐름을 운영자 기준으로 정리한다.
+
+핵심 원칙:
+
+- ontology artifact의 근거와 신뢰를 우선한다.
+- 자동 repair는 claim 문장, 숫자 값, support reference를 추측 수정하지 않는다.
+- 장시간 작업은 기본적으로 background worker로 실행한다.
+- 상태 확인은 `watch`, 로그 확인은 `log` 또는 `*-watch` 명령으로 한다.
+
+## 1. 전체 운영 흐름
+
+일반적인 순서:
+
+```bash
+krw-ontology quality check --env dev
+krw-ontology quality repair plan --env dev
+krw-ontology quality repair run
+krw-ontology quality repair watch
+krw-ontology quality repair log --follow
+krw-ontology queue status --compact
+krw-ontology release publish-dev
+krw-ontology release publish-dev-watch
+```
+
+중요한 구분:
+
+```text
+quality repair = running artifact 또는 quality queue 상태를 보완
+general queue = docs_missing 같은 티커 재수집/full_refresh 처리
+release publish-dev = running-root를 읽어서 dev agent_index.sqlite를 새로 생성하고 dev/current로 promote
+```
+
+## 2. Quality repair
+
+### 2.1 Plan 생성
+
+```bash
+krw-ontology quality repair plan --env dev
+```
+
+출력 예:
+
+```text
+Repair plan created: qr_20260602_134346
+Release: dev/current
+Queue: /Users/.../krw-ontology-data-running/.krw_pipeline/quality
+Jobs: 797
+```
+
+plan은 그 시점의 release SQL index를 기준으로 만든 스냅샷이다.
+
+코드나 artifact가 크게 바뀌면 새 plan을 다시 만드는 것이 맞다.
+
+### 2.2 기본 실행
+
+이제 기본 실행은 이 명령 하나다.
+
+```bash
+krw-ontology quality repair run
+```
+
+기본 의미:
+
+```text
+latest repair plan 자동 선택
+all executable pending jobs 선택
+실행 확정
+background worker 시작
+```
+
+즉 내부적으로는 다음과 같은 의미다.
+
+```text
+krw-ontology quality repair run --plan <latest> --all --yes --background
+```
+
+출력 예:
+
+```text
+Started quality repair worker pid=12345
+plan: qr_20260602_134346
+selected_jobs: 794
+log: /Users/.../.krw_pipeline/quality/logs/worker.log
+watch: krw-ontology quality repair watch --plan qr_20260602_134346
+```
+
+### 2.3 Preview
+
+실행하지 않고 선택될 job만 보려면:
+
+```bash
+krw-ontology quality repair run --preview
+```
+
+특정 plan:
+
+```bash
+krw-ontology quality repair run --plan qr_20260602_134346 --preview
+```
+
+특정 kind:
+
+```bash
+krw-ontology quality repair run --kind normalize_numeric --preview
+```
+
+### 2.4 Foreground 실행
+
+디버깅 목적이면 foreground로 실행할 수 있다.
+
+```bash
+krw-ontology quality repair run --foreground
+```
+
+일반 운영에서는 background 기본값을 사용한다.
+
+### 2.5 상태 확인
+
+```bash
+krw-ontology quality repair watch
+```
+
+특정 plan:
+
+```bash
+krw-ontology quality repair watch --plan qr_20260602_134346
+```
+
+한 번만 보기:
+
+```bash
+krw-ontology quality repair watch --once
+```
+
+출력 해석:
+
+```text
+Worker: running pid=...
+Jobs: pending=... running=... succeeded=... failed=... cancelled=...
+Kinds: batch_failure=..., docs_missing=..., normalize_numeric=...
+```
+
+`Worker: stopped`, `running=0`이면 quality repair worker는 끝난 상태다.
+
+`pending`이 남아 있어도 executor가 없는 kind라면 정상일 수 있다.
+
+### 2.6 로그 확인
+
+```bash
+krw-ontology quality repair log
+```
+
+follow:
+
+```bash
+krw-ontology quality repair log --follow
+```
+
+로그 파일 위치:
+
+```text
+<running-root>/.krw_pipeline/quality/logs/worker.log
+```
+
+### 2.7 Job 목록
+
+```bash
+krw-ontology quality repair list
+```
+
+필터:
+
+```bash
+krw-ontology quality repair list --status pending
+krw-ontology quality repair list --kind repair_reference
+krw-ontology quality repair list --kind normalize_numeric --status succeeded
+```
+
+## 3. Repair kind별 동작
+
+### 3.1 docs_missing
+
+`docs_missing`은 quality repair가 직접 문서를 생성하지 않는다.
+
+대신 일반 queue에 `full_refresh` job을 넣는다.
+
+```text
+quality queue docs_missing
+-> general queue full_refresh years=3
+```
+
+확인:
+
+```bash
+krw-ontology queue status --compact
+```
+
+일반 queue worker가 멈춰 있으면:
+
+```bash
+krw-ontology queue recover-stale
+krw-ontology queue start
+krw-ontology queue watch
+```
+
+주의:
+
+```text
+docs_missing succeeded = 일반 queue에 등록 성공
+문서 재수집 완료 아님
+```
+
+### 3.2 batch_failure
+
+Agent SDK stage를 재시도한다.
+
+예:
+
+```text
+extract_evidence_quotes
+extract_research_claims
+extract_assumption_candidates
+```
+
+Claude/API safety filter로 특정 batch가 실패할 수 있다.
+
+```text
+extract_assumption_candidates batch 7 failed; continuing
+```
+
+이 메시지는 전체 worker가 죽었다는 뜻은 아니다.
+
+### 3.3 section_fail / section_warn
+
+해당 문서의 section extraction을 다시 수행한다.
+
+문서 구조 산출물은 바뀔 수 있다.
+
+### 3.4 normalize_numeric
+
+근거 보존형 재검증/재계산만 수행한다.
+
+하는 일:
+
+```text
+numeric_evidence.jsonl 재생성
+numeric rejected 후보 재검증
+report 생성
+```
+
+하지 않는 일:
+
+```text
+claim 문장 수정
+숫자 값 수정
+rejected object 자동 accepted 승격
+```
+
+### 3.5 repair_reference
+
+파생 reference tail을 재계산하고 unresolved report를 만든다.
+
+하는 일:
+
+```text
+support_links.jsonl 재생성
+edges.jsonl 재생성
+reference/relation unresolved report 생성
+```
+
+하지 않는 일:
+
+```text
+없는 quote를 비슷한 quote로 자동 대체
+supported_by_quotes 추측 수정
+claim/assumption 의미 수정
+```
+
+### 3.6 coverage_gap
+
+현재는 자동 executor가 없다.
+
+이유:
+
+```text
+무엇을 더 추출할지 판단이 필요함
+근거를 추측해서 채우면 ontology 품질이 나빠질 수 있음
+```
+
+## 4. Repair report
+
+report 위치:
+
+```text
+<running-root>/.krw_pipeline/quality/reports/<job-id>.json
+```
+
+job payload에는 report 경로가 들어간다.
+
+```json
+{
+  "policy": "evidence_preserving_revalidation",
+  "report_path": "/Users/.../.krw_pipeline/quality/reports/<job-id>.json",
+  "auto_promoted_objects": 0,
+  "auto_modified_claims": 0,
+  "unresolved_count": 3
+}
+```
+
+중요한 invariant:
+
+```text
+auto_promoted_objects = 0
+auto_modified_claims = 0
+```
+
+이 값은 자동 repair가 근거/의미를 임의로 고치지 않았다는 안전장치다.
+
+## 5. General queue
+
+일반 queue는 이미 background worker 구조다.
+
+시작:
+
+```bash
+krw-ontology queue start
+```
+
+상태:
+
+```bash
+krw-ontology queue status --compact
+```
+
+로그:
+
+```bash
+krw-ontology queue watch
+```
+
+stale running 정리:
+
+```bash
+krw-ontology queue recover-stale
+```
+
+주의:
+
+```text
+Stop requested: yes
+```
+
+이면 worker가 새 job을 잡지 않는다. 필요하면 stale 정리 후 다시 시작한다.
+
+## 6. Dev index publish
+
+### 6.1 기본 실행
+
+```bash
+krw-ontology release publish-dev
+```
+
+기본 동작:
+
+```text
+background worker 시작
+configured running-root를 읽음
+dev release index path에 agent_index.sqlite 생성
+manifest 작성
+dev/current promote
+```
+
+중요:
+
+```text
+running-root 전체를 dev release로 복사하지 않는다.
+index builder의 입력 root만 running-root다.
+산출물은 dev release의 indexes/agent_index.sqlite다.
+```
+
+내부 의미:
+
+```python
+build_agent_index(
+    root="/Users/.../krw-ontology-data-running",
+    index_path="/Users/.../krw-ontology-data/releases/dev/<release-id>/indexes/agent_index.sqlite",
+    force=True,
+)
+```
+
+출력 예:
+
+```text
+Started dev publish worker pid=12345
+release_id: 20260603_231500
+source_root: /Users/.../krw-ontology-data-running
+release_root: /Users/.../krw-ontology-data/releases/dev/20260603_231500
+index_path: /Users/.../releases/dev/20260603_231500/indexes/agent_index.sqlite
+log: /Users/.../releases/dev/20260603_231500/logs/publish-dev.log
+progress: /Users/.../releases/dev/20260603_231500/indexes/build_progress.jsonl
+watch: krw-ontology release publish-dev-watch 20260603_231500
+```
+
+### 6.2 Foreground 실행
+
+```bash
+krw-ontology release publish-dev --foreground
+```
+
+디버깅용이다. 일반 운영에서는 기본 background를 사용한다.
+
+### 6.3 Dry run
+
+```bash
+krw-ontology release publish-dev --dry-run
+```
+
+### 6.4 상태 확인
+
+latest dev publish release:
+
+```bash
+krw-ontology release publish-dev-status
+```
+
+특정 release:
+
+```bash
+krw-ontology release publish-dev-status 20260603_231500
+```
+
+### 6.5 로그 확인
+
+latest:
+
+```bash
+krw-ontology release publish-dev-watch
+```
+
+특정 release:
+
+```bash
+krw-ontology release publish-dev-watch 20260603_231500
+```
+
+follow 없이 tail만:
+
+```bash
+krw-ontology release publish-dev-watch 20260603_231500 --no-follow
+```
+
+progress file:
+
+```text
+<dev-release-root>/indexes/build_progress.jsonl
+```
+
+worker log:
+
+```text
+<dev-release-root>/logs/publish-dev.log
+```
+
+## 7. finalize-dev와 publish-dev의 차이
+
+`release finalize-dev`:
+
+```text
+이미 준비된 dev release directory를 finalize한다.
+prepared release workflow용이다.
+```
+
+`release publish-dev`:
+
+```text
+running-root를 읽어서 dev release index를 만들고 dev/current로 promote한다.
+일반 운영자가 쓰는 기본 명령이다.
+```
+
+일반 운영에서는 보통 이 명령을 쓴다.
+
+```bash
+krw-ontology release publish-dev
+```
+
+`finalize-dev <release-id>`를 임의 release id로 실행하면 빈 release를 대상으로 만들 수 있으므로 주의한다.
+
+현재는 산출물이 없는 release root에 대해서는 empty index finalize를 거부한다.
+
+## 8. Prod 반영
+
+dev 확인 후 prod materialize:
+
+```bash
+krw-ontology release materialize-prod <release-id>
+```
+
+prod 서버 publish:
+
+```bash
+krw-ontology prod publish
+```
+
+`prod publish`는 운영 current를 바꾸는 명령이므로 foreground 유지가 안전하다.
+
+## 9. 자주 보는 문제
+
+### 9.1 `documents=0 objects=0`
+
+원인:
+
+```text
+빈 release root를 대상으로 index를 만들었거나
+input root에 companies artifact가 없음
+```
+
+권장:
+
+```bash
+krw-ontology release publish-dev
+```
+
+이 명령은 running-root를 input으로 사용한다.
+
+### 9.2 `Worker: stopped`인데 pending이 남음
+
+quality repair:
+
+```text
+executor 없는 kind가 pending으로 남을 수 있음
+coverage_gap 등
+```
+
+general queue:
+
+```text
+worker가 멈춰 있으면 pending은 처리되지 않음
+queue recover-stale 후 queue start 필요
+```
+
+### 9.3 Claude API 400 safety filter
+
+예:
+
+```text
+API Error: 400 [1301] System detected potentially unsafe or sensitive content
+```
+
+의미:
+
+```text
+특정 extraction batch가 safety filter에 걸림
+worker 전체가 죽었다는 뜻은 아님
+```
+
+로그와 quality events를 확인한다.
+
+```bash
+krw-ontology quality repair log --follow
+krw-ontology quality events --ticker <TICKER> --env dev
+```
+
+## 10. 권장 일상 명령 세트
+
+품질 확인:
+
+```bash
+krw-ontology quality check --env dev
+krw-ontology quality tickers --env dev --severity high
+```
+
+repair:
+
+```bash
+krw-ontology quality repair plan --env dev
+krw-ontology quality repair run
+krw-ontology quality repair watch
+```
+
+repair 로그:
+
+```bash
+krw-ontology quality repair log --follow
+```
+
+일반 queue:
+
+```bash
+krw-ontology queue status --compact
+krw-ontology queue start
+krw-ontology queue watch
+```
+
+dev index publish:
+
+```bash
+krw-ontology release publish-dev
+krw-ontology release publish-dev-watch
+krw-ontology release publish-dev-status
+```

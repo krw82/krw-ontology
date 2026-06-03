@@ -55,3 +55,19 @@ Answer order:
 ```
 
 Do not open with annual-only framing when the user explicitly asks for recent drivers.
+
+## News date vs filing period
+
+In news mode, separate source timing from financial-period timing.
+
+```text
+news date = event/reporting date
+source date = publication or company announcement date
+filing period = the financial baseline period
+```
+
+Recent news can be the current driver even when the latest filing period is older. The filing baseline still determines reported numbers, accounting classification, segment definitions, cash-flow treatment, and annual mix.
+
+Example: if a current news event appears after `CY2026Q1 10-Q`, use the news as the current event and `CY2026Q1` as the latest reported financial baseline.
+
+Example: if available filings are `CY2025 10-K` and `CY2026Q1 10-Q`, use `CY2026Q1` as the current financial driver and `CY2025` as annual mix/business baseline.

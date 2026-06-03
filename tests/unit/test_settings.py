@@ -60,6 +60,17 @@ def test_batch_size_defaults_are_tuned_for_glm_51_throughput(monkeypatch, tmp_pa
     assert config.batch_size_for_stage("extract_research_claims", default=8) == 12
 
 
+def test_agent_sdk_concurrency_defaults_to_seven(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+
+    config = PipelineConfig()
+
+    assert config.ai_concurrency == 7
+    assert config.concurrency_for_stage("extract_evidence_quotes") == 7
+    assert config.concurrency_for_stage("extract_research_claims") == 7
+    assert config.concurrency_for_stage("extract_assumption_candidates") == 7
+
+
 def test_batch_size_for_stage_uses_safe_positive_default(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
 

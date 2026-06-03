@@ -91,12 +91,16 @@ For normal KRW ontology research, query_context should receive a concise interna
 
 The brief is not a literal translation. Build it with awareness of the KRW ontology schema, evidence types, research packs, and MCP retrieval surface so it is optimized for ontology evidence retrieval.
 
+In news mode, build the English brief after stock-news event discovery. The brief should combine the user's original intent with the discovered event, source timing, financial channel, and ontology bridge hints. Do not pass a broad Korean news question directly into query_context.
+
 The English investment brief should preserve:
 
 ```text
 user intent
 tickers and company names
 periods
+event date and source timing
+event type
 exact metrics
 comparison axes
 direct-exposure factors

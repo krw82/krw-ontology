@@ -30,6 +30,7 @@ def test_mcp_public_schema_exposes_aliases_without_required_extra_args() -> None
     retrieve_schema = schemas["krw_ontology_retrieve"]
     retrieve_props = retrieve_schema["properties"]
     assert "ticker" in retrieve_props
+    assert "agent_context" in retrieve_props
     assert "extra_args" not in retrieve_props
     assert retrieve_schema.get("required") == ["question"]
 
@@ -123,6 +124,36 @@ def test_retrieve_tool_accepts_ticker_alias_and_records_unknown_args(tmp_path: P
     assert payload["query"]["ticker_alias"] == "VG"
     assert payload["input_warnings"][0]["code"] == "ignored_extra_args"
     assert payload["input_warnings"][0]["args"] == ["unused_model_arg"]
+
+
+def test_retrieve_tool_accepts_agent_context_without_unknown_arg_warning(
+    tmp_path: Path,
+) -> None:
+    _write_fixture(tmp_path)
+    build_agent_index(tmp_path)
+
+    payload = json.loads(
+        retrieve_tool(
+            root=str(tmp_path),
+            question="VG revenue growth evidence",
+            ticker="VG",
+            limit=3,
+            agent_context={
+                "tool_usage": {
+                    "total": 7,
+                    "krw_ontology_retrieve": 2,
+                },
+            },
+        )
+    )
+
+    assert "input_warnings" not in payload
+    assert payload["agent_guidance"]["severity"] == "soft"
+    assert payload["agent_guidance"]["reason"] == "repeated_retrieve"
+    assert payload["agent_guidance"]["tool_usage"] == {
+        "total": 7,
+        "krw_ontology_retrieve": 2,
+    }
 
 
 def test_compare_tool_accepts_pair_aliases_and_records_unknown_args(tmp_path: Path) -> None:

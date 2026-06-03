@@ -13,6 +13,7 @@ import sys
 import tarfile
 import tempfile
 import time
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -59,6 +60,24 @@ from krw_ontology.release import (
     write_release_manifest,
 )
 from krw_ontology.web_catalog import write_web_catalog
+from krw_ontology.quality.models import (
+    BATCH_FAILURE as QUALITY_BATCH_FAILURE,
+    CANCELLED as QUALITY_CANCELLED,
+    COVERAGE_GAP as QUALITY_COVERAGE_GAP,
+    DOCS_MISSING as QUALITY_DOCS_MISSING,
+    EXECUTABLE_REPAIR_KINDS as QUALITY_EXECUTABLE_REPAIR_KINDS,
+    FAILED as QUALITY_FAILED,
+    NORMALIZE_NUMERIC as QUALITY_NORMALIZE_NUMERIC,
+    PENDING as QUALITY_PENDING,
+    REPAIR_REFERENCE as QUALITY_REPAIR_REFERENCE,
+    RUNNING as QUALITY_RUNNING,
+    SECTION_FAIL as QUALITY_SECTION_FAIL,
+    SECTION_WARN as QUALITY_SECTION_WARN,
+    SUCCEEDED as QUALITY_SUCCEEDED,
+    RepairPlan,
+)
+from krw_ontology.quality.queue import QualityRepairStore, default_plan_id
+from krw_ontology.quality.scanner import QualityScanner
 
 app = typer.Typer(
     name="krw-ontology",
@@ -149,6 +168,7 @@ release_app = typer.Typer(
     ),
     epilog=(
         "Typical local worker flow:\n"
+        "  krw-ontology release publish-dev\n"
         "  krw-ontology release write-manifest --root /data/releases/prod/20260529_020000 --env prod\n"
         "  krw-ontology release verify --root /data/releases/prod/20260529_020000 --env prod\n"
         "  krw-ontology release promote 20260529_020000 --releases-root /data/releases --env prod\n"
@@ -159,10 +179,37 @@ release_app = typer.Typer(
     ),
     no_args_is_help=True,
 )
+quality_app = typer.Typer(
+    name="quality",
+    help=(
+        "Inspect release quality and plan targeted repairs. Repair commands create "
+        "operator-reviewed plans before any costly execution."
+    ),
+    epilog=(
+        "Typical flow:\n"
+        "  krw-ontology quality check --env dev\n"
+        "  krw-ontology quality tickers --env dev --severity high\n"
+        "  krw-ontology quality explain FCX --env dev\n"
+        "  krw-ontology quality repair plan --env dev\n"
+        "  krw-ontology quality repair show\n"
+        "  krw-ontology quality repair run --plan <plan-id> --limit 20 --yes"
+    ),
+    no_args_is_help=True,
+)
+quality_repair_app = typer.Typer(
+    name="repair",
+    help=(
+        "Create, inspect, and run targeted quality repair plans. Internally this is "
+        "a separate quality queue under <running-root>/.krw_pipeline/quality."
+    ),
+    no_args_is_help=True,
+)
 app.add_typer(queue_app, name="queue")
 app.add_typer(config_app, name="config")
 app.add_typer(prod_app, name="prod")
 app.add_typer(release_app, name="release")
+quality_app.add_typer(quality_repair_app, name="repair")
+app.add_typer(quality_app, name="quality")
 
 ACCEPTED_DOC_TYPES = {"10-K", "10-Q"}
 DEFAULT_E2E_TICKERS = ["AAPL", "NVDA", "JPM", "XOM"]
@@ -183,6 +230,840 @@ def validate_config_key(key: str) -> str:
         supported = ", ".join(sorted(CONFIG_KEYS))
         raise typer.BadParameter(f"Unknown config key '{key}'. Supported keys: {supported}")
     return key
+
+
+def _quality_index_context(
+    *,
+    index_path: Path | None,
+    release_root: Path | None,
+    release: str | None,
+    env: str,
+    releases_root: Path | None,
+) -> tuple[Path, str, Path | None]:
+    if index_path is not None:
+        resolved = index_path.expanduser().resolve()
+        return resolved, f"index:{resolved}", None
+    if release_root is not None:
+        root = release_root.expanduser().resolve()
+        return root / "indexes" / "agent_index.sqlite", str(root), root
+
+    release_env = normalize_ontology_env(env)
+    release_id = release or "current"
+    if release and "/" in release:
+        parts = release.split("/", 1)
+        release_env = normalize_ontology_env(parts[0])
+        release_id = parts[1] or "current"
+    root_base = (releases_root or _default_releases_root()).expanduser().resolve()
+    root = release_env_root(root_base, release_env) / release_id
+    return root / "indexes" / "agent_index.sqlite", f"{release_env}/{release_id}", root
+
+
+def _quality_scanner(
+    *,
+    index_path: Path | None,
+    release_root: Path | None,
+    release: str | None,
+    env: str,
+    releases_root: Path | None,
+) -> tuple[QualityScanner, str, Path | None]:
+    resolved_index_path, label, root = _quality_index_context(
+        index_path=index_path,
+        release_root=release_root,
+        release=release,
+        env=env,
+        releases_root=releases_root,
+    )
+    return QualityScanner(resolved_index_path), label, root
+
+
+def _echo_json(payload: dict | list) -> None:
+    typer.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+
+
+def _quality_job_description(job) -> str:
+    parts = [job.kind, job.ticker]
+    if job.doc_type_key and job.period:
+        parts.append(f"{job.doc_type_key}:{job.period}")
+    if job.stage:
+        parts.append(job.stage)
+    if job.batch_index is not None:
+        parts.append(f"batch={job.batch_index}")
+    if job.count and job.count != 1:
+        parts.append(f"count={job.count}")
+    return " ".join(parts)
+
+
+def _quality_selected_plan(store: QualityRepairStore, plan_id: str | None) -> RepairPlan:
+    if plan_id:
+        return store.load_plan(plan_id)
+    plan = store.latest_plan()
+    if plan is None:
+        raise FileNotFoundError("No quality repair plan found.")
+    return plan
+
+
+def _quality_repair_store(root: Path | None) -> QualityRepairStore:
+    output_root = resolve_running_root(root, fallback_to_cwd=False)
+    store = QualityRepairStore(output_root)
+    store.ensure_dirs()
+    return store
+
+
+@quality_app.command("check")
+def quality_check_cmd(
+    env: str = typer.Option("dev", "--env", help="Release environment: dev, staging, or prod."),
+    release: Optional[str] = typer.Option(
+        None,
+        "--release",
+        help="Release id or env/release id. Defaults to <env>/current.",
+    ),
+    releases_root: Optional[Path] = typer.Option(None, "--releases-root", help="Releases root."),
+    release_root: Optional[Path] = typer.Option(None, "--release-root", help="Explicit release root."),
+    index_path: Optional[Path] = typer.Option(None, "--index-path", help="Explicit agent index path."),
+    min_docs: int = typer.Option(5, "--min-docs", min=1, help="Minimum expected documents per ticker."),
+    json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
+) -> None:
+    """Check release quality at a glance."""
+    try:
+        scanner, label, root = _quality_scanner(
+            index_path=index_path,
+            release_root=release_root,
+            release=release,
+            env=env,
+            releases_root=releases_root,
+        )
+        report = scanner.scan(min_docs=min_docs)
+    except Exception as exc:
+        typer.echo(f"FAILED quality check: {exc}")
+        raise typer.Exit(1) from exc
+
+    if json_output:
+        _echo_json({"release": label, "release_root": str(root) if root else None, **report})
+        return
+
+    totals = report["totals"]
+    kind_counts = report["kind_counts"]
+    severity_counts = report["severity_counts"]
+    typer.echo(f"Release: {label}")
+    typer.echo(f"Index: {report['index_path']}")
+    typer.echo(
+        "Totals: "
+        f"documents={totals['documents']} tickers={totals['tickers']} "
+        f"objects={totals['objects']} quality_events={totals['quality_events']}"
+    )
+    typer.echo(f"Problem tickers: {report['problem_ticker_count']}")
+    typer.echo(
+        "Severity: "
+        f"high={severity_counts.get('high', 0)} "
+        f"medium={severity_counts.get('medium', 0)} "
+        f"low={severity_counts.get('low', 0)}"
+    )
+    typer.echo(
+        "Kinds: "
+        f"docs_missing={kind_counts.get(QUALITY_DOCS_MISSING, 0)} "
+        f"section_fail={kind_counts.get(QUALITY_SECTION_FAIL, 0)} "
+        f"section_warn={kind_counts.get(QUALITY_SECTION_WARN, 0)} "
+        f"batch_failure={kind_counts.get(QUALITY_BATCH_FAILURE, 0)} "
+        f"coverage_gap={kind_counts.get(QUALITY_COVERAGE_GAP, 0)}"
+    )
+
+
+@quality_app.command("summary", hidden=True)
+def quality_summary_cmd(
+    env: str = typer.Option("dev", "--env"),
+    release: Optional[str] = typer.Option(None, "--release"),
+    releases_root: Optional[Path] = typer.Option(None, "--releases-root"),
+    release_root: Optional[Path] = typer.Option(None, "--release-root"),
+    index_path: Optional[Path] = typer.Option(None, "--index-path"),
+    min_docs: int = typer.Option(5, "--min-docs", min=1),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Backward-compatible alias for `quality check`."""
+    quality_check_cmd(
+        env=env,
+        release=release,
+        releases_root=releases_root,
+        release_root=release_root,
+        index_path=index_path,
+        min_docs=min_docs,
+        json_output=json_output,
+    )
+
+
+@quality_app.command("tickers")
+def quality_tickers_cmd(
+    env: str = typer.Option("dev", "--env", help="Release environment: dev, staging, or prod."),
+    release: Optional[str] = typer.Option(None, "--release", help="Release id or env/release id."),
+    releases_root: Optional[Path] = typer.Option(None, "--releases-root", help="Releases root."),
+    release_root: Optional[Path] = typer.Option(None, "--release-root", help="Explicit release root."),
+    index_path: Optional[Path] = typer.Option(None, "--index-path", help="Explicit agent index path."),
+    min_docs: int = typer.Option(5, "--min-docs", min=1),
+    severity: Optional[str] = typer.Option(None, "--severity", help="Filter by high, medium, low, ok."),
+    kind: Optional[str] = typer.Option(None, "--kind", help="Filter by issue kind."),
+    bad_only: bool = typer.Option(True, "--bad/--all", help="Show only problematic tickers."),
+    limit: Optional[int] = typer.Option(None, "--limit", min=1, help="Maximum tickers to show."),
+    json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
+) -> None:
+    """List ticker-level quality status."""
+    try:
+        scanner, label, _root = _quality_scanner(
+            index_path=index_path,
+            release_root=release_root,
+            release=release,
+            env=env,
+            releases_root=releases_root,
+        )
+        tickers = scanner.ticker_quality(min_docs=min_docs)
+    except Exception as exc:
+        typer.echo(f"FAILED quality tickers: {exc}")
+        raise typer.Exit(1) from exc
+
+    rows = []
+    for ticker in tickers:
+        payload = ticker.to_dict(min_docs=min_docs)
+        if bad_only and not payload["problem_kinds"]:
+            continue
+        if severity and payload["severity"] != severity:
+            continue
+        if kind and kind not in payload["problem_kinds"]:
+            continue
+        rows.append(payload)
+    if limit is not None:
+        rows = rows[:limit]
+
+    if json_output:
+        _echo_json({"release": label, "tickers": rows, "count": len(rows)})
+        return
+
+    typer.echo(f"Release: {label}")
+    typer.echo(f"Tickers: {len(rows)}")
+    for row in rows:
+        kinds = ",".join(row["problem_kinds"]) or "none"
+        typer.echo(
+            f"- {row['ticker']} severity={row['severity']} docs={row['docs']} "
+            f"kinds={kinds} section_fail={row['section_fail']} "
+            f"section_warn={row['section_warn']} batch_failure={row['batch_failure']} "
+            f"coverage_gap={row['coverage_gap']}"
+        )
+
+
+@quality_app.command("explain")
+def quality_explain_cmd(
+    ticker: str = typer.Argument(..., help="Ticker to explain."),
+    env: str = typer.Option("dev", "--env", help="Release environment: dev, staging, or prod."),
+    release: Optional[str] = typer.Option(None, "--release", help="Release id or env/release id."),
+    releases_root: Optional[Path] = typer.Option(None, "--releases-root", help="Releases root."),
+    release_root: Optional[Path] = typer.Option(None, "--release-root", help="Explicit release root."),
+    index_path: Optional[Path] = typer.Option(None, "--index-path", help="Explicit agent index path."),
+    min_docs: int = typer.Option(5, "--min-docs", min=1),
+    limit: int = typer.Option(20, "--limit", min=1),
+    json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
+) -> None:
+    """Explain why a ticker is flagged."""
+    try:
+        scanner, label, _root = _quality_scanner(
+            index_path=index_path,
+            release_root=release_root,
+            release=release,
+            env=env,
+            releases_root=releases_root,
+        )
+        explanation = scanner.explain_ticker(ticker, min_docs=min_docs, limit=limit)
+    except Exception as exc:
+        typer.echo(f"FAILED quality explain: {exc}")
+        raise typer.Exit(1) from exc
+
+    if json_output:
+        _echo_json({"release": label, **explanation})
+        return
+
+    summary = explanation.get("summary") or {}
+    typer.echo(f"Release: {label}")
+    typer.echo(
+        f"{explanation['ticker']}: severity={summary.get('severity', 'unknown')} "
+        f"docs={summary.get('docs', 0)} kinds={','.join(summary.get('problem_kinds', [])) or 'none'}"
+    )
+    for doc in explanation["documents"]:
+        status = doc.get("section_quality_status") or "unknown"
+        if status == "pass":
+            continue
+        quality = doc.get("section_quality") or {}
+        missing = ",".join(quality.get("missing_core_sections") or [])
+        reasons = ",".join(quality.get("fail_reasons") or quality.get("warn_reasons") or [])
+        typer.echo(f"- {doc['document_type']} {doc['period']} section={status} missing={missing} reasons={reasons}")
+    for event in explanation["event_summary"]:
+        typer.echo(
+            f"- event {event['category']} severity={event['severity']} "
+            f"stage={event['stage'] or '<none>'} count={event['count']}"
+        )
+    for reason in explanation["rejected_reasons"][:5]:
+        typer.echo(f"- rejected {reason['reason']} count={reason['count']}")
+
+
+@quality_app.command("events")
+def quality_events_cmd(
+    ticker: Optional[str] = typer.Option(None, "--ticker", help="Filter by ticker."),
+    category: Optional[str] = typer.Option(None, "--category", help="Filter by quality category."),
+    stage: Optional[str] = typer.Option(None, "--stage", help="Filter by stage."),
+    env: str = typer.Option("dev", "--env", help="Release environment: dev, staging, or prod."),
+    release: Optional[str] = typer.Option(None, "--release", help="Release id or env/release id."),
+    releases_root: Optional[Path] = typer.Option(None, "--releases-root", help="Releases root."),
+    release_root: Optional[Path] = typer.Option(None, "--release-root", help="Explicit release root."),
+    index_path: Optional[Path] = typer.Option(None, "--index-path", help="Explicit agent index path."),
+    limit: int = typer.Option(50, "--limit", min=1),
+    json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
+) -> None:
+    """List quality events."""
+    try:
+        scanner, label, _root = _quality_scanner(
+            index_path=index_path,
+            release_root=release_root,
+            release=release,
+            env=env,
+            releases_root=releases_root,
+        )
+        events = scanner.events(ticker=ticker, category=category, stage=stage, limit=limit)
+    except Exception as exc:
+        typer.echo(f"FAILED quality events: {exc}")
+        raise typer.Exit(1) from exc
+
+    if json_output:
+        _echo_json({"release": label, "events": events, "count": len(events)})
+        return
+
+    typer.echo(f"Release: {label}")
+    typer.echo(f"Events: {len(events)}")
+    for event in events:
+        typer.echo(
+            f"- {event['ticker']} {event['doc_type_key']} {event['period']} "
+            f"{event['severity']} {event['category']} stage={event.get('stage') or '<none>'} "
+            f"message={event['message']}"
+        )
+
+
+@quality_app.command("gate")
+def quality_gate_cmd(
+    env: str = typer.Option("dev", "--env", help="Release environment: dev, staging, or prod."),
+    release: Optional[str] = typer.Option(None, "--release", help="Release id or env/release id."),
+    releases_root: Optional[Path] = typer.Option(None, "--releases-root", help="Releases root."),
+    release_root: Optional[Path] = typer.Option(None, "--release-root", help="Explicit release root."),
+    index_path: Optional[Path] = typer.Option(None, "--index-path", help="Explicit agent index path."),
+    min_docs: int = typer.Option(5, "--min-docs", min=1),
+    max_docs_missing: int = typer.Option(0, "--max-docs-missing", min=0),
+    max_section_fail: int = typer.Option(0, "--max-section-fail", min=0),
+    max_batch_failure: int = typer.Option(0, "--max-batch-failure", min=0),
+    max_coverage_gap: int = typer.Option(0, "--max-coverage-gap", min=0),
+    json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
+) -> None:
+    """Fail if release quality exceeds operator thresholds."""
+    try:
+        scanner, label, _root = _quality_scanner(
+            index_path=index_path,
+            release_root=release_root,
+            release=release,
+            env=env,
+            releases_root=releases_root,
+        )
+        report = scanner.scan(min_docs=min_docs)
+    except Exception as exc:
+        typer.echo(f"FAILED quality gate: {exc}")
+        raise typer.Exit(1) from exc
+
+    kind_counts = report["kind_counts"]
+    failures = []
+    thresholds = {
+        QUALITY_DOCS_MISSING: max_docs_missing,
+        QUALITY_SECTION_FAIL: max_section_fail,
+        QUALITY_BATCH_FAILURE: max_batch_failure,
+        QUALITY_COVERAGE_GAP: max_coverage_gap,
+    }
+    for kind_name, maximum in thresholds.items():
+        actual = int(kind_counts.get(kind_name, 0))
+        if actual > maximum:
+            failures.append({"kind": kind_name, "actual": actual, "maximum": maximum})
+
+    payload = {"release": label, "ok": not failures, "failures": failures, "kind_counts": kind_counts}
+    if json_output:
+        _echo_json(payload)
+    else:
+        typer.echo(f"Release: {label}")
+        typer.echo("Quality gate: " + ("pass" if not failures else "fail"))
+        for failure in failures:
+            typer.echo(f"- {failure['kind']}: {failure['actual']} > {failure['maximum']}")
+    if failures:
+        raise typer.Exit(1)
+
+
+@quality_repair_app.command("plan")
+def quality_repair_plan_cmd(
+    root: Optional[Path] = typer.Option(None, "--root", help="Running root for quality repair state."),
+    env: str = typer.Option("dev", "--env", help="Release environment: dev, staging, or prod."),
+    release: Optional[str] = typer.Option(None, "--release", help="Release id or env/release id."),
+    releases_root: Optional[Path] = typer.Option(None, "--releases-root", help="Releases root."),
+    release_root: Optional[Path] = typer.Option(None, "--release-root", help="Explicit release root."),
+    index_path: Optional[Path] = typer.Option(None, "--index-path", help="Explicit agent index path."),
+    plan_id: Optional[str] = typer.Option(None, "--plan", "--plan-id", help="Repair plan id."),
+    kind: Optional[list[str]] = typer.Option(None, "--kind", help="Only plan this repair kind."),
+    include_warn: bool = typer.Option(False, "--include-warn", help="Include section_warn repairs."),
+    min_docs: int = typer.Option(5, "--min-docs", min=1),
+    force: bool = typer.Option(False, "--force", help="Overwrite an existing plan id."),
+    json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
+) -> None:
+    """Create a reviewed repair plan from quality events."""
+    try:
+        scanner, label, _release_root = _quality_scanner(
+            index_path=index_path,
+            release_root=release_root,
+            release=release,
+            env=env,
+            releases_root=releases_root,
+        )
+        resolved_plan_id = plan_id or default_plan_id()
+        jobs = scanner.build_repair_jobs(
+            plan_id=resolved_plan_id,
+            min_docs=min_docs,
+            kinds=kind,
+            include_warn=include_warn,
+        )
+        store = _quality_repair_store(root)
+        plan = RepairPlan(
+            plan_id=resolved_plan_id,
+            source_index_path=str(scanner.index_path),
+            release_label=label,
+            min_docs=min_docs,
+            job_ids=[job.job_id for job in jobs],
+            summary=dict(Counter(job.kind for job in jobs)),
+        )
+        plan = store.add_plan(plan, jobs, force=force)
+    except Exception as exc:
+        typer.echo(f"FAILED quality repair plan: {exc}")
+        raise typer.Exit(1) from exc
+
+    if json_output:
+        _echo_json({"plan": plan.to_dict(), "queue_root": str(store.queue_dir)})
+        return
+    typer.echo(f"Repair plan created: {plan.plan_id}")
+    typer.echo(f"Release: {plan.release_label}")
+    typer.echo(f"Queue: {store.queue_dir}")
+    typer.echo(f"Jobs: {len(plan.job_ids)}")
+    for repair_kind, count in sorted(plan.summary.items()):
+        typer.echo(f"- {repair_kind}: {count}")
+    typer.echo("Nothing executed yet.")
+
+
+@quality_repair_app.command("show")
+def quality_repair_show_cmd(
+    root: Optional[Path] = typer.Option(None, "--root", help="Running root for quality repair state."),
+    plan_id: Optional[str] = typer.Option(None, "--plan", "--plan-id", help="Repair plan id."),
+    limit: int = typer.Option(50, "--limit", min=1),
+    json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
+) -> None:
+    """Show repair plan details."""
+    try:
+        store = _quality_repair_store(root)
+        plan = _quality_selected_plan(store, plan_id)
+        jobs = store.list_jobs(plan_id=plan.plan_id)
+    except Exception as exc:
+        typer.echo(f"FAILED quality repair show: {exc}")
+        raise typer.Exit(1) from exc
+
+    if json_output:
+        _echo_json({"plan": plan.to_dict(), "jobs": [job.to_dict() for job in jobs]})
+        return
+    typer.echo(f"Repair plan: {plan.plan_id}")
+    typer.echo(f"Release: {plan.release_label}")
+    typer.echo(f"Source index: {plan.source_index_path}")
+    typer.echo(f"Jobs: {len(jobs)}")
+    for repair_kind, count in sorted(plan.summary.items()):
+        typer.echo(f"- {repair_kind}: {count}")
+    for job in jobs[:limit]:
+        typer.echo(f"- {job.status} {_quality_job_description(job)} job={job.job_id}")
+
+
+@quality_repair_app.command("status")
+def quality_repair_status_cmd(
+    root: Optional[Path] = typer.Option(None, "--root", help="Running root for quality repair state."),
+    plan_id: Optional[str] = typer.Option(None, "--plan", "--plan-id", help="Repair plan id."),
+    json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
+) -> None:
+    """Show quality repair status."""
+    try:
+        store = _quality_repair_store(root)
+        plan = _quality_selected_plan(store, plan_id) if plan_id or store.latest_plan() else None
+        selected_plan_id = plan.plan_id if plan else None
+        status_counts = store.status_counts(plan_id=selected_plan_id)
+        kind_counts = store.kind_counts(plan_id=selected_plan_id)
+    except Exception as exc:
+        typer.echo(f"FAILED quality repair status: {exc}")
+        raise typer.Exit(1) from exc
+
+    payload = {
+        "queue_root": str(store.queue_dir),
+        "plan_id": selected_plan_id,
+        "worker_running": store.worker_is_running(),
+        "status_counts": status_counts,
+        "kind_counts": kind_counts,
+    }
+    if json_output:
+        _echo_json(payload)
+        return
+    typer.echo(f"QUALITY_QUEUE={store.queue_dir}")
+    typer.echo(f"Plan: {selected_plan_id or '<none>'}")
+    typer.echo(f"Worker: {'running' if payload['worker_running'] else 'stopped'}")
+    typer.echo(
+        "Jobs: "
+        f"pending={status_counts.get(QUALITY_PENDING, 0)} "
+        f"running={status_counts.get(QUALITY_RUNNING, 0)} "
+        f"succeeded={status_counts.get(QUALITY_SUCCEEDED, 0)} "
+        f"failed={status_counts.get(QUALITY_FAILED, 0)} "
+        f"cancelled={status_counts.get(QUALITY_CANCELLED, 0)}"
+    )
+    for repair_kind, count in sorted(kind_counts.items()):
+        typer.echo(f"- {repair_kind}: {count}")
+
+
+@quality_repair_app.command("watch")
+def quality_repair_watch_cmd(
+    root: Optional[Path] = typer.Option(None, "--root", help="Running root for quality repair state."),
+    plan_id: Optional[str] = typer.Option(None, "--plan", "--plan-id", help="Repair plan id."),
+    interval: float = typer.Option(5.0, "--interval", min=1.0, help="Seconds between refreshes."),
+    once: bool = typer.Option(False, "--once", help="Print one snapshot and exit."),
+) -> None:
+    """Watch quality repair status."""
+    while True:
+        try:
+            store = _quality_repair_store(root)
+            plan = _quality_selected_plan(store, plan_id) if plan_id or store.latest_plan() else None
+            selected_plan_id = plan.plan_id if plan else None
+            status_counts = store.status_counts(plan_id=selected_plan_id)
+            kind_counts = store.kind_counts(plan_id=selected_plan_id)
+            running_jobs = store.list_jobs(plan_id=selected_plan_id, statuses=[QUALITY_RUNNING])
+            failed_jobs = store.list_jobs(plan_id=selected_plan_id, statuses=[QUALITY_FAILED])[-5:]
+        except Exception as exc:
+            typer.echo(f"FAILED quality repair watch: {exc}")
+            raise typer.Exit(1) from exc
+
+        if not once:
+            typer.clear()
+        typer.echo(f"QUALITY_QUEUE={store.queue_dir}")
+        typer.echo(f"Time: {_now_label()}")
+        typer.echo(f"Plan: {selected_plan_id or '<none>'}")
+        pid = store.worker_pid()
+        typer.echo(
+            f"Worker: {'running' if store.worker_is_running() else 'stopped'}"
+            + (f" pid={pid}" if pid is not None else "")
+        )
+        typer.echo(f"Log: {store.worker_log_path}")
+        typer.echo(
+            "Jobs: "
+            f"pending={status_counts.get(QUALITY_PENDING, 0)} "
+            f"running={status_counts.get(QUALITY_RUNNING, 0)} "
+            f"succeeded={status_counts.get(QUALITY_SUCCEEDED, 0)} "
+            f"failed={status_counts.get(QUALITY_FAILED, 0)} "
+            f"cancelled={status_counts.get(QUALITY_CANCELLED, 0)}"
+        )
+        typer.echo("Kinds: " + ", ".join(f"{k}={v}" for k, v in sorted(kind_counts.items())))
+        if running_jobs:
+            typer.echo("Running:")
+            for job in running_jobs:
+                typer.echo(f"- {_quality_job_description(job)} job={job.job_id}")
+        if failed_jobs:
+            typer.echo("Recent failed:")
+            for job in failed_jobs:
+                typer.echo(f"- {_quality_job_description(job)} error={job.error}")
+        if once:
+            return
+        time.sleep(interval)
+
+
+@quality_repair_app.command("list")
+def quality_repair_list_cmd(
+    root: Optional[Path] = typer.Option(None, "--root", help="Running root for quality repair state."),
+    plan_id: Optional[str] = typer.Option(None, "--plan", "--plan-id", help="Repair plan id."),
+    status: Optional[str] = typer.Option(None, "--status", help="Filter by status."),
+    kind: Optional[str] = typer.Option(None, "--kind", help="Filter by repair kind."),
+    limit: int = typer.Option(50, "--limit", min=1),
+    json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
+) -> None:
+    """List quality repair jobs."""
+    try:
+        store = _quality_repair_store(root)
+        selected_plan_id = plan_id
+        if selected_plan_id is None:
+            latest = store.latest_plan()
+            selected_plan_id = latest.plan_id if latest else None
+        jobs = store.list_jobs(plan_id=selected_plan_id)
+    except Exception as exc:
+        typer.echo(f"FAILED quality repair list: {exc}")
+        raise typer.Exit(1) from exc
+
+    if status:
+        jobs = [job for job in jobs if job.status == status]
+    if kind:
+        jobs = [job for job in jobs if job.kind == kind]
+    jobs = jobs[:limit]
+
+    if json_output:
+        _echo_json({"plan_id": selected_plan_id, "jobs": [job.to_dict() for job in jobs]})
+        return
+    typer.echo(f"Plan: {selected_plan_id or '<none>'}")
+    typer.echo(f"Jobs: {len(jobs)}")
+    for job in jobs:
+        typer.echo(f"- {job.status} {_quality_job_description(job)} job={job.job_id}")
+
+
+@quality_repair_app.command("clear")
+def quality_repair_clear_cmd(
+    root: Optional[Path] = typer.Option(None, "--root", help="Running root for quality repair state."),
+    plan_id: Optional[str] = typer.Option(None, "--plan", "--plan-id", help="Repair plan id."),
+    yes: bool = typer.Option(False, "--yes", help="Confirm deletion."),
+) -> None:
+    """Clear quality repair plans/jobs."""
+    if not yes:
+        typer.echo("Refusing to clear quality repair state without --yes.")
+        raise typer.Exit(1)
+    try:
+        store = _quality_repair_store(root)
+        removed = store.clear(plan_id=plan_id)
+    except Exception as exc:
+        typer.echo(f"FAILED quality repair clear: {exc}")
+        raise typer.Exit(1) from exc
+    typer.echo(f"Cleared quality repair state: removed={removed}")
+
+
+@quality_repair_app.command("log")
+def quality_repair_log_cmd(
+    root: Optional[Path] = typer.Option(None, "--root", help="Running root for quality repair state."),
+    lines: int = typer.Option(80, "--lines", min=1, help="Number of trailing lines to show."),
+    follow: bool = typer.Option(False, "--follow/--no-follow", help="Follow appended log output."),
+) -> None:
+    """Show the quality repair background worker log."""
+    store = _quality_repair_store(root)
+    path = store.worker_log_path
+    if not path.exists():
+        typer.echo(f"Log does not exist: {path}")
+        raise typer.Exit(1)
+    tail = _tail_text(path, lines)
+    if tail:
+        typer.echo(tail)
+    if not follow:
+        return
+    with path.open("r", encoding="utf-8") as handle:
+        handle.seek(0, os.SEEK_END)
+        while True:
+            line = handle.readline()
+            if line:
+                typer.echo(line.rstrip())
+            else:
+                time.sleep(1)
+
+
+def _quality_select_pending_jobs(
+    *,
+    store: QualityRepairStore,
+    plan: RepairPlan,
+    kind: str | None,
+    all_jobs: bool,
+    limit: int,
+) -> tuple[list, int]:
+    jobs = store.list_jobs(plan_id=plan.plan_id, statuses=[QUALITY_PENDING])
+    skipped_count = 0
+    if kind:
+        jobs = [job for job in jobs if job.kind == kind]
+        if jobs and kind not in QUALITY_EXECUTABLE_REPAIR_KINDS:
+            return [], len(jobs)
+    else:
+        planned_count = len(jobs)
+        jobs = [job for job in jobs if job.kind in QUALITY_EXECUTABLE_REPAIR_KINDS]
+        skipped_count = planned_count - len(jobs)
+    if not all_jobs:
+        jobs = jobs[:limit]
+    return jobs, skipped_count
+
+
+@quality_repair_app.command("run")
+def quality_repair_run_cmd(
+    root: Optional[Path] = typer.Option(None, "--root", help="Running root for quality repair state."),
+    plan_id: Optional[str] = typer.Option(None, "--plan", "--plan-id", help="Repair plan id."),
+    kind: Optional[str] = typer.Option(None, "--kind", help="Only run this repair kind."),
+    limit: int = typer.Option(20, "--limit", min=1),
+    all_jobs: bool = typer.Option(
+        True,
+        "--all/--limit-only",
+        help="Run all selected executable pending jobs. Use --limit-only to apply --limit.",
+    ),
+    concurrency: Optional[int] = typer.Option(
+        None,
+        "--concurrency",
+        min=1,
+        help="Override Agent SDK batch concurrency for executable repair stages.",
+    ),
+    preview: bool = typer.Option(False, "--preview", help="Preview selected jobs without running."),
+    foreground: bool = typer.Option(False, "--foreground", help="Run in the foreground instead of starting a background worker."),
+    yes: bool = typer.Option(True, "--yes/--no-yes", help="Confirm execution. Defaults to yes; use --preview for dry run."),
+) -> None:
+    """Run pending repair jobs. This can invoke Agent SDK calls."""
+    try:
+        store = _quality_repair_store(root)
+        plan = _quality_selected_plan(store, plan_id)
+        jobs, skipped_count = _quality_select_pending_jobs(
+            store=store,
+            plan=plan,
+            kind=kind,
+            all_jobs=all_jobs,
+            limit=limit,
+        )
+    except Exception as exc:
+        typer.echo(f"FAILED quality repair run: {exc}")
+        raise typer.Exit(1) from exc
+
+    if skipped_count:
+        typer.echo(
+            f"Skipped {skipped_count} pending jobs without executors. "
+            "Use --kind to inspect a specific kind."
+        )
+    if not jobs:
+        typer.echo("No pending quality repair jobs selected.")
+        return
+
+    if preview or not yes:
+        typer.echo(f"Repair plan: {plan.plan_id}")
+        typer.echo(f"Selected jobs: {len(jobs)}")
+        if all_jobs:
+            typer.echo("Selection: all executable pending jobs")
+        for job in jobs:
+            typer.echo(f"- would run {_quality_job_description(job)} job={job.job_id}")
+        typer.echo("Nothing executed.")
+        raise typer.Exit(1)
+
+    if not foreground:
+        if store.worker_is_running():
+            typer.echo("Quality repair worker is already running.")
+            raise typer.Exit(1)
+        command = [
+            sys.executable,
+            "-c",
+            "from krw_ontology.cli.main import app; app()",
+            "quality-repair-worker",
+            "--root",
+            str(store.root),
+            "--plan",
+            plan.plan_id,
+        ]
+        if kind:
+            command.extend(["--kind", kind])
+        if all_jobs:
+            command.append("--all")
+        else:
+            command.extend(["--limit", str(limit)])
+        if concurrency is not None:
+            command.extend(["--concurrency", str(concurrency)])
+        store.ensure_dirs()
+        with store.worker_log_path.open("a", encoding="utf-8") as log_handle:
+            log_handle.write(f"\n[{_now_label()}] quality repair launching background worker\n")
+            log_handle.flush()
+            process = subprocess.Popen(
+                command,
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        typer.echo(f"Started quality repair worker pid={process.pid}")
+        typer.echo(f"plan: {plan.plan_id}")
+        typer.echo(f"selected_jobs: {len(jobs)}")
+        typer.echo(f"log: {store.worker_log_path}")
+        typer.echo(f"watch: krw-ontology quality repair watch --plan {plan.plan_id}")
+        return
+
+    from krw_ontology.quality.runner import run_repair_jobs
+
+    try:
+        with FileProcessLock(store.worker_lock_path):
+            store.write_worker_pid(os.getpid())
+            store.write_worker_state(
+                os.getpid(),
+                mode={
+                    "plan_id": plan.plan_id,
+                    "kind": kind,
+                    "all_jobs": all_jobs,
+                    "limit": limit,
+                    "concurrency": concurrency,
+                    "foreground": True,
+                },
+            )
+            result = run_repair_jobs(
+                store=store,
+                jobs=jobs,
+                root=store.root,
+                concurrency=concurrency,
+            )
+    except Exception as exc:
+        typer.echo(f"FAILED quality repair run: {exc}")
+        raise typer.Exit(1) from exc
+    finally:
+        store.clear_worker_state(os.getpid())
+        store.clear_worker_pid(os.getpid())
+    typer.echo(
+        "Quality repair run complete: "
+        f"succeeded={result['succeeded']} failed={result['failed']} skipped={result['skipped']}"
+    )
+
+
+@app.command("quality-repair-worker", hidden=True)
+def quality_repair_worker_cmd(
+    root: Path = typer.Option(..., "--root", help="Running root for quality repair state."),
+    plan_id: str = typer.Option(..., "--plan", "--plan-id", help="Repair plan id."),
+    kind: Optional[str] = typer.Option(None, "--kind", help="Only run this repair kind."),
+    limit: int = typer.Option(20, "--limit", min=1),
+    all_jobs: bool = typer.Option(False, "--all", help="Run all selected executable pending jobs."),
+    concurrency: Optional[int] = typer.Option(None, "--concurrency", min=1),
+) -> None:
+    """Internal background worker for quality repair runs."""
+    from krw_ontology.quality.runner import run_repair_jobs
+
+    store = _quality_repair_store(root)
+    plan = _quality_selected_plan(store, plan_id)
+    jobs, skipped_count = _quality_select_pending_jobs(
+        store=store,
+        plan=plan,
+        kind=kind,
+        all_jobs=all_jobs,
+        limit=limit,
+    )
+    try:
+        with FileProcessLock(store.worker_lock_path):
+            store.write_worker_pid(os.getpid())
+            store.write_worker_state(
+                os.getpid(),
+                mode={
+                    "plan_id": plan.plan_id,
+                    "kind": kind,
+                    "all_jobs": all_jobs,
+                    "limit": limit,
+                    "concurrency": concurrency,
+                    "foreground": False,
+                },
+            )
+            typer.echo(f"[{_now_label()}] Quality repair worker started plan={plan.plan_id}")
+            if skipped_count:
+                typer.echo(f"Skipped {skipped_count} pending jobs without executors.")
+            typer.echo(f"Selected jobs: {len(jobs)}")
+            result = run_repair_jobs(
+                store=store,
+                jobs=jobs,
+                root=store.root,
+                concurrency=concurrency,
+            )
+            typer.echo(
+                "Quality repair run complete: "
+                f"succeeded={result['succeeded']} failed={result['failed']} skipped={result['skipped']}"
+            )
+    except Exception as exc:
+        typer.echo(f"FAILED quality repair worker: {exc}")
+        raise typer.Exit(1) from exc
+    finally:
+        store.clear_worker_state(os.getpid())
+        store.clear_worker_pid(os.getpid())
 
 
 @config_app.command("show")
@@ -524,6 +1405,189 @@ def _default_release_index_path(root: Path) -> Path:
     return root / "indexes" / "agent_index.sqlite"
 
 
+def _release_root_has_ontology_artifacts(root: Path) -> bool:
+    companies_root = root / "companies"
+    if not companies_root.is_dir():
+        return False
+    return any(path.is_file() for path in companies_root.rglob("*"))
+
+
+def _resolve_release_id_for_finalize_dev(env: str, releases_root: Path) -> str | None:
+    release_id = _resolve_release_id_from_publish_config(env, releases_root)
+    if release_id:
+        return release_id
+    env_root = release_env_root(releases_root, env).expanduser().resolve()
+    return current_release_id(env_root)
+
+
+def _release_publish_dev(
+    *,
+    releases_root: Path,
+    release_id: str,
+    source_root: Path,
+    build_index: bool,
+    promote: bool,
+    allow_running_queue: bool,
+    dry_run: bool,
+    allow_prepared_release_root: bool = False,
+) -> dict:
+    env = "dev"
+    resolved_source_root = source_root.expanduser().resolve()
+    if not resolved_source_root.is_dir():
+        raise FileNotFoundError(f"Source root not found: {resolved_source_root}")
+    if not _release_root_has_ontology_artifacts(resolved_source_root):
+        raise RuntimeError(
+            "Source root has no ontology artifacts under companies/: "
+            f"{resolved_source_root}"
+        )
+
+    queue = PipelineQueue(resolved_source_root)
+    queue.ensure_dirs()
+    if queue.worker_is_running() and not allow_running_queue:
+        raise RuntimeError(
+            "Queue worker is running. Stop it first, or pass --allow-running-queue."
+        )
+
+    env_root = release_env_root(releases_root, env).expanduser().resolve()
+    release_root = env_root / release_id
+    index_path = _default_release_index_path(release_root)
+    if release_root.exists():
+        if not allow_prepared_release_root:
+            raise FileExistsError(f"Release directory already exists: {release_root}")
+        if (release_root / RELEASE_MANIFEST_FILENAME).exists() or index_path.exists():
+            raise FileExistsError(f"Release directory already has finalized artifacts: {release_root}")
+
+    if dry_run:
+        return {
+            "release_id": release_id,
+            "source_root": str(resolved_source_root),
+            "release_root": str(release_root),
+            "index_path": str(index_path),
+            "manifest": None,
+            "index_present": False,
+            "build_index": build_index,
+            "promoted": promote,
+            "totals": None,
+        }
+
+    release_root.mkdir(parents=True, exist_ok=allow_prepared_release_root)
+
+    index_result = None
+    if build_index:
+        from krw_ontology.agent_index import build_agent_index
+
+        index_result = build_agent_index(resolved_source_root, index_path=index_path, force=True)
+
+    manifest = write_release_manifest(
+        release_root,
+        release_id=release_id,
+        env=env,
+        source_root=resolved_source_root,
+        index_path=index_path,
+        write_legacy=True,
+    )
+    if build_index:
+        verification = verify_release_root(release_root, env=env, index_path=index_path)
+        if not verification["ok"]:
+            raise RuntimeError(f"Release verify failed: {', '.join(verification['errors'])}")
+
+    promoted = False
+    if promote:
+        promote_local_release(releases_root, env=env, release_id=release_id)
+        promoted = True
+
+    return {
+        "release_id": release_id,
+        "source_root": str(resolved_source_root),
+        "release_root": str(release_root),
+        "index_path": str(index_path),
+        "manifest": str(release_root / RELEASE_MANIFEST_FILENAME),
+        "index_present": manifest["index_present"],
+        "build_index": build_index,
+        "promoted": promoted,
+        "totals": index_result["totals"] if index_result is not None else None,
+    }
+
+
+def _dev_publish_paths(releases_root: Path, release_id: str) -> dict[str, Path]:
+    release_root = release_env_root(releases_root, "dev").expanduser().resolve() / release_id
+    return {
+        "release_root": release_root,
+        "index_path": _default_release_index_path(release_root),
+        "log_path": release_root / "logs" / "publish-dev.log",
+        "progress_path": _default_release_index_path(release_root).parent / "build_progress.jsonl",
+        "worker_pid_path": release_root / "worker.pid",
+        "worker_state_path": release_root / "worker_state.json",
+    }
+
+
+def _write_dev_publish_worker_state(
+    *,
+    releases_root: Path,
+    release_id: str,
+    pid: int,
+    mode: dict,
+) -> None:
+    paths = _dev_publish_paths(releases_root, release_id)
+    paths["release_root"].mkdir(parents=True, exist_ok=True)
+    paths["worker_pid_path"].write_text(str(pid), encoding="utf-8")
+    payload = {
+        "pid": pid,
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "mode": mode,
+    }
+    tmp_path = paths["worker_state_path"].with_suffix(".json.tmp")
+    tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp_path.replace(paths["worker_state_path"])
+
+
+def _clear_dev_publish_worker_state(
+    *,
+    releases_root: Path,
+    release_id: str,
+    pid: int | None = None,
+) -> None:
+    paths = _dev_publish_paths(releases_root, release_id)
+    if pid is not None and paths["worker_pid_path"].exists():
+        try:
+            if int(paths["worker_pid_path"].read_text(encoding="utf-8").strip()) != pid:
+                return
+        except ValueError:
+            pass
+    paths["worker_pid_path"].unlink(missing_ok=True)
+    paths["worker_state_path"].unlink(missing_ok=True)
+
+
+def _dev_publish_worker_pid(releases_root: Path, release_id: str) -> int | None:
+    path = _dev_publish_paths(releases_root, release_id)["worker_pid_path"]
+    try:
+        return int(path.read_text(encoding="utf-8").strip())
+    except (FileNotFoundError, ValueError):
+        return None
+
+
+def _dev_publish_worker_state(releases_root: Path, release_id: str) -> dict | None:
+    path = _dev_publish_paths(releases_root, release_id)["worker_state_path"]
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+def _latest_dev_publish_id(releases_root: Path) -> str | None:
+    env_root = release_env_root(releases_root, "dev").expanduser().resolve()
+    if not env_root.exists():
+        return None
+    candidates = [
+        path
+        for path in env_root.iterdir()
+        if path.is_dir() and path.name != "current"
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda path: path.stat().st_mtime).name
+
+
 def _copy_release_tree(source_root: Path, target_root: Path) -> None:
     if target_root.exists():
         raise FileExistsError(f"Release directory already exists: {target_root}")
@@ -752,11 +1816,267 @@ def release_prepare_dev_cmd(
     typer.echo("Next: krw-ontology queue start --no-rebuild-agent-index")
 
 
+@release_app.command("publish-dev")
+def release_publish_dev_cmd(
+    release_id: Optional[str] = typer.Argument(
+        None,
+        help="Dev release id to create. Defaults to a timestamp id.",
+    ),
+    releases_root: Path = typer.Option(
+        _default_releases_root(),
+        "--releases-root",
+        help="Local releases root.",
+    ),
+    source_root: Optional[Path] = typer.Option(
+        None,
+        "--from-root",
+        help="Source running root. Defaults to configured running-root.",
+    ),
+    build_index: bool = typer.Option(
+        True,
+        "--build-index/--no-build-index",
+        help="Rebuild agent_index.sqlite inside the new dev release.",
+    ),
+    promote: bool = typer.Option(
+        True,
+        "--promote/--no-promote",
+        help="Promote dev/current to the new release after verification.",
+    ),
+    allow_running_queue: bool = typer.Option(
+        False,
+        "--allow-running-queue",
+        help="Allow reading running-root while the queue worker is running.",
+    ),
+    foreground: bool = typer.Option(False, "--foreground", help="Run in the foreground instead of starting a background worker."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show what would be published."),
+) -> None:
+    """Rebuild the running-root index into a new dev release and promote dev/current."""
+    resolved_release_id = release_id or _default_release_id()
+    try:
+        resolved_source_root = (
+            source_root.expanduser().resolve()
+            if source_root is not None
+            else resolve_running_root(None, fallback_to_cwd=False)
+        )
+        if dry_run or foreground:
+            result = _release_publish_dev(
+                releases_root=releases_root,
+                release_id=resolved_release_id,
+                source_root=resolved_source_root,
+                build_index=build_index,
+                promote=promote,
+                allow_running_queue=allow_running_queue,
+                dry_run=dry_run,
+            )
+        else:
+            if not resolved_source_root.is_dir():
+                raise FileNotFoundError(f"Source root not found: {resolved_source_root}")
+            if not _release_root_has_ontology_artifacts(resolved_source_root):
+                raise RuntimeError(
+                    "Source root has no ontology artifacts under companies/: "
+                    f"{resolved_source_root}"
+                )
+            queue = PipelineQueue(resolved_source_root)
+            queue.ensure_dirs()
+            if queue.worker_is_running() and not allow_running_queue:
+                raise RuntimeError(
+                    "Queue worker is running. Stop it first, or pass --allow-running-queue."
+                )
+            paths = _dev_publish_paths(releases_root, resolved_release_id)
+            if paths["release_root"].exists():
+                raise FileExistsError(f"Release directory already exists: {paths['release_root']}")
+            paths["log_path"].parent.mkdir(parents=True, exist_ok=True)
+            command = [
+                sys.executable,
+                "-c",
+                "from krw_ontology.cli.main import app; app()",
+                "release-publish-dev-worker",
+                "--release-id",
+                resolved_release_id,
+                "--releases-root",
+                str(releases_root),
+                "--from-root",
+                str(resolved_source_root),
+            ]
+            if build_index:
+                command.append("--build-index")
+            else:
+                command.append("--no-build-index")
+            if promote:
+                command.append("--promote")
+            else:
+                command.append("--no-promote")
+            if allow_running_queue:
+                command.append("--allow-running-queue")
+            with paths["log_path"].open("a", encoding="utf-8") as log_handle:
+                log_handle.write(f"\n[{_now_label()}] publish-dev launching background worker\n")
+                log_handle.flush()
+                process = subprocess.Popen(
+                    command,
+                    stdout=log_handle,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                )
+            typer.echo(f"Started dev publish worker pid={process.pid}")
+            typer.echo(f"release_id: {resolved_release_id}")
+            typer.echo(f"source_root: {resolved_source_root}")
+            typer.echo(f"release_root: {paths['release_root']}")
+            typer.echo(f"index_path: {paths['index_path']}")
+            typer.echo(f"log: {paths['log_path']}")
+            typer.echo(f"progress: {paths['progress_path']}")
+            typer.echo(f"watch: krw-ontology release publish-dev-watch {resolved_release_id}")
+            return
+    except Exception as exc:
+        typer.echo(f"FAILED publish dev release: {exc}")
+        raise typer.Exit(1) from exc
+
+    prefix = "Dry run: would publish" if dry_run else "Dev release published"
+    typer.echo(f"{prefix}: {result['release_id']}")
+    typer.echo(f"source_root: {result['source_root']}")
+    typer.echo(f"release_root: {result['release_root']}")
+    typer.echo(f"index_path: {result['index_path']}")
+    if result["totals"] is not None:
+        totals = result["totals"]
+        typer.echo(
+            "Agent index built: "
+            f"documents={totals['documents']} "
+            f"objects={totals['objects']} "
+            f"edges={totals['edges']} "
+            f"quality_events={totals['quality_events']}"
+        )
+    else:
+        typer.echo("Agent index rebuild skipped.")
+    typer.echo(f"promoted: {result['promoted']}")
+    if not dry_run:
+        typer.echo(f"manifest: {result['manifest']}")
+        typer.echo("Next: krw-ontology release materialize-prod " + result["release_id"])
+
+
+@app.command("release-publish-dev-worker", hidden=True)
+def release_publish_dev_worker_cmd(
+    release_id: str = typer.Option(..., "--release-id", help="Dev release id."),
+    releases_root: Path = typer.Option(_default_releases_root(), "--releases-root"),
+    source_root: Path = typer.Option(..., "--from-root", help="Source running root."),
+    build_index: bool = typer.Option(True, "--build-index/--no-build-index"),
+    promote: bool = typer.Option(True, "--promote/--no-promote"),
+    allow_running_queue: bool = typer.Option(False, "--allow-running-queue"),
+) -> None:
+    """Internal background worker for publish-dev."""
+    try:
+        _write_dev_publish_worker_state(
+            releases_root=releases_root,
+            release_id=release_id,
+            pid=os.getpid(),
+            mode={
+                "source_root": str(source_root.expanduser().resolve()),
+                "build_index": build_index,
+                "promote": promote,
+            },
+        )
+        typer.echo(f"[{_now_label()}] publish-dev worker started release_id={release_id}")
+        result = _release_publish_dev(
+            releases_root=releases_root,
+            release_id=release_id,
+            source_root=source_root,
+            build_index=build_index,
+            promote=promote,
+            allow_running_queue=allow_running_queue,
+            dry_run=False,
+            allow_prepared_release_root=True,
+        )
+        typer.echo(f"Dev release published: {result['release_id']}")
+        typer.echo(f"source_root: {result['source_root']}")
+        typer.echo(f"release_root: {result['release_root']}")
+        typer.echo(f"index_path: {result['index_path']}")
+        if result["totals"] is not None:
+            totals = result["totals"]
+            typer.echo(
+                "Agent index built: "
+                f"documents={totals['documents']} "
+                f"objects={totals['objects']} "
+                f"edges={totals['edges']} "
+                f"quality_events={totals['quality_events']}"
+            )
+        else:
+            typer.echo("Agent index rebuild skipped.")
+        typer.echo(f"promoted: {result['promoted']}")
+        typer.echo(f"manifest: {result['manifest']}")
+        typer.echo("Next: krw-ontology release materialize-prod " + result["release_id"])
+    except Exception as exc:
+        typer.echo(f"FAILED publish-dev worker: {exc}")
+        raise typer.Exit(1) from exc
+    finally:
+        _clear_dev_publish_worker_state(
+            releases_root=releases_root,
+            release_id=release_id,
+            pid=os.getpid(),
+        )
+
+
+@release_app.command("publish-dev-status")
+def release_publish_dev_status_cmd(
+    release_id: Optional[str] = typer.Argument(None, help="Dev release id. Defaults to latest dev publish release."),
+    releases_root: Path = typer.Option(_default_releases_root(), "--releases-root", help="Local releases root."),
+) -> None:
+    """Show publish-dev worker and artifact status."""
+    selected_release_id = release_id or _latest_dev_publish_id(releases_root)
+    if selected_release_id is None:
+        typer.echo("No dev release found.")
+        raise typer.Exit(1)
+    paths = _dev_publish_paths(releases_root, selected_release_id)
+    pid = _dev_publish_worker_pid(releases_root, selected_release_id)
+    running = pid is not None and is_pid_running(pid)
+    current_id = current_release_id(release_env_root(releases_root, "dev").expanduser().resolve())
+    typer.echo("Publish-dev status")
+    typer.echo(f"release_id: {selected_release_id}")
+    typer.echo(f"worker: {'running' if running else 'stopped'}" + (f" pid={pid}" if pid else ""))
+    typer.echo(f"current: {current_id or '<missing>'}")
+    typer.echo(f"release_root: {paths['release_root']}")
+    typer.echo(f"index: {'present' if paths['index_path'].exists() else 'missing'} {paths['index_path']}")
+    typer.echo(f"manifest: {'present' if (paths['release_root'] / RELEASE_MANIFEST_FILENAME).exists() else 'missing'}")
+    typer.echo(f"log: {paths['log_path']}")
+    typer.echo(f"progress: {paths['progress_path']}")
+
+
+@release_app.command("publish-dev-watch")
+def release_publish_dev_watch_cmd(
+    release_id: Optional[str] = typer.Argument(None, help="Dev release id. Defaults to latest dev publish release."),
+    releases_root: Path = typer.Option(_default_releases_root(), "--releases-root", help="Local releases root."),
+    lines: int = typer.Option(80, "--lines", min=1, help="Number of trailing lines to show first."),
+    follow: bool = typer.Option(True, "--follow/--no-follow", help="Follow appended log output."),
+) -> None:
+    """Watch publish-dev logs."""
+    selected_release_id = release_id or _latest_dev_publish_id(releases_root)
+    if selected_release_id is None:
+        typer.echo("No dev release found.")
+        raise typer.Exit(1)
+    path = _dev_publish_paths(releases_root, selected_release_id)["log_path"]
+    if not path.exists():
+        typer.echo(f"Log does not exist: {path}")
+        raise typer.Exit(1)
+    tail = _tail_text(path, lines)
+    if tail:
+        typer.echo(tail)
+    if not follow:
+        return
+    with path.open("r", encoding="utf-8") as handle:
+        handle.seek(0, os.SEEK_END)
+        while True:
+            line = handle.readline()
+            if line:
+                typer.echo(line.rstrip())
+            else:
+                time.sleep(1)
+
+
 @release_app.command("finalize-dev")
 def release_finalize_dev_cmd(
     release_id: Optional[str] = typer.Argument(
         None,
-        help="Dev release id to finalize. Defaults to the configured publish-root release id.",
+        help=(
+            "Dev release id to finalize. Defaults to the configured publish-root "
+            "release id, then dev/current."
+        ),
     ),
     releases_root: Path = typer.Option(
         _default_releases_root(),
@@ -781,14 +2101,20 @@ def release_finalize_dev_cmd(
 ) -> None:
     """Rebuild, verify, and promote a completed dev release."""
     env = "dev"
-    release_id = release_id or _resolve_release_id_from_publish_config(env, releases_root)
+    release_id = release_id or _resolve_release_id_for_finalize_dev(env, releases_root)
     if release_id is None:
-        typer.echo("Missing release id. Pass one or run prepare-dev first.")
+        typer.echo("Missing release id. Pass one, run prepare-dev first, or promote dev/current.")
         raise typer.Exit(1)
     release_root = release_env_root(releases_root, env).expanduser().resolve() / release_id
     index_path = _default_release_index_path(release_root)
     if not release_root.is_dir():
         typer.echo(f"Release directory not found: {release_root}")
+        raise typer.Exit(1)
+    if not _release_root_has_ontology_artifacts(release_root):
+        typer.echo(
+            "Release has no ontology artifacts under companies/: "
+            f"{release_root}. Refusing to finalize an empty index."
+        )
         raise typer.Exit(1)
 
     if build_index:

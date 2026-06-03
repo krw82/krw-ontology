@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import sqlite3
 from contextlib import closing
+from pathlib import Path
+from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
@@ -45,7 +47,7 @@ def health_payload(
     root: str | None = None,
     index_path: str | None = None,
 ) -> tuple[dict, int]:
-    """Return health metadata for the configured read-only ontology index."""
+    """Return lightweight health metadata for the configured ontology release."""
     root_path = resolve_ontology_root(root, fallback_to_cwd=False)
     release_manifest, release_manifest_path = load_release_manifest(root_path)
     resolved_index_path = (
@@ -64,30 +66,63 @@ def health_payload(
         "agent_index_schema_version": release_manifest.get("agent_index_schema_version"),
         "index_generated_at": release_manifest.get("index_generated_at"),
         "cache": mcp_runtime_cache_status(),
-        "documents": 0,
-        "objects": 0,
+        "documents": _manifest_non_negative_int(release_manifest.get("document_count")),
+        "objects": _manifest_non_negative_int(release_manifest.get("object_count")),
+        "sqlite_checked": False,
         "tools": sorted(tool.name for tool in mcp._tool_manager.list_tools()),
     }
     if not resolved_index_path.exists():
         payload["error"] = "agent_index_not_found"
         return payload, 503
 
+    payload["ok"] = True
+    return payload, 200
+
+
+def diagnostics_payload(
+    *,
+    root: str | None = None,
+    index_path: str | None = None,
+) -> tuple[dict, int]:
+    """Return heavier diagnostics, including live SQLite count queries."""
+    payload, status_code = health_payload(root=root, index_path=index_path)
+    if status_code != 200:
+        payload["sqlite_checked"] = False
+        return payload, status_code
+
+    resolved_index_path = Path(str(payload["index_path"]))
     try:
         with closing(sqlite3.connect(resolved_index_path)) as conn:
             payload["documents"] = conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
             payload["objects"] = conn.execute("SELECT COUNT(*) FROM objects").fetchone()[0]
     except sqlite3.Error as exc:
         payload["error"] = f"sqlite_error: {exc}"
+        payload["sqlite_checked"] = True
+        payload["ok"] = False
         return payload, 503
 
+    payload["sqlite_checked"] = True
     payload["ok"] = True
     return payload, 200
+
+
+def _manifest_non_negative_int(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if value >= 0 else None
 
 
 @mcp.custom_route("/health", methods=["GET"], include_in_schema=False)
 async def krw_ontology_health(_request: Request) -> JSONResponse:
     """Health endpoint for local web and agent clients."""
     payload, status_code = health_payload()
+    return JSONResponse(payload, status_code=status_code)
+
+
+@mcp.custom_route("/diagnostics", methods=["GET"], include_in_schema=False)
+async def krw_ontology_diagnostics(_request: Request) -> JSONResponse:
+    """Diagnostics endpoint for explicit operator checks."""
+    payload, status_code = diagnostics_payload()
     return JSONResponse(payload, status_code=status_code)
 
 
@@ -306,6 +341,7 @@ async def krw_ontology_retrieve(
     answer_candidate_only: bool = False,
     response_format: ResponseFormat = ResponseFormat.JSON,
     response_detail: ResponseDetail = ResponseDetail.COMPACT,
+    agent_context: dict[str, Any] | None = None,
 ) -> str:
     """Run the deterministic local planner for a natural-language ontology question."""
     return retrieve_tool(
@@ -324,6 +360,7 @@ async def krw_ontology_retrieve(
         answer_candidate_only=answer_candidate_only,
         response_format=response_format,
         response_detail=response_detail,
+        agent_context=agent_context,
     )
 
 

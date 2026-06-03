@@ -7,9 +7,10 @@ This reference preserves the old skill's core discipline while keeping normal we
 KRW ontology evidence is not the final answer. It is the research state the analyst uses to write the final answer.
 
 ```text
-MCP output = evidence workbench
+stock-news output = current event and source workbench
+KRW ontology output = company baseline and filing evidence workbench
 AI agent = analyst judgment and final Korean explanation
-Final answer = business interpretation grounded in filing evidence
+Final answer = business interpretation grounded in news timing and filing baseline
 ```
 
 Do not copy ontology internals into user-facing prose.
@@ -81,6 +82,31 @@ business, product, platform, customer, or demand descriptions
 
 Numbers are evidence, not the answer. Use them internally to verify magnitude, direction, period alignment, and accounting treatment. In the final answer, translate the numbers into business and investor meaning.
 
+## News plus ontology synthesis
+
+For news-mode answers, do not write a mechanical two-part report that says "news says X, ontology says Y" unless the user explicitly asks for source separation.
+
+Use this fused interpretation shape:
+
+```text
+1. What changed in the recent news/event flow
+2. Whether that event changes, reinforces, or contradicts the latest filing baseline
+3. Which financial channel matters: revenue, margin, cash flow, capex, share count, risk, or valuation narrative
+4. Why that matters for the investment thesis
+5. What to watch in the next filing or company update
+```
+
+Prefer interpretation tables over raw number tables:
+
+```text
+구분 | 투자적으로 보는 의미 | 확인할 지점
+뉴스 이벤트 | 단기 주가/심리/리스크 변화 | 일회성인지 구조적인지
+공시 baseline | 기존 사업/현금흐름/비용 체력 | 이벤트를 흡수할 여력
+장기 관점 | thesis 변화 여부 | 다음 분기에서 확인할 지표
+```
+
+Use exact figures only when they change the conclusion, prevent ambiguity, or correct a likely misunderstanding.
+
 ## Numeric evidence to investor language
 
 Prefer:
@@ -131,6 +157,11 @@ Costco's disclosures point to a value-oriented consumer and price investment str
 Never expose these in normal answers:
 
 ```text
+stock-news tool names
+event IDs
+source tiers
+recency buckets
+ontology bridge briefs
 object type names
 ontology layer names
 specificity scores

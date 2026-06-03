@@ -37,6 +37,15 @@ Do not write:
 MCP
 plugin
 skill
+stock-news-zai
+route_news_question
+resolve_news_entities
+search_company_news_events
+search_market_news_events
+search_news_by_domain
+read_news_sources
+build_news_timeline
+audit_news_sources
 agent_index
 SQLite
 JSONL
@@ -47,6 +56,12 @@ artifact contract
 validation
 rejected object
 rejected_object
+event_id
+source tier
+source_tier
+recency bucket
+recency_bucket
+ontology_bridge_brief
 index internals
 pipeline
 registry

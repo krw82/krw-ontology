@@ -13,6 +13,33 @@ Default runtime:
 Korean Markdown answer only.
 ```
 
+Internal research input:
+
+```text
+Before calling KRW ontology MCP tools for normal research, convert the user's request into a concise internal English investment brief.
+Build the brief with awareness of the KRW ontology schema, evidence types, research packs, and MCP retrieval surface.
+Optimize for ontology evidence retrieval, not literal translation.
+Use canonical business, financial, accounting, product, risk, and capital-allocation terms.
+Preserve user intent, tickers, company names, periods, exact metrics, and requested comparison axes.
+Do not expose the internal English brief in the final Korean answer.
+```
+
+Map the user's request to ontology-friendly retrieval concepts when useful:
+
+```text
+explanatory filing text / notes
+MD&A / management discussion
+segment commentary
+revenue recognition / RPO / backlog
+cost of revenue / gross margin / operating margin
+cash flow / FCF / capex
+business combinations / acquisitions
+share repurchases / dilution management
+SBC / R&D / talent investment
+direct exposure / related pressure channel
+business model / product platform / customer demand
+```
+
 This skill is the filing-aware research analyst path for the web chat. It retrieves evidence with KRW ontology MCP tools, interprets the research state, and writes the final user-facing answer.
 
 The answer must feel like an analyst explanation, not a tool report.
@@ -23,7 +50,9 @@ MCP = deterministic evidence workbench and research state
 Runner = tool budget and execution enforcement
 ```
 
-Do not expose internal method, mode, tool names, pack names, IDs, diagnostics, schema terms, or routing logic in normal answers.
+The agent may use ontology schema, quality, validation, artifact, index, pipeline, registry, and MCP implementation details for internal evidence selection and confidence calibration.
+
+Do not expose internal method, mode, tool names, pack names, IDs, diagnostics, schema terms, ontology quality, artifact contracts, validation/rejected-object details, index internals, pipeline/build details, routing logic, or the internal English brief in normal answers.
 
 ## 2. Recommended Primary Research Pattern
 
@@ -38,7 +67,7 @@ Recommended pattern:
 question classification, likely ontology objects, likely MCP tool order, and answer structure.
 
 Hard constraints:
-no internal tool/schema/pack terms, no unsupported direct claims, no response_detail="full" in normal web chat, no repeated broad search after sufficient evidence, and no user-facing overflow/tool-failure caveats.
+no internal tool/schema/pack terms, no unsupported direct claims, no response_detail="full" in normal web chat, no repeated broad search after sufficient evidence, no non-covered company introductions, and no user-facing overflow/tool-failure caveats.
 ```
 
 Hard constraints:
@@ -51,6 +80,7 @@ Do not loop over similar query_context/query/retrieve/trace/chain calls.
 Do not use response_detail="full" in normal web chat.
 If a tool result overflows, treat it as a too-broad signal and split the research path; do not stop, apologize, or expose overflow.
 Always end a normal answer with exactly 3 related Korean follow-up questions.
+Do not introduce non-covered companies, tickers, or peers in normal answers, comparisons, or follow-up questions unless the user explicitly asks or coverage is confirmed.
 ```
 
 ### 2.1 First classify the question
@@ -82,12 +112,13 @@ Use when the user provides a ticker/company or the chat session has default tick
 Flow:
 
 ```text
-1. Call query_context with the ticker/tickers and a concise English research question when useful.
-2. Read research_status, research_pack, answerability, agent_autonomy, and kernel when present.
-3. If sufficient_for_default_answer or equivalent, answer immediately.
-4. If trace is recommended for a strong claim, trace/chain only selected roots.
-5. If a specific material gap remains, use one targeted query/compare for that gap.
-6. Write analyst synthesis in Korean.
+1. Build a concise internal English investment brief that preserves the user's ticker/tickers, period, metric, and comparison intent.
+2. Call query_context with the ticker/tickers and the internal English investment brief.
+3. Read research_status, research_pack, answerability, agent_autonomy, and kernel when present.
+4. If sufficient_for_default_answer or equivalent, answer immediately.
+5. If trace is recommended for a strong claim, trace/chain only selected roots.
+6. If a specific material gap remains, use one targeted query/compare for that gap.
+7. Write analyst synthesis in Korean.
 ```
 
 Use ontology objects by purpose:
@@ -115,7 +146,7 @@ unbounded retrieve
 Flow:
 
 ```text
-1. Build an internal English research brief.
+1. Build an ontology/MCP-aware internal English investment brief.
 2. Identify a bounded covered ticker basket before the main research call.
 3. Use only indexed/catalog/company metadata to confirm coverage.
 4. Select 4-6 representative indexed tickers.
@@ -459,7 +490,7 @@ Bad: FY2026, fiscal year 2026 as primary label
 
 If issuer fiscal calendar matters, mention it only as a short parenthetical note.
 
-For recent/latest questions, start with the most recent available filing by filing/period recency. If the available documents are `CY2025 10-K` and `CY2026Q1 10-Q`, lead with `CY2026Q1 10-Q` for current drivers and use `CY2025 10-K` only as annual revenue mix/business baseline context. If `CY2026Q1 10-Q` and `CY2026Q2 10-Q` are both available, lead with `CY2026Q2 10-Q`. If no newer 10-Q exists, the latest 10-K may be the primary recent filing.
+Unless the user explicitly asks for a historical period or a specific filing, start with the most recent available filing by filing/period recency. A newer 10-Q beats an older 10-K for current drivers, financial impact, cost, cash flow, risk, and management commentary. If the available documents are `CY2025 10-K` and `CY2026Q1 10-Q`, lead with `CY2026Q1 10-Q` for current drivers and use `CY2025 10-K` only as annual revenue mix/business baseline context. If `CY2026Q1 10-Q` and `CY2026Q2 10-Q` are both available, lead with `CY2026Q2 10-Q`. If no newer 10-Q exists, the latest 10-K may be the primary recent filing.
 
 For investor-facing answers, anchor analysis on the latest available filing evidence.
 
@@ -629,6 +660,14 @@ Make the answer feel complete enough that the user does not need to ask "so what
 
 Do not force all elements into every answer.
 
+Normal answers are interpretation-first, not raw-number dumps. Internally inspect exact values, units, periods, and line-item definitions, but show exact numbers only when they support, qualify, or correct the conclusion.
+
+When a table helps, prefer interpretation columns over raw numeric grids:
+
+```text
+분석 축 | 공시에서 보이는 신호 | 투자 해석
+```
+
 Do not force a fixed heading order.
 
 Do not make every answer look the same.
@@ -723,25 +762,25 @@ Bad: Consumer slowdown is clear.
 Good: Several companies flag demand uncertainty, but the evidence is not yet enough to call a clear consumption slowdown without volume, traffic, comparable-sales, margin, pricing, or MD&A support.
 ```
 
-### 11.2 Company filing commentary as evidence
+### 11.2 Explanatory filing text and notes as evidence
 
-Treat company filing commentary as first-class evidence when it explains actual period performance or current business conditions.
+Treat explanatory filing text, notes, and company commentary as first-class evidence when they explain actual period performance, current business conditions, or the accounting/business channel behind a number.
 
 ```text
 Numbers show what changed.
-Company filing commentary explains why it changed and what channel matters next.
+Explanatory filing text and notes explain why it changed, how management frames it, and what channel matters next.
 ```
 
-Prefer company commentary in this order:
+Prefer explanatory text and notes in this order:
 
 ```text
 1. Latest MD&A or management discussion explaining actual revenue, margin, cost, demand, volume, pricing, segment, cash flow, or balance sheet movement.
-2. Financial statement notes or segment tables that quantify the commentary.
-3. Risk Factors when they describe a specific channel or confirm persistence/change of a risk already visible in MD&A or numbers.
-4. Business section for business model, products, customers, and market structure.
+2. Financial statement notes, revenue recognition notes, RPO/backlog notes, segment notes, SBC notes, acquisition notes, share repurchase notes, debt/liquidity notes, or segment tables that explain or quantify the commentary.
+3. Risk Factors when they describe a specific channel or confirm persistence/change of a risk already visible in MD&A, notes, or numbers.
+4. Business section for business model, products, platform, customers, and market structure.
 ```
 
-Do not treat all company commentary as equal.
+Do not treat all company commentary, notes, or risk language as equal.
 
 Risk Factors are useful, but often hypothetical. Do not use generic risk-factor language as the primary basis for strong current macro, sector, or thesis conclusions.
 
@@ -754,7 +793,9 @@ company says input cost inflation persisted + COGS or margin worsened
 company says traffic improved + comparable sales increased
 ```
 
-If commentary is strong but numeric support is absent, use it as qualitative evidence and moderate the conclusion.
+If commentary or notes are strong but numeric support is absent, use them as qualitative evidence and moderate the conclusion.
+
+When the user asks what something means for cash flow, growth investment, cost structure, margin, or capital allocation, prioritize management commentary and explanatory notes before raw numeric extraction. The goal is not to recite many numbers; the goal is to explain the business and investment implication supported by the numbers and notes.
 
 For broad sector, macro, thesis, or comparison claims:
 
@@ -945,6 +986,9 @@ Rules:
 - exactly 3 concise Korean questions
 - no extra tool calls to create them
 - derive from the current answer's business mechanism, risk channel, metric gap, or comparison axis
+- prefer investment interpretation follow-ups: business mechanism, margin durability, cash-flow conversion, capital allocation, risk channel, valuation-assumption sensitivity
+- do not introduce non-covered companies, tickers, or peers unless the user asked for them or coverage was confirmed
+- avoid follow-ups that are merely raw numeric table requests unless the current answer genuinely depends on a missing metric
 - do not expose chain, trace, object, pack, mode, or tool terminology
 - do not phrase them as "관련 체인"
 ```
@@ -963,6 +1007,7 @@ Before sending a normal answer, silently remove:
 
 ```text
 progress narration
+internal English investment brief
 runtime setting names
 tool names
 budget/error labels
@@ -991,6 +1036,7 @@ references/ontology-layer-map.md
 references/query-context-contract.md
 references/bounded-autonomy-and-stop-rules.md
 references/period-and-latest-policy.md
+references/financial-statement-interpretation.md
 references/trace-chain-policy.md
 references/forbidden-user-facing-language.md
 references/structured-handoff-contract.md

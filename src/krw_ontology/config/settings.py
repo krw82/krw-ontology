@@ -17,11 +17,11 @@ class PipelineConfig:
     execution_mode: str = "full"
     model: str = _DEFAULT_MODEL
     stage_models: dict[str, str] = field(default_factory=dict)
-    ai_concurrency: int = 10
+    ai_concurrency: int = 7
     stage_concurrency: dict[str, int] = field(default_factory=lambda: {
-        "extract_evidence_quotes": 10,
-        "extract_research_claims": 10,
-        "extract_assumption_candidates": 10,
+        "extract_evidence_quotes": 7,
+        "extract_research_claims": 7,
+        "extract_assumption_candidates": 7,
     })
     max_turns: int = 10
     call_timeout_seconds: int = 600

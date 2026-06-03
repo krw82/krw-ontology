@@ -47,6 +47,12 @@ _MCP_STORE_MODE_ENV = "KRW_MCP_STORE_MODE"
 _MCP_STORE_POOL_MAX_ENV = "KRW_MCP_STORE_POOL_MAX"
 _MCP_STORE_MODE_PERSISTENT = "persistent"
 _DEFAULT_MCP_STORE_POOL_MAX = 8
+_REPEATED_RETRIEVE_PRIOR_CALL_THRESHOLD = 2
+_REPEATED_RETRIEVE_GUIDANCE_MESSAGE = (
+    "You have already used krw_ontology_retrieve multiple times. "
+    "Prefer query_context, targeted query, trace, or chain for the next step unless another "
+    "retrieve is clearly necessary. Do not repeat broad retrieve calls."
+)
 
 
 def _read_int_env(name: str, default: int, *, min_value: int) -> int:
@@ -805,6 +811,7 @@ def retrieve_tool(
     answer_candidate_only: bool = False,
     response_format: ResponseFormat = ResponseFormat.JSON,
     response_detail: ResponseDetail = ResponseDetail.COMPACT,
+    agent_context: Mapping[str, Any] | None = None,
     **extra_args: Any,
 ) -> str:
     """Use the deterministic local planner, then retrieve evidence bundles."""
@@ -817,6 +824,7 @@ def retrieve_tool(
     limit_per_group = _bounded_limit_per_group(limit_per_group)
     normalized_tickers = _merge_ticker_alias(ticker=ticker, tickers=tickers)
     input_warnings = _input_warnings(extra_args)
+    agent_guidance = _retrieve_agent_guidance(agent_context)
     summary_mode = detail == ResponseDetail.TICKER_SUMMARY or normalized_group_by == "ticker"
     fetch_limit = _discovery_fetch_limit(limit, limit_groups, limit_per_group) if summary_mode else limit
     if summary_mode:
@@ -875,6 +883,7 @@ def retrieve_tool(
         }
         if input_warnings:
             payload["input_warnings"] = input_warnings
+        _attach_agent_guidance(payload, agent_guidance)
         if isinstance(payload.get("results_by_ticker"), Mapping):
             payload["results_by_ticker"] = {
                 ticker_key: list(rows or [])[:limit_per_group]
@@ -935,6 +944,7 @@ def retrieve_tool(
             }
             if input_warnings:
                 payload["input_warnings"] = input_warnings
+            _attach_agent_guidance(payload, agent_guidance)
             return _format_response(payload, response_format, _markdown_retrieve)
         if _should_skip_legacy_retrieve(research_context, detail=detail):
             payload = {
@@ -979,6 +989,7 @@ def retrieve_tool(
             }
             if input_warnings:
                 payload["input_warnings"] = input_warnings
+            _attach_agent_guidance(payload, agent_guidance)
             return _format_response(payload, response_format, _markdown_retrieve)
 
         result = AgentRetriever(store).retrieve(
@@ -1046,6 +1057,7 @@ def retrieve_tool(
     )
     if input_warnings:
         payload["input_warnings"] = input_warnings
+    _attach_agent_guidance(payload, agent_guidance)
     payload["response_detail"] = detail.value
     payload["response_detail_policy"] = detail_policy
     return _format_response(payload, response_format, _markdown_retrieve)
@@ -2621,6 +2633,56 @@ def _input_warnings(extra_args: Mapping[str, Any] | None) -> list[dict[str, Any]
     ]
 
 
+def _retrieve_agent_guidance(agent_context: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    tool_usage = _agent_context_tool_usage(agent_context)
+    retrieve_count = tool_usage.get("krw_ontology_retrieve")
+    if retrieve_count is None or retrieve_count < _REPEATED_RETRIEVE_PRIOR_CALL_THRESHOLD:
+        return None
+    return {
+        "severity": "soft",
+        "reason": "repeated_retrieve",
+        "message": _REPEATED_RETRIEVE_GUIDANCE_MESSAGE,
+        "tool_usage": tool_usage,
+    }
+
+
+def _agent_context_tool_usage(agent_context: Mapping[str, Any] | None) -> dict[str, int]:
+    if not isinstance(agent_context, Mapping):
+        return {}
+    raw_tool_usage = agent_context.get("tool_usage")
+    if not isinstance(raw_tool_usage, Mapping):
+        return {}
+
+    tool_usage: dict[str, int] = {}
+    for key in ("total", "krw_ontology_retrieve"):
+        value = _non_negative_int(raw_tool_usage.get(key))
+        if value is not None:
+            tool_usage[key] = value
+    return tool_usage
+
+
+def _non_negative_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, str) and re.fullmatch(r"\d+", value.strip()):
+        return int(value)
+    return None
+
+
+def _attach_agent_guidance(
+    payload: dict[str, Any],
+    agent_guidance: Mapping[str, Any] | None,
+) -> None:
+    if not agent_guidance:
+        return
+    payload["agent_guidance"] = dict(agent_guidance)
+    research_context = payload.get("research_context")
+    if isinstance(research_context, dict):
+        research_context.setdefault("agent_guidance", dict(agent_guidance))
+
+
 def _pagination(total_count: int, offset: int, count: int, limit: int) -> dict[str, Any]:
     next_offset = offset + count if total_count > offset + count else None
     return {
@@ -2751,6 +2813,9 @@ def _markdown_retrieve(payload: dict[str, Any]) -> str:
     ]
     if stop_guard:
         lines.append(f"- Cannot answer reason: {stop_guard.get('cannot_answer_reason')}")
+    agent_guidance = payload.get("agent_guidance")
+    if isinstance(agent_guidance, Mapping) and agent_guidance.get("message"):
+        lines.append(f"- Agent guidance: {agent_guidance.get('message')}")
     for title, field_name in (
         ("Direct Evidence", "direct_evidence"),
         ("Related Context", "related_context"),
@@ -2778,6 +2843,9 @@ def _markdown_ticker_summary(payload: dict[str, Any]) -> str:
         f"- Strong claim requires: {', '.join(guard.get('strong_claim_requires') or [])}",
         "",
     ]
+    agent_guidance = payload.get("agent_guidance")
+    if isinstance(agent_guidance, Mapping) and agent_guidance.get("message"):
+        lines.extend([f"- Agent guidance: {agent_guidance.get('message')}", ""])
     for index, candidate in enumerate(candidates, 1):
         lines.append(
             f"{index}. `{candidate.get('ticker')}` "

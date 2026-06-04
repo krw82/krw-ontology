@@ -64,6 +64,7 @@ from krw_ontology.quality.models import (
     BATCH_FAILURE as QUALITY_BATCH_FAILURE,
     CANCELLED as QUALITY_CANCELLED,
     COVERAGE_GAP as QUALITY_COVERAGE_GAP,
+    DEFERRED_REPAIR_KINDS as QUALITY_DEFERRED_REPAIR_KINDS,
     DOCS_MISSING as QUALITY_DOCS_MISSING,
     EXECUTABLE_REPAIR_KINDS as QUALITY_EXECUTABLE_REPAIR_KINDS,
     FAILED as QUALITY_FAILED,
@@ -291,6 +292,131 @@ def _quality_job_description(job) -> str:
     if job.count and job.count != 1:
         parts.append(f"count={job.count}")
     return " ".join(parts)
+
+
+def _quality_job_outcome(job) -> str:
+    if job.status == QUALITY_FAILED:
+        return "failed"
+    if job.status == QUALITY_CANCELLED:
+        return "cancelled"
+    if job.status == QUALITY_RUNNING:
+        return "running"
+    if job.kind in QUALITY_DEFERRED_REPAIR_KINDS:
+        if job.status == QUALITY_SUCCEEDED:
+            return str(job.payload.get("repair_outcome") or "deferred_kind_executed_legacy")
+        return "deferred"
+    if job.kind == QUALITY_COVERAGE_GAP:
+        return "needs_manual_review"
+    if job.status == QUALITY_PENDING:
+        return "pending"
+    outcome = job.payload.get("repair_outcome")
+    if outcome:
+        return str(outcome)
+    resolved = int(job.payload.get("resolved_count") or job.payload.get("candidate_now_valid_count") or 0)
+    unresolved = int(job.payload.get("unresolved_count") or 0)
+    if resolved and unresolved:
+        return "partially_resolved_reported"
+    if resolved:
+        return "resolved_reported"
+    if unresolved:
+        return "unresolved_reported"
+    if job.kind == QUALITY_DOCS_MISSING:
+        return "pipeline_job_pending"
+    if job.kind in {QUALITY_SECTION_FAIL, QUALITY_SECTION_WARN}:
+        return "resectioned_needs_verify"
+    if job.kind == QUALITY_BATCH_FAILURE:
+        return "batch_retried_needs_verify"
+    if job.kind == QUALITY_REPAIR_REFERENCE:
+        return "revalidated_needs_verify"
+    return "executed"
+
+
+def _quality_repair_summary(store: QualityRepairStore, plan_id: str | None) -> dict:
+    jobs = store.list_jobs(plan_id=plan_id)
+    by_kind: dict[str, dict] = {}
+    outcomes: Counter[str] = Counter()
+    totals: Counter[str] = Counter()
+    for job in jobs:
+        outcome = _quality_job_outcome(job)
+        outcomes[outcome] += 1
+        kind = by_kind.setdefault(
+            job.kind,
+            {
+                "jobs": 0,
+                "statuses": Counter(),
+                "outcomes": Counter(),
+                "resolved_candidates": 0,
+                "unresolved_candidates": 0,
+                "pruned_reference_objects": 0,
+                "enqueued_pipeline_jobs": 0,
+                "active_pipeline_jobs": 0,
+                "deferred_jobs": 0,
+                "manual_review_jobs": 0,
+            },
+        )
+        kind["jobs"] += 1
+        kind["statuses"][job.status] += 1
+        kind["outcomes"][outcome] += 1
+        resolved = int(job.payload.get("resolved_count") or job.payload.get("candidate_now_valid_count") or 0)
+        unresolved = int(job.payload.get("unresolved_count") or 0)
+        kind["resolved_candidates"] += resolved
+        kind["unresolved_candidates"] += unresolved
+        totals["resolved_candidates"] += resolved
+        totals["unresolved_candidates"] += unresolved
+        pruned = int(job.payload.get("pruned_reference_object_count") or 0)
+        kind["pruned_reference_objects"] += pruned
+        totals["pruned_reference_objects"] += pruned
+        if job.payload.get("pipeline_queue_action") == "queued_full_refresh":
+            kind["enqueued_pipeline_jobs"] += 1
+            totals["enqueued_pipeline_jobs"] += 1
+        if job.payload.get("pipeline_queue_action") == "skipped_active_job":
+            kind["active_pipeline_jobs"] += 1
+            totals["active_pipeline_jobs"] += 1
+        if outcome == "deferred":
+            kind["deferred_jobs"] += 1
+            totals["deferred_jobs"] += 1
+        if outcome == "needs_manual_review":
+            kind["manual_review_jobs"] += 1
+            totals["manual_review_jobs"] += 1
+    return {
+        "jobs": len(jobs),
+        "outcomes": dict(outcomes),
+        "totals": dict(totals),
+        "by_kind": {
+            kind: {
+                **{
+                    key: value
+                    for key, value in payload.items()
+                    if key not in {"statuses", "outcomes"}
+                },
+                "statuses": dict(payload["statuses"]),
+                "outcomes": dict(payload["outcomes"]),
+            }
+            for kind, payload in sorted(by_kind.items())
+        },
+    }
+
+
+def _quality_report_reasons(jobs, *, limit: int) -> list[tuple[str, int]]:
+    reasons: Counter[str] = Counter()
+    for job in jobs:
+        report_path = job.payload.get("report_path")
+        if not report_path:
+            continue
+        path = Path(str(report_path)).expanduser()
+        try:
+            report = json.loads(path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            continue
+        for item in (
+            list(report.get("unresolved") or [])
+            + list(report.get("accepted_reference_failures") or [])
+            + list(report.get("accepted_relation_failures") or [])
+        ):
+            reason = str(item.get("current_reason") or item.get("reason") or item.get("original_reason") or "").strip()
+            if reason:
+                reasons[reason[:240]] += 1
+    return reasons.most_common(limit)
 
 
 def _quality_selected_plan(store: QualityRepairStore, plan_id: str | None) -> RepairPlan:
@@ -604,6 +730,11 @@ def quality_repair_plan_cmd(
     index_path: Optional[Path] = typer.Option(None, "--index-path", help="Explicit agent index path."),
     plan_id: Optional[str] = typer.Option(None, "--plan", "--plan-id", help="Repair plan id."),
     kind: Optional[list[str]] = typer.Option(None, "--kind", help="Only plan this repair kind."),
+    include_deferred: bool = typer.Option(
+        False,
+        "--include-deferred",
+        help="Include deferred repair kinds such as normalize_numeric. Deferred jobs are not run by default.",
+    ),
     include_warn: bool = typer.Option(False, "--include-warn", help="Include section_warn repairs."),
     min_docs: int = typer.Option(5, "--min-docs", min=1),
     force: bool = typer.Option(False, "--force", help="Overwrite an existing plan id."),
@@ -625,6 +756,9 @@ def quality_repair_plan_cmd(
             kinds=kind,
             include_warn=include_warn,
         )
+        deferred_jobs = [job for job in jobs if job.kind in QUALITY_DEFERRED_REPAIR_KINDS]
+        if not include_deferred:
+            jobs = [job for job in jobs if job.kind not in QUALITY_DEFERRED_REPAIR_KINDS]
         store = _quality_repair_store(root)
         plan = RepairPlan(
             plan_id=resolved_plan_id,
@@ -640,7 +774,11 @@ def quality_repair_plan_cmd(
         raise typer.Exit(1) from exc
 
     if json_output:
-        _echo_json({"plan": plan.to_dict(), "queue_root": str(store.queue_dir)})
+        _echo_json({
+            "plan": plan.to_dict(),
+            "queue_root": str(store.queue_dir),
+            "deferred_excluded": dict(Counter(job.kind for job in deferred_jobs)) if not include_deferred else {},
+        })
         return
     typer.echo(f"Repair plan created: {plan.plan_id}")
     typer.echo(f"Release: {plan.release_label}")
@@ -648,6 +786,15 @@ def quality_repair_plan_cmd(
     typer.echo(f"Jobs: {len(plan.job_ids)}")
     for repair_kind, count in sorted(plan.summary.items()):
         typer.echo(f"- {repair_kind}: {count}")
+    if deferred_jobs and not include_deferred:
+        typer.echo(
+            "Deferred excluded: "
+            + ", ".join(
+                f"{repair_kind}={count}"
+                for repair_kind, count in sorted(Counter(job.kind for job in deferred_jobs).items())
+            )
+            + " (use --include-deferred to inspect, not recommended for run)"
+        )
     typer.echo("Nothing executed yet.")
 
 
@@ -693,6 +840,7 @@ def quality_repair_status_cmd(
         selected_plan_id = plan.plan_id if plan else None
         status_counts = store.status_counts(plan_id=selected_plan_id)
         kind_counts = store.kind_counts(plan_id=selected_plan_id)
+        repair_summary = _quality_repair_summary(store, selected_plan_id) if selected_plan_id else {}
     except Exception as exc:
         typer.echo(f"FAILED quality repair status: {exc}")
         raise typer.Exit(1) from exc
@@ -703,6 +851,7 @@ def quality_repair_status_cmd(
         "worker_running": store.worker_is_running(),
         "status_counts": status_counts,
         "kind_counts": kind_counts,
+        "repair_summary": repair_summary,
     }
     if json_output:
         _echo_json(payload)
@@ -720,6 +869,21 @@ def quality_repair_status_cmd(
     )
     for repair_kind, count in sorted(kind_counts.items()):
         typer.echo(f"- {repair_kind}: {count}")
+    if repair_summary:
+        totals = repair_summary.get("totals", {})
+        typer.echo(
+            "Resolution: "
+            f"resolved_candidates={totals.get('resolved_candidates', 0)} "
+            f"unresolved_candidates={totals.get('unresolved_candidates', 0)} "
+            f"pruned_reference_objects={totals.get('pruned_reference_objects', 0)} "
+            f"enqueued_pipeline_jobs={totals.get('enqueued_pipeline_jobs', 0)} "
+            f"active_pipeline_jobs={totals.get('active_pipeline_jobs', 0)} "
+            f"deferred_jobs={totals.get('deferred_jobs', 0)} "
+            f"manual_review_jobs={totals.get('manual_review_jobs', 0)}"
+        )
+        outcomes = repair_summary.get("outcomes", {})
+        if outcomes:
+            typer.echo("Outcomes: " + ", ".join(f"{k}={v}" for k, v in sorted(outcomes.items())))
 
 
 @quality_repair_app.command("watch")
@@ -737,6 +901,7 @@ def quality_repair_watch_cmd(
             selected_plan_id = plan.plan_id if plan else None
             status_counts = store.status_counts(plan_id=selected_plan_id)
             kind_counts = store.kind_counts(plan_id=selected_plan_id)
+            repair_summary = _quality_repair_summary(store, selected_plan_id) if selected_plan_id else {}
             running_jobs = store.list_jobs(plan_id=selected_plan_id, statuses=[QUALITY_RUNNING])
             failed_jobs = store.list_jobs(plan_id=selected_plan_id, statuses=[QUALITY_FAILED])[-5:]
         except Exception as exc:
@@ -763,6 +928,18 @@ def quality_repair_watch_cmd(
             f"cancelled={status_counts.get(QUALITY_CANCELLED, 0)}"
         )
         typer.echo("Kinds: " + ", ".join(f"{k}={v}" for k, v in sorted(kind_counts.items())))
+        if repair_summary:
+            totals = repair_summary.get("totals", {})
+            typer.echo(
+                "Resolution: "
+                f"resolved_candidates={totals.get('resolved_candidates', 0)} "
+                f"unresolved_candidates={totals.get('unresolved_candidates', 0)} "
+                f"pruned_reference_objects={totals.get('pruned_reference_objects', 0)} "
+                f"enqueued_pipeline_jobs={totals.get('enqueued_pipeline_jobs', 0)} "
+                f"active_pipeline_jobs={totals.get('active_pipeline_jobs', 0)} "
+                f"deferred_jobs={totals.get('deferred_jobs', 0)} "
+                f"manual_review_jobs={totals.get('manual_review_jobs', 0)}"
+            )
         if running_jobs:
             typer.echo("Running:")
             for job in running_jobs:
@@ -774,6 +951,116 @@ def quality_repair_watch_cmd(
         if once:
             return
         time.sleep(interval)
+
+
+@quality_repair_app.command("report")
+def quality_repair_report_cmd(
+    root: Optional[Path] = typer.Option(None, "--root", help="Running root for quality repair state."),
+    plan_id: Optional[str] = typer.Option(None, "--plan", "--plan-id", help="Repair plan id."),
+    kind: Optional[str] = typer.Option(None, "--kind", help="Filter by repair kind."),
+    ticker: Optional[str] = typer.Option(None, "--ticker", help="Filter by ticker."),
+    reasons_limit: int = typer.Option(10, "--reasons-limit", min=0, help="Top unresolved reasons to show."),
+    json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
+) -> None:
+    """Summarize executed repair outcomes separately from queue status."""
+    try:
+        store = _quality_repair_store(root)
+        plan = _quality_selected_plan(store, plan_id)
+        jobs = store.list_jobs(plan_id=plan.plan_id)
+    except Exception as exc:
+        typer.echo(f"FAILED quality repair report: {exc}")
+        raise typer.Exit(1) from exc
+
+    if kind:
+        jobs = [job for job in jobs if job.kind == kind]
+    if ticker:
+        jobs = [job for job in jobs if job.ticker.upper() == ticker.upper()]
+    summary = _quality_repair_summary(store, plan.plan_id)
+    if kind or ticker:
+        temp_store_jobs = jobs
+        outcomes = Counter(_quality_job_outcome(job) for job in temp_store_jobs)
+        filtered_by_kind: dict[str, dict] = {}
+        for job in temp_store_jobs:
+            payload = filtered_by_kind.setdefault(
+                job.kind,
+                {
+                    "jobs": 0,
+                    "outcomes": Counter(),
+                    "resolved_candidates": 0,
+                    "unresolved_candidates": 0,
+                    "pruned_reference_objects": 0,
+                    "enqueued_pipeline_jobs": 0,
+                    "active_pipeline_jobs": 0,
+                    "deferred_jobs": 0,
+                    "manual_review_jobs": 0,
+                },
+            )
+            outcome = _quality_job_outcome(job)
+            payload["jobs"] += 1
+            payload["outcomes"][outcome] += 1
+            payload["resolved_candidates"] += int(job.payload.get("resolved_count") or job.payload.get("candidate_now_valid_count") or 0)
+            payload["unresolved_candidates"] += int(job.payload.get("unresolved_count") or 0)
+            payload["pruned_reference_objects"] += int(job.payload.get("pruned_reference_object_count") or 0)
+            if job.payload.get("pipeline_queue_action") == "queued_full_refresh":
+                payload["enqueued_pipeline_jobs"] += 1
+            if job.payload.get("pipeline_queue_action") == "skipped_active_job":
+                payload["active_pipeline_jobs"] += 1
+            if outcome == "deferred":
+                payload["deferred_jobs"] += 1
+            if outcome == "needs_manual_review":
+                payload["manual_review_jobs"] += 1
+        summary = {
+            "jobs": len(temp_store_jobs),
+            "outcomes": dict(outcomes),
+            "totals": {
+                "resolved_candidates": sum(v["resolved_candidates"] for v in filtered_by_kind.values()),
+                "unresolved_candidates": sum(v["unresolved_candidates"] for v in filtered_by_kind.values()),
+                "pruned_reference_objects": sum(v["pruned_reference_objects"] for v in filtered_by_kind.values()),
+                "enqueued_pipeline_jobs": sum(v["enqueued_pipeline_jobs"] for v in filtered_by_kind.values()),
+                "active_pipeline_jobs": sum(v["active_pipeline_jobs"] for v in filtered_by_kind.values()),
+                "deferred_jobs": sum(v["deferred_jobs"] for v in filtered_by_kind.values()),
+                "manual_review_jobs": sum(v["manual_review_jobs"] for v in filtered_by_kind.values()),
+            },
+            "by_kind": {
+                key: {**value, "outcomes": dict(value["outcomes"])}
+                for key, value in sorted(filtered_by_kind.items())
+            },
+        }
+    reasons = _quality_report_reasons(jobs, limit=reasons_limit) if reasons_limit else []
+    payload = {"plan": plan.to_dict(), "summary": summary, "top_unresolved_reasons": reasons}
+    if json_output:
+        _echo_json(payload)
+        return
+
+    typer.echo(f"Repair report: {plan.plan_id}")
+    typer.echo(f"Release: {plan.release_label}")
+    typer.echo(f"Jobs: {summary.get('jobs', 0)}")
+    outcomes = summary.get("outcomes") or {}
+    if outcomes:
+        typer.echo("Outcomes: " + ", ".join(f"{k}={v}" for k, v in sorted(outcomes.items())))
+    totals = summary.get("totals") or {}
+    typer.echo(
+        "Resolution: "
+        f"resolved_candidates={totals.get('resolved_candidates', 0)} "
+        f"unresolved_candidates={totals.get('unresolved_candidates', 0)} "
+        f"pruned_reference_objects={totals.get('pruned_reference_objects', 0)} "
+        f"enqueued_pipeline_jobs={totals.get('enqueued_pipeline_jobs', 0)} "
+        f"active_pipeline_jobs={totals.get('active_pipeline_jobs', 0)} "
+        f"deferred_jobs={totals.get('deferred_jobs', 0)} "
+        f"manual_review_jobs={totals.get('manual_review_jobs', 0)}"
+    )
+    for repair_kind, item in sorted((summary.get("by_kind") or {}).items()):
+        typer.echo(
+            f"- {repair_kind}: jobs={item.get('jobs', 0)} "
+            f"resolved={item.get('resolved_candidates', 0)} "
+            f"unresolved={item.get('unresolved_candidates', 0)} "
+            f"pruned={item.get('pruned_reference_objects', 0)} "
+            f"outcomes={item.get('outcomes', {})}"
+        )
+    if reasons:
+        typer.echo("Top unresolved reasons:")
+        for reason, count in reasons:
+            typer.echo(f"- {count} {reason}")
 
 
 @quality_repair_app.command("list")
@@ -919,7 +1206,7 @@ def quality_repair_run_cmd(
 
     if skipped_count:
         typer.echo(
-            f"Skipped {skipped_count} pending jobs without executors. "
+            f"Skipped {skipped_count} pending jobs that are deferred or lack executors. "
             "Use --kind to inspect a specific kind."
         )
     if not jobs:
@@ -1005,7 +1292,9 @@ def quality_repair_run_cmd(
         store.clear_worker_pid(os.getpid())
     typer.echo(
         "Quality repair run complete: "
-        f"succeeded={result['succeeded']} failed={result['failed']} skipped={result['skipped']}"
+        f"succeeded={result['succeeded']} failed={result['failed']} skipped={result['skipped']} "
+        f"resolved={result.get('resolved', 0)} unresolved={result.get('unresolved', 0)} "
+        f"enqueued={result.get('enqueued', 0)} active={result.get('active', 0)}"
     )
 
 
@@ -1046,7 +1335,7 @@ def quality_repair_worker_cmd(
             )
             typer.echo(f"[{_now_label()}] Quality repair worker started plan={plan.plan_id}")
             if skipped_count:
-                typer.echo(f"Skipped {skipped_count} pending jobs without executors.")
+                typer.echo(f"Skipped {skipped_count} pending jobs that are deferred or lack executors.")
             typer.echo(f"Selected jobs: {len(jobs)}")
             result = run_repair_jobs(
                 store=store,
@@ -1056,7 +1345,9 @@ def quality_repair_worker_cmd(
             )
             typer.echo(
                 "Quality repair run complete: "
-                f"succeeded={result['succeeded']} failed={result['failed']} skipped={result['skipped']}"
+                f"succeeded={result['succeeded']} failed={result['failed']} skipped={result['skipped']} "
+                f"resolved={result.get('resolved', 0)} unresolved={result.get('unresolved', 0)} "
+                f"enqueued={result.get('enqueued', 0)} active={result.get('active', 0)}"
             )
     except Exception as exc:
         typer.echo(f"FAILED quality repair worker: {exc}")

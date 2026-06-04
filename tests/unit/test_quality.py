@@ -107,20 +107,21 @@ def test_quality_cli_repair_plan_show_status_list_clear(tmp_path: Path, monkeypa
     )
     assert plan.exit_code == 0
     assert "Repair plan created: qr_test" in plan.output
+    assert "Deferred excluded: normalize_numeric=1" in plan.output
     assert "Nothing executed yet." in plan.output
 
     store = QualityRepairStore(root)
     assert store.load_plan("qr_test").plan_id == "qr_test"
-    assert store.status_counts(plan_id="qr_test")["pending"] == 5
+    assert store.status_counts(plan_id="qr_test")["pending"] == 4
 
     show = runner.invoke(app, ["quality", "repair", "show", "--root", str(root), "--plan", "qr_test"])
     assert show.exit_code == 0
     assert "Repair plan: qr_test" in show.output
-    assert "normalize_numeric" in show.output
+    assert "normalize_numeric" not in show.output
 
     status = runner.invoke(app, ["quality", "repair", "status", "--root", str(root), "--plan", "qr_test"])
     assert status.exit_code == 0
-    assert "pending=5" in status.output
+    assert "pending=4" in status.output
 
     listed = runner.invoke(
         app,
@@ -162,7 +163,6 @@ def test_quality_repair_run_preview_defaults_to_executable_jobs(tmp_path: Path, 
     assert "would run section_fail" in preview.output
     assert "would run batch_failure" in preview.output
     assert "would run docs_missing" in preview.output
-    assert "would run normalize_numeric" in preview.output
     assert "would run repair_reference" in preview.output
 
     numeric_preview = runner.invoke(
@@ -170,8 +170,9 @@ def test_quality_repair_run_preview_defaults_to_executable_jobs(tmp_path: Path, 
         ["quality", "repair", "run", "--root", str(root), "--plan", "qr_test", "--kind", NORMALIZE_NUMERIC, "--preview"],
     )
 
-    assert numeric_preview.exit_code == 1
-    assert "would run normalize_numeric" in numeric_preview.output
+    assert numeric_preview.exit_code == 0
+    assert "Skipped" not in numeric_preview.output
+    assert "No pending quality repair jobs selected." in numeric_preview.output
 
 
 def test_quality_repair_run_all_and_watch_once(tmp_path: Path, monkeypatch):
@@ -202,7 +203,7 @@ def test_quality_repair_run_all_and_watch_once(tmp_path: Path, monkeypatch):
 
     assert preview.exit_code == 1
     assert "Selection: all executable pending jobs" in preview.output
-    assert preview.output.count("would run") == 5
+    assert preview.output.count("would run") == 4
     assert "would run docs_missing" in preview.output
 
     watch = runner.invoke(
@@ -212,7 +213,7 @@ def test_quality_repair_run_all_and_watch_once(tmp_path: Path, monkeypatch):
 
     assert watch.exit_code == 0
     assert "QUALITY_QUEUE=" in watch.output
-    assert "pending=5" in watch.output
+    assert "pending=4" in watch.output
 
 
 def test_quality_repair_run_defaults_to_latest_all_background(tmp_path: Path, monkeypatch):
@@ -260,7 +261,7 @@ def test_quality_repair_run_defaults_to_latest_all_background(tmp_path: Path, mo
     assert calls[0][1] is cli_main.subprocess.STDOUT
     assert calls[0][2] is True
     assert "Started quality repair worker pid=12345" in result.output
-    assert "selected_jobs: 5" in result.output
+    assert "selected_jobs: 4" in result.output
     assert (root / ".krw_pipeline" / "quality" / "logs" / "worker.log").exists()
 
 
@@ -283,7 +284,11 @@ def test_docs_missing_repair_enqueues_general_pipeline_queue(tmp_path: Path):
 
     result = run_repair_jobs(store=store, jobs=store.list_jobs(plan_id=plan.plan_id), root=root)
 
-    assert result == {"succeeded": 1, "failed": 0, "skipped": 0}
+    assert result["succeeded"] == 1
+    assert result["failed"] == 0
+    assert result["skipped"] == 0
+    assert result["enqueued"] == 1
+    assert result["active"] == 0
     pipeline_jobs = PipelineQueue(root).list_jobs()
     assert len(pipeline_jobs) == 1
     assert pipeline_jobs[0].ticker == "FCX"
@@ -321,7 +326,11 @@ def test_docs_missing_repair_skips_existing_active_pipeline_job(tmp_path: Path):
 
     result = run_repair_jobs(store=store, jobs=store.list_jobs(plan_id=plan.plan_id), root=root)
 
-    assert result == {"succeeded": 1, "failed": 0, "skipped": 0}
+    assert result["succeeded"] == 1
+    assert result["failed"] == 0
+    assert result["skipped"] == 0
+    assert result["enqueued"] == 0
+    assert result["active"] == 1
     assert len(PipelineQueue(root).list_jobs()) == 1
     repaired = store.list_jobs(plan_id=plan.plan_id)[0]
     assert repaired.payload["pipeline_queue_action"] == "skipped_active_job"
@@ -361,7 +370,10 @@ def test_normalize_numeric_repair_rebuilds_evidence_without_promoting_rejected(
 
     result = run_repair_jobs(store=store, jobs=store.list_jobs(plan_id=plan.plan_id), root=root)
 
-    assert result == {"succeeded": 1, "failed": 0, "skipped": 0}
+    assert result["succeeded"] == 1
+    assert result["failed"] == 0
+    assert result["skipped"] == 0
+    assert result["unresolved"] == 1
     repaired = store.list_jobs(plan_id=plan.plan_id)[0]
     assert repaired.payload["policy"] == "evidence_preserving_revalidation"
     assert repaired.payload["auto_promoted_objects"] == 0
@@ -407,7 +419,10 @@ def test_repair_reference_rebuilds_tail_without_guessing_references(tmp_path: Pa
 
     result = run_repair_jobs(store=store, jobs=store.list_jobs(plan_id=plan.plan_id), root=root)
 
-    assert result == {"succeeded": 1, "failed": 0, "skipped": 0}
+    assert result["succeeded"] == 1
+    assert result["failed"] == 0
+    assert result["skipped"] == 0
+    assert result["unresolved"] >= 1
     repaired = store.list_jobs(plan_id=plan.plan_id)[0]
     assert repaired.payload["policy"] == "evidence_preserving_revalidation"
     assert repaired.payload["auto_promoted_objects"] == 0

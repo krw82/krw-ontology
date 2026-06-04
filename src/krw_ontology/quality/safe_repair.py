@@ -18,7 +18,7 @@ from krw_ontology.pipeline.stages.generate_edges import generate_edges
 from krw_ontology.pipeline.stages.generate_support_links import generate_support_links
 from krw_ontology.pipeline.stages.validate_ontology import _load_metric_objects
 from krw_ontology.quality.models import RepairJob, utc_now
-from krw_ontology.utils.io import atomic_write_json, read_jsonl
+from krw_ontology.utils.io import atomic_write_json, read_jsonl, write_jsonl
 from krw_ontology.validators.numeric_guard import validate_numeric
 from krw_ontology.validators.reference_validator import validate_references
 from krw_ontology.validators.relation_validator import _load_relations, validate_edge
@@ -78,6 +78,12 @@ OBJECT_FILES = (
     "run_manifests.jsonl",
     "ontology_registry_snapshots.jsonl",
     "validation_reports.jsonl",
+)
+
+PRUNABLE_REFERENCE_FILES = (
+    "support_links.jsonl",
+    "edges.jsonl",
+    "entity_mentions.jsonl",
 )
 
 
@@ -163,6 +169,7 @@ def run_reference_rebuild(job: RepairJob, *, root: Path) -> dict[str, Any]:
     mutable_paths = [
         ontology_dir / "support_links.jsonl",
         ontology_dir / "edges.jsonl",
+        ontology_dir / "entity_mentions.jsonl",
     ]
 
     report: dict[str, Any] = {
@@ -173,7 +180,7 @@ def run_reference_rebuild(job: RepairJob, *, root: Path) -> dict[str, Any]:
         "operation": "repair_reference",
         "auto_promoted_objects": AUTO_PROMOTED_OBJECTS,
         "auto_modified_claims": AUTO_MODIFIED_CLAIMS,
-        "mutated_artifacts": ["support_links.jsonl", "edges.jsonl"],
+        "mutated_artifacts": ["support_links.jsonl", "edges.jsonl", "entity_mentions.jsonl"],
     }
     before = _snapshot_files(mutable_paths)
 
@@ -196,6 +203,7 @@ def run_reference_rebuild(job: RepairJob, *, root: Path) -> dict[str, Any]:
         )
         report["support_links_rows"] = len(support_links)
         report["edges_rows"] = len(edges)
+        report.update(_prune_invalid_reference_artifacts(ontology_dir))
 
     _with_rollback(mutable_paths, rebuild)
 
@@ -264,13 +272,32 @@ def write_repair_report(job: RepairJob, *, root: Path, report: dict[str, Any]) -
 
 
 def _attach_report_payload(job: RepairJob, report: dict[str, Any], report_path: Path) -> None:
+    resolved_count = int(report.get("candidate_now_valid_count") or 0)
+    unresolved_count = int(report.get("unresolved_count") or 0)
+    pruned_count = int(report.get("pruned_reference_object_count") or 0)
+    if pruned_count and unresolved_count:
+        outcome = "pruned_invalid_references_with_unresolved_report"
+    elif pruned_count:
+        outcome = "pruned_invalid_references_needs_verify"
+    elif resolved_count and unresolved_count:
+        outcome = "partially_resolved_reported"
+    elif resolved_count:
+        outcome = "resolved_reported"
+    elif unresolved_count:
+        outcome = "unresolved_reported"
+    else:
+        outcome = "revalidated_no_candidates"
     job.payload["policy"] = POLICY
     job.payload["report_path"] = str(report_path)
+    job.payload["repair_outcome"] = outcome
+    job.payload["resolved_count"] = resolved_count
+    job.payload["pruned_reference_object_count"] = pruned_count
     job.payload["auto_promoted_objects"] = AUTO_PROMOTED_OBJECTS
     job.payload["auto_modified_claims"] = AUTO_MODIFIED_CLAIMS
     job.payload["mutated_artifacts"] = list(report.get("mutated_artifacts") or [])
-    job.payload["unresolved_count"] = int(report.get("unresolved_count") or 0)
-    job.payload["candidate_now_valid_count"] = int(report.get("candidate_now_valid_count") or 0)
+    job.payload["unresolved_count"] = unresolved_count
+    job.payload["candidate_now_valid_count"] = resolved_count
+    job.payload["verification_required"] = True
 
 
 def _resolve_ontology_dir(job: RepairJob) -> Path:
@@ -328,6 +355,50 @@ def _load_lookup(ontology_dir: Path) -> dict[str, dict[str, Any]]:
                 lookup[str(obj_id)] = obj
     lookup.update(_load_metric_objects(ontology_dir))
     return lookup
+
+
+def _prune_invalid_reference_artifacts(ontology_dir: Path) -> dict[str, Any]:
+    """Remove invalid derived reference objects without editing authored claims.
+
+    This is intentionally limited to deterministic/derived link artifacts. If a
+    claim or metric has bad support, we report it instead of editing the object.
+    """
+    lookup = _load_lookup(ontology_dir)
+    relations = _relations_whitelist()
+    pruned_by_file: dict[str, int] = {}
+    pruned_examples: list[dict[str, Any]] = []
+    total_pruned = 0
+    for filename in PRUNABLE_REFERENCE_FILES:
+        path = ontology_dir / filename
+        rows = read_jsonl(path)
+        if not rows:
+            pruned_by_file[filename] = 0
+            continue
+        kept: list[dict[str, Any]] = []
+        pruned: list[dict[str, Any]] = []
+        for obj in rows:
+            ok, reason = validate_references(obj, lookup)
+            if ok and obj.get("type") == "Edge":
+                ok, reason = validate_edge(obj, relations, lookup)
+            if ok:
+                kept.append(obj)
+            else:
+                pruned.append(_object_failure_report(obj, reason))
+        if pruned:
+            write_jsonl(path, kept)
+            pruned_ids = {str(item.get("id")) for item in pruned if item.get("id")}
+            for obj in rows:
+                obj_id = obj.get("id")
+                if obj_id and str(obj_id) in pruned_ids:
+                    lookup.pop(str(obj_id), None)
+        pruned_by_file[filename] = len(pruned)
+        total_pruned += len(pruned)
+        pruned_examples.extend(pruned[:10])
+    return {
+        "pruned_reference_object_count": total_pruned,
+        "pruned_reference_objects_by_file": pruned_by_file,
+        "pruned_reference_object_examples": pruned_examples[:50],
+    }
 
 
 def _rejected_candidates(ontology_dir: Path, stages: set[str]) -> list[dict[str, Any]]:

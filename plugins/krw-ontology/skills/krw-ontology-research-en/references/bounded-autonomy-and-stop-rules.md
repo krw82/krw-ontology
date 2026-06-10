@@ -8,7 +8,7 @@ interpretation
 comparison judgment
 caveats
 business mechanism explanation
-final Korean prose
+final English prose
 
 AI autonomy to bound:
 repeated broad search
@@ -24,7 +24,7 @@ turning related evidence into direct proof
 1. query_context first
 2. targeted query/compare only for explicit gaps
 3. selected trace/chain only when materially useful
-4. final Korean answer
+4. final English answer
 ```
 
 ## Tool budgets as behavior, not user-facing content

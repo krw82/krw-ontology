@@ -266,7 +266,7 @@ Never expose:
 
 ```text
 MCP/tool/plugin/skill names
-stock-news-zai
+stock-news
 tool call names
 source tier
 recency bucket

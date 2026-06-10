@@ -5,7 +5,7 @@ Use these gates for web-chat quality checks and E2E harnesses.
 ## Normal answer gates
 
 ```text
-Korean Markdown only
+English Markdown only
 no internal terms
 no mode/tool/pack names
 no budget/fallback/error labels

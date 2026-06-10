@@ -1,16 +1,16 @@
 ---
-name: krw-ontology-research
+name: krw-ontology-research-en
 description: Use when answering equity research questions from KRW ontology data, especially filing evidence, business drivers, external exposures, metrics, agreement terms, events, scenario analysis, direct exposure checks, and cross-company comparisons. Use KRW ontology MCP tools instead of raw JSONL or memory.
 ---
 
-# KRW Ontology Research Skill
+# KRW Ontology Research Skill (English)
 
 ## 1. Operating contract
 
 Default runtime:
 
 ```text
-Korean Markdown answer only.
+English Markdown answer only.
 ```
 
 Internal research input:
@@ -21,7 +21,7 @@ Build the brief with awareness of the KRW ontology schema, evidence types, resea
 Optimize for ontology evidence retrieval, not literal translation.
 Use canonical business, financial, accounting, product, risk, and capital-allocation terms.
 Preserve user intent, tickers, company names, periods, exact metrics, and requested comparison axes.
-Do not expose the internal English brief in the final Korean answer.
+Do not expose the internal English brief in the final English answer.
 ```
 
 Map the user's request to ontology-friendly retrieval concepts when useful:
@@ -81,8 +81,7 @@ Do not call broad retrieve after a sufficient query_context.
 Do not loop over similar query_context/query/retrieve/trace/chain calls.
 Do not use response_detail="full" in normal web chat.
 If a tool result overflows, treat it as a too-broad signal and split the research path; do not stop, apologize, or expose overflow.
-Final Korean answers must follow `references/plain-korean-investor-language.md`: plain Korean for general investors, no unexplained English acronyms or jargon, and every important number tied to investor meaning.
-Always end a normal answer with exactly 3 related Korean follow-up questions.
+Always end a normal answer with exactly 3 related English follow-up questions.
 ```
 
 ### 2.1 First classify the question
@@ -120,7 +119,7 @@ Flow:
 4. If sufficient_for_default_answer or equivalent, answer immediately.
 5. If trace is recommended for a strong claim, trace/chain only selected roots.
 6. If a specific material gap remains, use one targeted query/compare for that gap.
-7. Write analyst synthesis in Korean.
+7. Write analyst synthesis in English.
 ```
 
 Use ontology objects by purpose:
@@ -314,7 +313,7 @@ Flow:
 
 ### 2.10 Path I: valuation/price target/investment decision question
 
-Use for target price, fair value, investment recommendation, buy/sell/hold, 12-month target, final valuation conclusion, or vague decision questions such as "지금 사?", "사 말아?", "보유해?", "팔까?", "지금 들어가도 돼?", or "장기적으로 괜찮아?".
+Use for target price, fair value, investment recommendation, buy/sell/hold, 12-month target, final valuation conclusion, or vague decision questions such as "Should I buy now?", "Buy or wait?", "Should I hold?", "Should I sell?", "Is it too late to enter?", "Is it good long term?", "지금 사?", "사 말아?", "보유해?", "팔까?", "지금 들어가도 돼?", or "장기적으로 괜찮아?".
 
 This path does not change normal metric, business model, risk/thesis, direct exposure, comparison, or factual lookup questions. Use this investment decision frame only when the user is asking for buy/sell/hold/timing judgment or a valuation/recommendation-like conclusion.
 
@@ -329,7 +328,7 @@ Flow:
 6. Provide filing-supported assumptions only: revenue drivers, margin risks, cash flow, capex, debt, segment trends, capital allocation, and risk factors.
 7. If the user supplies an external model/price/assumption, analyze filing support for that assumption.
 8. Anchor the decision on the web runtime Company filing anchor when provided. Start from Current driver, use Annual baseline only for annual business mix/historical trend/risk baseline, and use Historical context only for cycle comparison or change over time. If a newer 10-Q exists after the latest 10-K, use that 10-Q as the current driver and use the 10-K only as annual baseline/business mix context. Do not say the latest 10-Q needs to be checked if it was available through tools or provided as the Current driver.
-9. For these triggered buy/sell/hold-style questions only, render the final Korean answer as a detailed but scannable compact investment-decision report. The first visible sentence must be a practical filing-supported judgment such as "내 판단: 신규 매수는 아직 성급함. 보유자는 유지 가능." This opening sentence must appear before any Markdown heading, title, table, caveat, or disclaimer. Unless the user explicitly asks for a short answer, after that opening sentence use the exact heading order from `references/investment-decision-questions.md`: `판단 라벨`, `판단 대시보드`, `왜 이렇게 보나`, `판단이 바뀌는 조건`, `최종 판단`, and `다음으로 파고들 질문`. Do not rename, merge, omit, or reorder these headings. Use standardized decision labels from `references/investment-decision-questions.md`, and end with exactly 3 action-oriented follow-up prompts focused on the same company and the user's original decision type. Each follow-up must use a decision-action frame such as 신규 매수 체크리스트, 매도 신호, 손절 판단, 보유 조건, 리스크 완화/악화 조건, or 판단이 바뀌는 조건. Do not introduce peer/comparison follow-ups unless the user explicitly asked for comparison or named peers. Do not infer profit/loss/익절/손절 position state unless the user supplied cost basis, return, purchase price, or position status. Do not invent numeric/percentage/time-horizon/valuation/checklist thresholds, "N out of M conditions" rules, or raw-number-heavy dashboard tables unless the user supplied them or filings/guidance explicitly support them. Do not shorten into a quick answer unless the user explicitly asks for a short answer. Do not apply this custom report shape to ordinary research questions.
+9. For these triggered buy/sell/hold-style questions only, render the final English answer as a detailed but scannable compact investment-decision report. The first visible sentence must be a practical filing-supported judgment such as "My view: a new buy still looks premature; existing holders can continue holding." This opening sentence must appear before any Markdown heading, title, table, caveat, or disclaimer. Unless the user explicitly asks for a short answer, after that opening sentence use the exact heading order from `references/investment-decision-questions.md`: `Decision Label`, `Decision Dashboard`, `Why I See It This Way`, `What Would Change The View`, `Final View`, and `Next Questions To Dig Into`. Do not rename, merge, omit, or reorder these headings. Use standardized decision labels from `references/investment-decision-questions.md`, and end with exactly 3 action-oriented follow-up prompts focused on the same company and the user's original decision type. Each follow-up must use a decision-action frame such as new-buy checklist, sell signals, thesis-break judgment, hold conditions, risk improvement/deterioration conditions, or view-change conditions. Do not introduce peer/comparison follow-ups unless the user explicitly asked for comparison or named peers. Do not infer profit/loss/take-profit/stop-loss position state unless the user supplied cost basis, return, purchase price, or position status. Do not invent numeric/percentage/time-horizon/valuation/checklist thresholds, "N out of M conditions" rules, or raw-number-heavy dashboard tables unless the user supplied them or filings/guidance explicitly support them. Do not shorten into a quick answer unless the user explicitly asks for a short answer. Do not apply this custom report shape to ordinary research questions.
 ```
 
 ## 3. Tool policy
@@ -639,11 +638,11 @@ Reference: `references/trace-chain-policy.md`.
 
 ## 10. Answer style
 
-Write dense, useful Korean Markdown.
+Write dense, useful English Markdown.
 
 Do not force a fixed answer template. Choose the structure that best fits the user's question, the available evidence, and the natural reading flow.
 
-Mobile readability matters. Write Korean Markdown that is easy to read on a phone:
+Mobile readability matters. Write English Markdown that is easy to read on a phone:
 
 ```text
 Avoid long paragraphs.
@@ -669,18 +668,12 @@ Make the answer feel complete enough that the user does not need to ask "so what
 
 Do not force all elements into every answer.
 
-Normal answers are interpretation-first, not raw-number dumps. Internally inspect exact values, units, periods, and line-item definitions, but show exact numbers only when they support, qualify, or correct the conclusion. Translate professional terms into plain Korean using `references/plain-korean-investor-language.md`.
+Normal answers are interpretation-first, not raw-number dumps. Internally inspect exact values, units, periods, and line-item definitions, but show exact numbers only when they support, qualify, or correct the conclusion.
 
 When a table helps, prefer interpretation columns over raw numeric grids:
 
 ```text
 분석 축 | 공시에서 보이는 신호 | 투자 해석
-```
-
-For general-investor answers, prefer even plainer table columns when possible:
-
-```text
-항목 | 쉽게 말하면 | 투자 의미
 ```
 
 Do not force a fixed heading order.
@@ -858,12 +851,12 @@ Avoid weak endings:
 Instead, adjust confidence and explain what would change the conclusion:
 
 ```text
-확인된 공시 근거 기준으로는 A가 핵심입니다. 다만 B가 확인되면 결론의 강도는 달라질 수 있습니다.
+Based on confirmed filing evidence, A is the key point. If B is confirmed later, the strength of the conclusion can change.
 ```
 
-## 12. Korean investor-facing style
+## 12. English investor-facing style
 
-Write for a Korean equity investor, not for an internal research system and not like a literal translation of a U.S. analyst memo.
+Write for an English-speaking equity investor, not for an internal research system and not like a literal translation from Korean.
 
 This is a style preference, not a rigid answer template. Preserve analytical judgment, but default to this style in normal answers.
 
@@ -871,9 +864,9 @@ Core style:
 
 ```text
 Start with the investment conclusion before listing evidence.
-Use natural Korean financial language before English jargon.
-If an English term is useful, write Korean first and English in parentheses once.
-Do not repeatedly use untranslated terms like headwind, tailwind, trade-down, pricing power, gross margin, unit case volume, or watchpoint.
+Use natural English financial language before jargon.
+Define technical terms only when they materially help the user understand the investment point.
+Do not repeatedly use unexplained jargon like headwind, tailwind, trade-down, pricing power, gross margin, unit case volume, or watchpoint.
 Never expose ontology, tool, schema, diagnostic, pack, routing, object ID, or directness-grade terms.
 Translate filing evidence into investor meaning: what does it imply for revenue, margins, cash flow, risk, or valuation assumptions?
 Use short paragraphs and decisive section headings.
@@ -942,14 +935,14 @@ direct grade
 high materiality
 watchpoint
 trade-down pressure
-headwind without Korean explanation
+headwind without explaining the business impact
 ```
 
 Prefer this style:
 
 ```text
-공시를 종합하면, 비용 부담은 완화됐지만 높은 수준에서 유지되고 있습니다.
-투자 관점에서는 매출 성장률보다 판매량, 가격 전가력, 매출총이익률 방어 여부가 더 중요합니다.
+Taken together, the filings suggest cost pressure has eased but remains elevated.
+For investors, the more important question is whether volume, pricing power, and gross-margin defense can hold up better than headline revenue growth.
 ```
 
 ## 13. Forbidden user-facing language
@@ -997,13 +990,13 @@ Reference: `references/forbidden-user-facing-language.md`.
 Every normal web-chat research answer should end with this section unless the user explicitly asks for no follow-ups or the response is raw/debug/audit output:
 
 ```text
-다음으로 파고들 질문
+Next Questions To Dig Into
 ```
 
 Rules:
 
 ```text
-- exactly 3 concise Korean questions
+- exactly 3 concise English questions
 - no extra tool calls to create them
 - derive from the current answer's business mechanism, risk channel, metric gap, or comparison axis
 - prefer investment interpretation follow-ups: business mechanism, margin durability, cash-flow conversion, capital allocation, risk channel, valuation-assumption sensitivity
@@ -1057,7 +1050,6 @@ references/ontology-layer-map.md
 references/query-context-contract.md
 references/bounded-autonomy-and-stop-rules.md
 references/period-and-latest-policy.md
-references/plain-korean-investor-language.md
 references/financial-statement-interpretation.md
 references/investment-decision-questions.md
 references/trace-chain-policy.md

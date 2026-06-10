@@ -37,7 +37,7 @@ Do not write:
 MCP
 plugin
 skill
-stock-news-zai
+stock-news
 route_news_question
 resolve_news_entities
 search_company_news_events

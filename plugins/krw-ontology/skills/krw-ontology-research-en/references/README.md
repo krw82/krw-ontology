@@ -1,12 +1,12 @@
 # KRW Ontology Research References
 
-These references are internal guidance for the `krw-ontology-research` skill. Normal web-chat answers should not expose file names, schema terms, tool names, object IDs, diagnostics, runtime settings, or routing logic.
+These references are internal guidance for the `krw-ontology-research-en` skill. Normal web-chat answers should not expose file names, schema terms, tool names, object IDs, diagnostics, runtime settings, or routing logic.
 
 ## Active references
 
 ```text
 web-chat-runtime.md
-- visible answer shape, Korean Markdown boundary, follow-up question rule
+- visible answer shape, English Markdown boundary, follow-up question rule
 
 tool-policy.md
 - MCP tool roles and normal tool workflow

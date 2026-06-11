@@ -72,6 +72,7 @@ from krw_ontology.release import (
     resolve_global_topic_ranking_threshold_metadata,
     rollback_local_release,
     verify_release_root,
+    verify_release_startup,
     write_release_verification_report,
     write_release_manifest,
     write_ranking_threshold_calibration_report,
@@ -105,7 +106,7 @@ app = typer.Typer(
     epilog=(
         "Recommended first setup:\n"
         "  krw-ontology config set running-root ~/krw-ontology-data-running\n"
-        "  krw-ontology config set publish-root ~/krw-ontology-data\n\n"
+        "  krw-ontology config set publish-root ~/krw-ontology-data/releases\n\n"
         "Optional prod setup:\n"
         "  krw-ontology prod configure --host ubuntu@prod --remote-root /var/krw-ontology-data\n\n"
         "Daily queue flow:\n"
@@ -153,7 +154,7 @@ config_app = typer.Typer(
         "  prod-keep-releases  number of prod releases to keep\n\n"
         "Examples:\n"
         "  krw-ontology config set running-root ~/krw-ontology-data-running\n"
-        "  krw-ontology config set publish-root ~/krw-ontology-data\n"
+        "  krw-ontology config set publish-root ~/krw-ontology-data/releases\n"
         "  krw-ontology config show"
     ),
     no_args_is_help=True,
@@ -1919,6 +1920,11 @@ def prod_publish_cmd(
     if stable_root is None:
         typer.echo("Set publish-root or pass --root before publishing to prod.")
         raise typer.Exit(1)
+    try:
+        _assert_prod_publish_source_v2(stable_root)
+    except Exception as exc:
+        typer.echo(f"FAILED prod publish preflight: {exc}")
+        raise typer.Exit(1) from exc
     pre_status = _try_get_prod_status(
         host=host,
         remote_root=remote_root,
@@ -1937,6 +1943,78 @@ def prod_publish_cmd(
         )
     except Exception as exc:
         typer.echo(f"FAILED prod publish: {exc}")
+        raise typer.Exit(1) from exc
+    _print_prod_publish_result(result, dry_run=dry_run, pre_status=pre_status)
+
+
+@prod_app.command("publish-dev")
+def prod_publish_dev_cmd(
+    root: Optional[Path] = typer.Option(
+        None,
+        "--root",
+        help="Local dev release root to upload. Defaults to configured publish-root dev/current.",
+    ),
+    host: Optional[str] = typer.Option(None, "--host", help="Override configured prod SSH host."),
+    remote_root: Optional[str] = typer.Option(
+        None,
+        "--remote-root",
+        help="Override configured production data root.",
+    ),
+    reload_command: Optional[str] = typer.Option(
+        None,
+        "--reload-command",
+        help="Override configured prod reload command.",
+    ),
+    health_url: Optional[str] = typer.Option(
+        None,
+        "--health-url",
+        help="Override configured prod health URL.",
+    ),
+    keep_releases: Optional[int] = typer.Option(
+        None,
+        "--keep-releases",
+        min=1,
+        help="Override configured number of prod releases to keep.",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Show what would be published without uploading or activating.",
+    ),
+    delta: bool = typer.Option(
+        True,
+        "--delta/--full",
+        help="Use delta upload by default; pass --full for a full bundle upload.",
+    ),
+) -> None:
+    """Publish configured dev/current to production, using delta upload by default."""
+    stable_root = _resolve_local_release_upload_root(root, env="dev")
+    if stable_root is None:
+        typer.echo("Set publish-root or pass --root before publishing dev/current to prod.")
+        raise typer.Exit(1)
+    try:
+        _assert_prod_publish_source_v2(stable_root)
+    except Exception as exc:
+        typer.echo(f"FAILED prod publish-dev preflight: {exc}")
+        raise typer.Exit(1) from exc
+    pre_status = _try_get_prod_status(
+        host=host,
+        remote_root=remote_root,
+        health_url=health_url,
+    )
+    try:
+        result = _publish_prod_root(
+            stable_root=stable_root,
+            host=host,
+            remote_root=remote_root,
+            reload_command=reload_command,
+            health_url=health_url,
+            keep_releases=keep_releases,
+            dry_run=dry_run,
+            delta=delta,
+        )
+    except Exception as exc:
+        typer.echo(f"FAILED prod publish-dev: {exc}")
         raise typer.Exit(1) from exc
     _print_prod_publish_result(result, dry_run=dry_run, pre_status=pre_status)
 
@@ -1981,6 +2059,23 @@ def prod_rollback_cmd(
 
 def _default_releases_root() -> Path:
     return Path.home() / "krw-ontology-data" / "releases"
+
+
+def _resolve_configured_releases_root(
+    releases_root: Path | None = None,
+    *,
+    env: str | None = "dev",
+) -> Path:
+    if releases_root is not None:
+        return releases_root.expanduser().resolve()
+    configured_publish_root = resolve_publish_root(None)
+    if configured_publish_root is not None:
+        resolved_releases_root, _resolved_env = _resolve_release_publish_config(
+            configured_publish_root,
+            env,
+        )
+        return resolved_releases_root.expanduser().resolve()
+    return _default_releases_root().expanduser().resolve()
 
 
 def _default_release_id() -> str:
@@ -2030,6 +2125,16 @@ def _resolve_local_release_upload_root(root: Path | None, *, env: str | None = N
 
 def _default_release_index_path(root: Path) -> Path:
     return root / "indexes" / "agent_index.sqlite"
+
+
+def _assert_prod_publish_source_v2(root: Path) -> dict[str, object]:
+    verification = verify_release_startup(root, check_sqlite=False)
+    if not verification["ok"]:
+        raise RuntimeError(
+            "prod publish source must be a v2 immutable release: "
+            + ", ".join(str(error) for error in verification["errors"])
+        )
+    return verification
 
 
 def _release_root_has_ontology_artifacts(root: Path) -> bool:
@@ -2196,15 +2301,14 @@ def _publish_tickers_as_release(
         try:
             release_root.mkdir(parents=True)
             if current_root.exists() or current_root.is_symlink():
-                current_verification = verify_release_root(
+                current_verification = verify_release_startup(
                     current_root,
                     env=resolved_env,
                     require_current_symlink=current_root.is_symlink(),
-                    run_smoke=True,
                 )
                 if not current_verification["ok"]:
                     errors = ", ".join(current_verification["errors"])
-                    raise RuntimeError(f"Current release verify failed before publish: {errors}")
+                    raise RuntimeError(f"Current release startup verify failed before publish: {errors}")
                 _materialize_release_root_from_source(current_root.resolve(), release_root)
 
             for ticker in selected_tickers:
@@ -2328,16 +2432,15 @@ def _publish_root_as_local_release(
             raise FileExistsError(f"Release directory already exists: {release_root}")
         current_root = env_root / "current"
         current_verification: dict | None = None
-        if current_root.exists() or current_root.is_symlink():
-            current_verification = verify_release_root(
+        if not force_release and (current_root.exists() or current_root.is_symlink()):
+            current_verification = verify_release_startup(
                 current_root,
                 env=resolved_env,
                 require_current_symlink=current_root.is_symlink(),
-                run_smoke=True,
             )
             if not current_verification["ok"]:
                 raise RuntimeError(
-                    "Current release verify failed before publish: "
+                    "Current release startup verify failed before publish: "
                     + ", ".join(current_verification["errors"])
                 )
             source_signature = _try_release_index_content_signature(resolved_source_root)
@@ -2806,10 +2909,10 @@ def release_publish_dev_cmd(
         None,
         help="Dev release id to create. Defaults to a timestamp id.",
     ),
-    releases_root: Path = typer.Option(
-        _default_releases_root(),
+    releases_root: Optional[Path] = typer.Option(
+        None,
         "--releases-root",
-        help="Local releases root.",
+        help="Local releases root. Defaults to configured publish-root or ~/krw-ontology-data/releases.",
     ),
     source_root: Optional[Path] = typer.Option(
         None,
@@ -2840,6 +2943,7 @@ def release_publish_dev_cmd(
         raise typer.Exit(1)
     resolved_release_id = release_id or _default_release_id()
     try:
+        resolved_releases_root = _resolve_configured_releases_root(releases_root, env="dev")
         resolved_source_root = (
             source_root.expanduser().resolve()
             if source_root is not None
@@ -2847,7 +2951,7 @@ def release_publish_dev_cmd(
         )
         if dry_run or foreground:
             result = _release_publish_dev(
-                releases_root=releases_root,
+                releases_root=resolved_releases_root,
                 release_id=resolved_release_id,
                 source_root=resolved_source_root,
                 build_index=build_index,
@@ -2869,7 +2973,7 @@ def release_publish_dev_cmd(
                 raise RuntimeError(
                     "Queue worker is running. Stop it first, or pass --allow-running-queue."
                 )
-            paths = _dev_publish_paths(releases_root, resolved_release_id)
+            paths = _dev_publish_paths(resolved_releases_root, resolved_release_id)
             if paths["release_root"].exists():
                 raise FileExistsError(f"Release directory already exists: {paths['release_root']}")
             paths["log_path"].parent.mkdir(parents=True, exist_ok=True)
@@ -2881,7 +2985,7 @@ def release_publish_dev_cmd(
                 "--release-id",
                 resolved_release_id,
                 "--releases-root",
-                str(releases_root),
+                str(resolved_releases_root),
                 "--from-root",
                 str(resolved_source_root),
             ]
@@ -3005,17 +3109,22 @@ def release_publish_dev_worker_cmd(
 @release_app.command("publish-dev-status")
 def release_publish_dev_status_cmd(
     release_id: Optional[str] = typer.Argument(None, help="Dev release id. Defaults to latest dev publish release."),
-    releases_root: Path = typer.Option(_default_releases_root(), "--releases-root", help="Local releases root."),
+    releases_root: Optional[Path] = typer.Option(
+        None,
+        "--releases-root",
+        help="Local releases root. Defaults to configured publish-root or ~/krw-ontology-data/releases.",
+    ),
 ) -> None:
     """Show publish-dev worker and artifact status."""
-    selected_release_id = release_id or _latest_dev_publish_id(releases_root)
+    resolved_releases_root = _resolve_configured_releases_root(releases_root, env="dev")
+    selected_release_id = release_id or _latest_dev_publish_id(resolved_releases_root)
     if selected_release_id is None:
         typer.echo("No dev release found.")
         raise typer.Exit(1)
-    paths = _dev_publish_paths(releases_root, selected_release_id)
-    pid = _dev_publish_worker_pid(releases_root, selected_release_id)
+    paths = _dev_publish_paths(resolved_releases_root, selected_release_id)
+    pid = _dev_publish_worker_pid(resolved_releases_root, selected_release_id)
     running = pid is not None and is_pid_running(pid)
-    current_id = current_release_id(release_env_root(releases_root, "dev").expanduser().resolve())
+    current_id = current_release_id(release_env_root(resolved_releases_root, "dev").expanduser().resolve())
     typer.echo("Publish-dev status")
     typer.echo(f"release_id: {selected_release_id}")
     typer.echo(f"worker: {'running' if running else 'stopped'}" + (f" pid={pid}" if pid else ""))
@@ -3031,16 +3140,21 @@ def release_publish_dev_status_cmd(
 @release_app.command("publish-dev-watch")
 def release_publish_dev_watch_cmd(
     release_id: Optional[str] = typer.Argument(None, help="Dev release id. Defaults to latest dev publish release."),
-    releases_root: Path = typer.Option(_default_releases_root(), "--releases-root", help="Local releases root."),
+    releases_root: Optional[Path] = typer.Option(
+        None,
+        "--releases-root",
+        help="Local releases root. Defaults to configured publish-root or ~/krw-ontology-data/releases.",
+    ),
     lines: int = typer.Option(80, "--lines", min=1, help="Number of trailing lines to show first."),
     follow: bool = typer.Option(True, "--follow/--no-follow", help="Follow appended log output."),
 ) -> None:
     """Watch publish-dev logs."""
-    selected_release_id = release_id or _latest_dev_publish_id(releases_root)
+    resolved_releases_root = _resolve_configured_releases_root(releases_root, env="dev")
+    selected_release_id = release_id or _latest_dev_publish_id(resolved_releases_root)
     if selected_release_id is None:
         typer.echo("No dev release found.")
         raise typer.Exit(1)
-    path = _dev_publish_paths(releases_root, selected_release_id)["log_path"]
+    path = _dev_publish_paths(resolved_releases_root, selected_release_id)["log_path"]
     if not path.exists():
         typer.echo(f"Log does not exist: {path}")
         raise typer.Exit(1)
@@ -3288,6 +3402,11 @@ def release_verify_cmd(
         "--index-path",
         help="Optional explicit agent_index.sqlite path.",
     ),
+    startup_check: bool = typer.Option(
+        False,
+        "--startup-check",
+        help="Run the lightweight MCP startup contract check instead of deep release verification.",
+    ),
     write_report: bool = typer.Option(
         False,
         "--write-report",
@@ -3347,6 +3466,9 @@ def release_verify_cmd(
     ),
 ) -> None:
     """Verify release manifest, env, release id, and index presence."""
+    if startup_check and (write_report or smoke_baseline is not None or update_smoke_baseline):
+        typer.echo("FAIL --startup-check is read-only and cannot write verification artifacts")
+        raise typer.Exit(1)
     write_report = write_report or smoke_baseline is not None or update_smoke_baseline
     if write_report:
         _exit_if_path_mutates_current(root, "--root")
@@ -3360,17 +3482,28 @@ def release_verify_cmd(
         "sample_limit": ranking_sample_limit,
     }
     try:
-        ranking_threshold_metadata = resolve_global_topic_ranking_threshold_metadata(ranking_thresholds)
-        resolved_ranking_thresholds = ranking_threshold_metadata["thresholds"]
-        resolved_ranking_threshold_sources = ranking_threshold_metadata["sources"]
-        verification = verify_release_root(
-            root,
-            env=env,
-            index_path=index_path,
-            require_current_symlink=require_current_symlink,
-            run_smoke=smoke,
-            ranking_thresholds=ranking_thresholds,
-        )
+        if startup_check:
+            smoke = False
+            verification = verify_release_startup(
+                root,
+                env=env,
+                index_path=index_path,
+                require_current_symlink=require_current_symlink,
+            )
+            resolved_ranking_thresholds = {}
+            resolved_ranking_threshold_sources = {}
+        else:
+            ranking_threshold_metadata = resolve_global_topic_ranking_threshold_metadata(ranking_thresholds)
+            resolved_ranking_thresholds = ranking_threshold_metadata["thresholds"]
+            resolved_ranking_threshold_sources = ranking_threshold_metadata["sources"]
+            verification = verify_release_root(
+                root,
+                env=env,
+                index_path=index_path,
+                require_current_symlink=require_current_symlink,
+                run_smoke=smoke,
+                ranking_thresholds=ranking_thresholds,
+            )
     except ValueError as exc:
         typer.echo(f"FAIL {exc}")
         raise typer.Exit(1) from exc
@@ -3388,6 +3521,8 @@ def release_verify_cmd(
             verification=verification,
         )
     typer.echo(f"Release verify: {'ok' if verification['ok'] else 'failed'}")
+    if startup_check:
+        typer.echo("mode: startup")
     typer.echo(f"root: {verification['root']}")
     typer.echo(f"env: {verification.get('env') or '<missing>'}")
     typer.echo(f"release_id: {verification.get('release_id') or '<missing>'}")
@@ -3421,6 +3556,42 @@ def release_verify_cmd(
     if effective_errors:
         for error in effective_errors:
             typer.echo(f"FAIL {error}")
+        raise typer.Exit(1)
+
+
+@release_app.command("startup-check")
+def release_startup_check_cmd(
+    env: Optional[str] = typer.Option(None, "--env", help="Release environment. Defaults to KRW_ONTOLOGY_ENV or dev."),
+    releases_root: Optional[Path] = typer.Option(
+        None,
+        "--releases-root",
+        help="Local releases root. Defaults to configured publish-root or ~/krw-ontology-data/releases.",
+    ),
+    index_path: Optional[Path] = typer.Option(
+        None,
+        "--index-path",
+        help="Optional explicit agent_index.sqlite path.",
+    ),
+) -> None:
+    """Run the lightweight MCP startup contract check against <env>/current."""
+    resolved_env = normalize_ontology_env(env)
+    resolved_releases_root = _resolve_configured_releases_root(releases_root, env=resolved_env)
+    root = release_env_root(resolved_releases_root, resolved_env) / "current"
+    verification = verify_release_startup(
+        root,
+        env=resolved_env,
+        index_path=index_path,
+        require_current_symlink=True,
+    )
+    typer.echo(f"Release startup-check: {'ok' if verification['ok'] else 'failed'}")
+    typer.echo(f"root: {verification['root']}")
+    typer.echo(f"env: {verification.get('env') or '<missing>'}")
+    typer.echo(f"release_id: {verification.get('release_id') or '<missing>'}")
+    typer.echo(f"manifest: {verification.get('manifest_path') or '<missing>'}")
+    typer.echo(f"index: {'present' if verification.get('index_present') else 'missing'}")
+    for error in verification["errors"]:
+        typer.echo(f"FAIL {error}")
+    if not verification["ok"]:
         raise typer.Exit(1)
 
 
@@ -7671,6 +7842,7 @@ def _publish_prod_root(
     resolved_root = stable_root.expanduser().resolve()
     if not resolved_root.exists() or not resolved_root.is_dir():
         raise FileNotFoundError(f"Stable publish root not found: {resolved_root}")
+    _assert_prod_publish_source_v2(resolved_root)
     release_id = _new_release_id()
     result = {
         "release_id": release_id,

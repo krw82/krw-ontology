@@ -20,7 +20,7 @@ from krw_ontology.config.paths import (
 from krw_ontology.agent_index.builder import DEFAULT_INDEX_RELATIVE_PATH
 from krw_ontology.mcp_server.server import mcp
 from krw_ontology.mcp_server.tools import ensure_persistent_store_open
-from krw_ontology.release import normalize_ontology_env, verify_release_root
+from krw_ontology.release import normalize_ontology_env, verify_release_startup
 
 LOGGER = logging.getLogger(__name__)
 
@@ -56,7 +56,7 @@ def prepare_mcp_runtime(
         raise RuntimeError(f"store_mode must be persistent or per_call, got {store_mode!r}")
     root = root.expanduser()
     require_symlink = require_current_symlink or resolved_env == "prod"
-    verification = verify_release_root(
+    verification = verify_release_startup(
         root,
         env=resolved_env,
         index_path=index_path,

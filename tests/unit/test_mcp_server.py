@@ -278,6 +278,38 @@ def test_mcp_prepare_runtime_rejects_non_symlink_prod_root(tmp_path: Path):
         prepare_mcp_runtime(root=release, env="prod")
 
 
+def test_mcp_prepare_runtime_rejects_legacy_v1_current_without_sqlite_open(
+    tmp_path: Path,
+    monkeypatch,
+):
+    release = tmp_path / "releases" / "prod" / "20260529_legacy"
+    index_path = release / "indexes" / "agent_index.sqlite"
+    index_path.parent.mkdir(parents=True)
+    index_path.write_bytes(b"not a sqlite database")
+    (release / "manifest.json").write_text(
+        json.dumps(
+            {
+                "format": "krw-ontology-release/v1",
+                "env": "prod",
+                "release_id": release.name,
+                "index_path": "indexes/agent_index.sqlite",
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    current = release.parent / "current"
+    current.symlink_to(release.name)
+
+    def fail_connect(*_args, **_kwargs):
+        raise AssertionError("legacy manifest rejection must not open SQLite")
+
+    monkeypatch.setattr("krw_ontology.release.sqlite3.connect", fail_connect)
+
+    with pytest.raises(RuntimeError, match="manifest_format_unsupported"):
+        prepare_mcp_runtime(root=current, env="prod")
+
+
 def test_mcp_persistent_store_reuses_sqlite_connection(tmp_path: Path, monkeypatch):
     _write_fixture(tmp_path)
     index = build_agent_index(tmp_path)

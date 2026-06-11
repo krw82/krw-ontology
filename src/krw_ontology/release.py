@@ -615,6 +615,197 @@ def verify_release_root(
     }
 
 
+def verify_release_startup(
+    root: Path | str,
+    *,
+    env: str | None = None,
+    manifest_path: Path | str | None = None,
+    index_path: Path | str | None = None,
+    require_current_symlink: bool = False,
+    check_sqlite: bool = True,
+) -> dict[str, Any]:
+    """Verify only the cheap runtime contract needed before MCP startup.
+
+    Deep release verification intentionally remains in ``verify_release_root``.
+    Startup must not hash large SQLite files or run PRAGMA integrity_check.
+    """
+    supplied_root = Path(root).expanduser()
+    root_path = supplied_root.resolve()
+    errors: list[str] = []
+    if require_current_symlink and not _is_current_symlink_path(supplied_root):
+        errors.append("current_symlink_required")
+    if not root_path.exists():
+        errors.append("release_root_missing")
+    elif not root_path.is_dir():
+        errors.append("release_root_not_directory")
+
+    manifest, found_manifest_path = load_release_manifest(root_path, manifest_path=manifest_path)
+    if not manifest:
+        errors.append("manifest_missing")
+    else:
+        errors.extend(_release_manifest_startup_errors(root_path, manifest))
+
+    expected_env = normalize_ontology_env(env) if env is not None else None
+    manifest_env = manifest.get("env")
+    if expected_env is not None and manifest_env != expected_env:
+        errors.append("manifest_env_mismatch")
+
+    manifest_release_id = manifest.get("release_id")
+    if manifest and not manifest_release_id:
+        errors.append("manifest_release_id_missing")
+
+    resolved_index_path = resolve_manifest_index_path(root_path, manifest, index_path=index_path)
+    try:
+        resolved_index_path.relative_to(root_path)
+    except ValueError:
+        errors.append("index_path_outside_root")
+    index_verification: dict[str, Any] | None = None
+    if not resolved_index_path.exists():
+        errors.append("index_missing")
+    elif not resolved_index_path.is_file():
+        errors.append("index_not_file")
+    elif check_sqlite and not errors:
+        index_verification = _verify_agent_index_startup(resolved_index_path)
+        errors.extend(index_verification["errors"])
+    else:
+        index_verification = {
+            "ok": not errors,
+            "errors": [],
+            "index_path": str(resolved_index_path),
+            "integrity_check": None,
+            "counts": {},
+            "verification_mode": "startup",
+            "sqlite_checked": False,
+            "skipped": bool(errors),
+        }
+
+    return {
+        "ok": not errors,
+        "errors": errors,
+        "root": str(root_path),
+        "supplied_root": str(supplied_root),
+        "manifest_path": str(found_manifest_path) if found_manifest_path else None,
+        "manifest": manifest,
+        "env": manifest_env,
+        "release_id": manifest_release_id,
+        "index_path": str(resolved_index_path),
+        "index_present": resolved_index_path.exists(),
+        "index_verification": index_verification,
+        "index_shard_verification": None,
+        "smoke_verification": None,
+        "current_symlink": _is_current_symlink_path(supplied_root),
+        "verification_mode": "startup",
+    }
+
+
+def _release_manifest_startup_errors(root_path: Path, manifest: Mapping[str, Any]) -> list[str]:
+    errors: list[str] = []
+    if manifest.get("format") != RELEASE_FORMAT:
+        errors.append("manifest_format_unsupported")
+    if manifest.get("status") != "ready":
+        errors.append("manifest_status_not_ready")
+    release_id = manifest.get("release_id")
+    if (
+        isinstance(release_id, str)
+        and root_path.parent.name in ALLOWED_ONTOLOGY_ENVS
+        and root_path.name != release_id
+    ):
+        errors.append("manifest_release_id_directory_mismatch")
+    if not manifest.get("agent_index_schema_version"):
+        errors.append("manifest_agent_index_schema_version_missing")
+    manifest_index_path = manifest.get("index_path")
+    if not isinstance(manifest_index_path, str) or not manifest_index_path:
+        errors.append("manifest_index_path_missing")
+        return errors
+    candidate = Path(manifest_index_path)
+    if candidate.is_absolute():
+        errors.append("manifest_index_path_not_relative")
+        resolved = candidate.expanduser().resolve()
+    else:
+        resolved = (root_path / candidate).resolve()
+    try:
+        resolved.relative_to(root_path)
+    except ValueError:
+        errors.append("manifest_index_path_outside_root")
+    outputs = manifest.get("indexes")
+    if manifest.get("format") == RELEASE_FORMAT and not isinstance(outputs, Mapping):
+        errors.append("manifest_indexes_missing")
+    elif isinstance(outputs, Mapping):
+        monolith = outputs.get("monolith")
+        if not isinstance(monolith, Mapping):
+            errors.append("manifest_indexes_monolith_missing")
+        else:
+            output_path = monolith.get("path")
+            if not isinstance(output_path, str) or not output_path:
+                errors.append("manifest_index_output_path_missing:monolith")
+            elif output_path != manifest_index_path:
+                errors.append("manifest_indexes_monolith_path_mismatch")
+    return errors
+
+
+def _verify_agent_index_startup(index_path: Path) -> dict[str, Any]:
+    errors: list[str] = []
+    required_tables = {
+        "metadata",
+        "documents",
+        "objects",
+        "edges",
+        "quality_events",
+        "object_fts",
+        "object_text",
+        "object_search_text",
+        "object_traceability",
+        "metric_lookup",
+        "metric_dimension_lookup",
+        "company_dimension_catalog",
+        "exposure_lookup",
+        "agreement_lookup",
+        "event_lookup",
+        "factor_lookup",
+        "company_topic_index",
+        "company_topic_fts",
+        "company_topic_source_objects",
+    }
+    try:
+        with sqlite3.connect(f"{index_path.resolve().as_uri()}?mode=ro", uri=True) as conn:
+            table_rows = conn.execute(
+                """
+                SELECT name
+                FROM sqlite_master
+                WHERE type IN ('table', 'view')
+                """
+            ).fetchall()
+            existing_tables = {str(row[0]) for row in table_rows}
+            for table_name in sorted(required_tables - existing_tables):
+                errors.append(f"table_missing:{table_name}")
+            if "metadata" in existing_tables:
+                build_row = conn.execute("SELECT value FROM metadata WHERE key = 'build'").fetchone()
+                if build_row is None:
+                    errors.append("metadata_build_missing")
+                else:
+                    try:
+                        build_metadata = json.loads(build_row[0])
+                    except json.JSONDecodeError:
+                        errors.append("metadata_build_invalid_json")
+                    else:
+                        schema_version = (
+                            build_metadata.get("agent_index_schema_version")
+                            or build_metadata.get("schema_version")
+                        )
+                        if not schema_version:
+                            errors.append("agent_index_schema_version_missing")
+    except sqlite3.Error as exc:
+        errors.append(f"sqlite_error:{exc}")
+    return {
+        "ok": not errors,
+        "errors": errors,
+        "index_path": str(index_path),
+        "integrity_check": None,
+        "counts": {},
+        "verification_mode": "startup",
+    }
+
+
 def _is_current_symlink_path(path: Path) -> bool:
     return path.name == "current" and path.is_symlink()
 

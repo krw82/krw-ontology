@@ -1133,6 +1133,7 @@ class TestProdCommand:
         (stable / "companies" / "AAPL").mkdir(parents=True)
         (stable / "companies" / "AAPL" / "artifact.txt").write_text("ok")
         _write_minimal_agent_index(stable / "indexes" / "agent_index.sqlite")
+        write_release_manifest(stable, release_id="stable-dev", env="dev")
         runner.invoke(
             app,
             [
@@ -1334,7 +1335,8 @@ class TestProdCommand:
 
     def test_prod_publish_dry_run_skips_subprocess(self, tmp_path: Path, monkeypatch):
         stable = tmp_path / "stable"
-        stable.mkdir()
+        _write_minimal_agent_index(stable / "indexes" / "agent_index.sqlite")
+        write_release_manifest(stable, release_id="stable-dev", env="dev")
         runner.invoke(
             app,
             [
@@ -1364,7 +1366,8 @@ class TestProdCommand:
     def test_prod_publish_uses_configured_release_current_by_default(self, tmp_path: Path, monkeypatch):
         releases_root = tmp_path / "releases"
         release_root = releases_root / "dev" / "ready"
-        release_root.mkdir(parents=True)
+        _write_minimal_agent_index(release_root / "indexes" / "agent_index.sqlite")
+        write_release_manifest(release_root, release_id="ready", env="dev")
         (releases_root / "dev" / "current").symlink_to("ready")
         runner.invoke(app, ["config", "set", "publish-root", str(releases_root)])
         runner.invoke(
@@ -1404,6 +1407,53 @@ class TestProdCommand:
 
         assert result.exit_code == 0, result.output
         assert calls == [release_root.resolve()]
+
+    def test_prod_publish_dev_alias_defaults_to_delta_dev_current(self, tmp_path: Path, monkeypatch):
+        releases_root = tmp_path / "releases"
+        release_root = releases_root / "dev" / "ready"
+        _write_minimal_agent_index(release_root / "indexes" / "agent_index.sqlite")
+        write_release_manifest(release_root, release_id="ready", env="dev")
+        (releases_root / "dev" / "current").symlink_to("ready")
+        runner.invoke(app, ["config", "set", "publish-root", str(releases_root)])
+        runner.invoke(
+            app,
+            [
+                "prod",
+                "configure",
+                "--host",
+                "ubuntu@prod",
+                "--remote-root",
+                "/srv/krw-ontology-data",
+            ],
+        )
+        calls: list[dict[str, object]] = []
+        monkeypatch.setattr(
+            cli_main,
+            "_try_get_prod_status",
+            lambda **kwargs: {"current_kind": "missing", "releases": []},
+        )
+
+        def fake_publish_prod_root(**kwargs):
+            calls.append(kwargs)
+            return {
+                "release_id": "prod-release",
+                "stable_root": str(kwargs["stable_root"]),
+                "host": "ubuntu@prod",
+                "remote_root": "/srv/krw-ontology-data",
+                "keep_releases": 5,
+                "upload_mode": "delta" if kwargs["delta"] else "full",
+                "changed_file_count": 0,
+                "removed_file_count": 0,
+            }
+
+        monkeypatch.setattr(cli_main, "_publish_prod_root", fake_publish_prod_root)
+
+        result = runner.invoke(app, ["prod", "publish-dev"])
+
+        assert result.exit_code == 0, result.output
+        assert calls
+        assert calls[0]["stable_root"] == release_root.resolve()
+        assert calls[0]["delta"] is True
 
     def test_quality_check_uses_configured_release_current_by_default(self, tmp_path: Path):
         releases_root = tmp_path / "releases"
@@ -1741,6 +1791,67 @@ class TestReleaseCommand:
         assert os.readlink(releases_root / "staging" / "current") == "full-root-rel"
         assert (release_root / "manifest.json").exists()
         assert (release_root / "verify" / "release_verify.json").exists()
+
+    def test_release_force_bypasses_legacy_current_startup_verification(self, tmp_path: Path, monkeypatch):
+        source_root = tmp_path / "mutable-root"
+        releases_root = tmp_path / "releases"
+        artifact = source_root / "companies" / "VG" / "artifact.txt"
+        artifact.parent.mkdir(parents=True)
+        artifact.write_text("artifact", encoding="utf-8")
+
+        env_root = releases_root / "dev"
+        legacy_release = env_root / "old-v1"
+        legacy_release.mkdir(parents=True)
+        (legacy_release / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "format": "krw-ontology-release/v1",
+                    "env": "dev",
+                    "release_id": "old-v1",
+                    "index_path": "indexes/agent_index.sqlite",
+                },
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+        (env_root / "current").symlink_to("old-v1")
+
+        def fail_if_current_startup_verified(root, *args, **kwargs):
+            if Path(root) == env_root / "current" or Path(root).resolve() == legacy_release.resolve():
+                raise AssertionError("force release must not startup-verify legacy current")
+            return release_helpers.verify_release_startup(root, *args, **kwargs)
+
+        def fake_build_agent_index(root, *, index_path=None, force=True, source_manifest_path=None):
+            _write_minimal_agent_index(index_path or root / "indexes" / "agent_index.sqlite")
+            return {
+                "index_path": index_path or root / "indexes" / "agent_index.sqlite",
+                "totals": {"documents": 0, "objects": 0, "edges": 0, "quality_events": 0},
+            }
+
+        monkeypatch.setattr(cli_main, "verify_release_startup", fail_if_current_startup_verified)
+        monkeypatch.setattr(agent_index, "build_agent_index", fake_build_agent_index)
+
+        result = runner.invoke(
+            app,
+            [
+                "release",
+                "force",
+                "--from-root",
+                str(source_root),
+                "--releases-root",
+                str(releases_root),
+                "--env",
+                "dev",
+                "--release-id",
+                "new-v2",
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert os.readlink(env_root / "current") == "new-v2"
+        manifest = json.loads((env_root / "new-v2" / "manifest.json").read_text(encoding="utf-8"))
+        assert manifest["format"] == "krw-ontology-release/v2"
+        assert manifest["status"] == "ready"
 
     def test_release_build_and_import_current_have_distinct_promotion_semantics(
         self,
@@ -2321,6 +2432,58 @@ class TestReleaseCommand:
         assert "manifest_agent_index_schema_version_missing" in result.output
         assert "manifest_index_path_not_relative" in result.output
         assert "manifest_index_path_outside_root" in result.output
+
+    def test_release_verify_startup_check_rejects_legacy_v1_without_sqlite_open(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+    ):
+        release_root = tmp_path / "releases" / "prod" / "legacy-v1"
+        index_path = release_root / "indexes" / "agent_index.sqlite"
+        index_path.parent.mkdir(parents=True)
+        index_path.write_bytes(b"not a sqlite database")
+        (release_root / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "format": "krw-ontology-release/v1",
+                    "env": "prod",
+                    "release_id": "legacy-v1",
+                    "index_path": "indexes/agent_index.sqlite",
+                },
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+
+        def fail_connect(*_args, **_kwargs):
+            raise AssertionError("startup check must reject v1 before opening SQLite")
+
+        monkeypatch.setattr("krw_ontology.release.sqlite3.connect", fail_connect)
+
+        result = runner.invoke(
+            app,
+            ["release", "verify", "--startup-check", "--root", str(release_root), "--env", "prod"],
+        )
+
+        assert result.exit_code == 1, result.output
+        assert "Release verify: failed" in result.output
+        assert "mode: startup" in result.output
+        assert "manifest_format_unsupported" in result.output
+
+    def test_release_startup_check_uses_configured_dev_current_by_default(self, tmp_path: Path):
+        releases_root = tmp_path / "releases"
+        release_root = releases_root / "dev" / "ready"
+        _write_minimal_agent_index(release_root / "indexes" / "agent_index.sqlite")
+        write_release_manifest(release_root, release_id="ready", env="dev")
+        (releases_root / "dev" / "current").symlink_to("ready")
+        runner.invoke(app, ["config", "set", "publish-root", str(releases_root)])
+
+        result = runner.invoke(app, ["release", "startup-check"])
+
+        assert result.exit_code == 0, result.output
+        assert "Release startup-check: ok" in result.output
+        assert "release_id: ready" in result.output
+        assert f"root: {release_root.resolve()}" in result.output
 
     def test_release_verify_rejects_manifest_index_digest_mismatch(self, tmp_path: Path):
         release_root = tmp_path / "releases" / "prod" / "digest-bad"
@@ -4849,6 +5012,27 @@ def test_release_publish_dev_quarantines_new_release_candidate_when_index_build_
     assert not (releases_root / "dev" / "current").exists()
 
 
+def test_release_publish_dev_status_and_watch_use_configured_publish_root(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("KRW_ONTOLOGY_CLI_CONFIG", str(tmp_path / "config.json"))
+    releases_root = tmp_path / "releases"
+    release_root = releases_root / "dev" / "ready"
+    _write_minimal_agent_index(release_root / "indexes" / "agent_index.sqlite")
+    write_release_manifest(release_root, release_id="ready", env="dev")
+    (release_root / "logs").mkdir(parents=True)
+    (release_root / "logs" / "publish-dev.log").write_text("worker done\n", encoding="utf-8")
+    (releases_root / "dev" / "current").symlink_to("ready")
+    runner.invoke(app, ["config", "set", "publish-root", str(releases_root)])
+
+    status = runner.invoke(app, ["release", "publish-dev-status"])
+    watch = runner.invoke(app, ["release", "publish-dev-watch", "--no-follow"])
+
+    assert status.exit_code == 0, status.output
+    assert "release_id: ready" in status.output
+    assert f"release_root: {release_root.resolve()}" in status.output
+    assert watch.exit_code == 0, watch.output
+    assert "worker done" in watch.output
+
+
 def test_release_publish_dev_defaults_to_background_worker(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("KRW_ONTOLOGY_CLI_CONFIG", str(tmp_path / "config.json"))
     monkeypatch.setattr(cli_main, "_default_release_id", lambda: "20260603_120000")
@@ -4858,6 +5042,7 @@ def test_release_publish_dev_defaults_to_background_worker(tmp_path: Path, monke
     artifact.parent.mkdir(parents=True)
     artifact.write_text("{}\n")
     runner.invoke(app, ["config", "set", "running-root", str(running_root)])
+    runner.invoke(app, ["config", "set", "publish-root", str(releases_root)])
     calls = []
 
     class FakeProcess:
@@ -4871,7 +5056,7 @@ def test_release_publish_dev_defaults_to_background_worker(tmp_path: Path, monke
 
     monkeypatch.setattr(cli_main.subprocess, "Popen", fake_popen)
 
-    result = runner.invoke(app, ["release", "publish-dev", "--releases-root", str(releases_root)])
+    result = runner.invoke(app, ["release", "publish-dev"])
 
     release_root = releases_root / "dev" / "20260603_120000"
     assert result.exit_code == 0, result.output

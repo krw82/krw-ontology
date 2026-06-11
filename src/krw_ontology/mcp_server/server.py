@@ -37,7 +37,12 @@ from krw_ontology.mcp_server.tools import (
     topic_map_tool,
     trace_tool,
 )
-from krw_ontology.release import load_release_manifest, normalize_ontology_env, resolve_manifest_index_path
+from krw_ontology.release import (
+    load_release_manifest,
+    normalize_ontology_env,
+    resolve_manifest_index_path,
+    verify_release_startup,
+)
 
 mcp = FastMCP("krw_ontology_mcp")
 
@@ -65,6 +70,13 @@ def health_payload(
         if index_path is not None
         else resolve_manifest_index_path(root_path, release_manifest)
     )
+    startup_verification = verify_release_startup(
+        supplied_root_path,
+        env=configured_env,
+        index_path=Path(index_path) if index_path is not None else None,
+        require_current_symlink=configured_env == "prod",
+        check_sqlite=False,
+    )
     cache_status = mcp_runtime_cache_status()
     store_status = cache_status.get("store") if isinstance(cache_status.get("store"), dict) else {}
     payload = {
@@ -76,7 +88,9 @@ def health_payload(
         "env": release_manifest.get("env") or configured_env,
         "configured_env": configured_env,
         "manifest_path": str(release_manifest_path) if release_manifest_path else None,
-        "manifest_valid": bool(release_manifest),
+        "manifest_valid": bool(release_manifest) and startup_verification["ok"],
+        "startup_verification_ok": startup_verification["ok"],
+        "startup_verification_errors": list(startup_verification.get("errors") or []),
         "current_symlink": current_symlink["current_symlink"],
         "current_symlink_path": current_symlink["current_symlink_path"],
         "current_symlink_target": current_symlink["current_symlink_target"],
@@ -116,6 +130,9 @@ def health_payload(
         return payload, 503
     if not resolved_index_path.exists():
         payload["error"] = "agent_index_not_found"
+        return payload, 503
+    if not startup_verification["ok"]:
+        payload["error"] = "release_startup_verification_failed"
         return payload, 503
 
     payload["ok"] = True

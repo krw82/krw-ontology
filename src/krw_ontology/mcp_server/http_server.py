@@ -17,6 +17,7 @@ from krw_ontology.config.paths import (
     ONTOLOGY_RELEASE_ROOT_ENV,
     ONTOLOGY_ROOT_ENV,
 )
+from krw_ontology.agent_index.builder import DEFAULT_INDEX_RELATIVE_PATH
 from krw_ontology.mcp_server.server import mcp
 from krw_ontology.mcp_server.tools import ensure_persistent_store_open
 from krw_ontology.release import normalize_ontology_env, verify_release_root
@@ -70,17 +71,44 @@ def prepare_mcp_runtime(
             f"release_id mismatch: expected {expected_release_id}, got {release_id}"
         )
     manifest_path = verification.get("manifest_path")
-    resolved_index_path = verification["index_path"]
+    runtime_root = _absolute_without_resolving(root)
+    runtime_index_path = _runtime_index_path(
+        runtime_root=runtime_root,
+        verification=verification,
+        explicit_index_path=index_path,
+    )
 
     os.environ[ONTOLOGY_ENV_ENV] = resolved_env
-    os.environ[ONTOLOGY_RELEASE_ROOT_ENV] = verification["root"]
-    os.environ[ONTOLOGY_ROOT_ENV] = verification["root"]
+    os.environ[ONTOLOGY_RELEASE_ROOT_ENV] = str(runtime_root)
+    os.environ[ONTOLOGY_ROOT_ENV] = str(runtime_root)
     if manifest_path:
         os.environ[ONTOLOGY_MANIFEST_PATH_ENV] = str(manifest_path)
-    os.environ[ONTOLOGY_INDEX_PATH_ENV] = str(resolved_index_path)
+    os.environ[ONTOLOGY_INDEX_PATH_ENV] = str(runtime_index_path)
     os.environ["KRW_MCP_STORE_MODE"] = normalized_store_mode
-    ensure_persistent_store_open(Path(resolved_index_path))
+    ensure_persistent_store_open(runtime_index_path)
+    verification["runtime_root"] = str(runtime_root)
+    verification["runtime_index_path"] = str(runtime_index_path)
     return verification
+
+
+def _absolute_without_resolving(path: Path) -> Path:
+    return path.expanduser().absolute()
+
+
+def _runtime_index_path(
+    *,
+    runtime_root: Path,
+    verification: dict[str, Any],
+    explicit_index_path: Path | None,
+) -> Path:
+    if explicit_index_path is not None:
+        return _absolute_without_resolving(explicit_index_path)
+    manifest = verification.get("manifest") if isinstance(verification.get("manifest"), dict) else {}
+    manifest_index_path = manifest.get("index_path") if isinstance(manifest, dict) else None
+    if isinstance(manifest_index_path, str) and manifest_index_path:
+        candidate = Path(manifest_index_path).expanduser()
+        return candidate.absolute() if candidate.is_absolute() else runtime_root / candidate
+    return runtime_root / DEFAULT_INDEX_RELATIVE_PATH
 
 
 def serve(

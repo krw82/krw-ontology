@@ -4,17 +4,23 @@ from __future__ import annotations
 
 import os
 import json
+import sqlite3
+import tarfile
 from pathlib import Path
 
 import pytest
+import yaml
 from typer.testing import CliRunner
 
 import krw_ontology.agent_index as agent_index
+import krw_ontology.agent_index.builder as agent_index_builder
 import krw_ontology.cli.main as cli_main
+import krw_ontology.release as release_helpers
 import krw_ontology.pipeline.orchestrator as orchestrator
 import krw_ontology.pipeline.queue as pipeline_queue
 import krw_ontology.pipeline.research_plan as research_plan
 import krw_ontology.pipeline.stages.build_company_context as company_context_stage
+from krw_ontology.agent_index.builder import AGENT_INDEX_SCHEMA_VERSION
 from krw_ontology.cli.config import load_cli_config
 from krw_ontology.cli.main import app
 from krw_ontology.release import write_release_manifest
@@ -23,17 +29,154 @@ from krw_ontology.pipeline.research_plan import ResearchFilingTarget
 runner = CliRunner()
 
 
-def _write_company_context_artifact(root: Path, ticker: str) -> Path:
-    artifact_payload = (
-        '{"artifacts":[],"counts":{"company_business_profiles":1,'
-        '"trend_observations":1,"change_events":1,"temporal_links":1,"edges":1}}'
+def _write_minimal_agent_index(index_path: Path) -> None:
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+    (index_path.parent.parent / "companies" / "TEST").mkdir(parents=True, exist_ok=True)
+    index_path.unlink(missing_ok=True)
+    with sqlite3.connect(index_path) as conn:
+        agent_index_builder._create_schema(conn)
+        conn.execute(
+            "INSERT INTO metadata(key, value) VALUES('build', ?)",
+            (
+                json.dumps(
+                    {
+                        "schema_version": AGENT_INDEX_SCHEMA_VERSION,
+                        "agent_index_schema_version": AGENT_INDEX_SCHEMA_VERSION,
+                    }
+                ),
+            ),
+        )
+    _write_minimal_artifact_manifest(index_path.parent / "artifact_manifest.json")
+
+
+def _write_minimal_artifact_manifest(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "format": "krw-agent-index-artifact-manifest/v1",
+                "artifact_count": 0,
+                "artifacts": [],
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
     )
+
+
+def _write_global_topic_ranking_smoke_fixture(root: Path) -> Path:
+    index_path = root / "indexes" / "agent_index.sqlite"
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(index_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE company_topic_index(
+                topic_id TEXT,
+                topic_label TEXT,
+                topic_summary TEXT,
+                ticker TEXT,
+                boilerplate_score REAL
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO company_topic_index(
+                topic_id,
+                topic_label,
+                topic_summary,
+                ticker,
+                boilerplate_score
+            )
+            VALUES(
+                'topic:VG:risk',
+                'Regulatory risk',
+                'Regulatory risk could delay approvals.',
+                'VG',
+                0
+            )
+            """
+        )
+    (index_path.parent / "shard_manifest.json").write_text("{}", encoding="utf-8")
+    (index_path.parent / "global_topics.sqlite").touch()
+    return index_path
+
+
+def _topic_discovery_payload(
+    *,
+    topic_ids: list[str],
+    route_mode: str | None = None,
+    object_fallback: bool = False,
+) -> dict:
+    matched_topics = [
+        {
+            "topic_id": topic_id,
+            "ticker": "VG",
+            "matched_topics": [],
+        }
+        for topic_id in topic_ids
+    ]
+    diagnostics: dict = {"fts_strategy": "global_and_first"}
+    if route_mode is not None:
+        diagnostics["routing"] = {"mode": route_mode}
+    if object_fallback:
+        diagnostics["object_fallback"] = {"mode": "compact_object_fallback"}
+    return {
+        "ticker_candidates": [
+            {
+                "ticker": "VG",
+                "matched_topics": matched_topics,
+            }
+        ],
+        "results_by_ticker": {"VG": matched_topics},
+        "search_diagnostics": diagnostics,
+    }
+
+
+def _write_ranking_quality_report(path: Path, *, release_id: str, samples: list[dict]) -> None:
+    payload = {
+        "format": "krw-ontology-ranking-quality/v1",
+        "generated_at": "2026-06-11T00:00:00+00:00",
+        "release_id": release_id,
+        "env": "prod",
+        "index_path": "/data/indexes/agent_index.sqlite",
+        "ranking_quality_hash": "0" * 64,
+        "ok": True,
+        "errors": [],
+        "warnings": [],
+        "summary": {"check_count": 1},
+        "checks": [
+            {
+                "name": "global_topic_ranking",
+                "status": "passed",
+                "top_k": 5,
+                "samples": samples,
+            }
+        ],
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+
+
+def _write_company_context_artifact(root: Path, ticker: str) -> Path:
+    artifact_payload = {
+        "ticker": ticker.upper(),
+        "document_type": "COMPANY",
+        "doc_type_key": "COMPANY",
+        "period": "ALL",
+        "artifacts": [],
+        "counts": {
+            "company_business_profiles": 1,
+            "trend_observations": 1,
+            "change_events": 1,
+            "temporal_links": 1,
+            "edges": 1,
+        },
+    }
     artifact_index_path = root / "companies" / ticker / "context" / "artifact_index.json"
     artifact_index_path.parent.mkdir(parents=True, exist_ok=True)
-    artifact_index_path.write_text(artifact_payload, encoding="utf-8")
-    compatibility_path = root / "companies" / ticker / "company_context" / "artifact_index.json"
-    compatibility_path.parent.mkdir(parents=True, exist_ok=True)
-    compatibility_path.write_text(artifact_payload, encoding="utf-8")
+    artifact_index_path.write_text(json.dumps(artifact_payload, sort_keys=True), encoding="utf-8")
     return artifact_index_path
 
 
@@ -214,7 +357,7 @@ class TestBuildResearchPipelineCommand:
         def fake_run_pipeline(**kwargs):
             pipeline_calls.append(kwargs)
 
-        def fake_build_agent_index(root, *, index_path=None, force=True):
+        def fake_build_agent_index(root, *, index_path=None, force=True, source_manifest_path=None):
             index_calls.append((root, index_path, force))
             return {
                 "index_path": root / "indexes" / "agent_index.sqlite",
@@ -267,7 +410,7 @@ class TestBuildResearchPipelineCommand:
         def fake_run_pipeline(**kwargs):
             raise RuntimeError("boom")
 
-        def fake_build_agent_index(root, *, index_path=None, force=True):
+        def fake_build_agent_index(root, *, index_path=None, force=True, source_manifest_path=None):
             index_calls.append((root, index_path, force))
             return {
                 "index_path": root / "indexes" / "agent_index.sqlite",
@@ -322,10 +465,11 @@ class TestBuildResearchPipelineCommand:
                 "counts": {"company_business_profiles": 1},
             }
 
-        def fake_build_agent_index(root, *, index_path=None, force=True):
+        def fake_build_agent_index(root, *, index_path=None, force=True, source_manifest_path=None):
             events.append(("index", root))
+            _write_minimal_agent_index(index_path or root / "indexes" / "agent_index.sqlite")
             return {
-                "index_path": root / "indexes" / "agent_index.sqlite",
+                "index_path": index_path or root / "indexes" / "agent_index.sqlite",
                 "totals": {"documents": 1, "objects": 2, "edges": 0, "quality_events": 0},
             }
 
@@ -344,19 +488,22 @@ class TestBuildResearchPipelineCommand:
                 str(running),
                 "--publish-root",
                 str(stable),
+                "--release-id",
+                "research-rel",
             ],
         )
 
+        release_root = stable / "dev" / "research-rel"
         assert result.exit_code == 0
-        assert (stable / "companies" / "AAPL" / "artifact.txt").read_text() == "AAPL"
-        assert (stable / "companies" / "MSFT" / "artifact.txt").read_text() == "MSFT"
+        assert (release_root / "companies" / "AAPL" / "artifact.txt").read_text() == "AAPL"
+        assert (release_root / "companies" / "MSFT" / "artifact.txt").read_text() == "MSFT"
+        assert (stable / "dev" / "current").readlink() == Path("research-rel")
         assert events == [
             ("pipeline", "AAPL"),
             ("context", "AAPL"),
-            ("index", stable.resolve()),
             ("pipeline", "MSFT"),
             ("context", "MSFT"),
-            ("index", stable.resolve()),
+            ("index", release_root),
             ("index", running.resolve()),
         ]
         assert "Published AAPL" in result.output
@@ -396,10 +543,11 @@ class TestBuildResearchPipelineCommand:
                 "counts": {"company_business_profiles": 1},
             }
 
-        def fake_build_agent_index(root, *, index_path=None, force=True):
+        def fake_build_agent_index(root, *, index_path=None, force=True, source_manifest_path=None):
             index_calls.append(root)
+            _write_minimal_agent_index(index_path or root / "indexes" / "agent_index.sqlite")
             return {
-                "index_path": root / "indexes" / "agent_index.sqlite",
+                "index_path": index_path or root / "indexes" / "agent_index.sqlite",
                 "totals": {"documents": 1, "objects": 2, "edges": 0, "quality_events": 0},
             }
 
@@ -419,13 +567,17 @@ class TestBuildResearchPipelineCommand:
                 "--publish-root",
                 str(stable),
                 "--continue-on-error",
+                "--release-id",
+                "research-partial",
             ],
         )
 
+        release_root = stable / "dev" / "research-partial"
         assert result.exit_code == 1
-        assert not (stable / "companies" / "AAPL").exists()
-        assert (stable / "companies" / "MSFT" / "artifact.txt").read_text() == "MSFT"
-        assert index_calls == [stable.resolve(), running.resolve()]
+        assert not (release_root / "companies" / "AAPL").exists()
+        assert (release_root / "companies" / "MSFT" / "artifact.txt").read_text() == "MSFT"
+        assert (stable / "dev" / "current").readlink() == Path("research-partial")
+        assert index_calls == [release_root, running.resolve()]
         assert "Skipping publish for AAPL" in result.output
         assert "Published MSFT" in result.output
 
@@ -453,10 +605,11 @@ class TestUpdateTickerCommand:
                 "counts": {"company_business_profiles": 1},
             }
 
-        def fake_build_agent_index(root, *, index_path=None, force=True):
+        def fake_build_agent_index(root, *, index_path=None, force=True, source_manifest_path=None):
             events.append(("index", root, index_path, force))
+            _write_minimal_agent_index(index_path or root / "indexes" / "agent_index.sqlite")
             return {
-                "index_path": root / "indexes" / "agent_index.sqlite",
+                "index_path": index_path or root / "indexes" / "agent_index.sqlite",
                 "totals": {"documents": 1, "objects": 2, "edges": 0, "quality_events": 0},
             }
 
@@ -477,9 +630,12 @@ class TestUpdateTickerCommand:
                 str(running),
                 "--publish-root",
                 str(stable),
+                "--release-id",
+                "rel-update",
             ],
         )
 
+        release_root = stable / "dev" / "rel-update"
         assert result.exit_code == 0
         pipeline_kwargs = events[0][1]
         assert pipeline_kwargs["ticker"] == "CVX"
@@ -488,8 +644,9 @@ class TestUpdateTickerCommand:
         assert pipeline_kwargs["latest"] is False
         assert pipeline_kwargs["output_dir"] == running.resolve()
         assert events[1] == ("context", running.resolve(), "CVX")
-        assert events[2] == ("index", stable.resolve(), None, True)
-        assert (stable / "companies" / "CVX" / "artifact.txt").read_text() == "FY2026Q1"
+        assert events[2] == ("index", release_root, release_root / "indexes" / "agent_index.sqlite", True)
+        assert (release_root / "companies" / "CVX" / "artifact.txt").read_text() == "FY2026Q1"
+        assert (stable / "dev" / "current").readlink() == Path("rel-update")
         assert "Published CVX" in result.output
 
     def test_update_ticker_accepts_multiple_periods_and_publishes_once(
@@ -514,10 +671,11 @@ class TestUpdateTickerCommand:
                 "counts": {"company_business_profiles": 1},
             }
 
-        def fake_build_agent_index(root, *, index_path=None, force=True):
+        def fake_build_agent_index(root, *, index_path=None, force=True, source_manifest_path=None):
             events.append(("index", root, index_path, force))
+            _write_minimal_agent_index(index_path or root / "indexes" / "agent_index.sqlite")
             return {
-                "index_path": root / "indexes" / "agent_index.sqlite",
+                "index_path": index_path or root / "indexes" / "agent_index.sqlite",
                 "totals": {"documents": 2, "objects": 4, "edges": 0, "quality_events": 0},
             }
 
@@ -540,18 +698,22 @@ class TestUpdateTickerCommand:
                 str(running),
                 "--publish-root",
                 str(stable),
+                "--release-id",
+                "rel-multi",
             ],
         )
 
+        release_root = stable / "dev" / "rel-multi"
         assert result.exit_code == 0
         assert events == [
             ("pipeline", "FY2026Q1"),
             ("pipeline", "FY2026Q2"),
             ("context", running.resolve(), "CVX"),
-            ("index", stable.resolve(), None, True),
+            ("index", release_root, release_root / "indexes" / "agent_index.sqlite", True),
         ]
-        assert (stable / "companies" / "CVX" / "FY2026Q1.txt").read_text() == "FY2026Q1"
-        assert (stable / "companies" / "CVX" / "FY2026Q2.txt").read_text() == "FY2026Q2"
+        assert (release_root / "companies" / "CVX" / "FY2026Q1.txt").read_text() == "FY2026Q1"
+        assert (release_root / "companies" / "CVX" / "FY2026Q2.txt").read_text() == "FY2026Q2"
+        assert (stable / "dev" / "current").readlink() == Path("rel-multi")
         assert "Filing pipeline complete for CVX 10-Q FY2026Q1" in result.output
         assert "Filing pipeline complete for CVX 10-Q FY2026Q2" in result.output
 
@@ -655,7 +817,7 @@ class TestUpdateTickerCommand:
             (ticker_dir / "partial.txt").write_text("partial")
             raise RuntimeError("boom")
 
-        def fake_build_agent_index(root, *, index_path=None, force=True):
+        def fake_build_agent_index(root, *, index_path=None, force=True, source_manifest_path=None):
             index_calls.append(root)
             return {
                 "index_path": root / "indexes" / "agent_index.sqlite",
@@ -685,6 +847,180 @@ class TestUpdateTickerCommand:
         assert "stage=filing_pipeline" in result.output
 
 
+class TestObservabilityCommand:
+    def test_render_alertmanager_reads_env_without_echoing_secret_urls(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        output_path = tmp_path / "alertmanager.yml"
+        secret_urls = {
+            "KRW_ALERTMANAGER_DEFAULT_WEBHOOK_URL": "https://alerts.example/default?token=secret-default",
+            "KRW_ALERTMANAGER_CRITICAL_WEBHOOK_URL": "https://alerts.example/critical?token=secret-critical",
+            "KRW_ALERTMANAGER_WARNING_WEBHOOK_URL": "https://alerts.example/warning?token=secret-warning",
+        }
+        for key, value in secret_urls.items():
+            monkeypatch.setenv(key, value)
+
+        result = runner.invoke(
+            app,
+            [
+                "observability",
+                "render-alertmanager",
+                "--output",
+                str(output_path),
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert output_path.exists()
+        for value in secret_urls.values():
+            assert value not in result.output
+        assert "alertmanager_config:" in result.output
+        assert "receiver_critical: KRW_ALERTMANAGER_CRITICAL_WEBHOOK_URL" in result.output
+
+        payload = yaml.safe_load(output_path.read_text(encoding="utf-8"))
+        receivers = {receiver["name"]: receiver for receiver in payload["receivers"]}
+        assert receivers["krw-ontology-mcp-default"]["webhook_configs"][0]["url"] == secret_urls[
+            "KRW_ALERTMANAGER_DEFAULT_WEBHOOK_URL"
+        ]
+        assert receivers["krw-ontology-mcp-critical"]["webhook_configs"][0]["url"] == secret_urls[
+            "KRW_ALERTMANAGER_CRITICAL_WEBHOOK_URL"
+        ]
+        assert receivers["krw-ontology-mcp-warning"]["webhook_configs"][0]["url"] == secret_urls[
+            "KRW_ALERTMANAGER_WARNING_WEBHOOK_URL"
+        ]
+
+    def test_render_alertmanager_fails_without_receiver_urls(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        for key in (
+            "KRW_ALERTMANAGER_DEFAULT_WEBHOOK_URL",
+            "KRW_ALERTMANAGER_CRITICAL_WEBHOOK_URL",
+            "KRW_ALERTMANAGER_WARNING_WEBHOOK_URL",
+        ):
+            monkeypatch.delenv(key, raising=False)
+
+        result = runner.invoke(
+            app,
+            [
+                "observability",
+                "render-alertmanager",
+                "--output",
+                str(tmp_path / "alertmanager.yml"),
+            ],
+        )
+
+        assert result.exit_code == 1
+        assert "missing receiver URLs" in result.output
+
+    def test_render_prometheus_alerts_uses_threshold_options(self, tmp_path: Path):
+        output_path = tmp_path / "prometheus-alerts.yml"
+
+        result = runner.invoke(
+            app,
+            [
+                "observability",
+                "render-prometheus-alerts",
+                "--output",
+                str(output_path),
+                "--mcp-down-for",
+                "4m",
+                "--hot-swap-retired-age-seconds",
+                "600",
+                "--rotation-window",
+                "45m",
+                "--rotation-count",
+                "9",
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "prometheus_alerts:" in result.output
+        assert "threshold_hot_swap_retired_age_seconds: 600 (argument)" in result.output
+        assert "threshold_rotation_count: 9 (argument)" in result.output
+
+        payload = yaml.safe_load(output_path.read_text(encoding="utf-8"))
+        rules = {rule["alert"]: rule for rule in payload["groups"][0]["rules"]}
+        assert rules["KRWOntologyMCPDown"]["for"] == "4m"
+        assert rules["KRWOntologyMCPHotSwapStuck"]["expr"].endswith("> 600")
+        assert rules["KRWOntologyMCPExcessiveRotations"]["expr"] == (
+            "increase(krw_ontology_mcp_store_rotations_total[45m]) > 9"
+        )
+
+    def test_render_prometheus_alerts_rejects_invalid_duration(self, tmp_path: Path):
+        result = runner.invoke(
+            app,
+            [
+                "observability",
+                "render-prometheus-alerts",
+                "--output",
+                str(tmp_path / "prometheus-alerts.yml"),
+                "--mcp-down-for",
+                "minutes",
+            ],
+        )
+
+        assert result.exit_code == 1
+        assert "mcp_down_for must be a Prometheus duration" in result.output
+
+    def test_observability_doctor_rejects_prod_local_receivers(self):
+        result = runner.invoke(app, ["observability", "doctor"])
+
+        assert result.exit_code == 1
+        assert "Observability doctor" in result.output
+        assert "webhook_url_localhost" in result.output
+
+    def test_observability_doctor_accepts_rendered_configs(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        alertmanager_path = tmp_path / "alertmanager.yml"
+        report_path = tmp_path / "observability-doctor.json"
+        for key, value in {
+            "KRW_ALERTMANAGER_DEFAULT_WEBHOOK_URL": "https://alerts.example/default",
+            "KRW_ALERTMANAGER_CRITICAL_WEBHOOK_URL": "https://alerts.example/critical",
+            "KRW_ALERTMANAGER_WARNING_WEBHOOK_URL": "https://alerts.example/warning",
+        }.items():
+            monkeypatch.setenv(key, value)
+        render_result = runner.invoke(
+            app,
+            [
+                "observability",
+                "render-alertmanager",
+                "--output",
+                str(alertmanager_path),
+            ],
+        )
+
+        result = runner.invoke(
+            app,
+            [
+                "observability",
+                "doctor",
+                "--alertmanager",
+                str(alertmanager_path),
+                "--write-report",
+                str(report_path),
+            ],
+        )
+
+        assert render_result.exit_code == 0, render_result.output
+        assert result.exit_code == 0, result.output
+        assert "Observability doctor passed." in result.output
+        assert "observability_report:" in result.output
+        assert "observability_audit_hash:" in result.output
+        assert "alertmanager_receiver_count: 3" in result.output
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        assert report["format"] == "krw-ontology-observability-doctor/v1"
+        assert report["ok"] is True
+        assert len(report["audit_hash"]) == 64
+        assert len(report["alertmanager"]["sha256"]) == 64
+
+
 class TestConfigCommand:
     def test_config_set_show_and_unset(self, tmp_path: Path):
         running = tmp_path / "running"
@@ -709,6 +1045,17 @@ class TestConfigCommand:
         assert "Set prod-host=ubuntu@prod" in set_result.output
         assert show_result.exit_code == 0
         assert "prod-host: ubuntu@prod" in show_result.output
+
+
+def test_release_publish_config_infers_releases_root_from_prepared_release_root(tmp_path: Path):
+    releases_root = tmp_path / "releases"
+    prepared_release = releases_root / "dev" / "prepared"
+    prepared_release.mkdir(parents=True)
+
+    resolved_root, resolved_env = cli_main._resolve_release_publish_config(prepared_release)
+
+    assert resolved_root == releases_root.resolve()
+    assert resolved_env == "dev"
 
 
 class TestProdCommand:
@@ -740,6 +1087,43 @@ class TestProdCommand:
         assert "prod-health-url: http://127.0.0.1:8000/health" in show_result.output
         assert "prod-keep-releases: 3" in show_result.output
 
+    def test_prod_activation_quarantines_failed_release_before_current_switch(self, tmp_path: Path):
+        remote_root = tmp_path / "remote"
+        release_id = "bad-release"
+        incoming = remote_root / "incoming"
+        old_release = remote_root / "releases" / "old-release"
+        incoming.mkdir(parents=True)
+        old_release.mkdir(parents=True)
+        (remote_root / "current").symlink_to("releases/old-release")
+        bundle_source = tmp_path / "bundle-source"
+        bundle_source.mkdir()
+        (bundle_source / "manifest.json").write_text(
+            json.dumps({"env": "prod", "release_id": release_id}, sort_keys=True),
+            encoding="utf-8",
+        )
+        with tarfile.open(incoming / f"{release_id}.tar.gz", "w:gz") as archive:
+            archive.add(bundle_source / "manifest.json", arcname="manifest.json")
+
+        script = cli_main._prod_activation_script(
+            remote_root=str(remote_root),
+            release_id=release_id,
+            reload_command=None,
+            health_url=None,
+            keep_releases=5,
+        )
+        completed = cli_main.subprocess.run(
+            ["sh"],
+            input=script,
+            text=True,
+            capture_output=True,
+        )
+
+        assert completed.returncode != 0
+        assert "agent_index.sqlite missing" in completed.stderr
+        assert os.readlink(remote_root / "current") == "releases/old-release"
+        assert not (remote_root / "releases" / release_id).exists()
+        assert (remote_root / "failed" / release_id / "manifest.json").exists()
+
     def test_prod_publish_uploads_bundle_and_activates_release(
         self,
         tmp_path: Path,
@@ -748,8 +1132,7 @@ class TestProdCommand:
         stable = tmp_path / "stable"
         (stable / "companies" / "AAPL").mkdir(parents=True)
         (stable / "companies" / "AAPL" / "artifact.txt").write_text("ok")
-        (stable / "indexes").mkdir()
-        (stable / "indexes" / "agent_index.sqlite").write_text("sqlite")
+        _write_minimal_agent_index(stable / "indexes" / "agent_index.sqlite")
         runner.invoke(
             app,
             [
@@ -768,6 +1151,8 @@ class TestProdCommand:
             ],
         )
         run_calls = []
+        bundle_members = []
+        bundle_manifest = {}
 
         class FakeCompleted:
             returncode = 0
@@ -776,6 +1161,12 @@ class TestProdCommand:
 
         def fake_run(command, *, input=None, text, capture_output):
             run_calls.append((command, input))
+            if command[0] == "scp":
+                with tarfile.open(command[1], "r:gz") as archive:
+                    bundle_members.extend(archive.getnames())
+                    manifest_file = archive.extractfile("manifest.json")
+                    assert manifest_file is not None
+                    bundle_manifest.update(json.loads(manifest_file.read().decode("utf-8")))
             return FakeCompleted()
 
         monkeypatch.setattr(cli_main, "_new_release_id", lambda: "20260515-000000")
@@ -804,6 +1195,142 @@ class TestProdCommand:
         assert "HEALTH_URL=http://127.0.0.1:8000/health" in activation_script
         assert "Release manifest env is not prod" in activation_script
         assert "agent_index.sqlite missing" in activation_script
+        assert "python3 missing for remote SQLite verification" in activation_script
+        assert "remote manifest missing index_path" in activation_script
+        assert "remote index_sha256 mismatch" in activation_script
+        assert "remote manifest missing artifact_manifest_path" in activation_script
+        assert "remote artifact_manifest_sha256 mismatch" in activation_script
+        assert "remote manifest v2 missing indexes" in activation_script
+        assert "remote manifest v2 output sha256 mismatch" in activation_script
+        assert "quarantine_failed_release" in activation_script
+        assert 'rm -f "$ROOT/current"' in activation_script
+        assert 'for pragma in ("integrity_check", "quick_check")' in activation_script
+        assert '"PRAGMA %s" % pragma' in activation_script
+        assert "required monolith table missing" in activation_script
+        assert "remote_sqlite_verification=ok" in activation_script
+        assert "release_verify.json missing" in activation_script
+        assert "smoke_queries.json missing" in activation_script
+        assert "ranking_quality.json missing" in activation_script
+        assert "ranking_quality_hash mismatch" in activation_script
+        assert '"ranking_quality_path": "verify/ranking_quality.json"' in activation_script
+        assert 'ACTIVATION_LOG="$ROOT/activation_logs/$RELEASE_ID.log"' in activation_script
+        assert 'ACTIVATION_EVENTS="$ROOT/activation_events/$RELEASE_ID.jsonl"' in activation_script
+        assert 'ACTIVATION_LOG="$ROOT/releases/$RELEASE_ID/' not in activation_script
+        assert "activation_event \"current_switched\" \"ok\"" in activation_script
+        assert "rollback reload_failed" in activation_script
+        assert "rollback health_failed" in activation_script
+        assert "rollback health_not_ok" in activation_script
+        assert "rollback health_release_mismatch" in activation_script
+        assert '"release_id"[[:space:]]*:[[:space:]]*"\'"$RELEASE_ID"\'"' in activation_script
+        assert "manifest.json" in bundle_members
+        assert "release_manifest.json" not in bundle_members
+        assert "verify/release_verify.json" in bundle_members
+        assert "verify/smoke_queries.json" in bundle_members
+        assert "verify/ranking_quality.json" in bundle_members
+        assert "companies/AAPL/artifact.txt" in bundle_members
+        assert bundle_manifest["env"] == "prod"
+        assert bundle_manifest["release_id"] == "20260515-000000"
+
+    def test_prod_delta_activation_reconstructs_release_from_current(self, tmp_path: Path):
+        remote_root = tmp_path / "remote"
+        old_release = remote_root / "releases" / "old-release"
+        old_release.mkdir(parents=True)
+        _write_minimal_agent_index(old_release / "indexes" / "agent_index.sqlite")
+        (old_release / "companies" / "VG").mkdir(parents=True)
+        (old_release / "companies" / "VG" / "old.txt").write_text("old", encoding="utf-8")
+        write_release_manifest(old_release, release_id="old-release", env="prod")
+        release_helpers.write_release_verification_report(old_release, env="prod")
+        (remote_root / "current").symlink_to("releases/old-release")
+
+        stable = tmp_path / "stable"
+        cli_main._materialize_prod_bundle_root(old_release, stable)
+        (stable / "companies" / "VG" / "old.txt").unlink()
+        (stable / "companies" / "VG" / "new.txt").write_text("new", encoding="utf-8")
+        candidate = tmp_path / "candidate" / "delta-release"
+        cli_main._materialize_verified_prod_release(stable, candidate, "delta-release")
+        remote_files = cli_main._local_release_file_map(old_release)
+        delta_bundle = remote_root / "incoming" / "delta-release.delta.tar.gz"
+        delta_summary = cli_main._build_prod_release_delta_bundle(
+            candidate,
+            delta_bundle,
+            remote_files=remote_files,
+        )
+
+        script = cli_main._prod_activation_script(
+            remote_root=str(remote_root),
+            release_id="delta-release",
+            reload_command=None,
+            health_url=None,
+            keep_releases=5,
+        )
+        assert delta_summary["changed_file_count"] > 0
+        assert "companies/VG/old.txt" in delta_summary["removed_paths"]
+        with tarfile.open(delta_bundle, "r:gz") as archive:
+            members = set(archive.getnames())
+            delta_manifest_file = archive.extractfile(".krw_delta_manifest.json")
+            assert delta_manifest_file is not None
+            delta_manifest = json.loads(delta_manifest_file.read().decode("utf-8"))
+        assert ".krw_delta_manifest.json" in members
+        assert "companies/VG/new.txt" in members
+        assert "companies/VG/old.txt" not in members
+        assert "companies/VG/old.txt" in delta_manifest["removed"]
+        assert 'DELTA_BUNDLE="$ROOT/incoming/$RELEASE_ID.delta.tar.gz"' in script
+        assert 'tar -C "$ROOT/$CURRENT_TARGET" -cf - .' in script
+        assert "delta remove path escapes release root" in script
+
+    def test_prod_rollback_verifies_target_before_switch(self, monkeypatch):
+        runner.invoke(
+            app,
+            [
+                "prod",
+                "configure",
+                "--host",
+                "ubuntu@prod",
+                "--remote-root",
+                "/srv/krw-ontology-data",
+                "--reload-command",
+                "sudo systemctl restart krw-ontology-mcp",
+                "--health-url",
+                "http://127.0.0.1:8000/health",
+            ],
+        )
+        run_calls = []
+
+        class FakeCompleted:
+            returncode = 0
+            stderr = ""
+            stdout = "releases/20260515-000000\n"
+
+        def fake_run(command, *, input=None, text, capture_output):
+            run_calls.append((command, input))
+            return FakeCompleted()
+
+        monkeypatch.setattr(cli_main.subprocess, "run", fake_run)
+
+        result = runner.invoke(app, ["prod", "rollback", "20260515-000000"])
+
+        assert result.exit_code == 0
+        assert "Prod rollback activated release=20260515-000000" in result.output
+        assert [call[0][0] for call in run_calls] == ["ssh"]
+        rollback_script = run_calls[0][1]
+        assert "Rollback release manifest env is not prod" in rollback_script
+        assert "Rollback agent_index.sqlite missing" in rollback_script
+        assert "python3 missing for rollback SQLite verification" in rollback_script
+        assert "rollback manifest missing index_path" in rollback_script
+        assert "rollback index_sha256 mismatch" in rollback_script
+        assert "rollback manifest missing artifact_manifest_path" in rollback_script
+        assert "rollback artifact_manifest_sha256 mismatch" in rollback_script
+        assert "rollback manifest v2 missing indexes" in rollback_script
+        assert "rollback manifest v2 output sha256 mismatch" in rollback_script
+        assert 'for pragma in ("integrity_check", "quick_check")' in rollback_script
+        assert "rollback release_verify.json missing" in rollback_script
+        assert "rollback ranking_quality_hash mismatch" in rollback_script
+        assert "restore_current reload_failed" in rollback_script
+        assert "restore_current health_failed" in rollback_script
+        assert "restore_current health_not_ok" in rollback_script
+        assert "restore_current health_release_mismatch" in rollback_script
+        assert '"release_id"[[:space:]]*:[[:space:]]*"\'"$TARGET_RELEASE_ID"\'"' in rollback_script
+        assert rollback_script.index("rollback release_verify.json missing") < rollback_script.index('ln -sfn "$TARGET"')
 
     def test_prod_publish_dry_run_skips_subprocess(self, tmp_path: Path, monkeypatch):
         stable = tmp_path / "stable"
@@ -833,6 +1360,63 @@ class TestProdCommand:
         assert "Prod publish dry run" in result.output
         assert "No upload performed." in result.output
         assert run_calls == []
+
+    def test_prod_publish_uses_configured_release_current_by_default(self, tmp_path: Path, monkeypatch):
+        releases_root = tmp_path / "releases"
+        release_root = releases_root / "dev" / "ready"
+        release_root.mkdir(parents=True)
+        (releases_root / "dev" / "current").symlink_to("ready")
+        runner.invoke(app, ["config", "set", "publish-root", str(releases_root)])
+        runner.invoke(
+            app,
+            [
+                "prod",
+                "configure",
+                "--host",
+                "ubuntu@prod",
+                "--remote-root",
+                "/srv/krw-ontology-data",
+            ],
+        )
+        calls: list[Path] = []
+        monkeypatch.setattr(
+            cli_main,
+            "_try_get_prod_status",
+            lambda **kwargs: {"current_kind": "missing", "releases": []},
+        )
+
+        def fake_publish_prod_root(*, stable_root, **kwargs):
+            calls.append(stable_root)
+            return {
+                "release_id": "prod-release",
+                "stable_root": str(stable_root),
+                "host": "ubuntu@prod",
+                "remote_root": "/srv/krw-ontology-data",
+                "keep_releases": 5,
+                "upload_mode": "delta",
+                "changed_file_count": 0,
+                "removed_file_count": 0,
+            }
+
+        monkeypatch.setattr(cli_main, "_publish_prod_root", fake_publish_prod_root)
+
+        result = runner.invoke(app, ["prod", "publish", "--delta"])
+
+        assert result.exit_code == 0, result.output
+        assert calls == [release_root.resolve()]
+
+    def test_quality_check_uses_configured_release_current_by_default(self, tmp_path: Path):
+        releases_root = tmp_path / "releases"
+        release_root = releases_root / "dev" / "ready"
+        _write_minimal_agent_index(release_root / "indexes" / "agent_index.sqlite")
+        (releases_root / "dev" / "current").symlink_to("ready")
+        runner.invoke(app, ["config", "set", "publish-root", str(releases_root)])
+
+        result = runner.invoke(app, ["quality", "check", "--min-docs", "1"])
+
+        assert result.exit_code == 0, result.output
+        assert "Release: dev/current" in result.output
+        assert f"Index: {release_root.resolve() / 'indexes' / 'agent_index.sqlite'}" in result.output
 
     def test_prod_status_shows_current_release(self, monkeypatch):
         runner.invoke(
@@ -902,6 +1486,8 @@ class TestProdCommand:
                 completed.stdout = "\n".join(
                     [
                         "required_commands_missing=",
+                        "python_bin=/usr/bin/python3",
+                        "python_sqlite3=yes",
                         "root_state=exists",
                         "root_writable=yes",
                         "parent_writable=unknown",
@@ -918,19 +1504,404 @@ class TestProdCommand:
 
         assert result.exit_code == 0
         assert "OK ssh connectivity" in result.output
+        assert "OK remote publish commands: tar ln mv rm mkdir ls readlink xargs grep sed" in result.output
+        assert "OK remote Python sqlite3: /usr/bin/python3" in result.output
         assert "WARN Remote current is a directory" in result.output
         assert "Prod doctor passed." in result.output
         assert [call[0][0] for call in calls] == ["ssh", "ssh"]
 
+    def test_prod_doctor_rejects_missing_remote_python_sqlite3(self, tmp_path: Path, monkeypatch):
+        stable = tmp_path / "stable"
+        stable.mkdir()
+        runner.invoke(
+            app,
+            [
+                "prod",
+                "configure",
+                "--host",
+                "ubuntu@prod",
+                "--remote-root",
+                "/srv/krw-ontology-data",
+            ],
+        )
+
+        class FakeCompleted:
+            returncode = 0
+            stderr = ""
+            stdout = ""
+
+        def fake_run(command, *, input=None, text, capture_output):
+            completed = FakeCompleted()
+            if input and "python_sqlite3" in input:
+                completed.stdout = "\n".join(
+                    [
+                        "required_commands_missing=",
+                        "python_bin=/usr/bin/python3",
+                        "python_sqlite3=no",
+                        "root_state=exists",
+                        "root_writable=yes",
+                        "parent_writable=unknown",
+                        "current_kind=symlink",
+                        "current_target=releases/current-release",
+                        "",
+                    ]
+                )
+            return completed
+
+        monkeypatch.setattr(cli_main.subprocess, "run", fake_run)
+
+        result = runner.invoke(app, ["prod", "doctor", "--root", str(stable)])
+
+        assert result.exit_code == 1
+        assert "Remote Python sqlite3 unavailable" in result.output
+
 
 class TestReleaseCommand:
+    def test_release_preview_deploy_and_source_manifest_cli(self, tmp_path: Path, monkeypatch):
+        source_root = tmp_path / "mutable-root"
+        releases_root = tmp_path / "releases"
+        artifact_index = source_root / "companies" / "VG" / "context" / "artifact_index.json"
+        artifact_index.parent.mkdir(parents=True)
+        artifact_index.write_text(
+            json.dumps(
+                {
+                    "ticker": "VG",
+                    "document_type": "company-context",
+                    "doc_type_key": "company_context",
+                    "period": "all",
+                    "files": {},
+                    "counts": {},
+                },
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+
+        manifest_result = runner.invoke(
+            app,
+            ["source-manifest", "generate", "--root", str(source_root)],
+        )
+        assert manifest_result.exit_code == 0, manifest_result.output
+        assert "Source manifest written:" in manifest_result.output
+        verify_result = runner.invoke(
+            app,
+            ["source-manifest", "verify", "--root", str(source_root)],
+        )
+        assert verify_result.exit_code == 0, verify_result.output
+        assert "Source manifest verify: ok" in verify_result.output
+
+        preview = runner.invoke(
+            app,
+            [
+                "release",
+                "preview",
+                "--from-root",
+                str(source_root),
+                "--releases-root",
+                str(releases_root),
+                "--env",
+                "staging",
+            ],
+        )
+        assert preview.exit_code == 0, preview.output
+        assert "Release preview" in preview.output
+        assert "source_manifest_hash: sha256:" in preview.output
+        assert "artifacts: 1" in preview.output
+
+        def fake_build_agent_index(root, *, index_path=None, force=True, source_manifest_path=None):
+            _write_minimal_agent_index(index_path or root / "indexes" / "agent_index.sqlite")
+            return {
+                "index_path": index_path or root / "indexes" / "agent_index.sqlite",
+                "totals": {"documents": 0, "objects": 0, "edges": 0, "quality_events": 0},
+            }
+
+        monkeypatch.setattr(agent_index, "build_agent_index", fake_build_agent_index)
+        deploy = runner.invoke(
+            app,
+            [
+                "release",
+                "deploy",
+                "--from-root",
+                str(source_root),
+                "--releases-root",
+                str(releases_root),
+                "--env",
+                "staging",
+                "--release-id",
+                "deploy-rel",
+            ],
+        )
+
+        release_root = releases_root / "staging" / "deploy-rel"
+        assert deploy.exit_code == 0, deploy.output
+        assert "Release deploy completed: env=staging release_id=deploy-rel promoted=True" in deploy.output
+        assert (release_root / "indexes" / "source_manifest.json").exists()
+        assert os.readlink(releases_root / "staging" / "current") == "deploy-rel"
+
+    def test_release_deploy_and_force_use_configured_roots_and_env(self, tmp_path: Path, monkeypatch):
+        source_root = tmp_path / "running"
+        releases_root = tmp_path / "releases"
+        source_root.mkdir()
+        calls: list[dict[str, object]] = []
+        runner.invoke(app, ["config", "set", "running-root", str(source_root)])
+        runner.invoke(app, ["config", "set", "publish-root", str(releases_root)])
+        monkeypatch.setenv("KRW_ONTOLOGY_ENV", "staging")
+
+        def fake_run_full_root_release_command(**kwargs):
+            calls.append(kwargs)
+            typer_label = kwargs["label"]
+            typer_release = kwargs["release_id"]
+            print(
+                f"Release {typer_label} completed: "
+                f"env={kwargs['env']} release_id={typer_release} promoted=True"
+            )
+
+        monkeypatch.setattr(cli_main, "_run_full_root_release_command", fake_run_full_root_release_command)
+
+        deploy = runner.invoke(app, ["release", "deploy", "--force", "--release-id", "cfg-deploy"])
+        force = runner.invoke(app, ["release", "force", "--release-id", "cfg-force"])
+
+        assert deploy.exit_code == 0, deploy.output
+        assert force.exit_code == 0, force.output
+        assert calls == [
+            {
+                "source_root": source_root.resolve(),
+                "releases_root": releases_root.resolve(),
+                "env": "staging",
+                "release_id": "cfg-deploy",
+                "promote": True,
+                "force_release": True,
+                "label": "deploy",
+            },
+            {
+                "source_root": source_root.resolve(),
+                "releases_root": releases_root.resolve(),
+                "env": "staging",
+                "release_id": "cfg-force",
+                "promote": True,
+                "force_release": True,
+                "label": "force",
+            },
+        ]
+
+    def test_release_plan_and_publish_full_root_transaction(self, tmp_path: Path, monkeypatch):
+        source_root = tmp_path / "mutable-root"
+        releases_root = tmp_path / "releases"
+        artifact = source_root / "companies" / "VG" / "artifact.txt"
+        artifact.parent.mkdir(parents=True)
+        artifact.write_text("artifact", encoding="utf-8")
+
+        plan = runner.invoke(
+            app,
+            [
+                "release",
+                "plan",
+                "--from-root",
+                str(source_root),
+                "--releases-root",
+                str(releases_root),
+                "--env",
+                "staging",
+            ],
+        )
+
+        assert plan.exit_code == 0, plan.output
+        assert "Release plan" in plan.output
+        assert "env: staging" in plan.output
+        assert "no_op: False" in plan.output
+        assert not releases_root.exists()
+
+        def fake_build_agent_index(root, *, index_path=None, force=True, source_manifest_path=None):
+            _write_minimal_agent_index(index_path or root / "indexes" / "agent_index.sqlite")
+            return {
+                "index_path": index_path or root / "indexes" / "agent_index.sqlite",
+                "totals": {"documents": 0, "objects": 0, "edges": 0, "quality_events": 0},
+            }
+
+        monkeypatch.setattr(agent_index, "build_agent_index", fake_build_agent_index)
+        publish = runner.invoke(
+            app,
+            [
+                "release",
+                "publish",
+                "--from-root",
+                str(source_root),
+                "--releases-root",
+                str(releases_root),
+                "--env",
+                "staging",
+                "--release-id",
+                "full-root-rel",
+            ],
+        )
+
+        release_root = releases_root / "staging" / "full-root-rel"
+        assert publish.exit_code == 0, publish.output
+        assert "Release publish completed: env=staging release_id=full-root-rel promoted=True" in publish.output
+        assert os.readlink(releases_root / "staging" / "current") == "full-root-rel"
+        assert (release_root / "manifest.json").exists()
+        assert (release_root / "verify" / "release_verify.json").exists()
+
+    def test_release_build_and_import_current_have_distinct_promotion_semantics(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+    ):
+        source_root = tmp_path / "mutable-root"
+        releases_root = tmp_path / "releases"
+        artifact = source_root / "companies" / "VG" / "artifact.txt"
+        artifact.parent.mkdir(parents=True)
+        artifact.write_text("artifact", encoding="utf-8")
+
+        def fake_build_agent_index(root, *, index_path=None, force=True, source_manifest_path=None):
+            _write_minimal_agent_index(index_path or root / "indexes" / "agent_index.sqlite")
+            return {
+                "index_path": index_path or root / "indexes" / "agent_index.sqlite",
+                "totals": {"documents": 0, "objects": 0, "edges": 0, "quality_events": 0},
+            }
+
+        monkeypatch.setattr(agent_index, "build_agent_index", fake_build_agent_index)
+        build = runner.invoke(
+            app,
+            [
+                "release",
+                "build",
+                "--from-root",
+                str(source_root),
+                "--releases-root",
+                str(releases_root),
+                "--release-id",
+                "built-only",
+                "--force-release",
+            ],
+        )
+
+        assert build.exit_code == 0, build.output
+        assert "promoted=False" in build.output
+        assert (releases_root / "dev" / "built-only").is_dir()
+        assert not (releases_root / "dev" / "current").exists()
+
+        imported = runner.invoke(
+            app,
+            [
+                "release",
+                "import-current",
+                "--from-root",
+                str(source_root),
+                "--releases-root",
+                str(releases_root),
+                "--release-id",
+                "imported",
+            ],
+        )
+
+        assert imported.exit_code == 0, imported.output
+        assert "promoted=True" in imported.output
+        assert os.readlink(releases_root / "dev" / "current") == "imported"
+
+    def test_release_list_inspect_and_gc_protect_current(self, tmp_path: Path):
+        releases_root = tmp_path / "releases"
+        env_root = releases_root / "prod"
+        old = env_root / "old"
+        current_release = env_root / "current-release"
+        newest = env_root / "newest"
+        for position, release_root in enumerate((old, current_release, newest), start=1):
+            _write_minimal_agent_index(release_root / "indexes" / "agent_index.sqlite")
+            write_release_manifest(release_root, release_id=release_root.name, env="prod")
+            os.utime(release_root, (position, position))
+        (env_root / "current").symlink_to(current_release.name)
+        (env_root / "locks").mkdir()
+        (env_root / "events").mkdir()
+        failed = env_root / "failed" / "failed-one"
+        failed.mkdir(parents=True)
+        (failed / "failure.json").write_text(
+            json.dumps({"action": "publish_root", "error": "boom"}, sort_keys=True),
+            encoding="utf-8",
+        )
+
+        listed = runner.invoke(
+            app,
+            ["release", "list", "--releases-root", str(releases_root), "--env", "prod", "--include-failed", "--json"],
+        )
+
+        assert listed.exit_code == 0, listed.output
+        payload = json.loads(listed.output)
+        assert payload["current"] == current_release.name
+        assert payload["releases"] == ["newest", "current-release", "old"]
+        assert payload["failed"] == ["failed-one"]
+        assert "locks" not in payload["releases"]
+        assert "events" not in payload["releases"]
+        assert "failed" not in payload["releases"]
+
+        inspected = runner.invoke(
+            app,
+            [
+                "release",
+                "inspect",
+                "failed-one",
+                "--releases-root",
+                str(releases_root),
+                "--env",
+                "prod",
+                "--failed",
+                "--json",
+            ],
+        )
+        assert inspected.exit_code == 0, inspected.output
+        inspected_payload = json.loads(inspected.output)
+        assert inspected_payload["failed"] is True
+        assert inspected_payload["failure"]["error"] == "boom"
+
+        dry_run = runner.invoke(
+            app,
+            [
+                "release",
+                "gc",
+                "--releases-root",
+                str(releases_root),
+                "--env",
+                "prod",
+                "--keep",
+                "1",
+                "--include-failed",
+            ],
+        )
+        assert dry_run.exit_code == 0, dry_run.output
+        assert "Release GC: dry-run" in dry_run.output
+        assert old.exists()
+        assert current_release.exists()
+        assert newest.exists()
+        assert failed.exists()
+
+        deleted = runner.invoke(
+            app,
+            [
+                "release",
+                "gc",
+                "--releases-root",
+                str(releases_root),
+                "--env",
+                "prod",
+                "--keep",
+                "1",
+                "--include-failed",
+                "--yes",
+            ],
+        )
+        assert deleted.exit_code == 0, deleted.output
+        assert not old.exists()
+        assert current_release.exists()
+        assert newest.exists()
+        assert not failed.exists()
+        assert (env_root / "events").exists()
+        assert os.readlink(env_root / "current") == current_release.name
+
     def test_release_manifest_verify_promote_and_rollback(self, tmp_path: Path):
         releases_root = tmp_path / "releases"
         first = releases_root / "prod" / "20260528_010000"
         second = releases_root / "prod" / "20260528_020000"
         for release_dir in (first, second):
-            (release_dir / "indexes").mkdir(parents=True)
-            (release_dir / "indexes" / "agent_index.sqlite").write_text("not-a-real-db")
+            _write_minimal_agent_index(release_dir / "indexes" / "agent_index.sqlite")
 
         first_manifest = runner.invoke(
             app,
@@ -962,9 +1933,12 @@ class TestReleaseCommand:
         assert first_manifest.exit_code == 0
         assert second_manifest.exit_code == 0
         manifest = json.loads((first / "manifest.json").read_text(encoding="utf-8"))
+        assert manifest["format"] == "krw-ontology-release/v2"
         assert manifest["env"] == "prod"
         assert manifest["release_id"] == "20260528_010000"
         assert manifest["index_present"] is True
+        assert manifest["indexes"]["monolith"]["path"] == "indexes/agent_index.sqlite"
+        assert manifest["indexes"]["monolith"]["sha256"] == manifest["index_sha256"]
 
         verify_result = runner.invoke(
             app,
@@ -988,6 +1962,13 @@ class TestReleaseCommand:
         assert promote_first.exit_code == 0
         assert (releases_root / "prod" / "current").is_symlink()
         assert os.readlink(releases_root / "prod" / "current") == "20260528_010000"
+        assert "event_log:" in promote_first.output
+        assert "release_event_log:" in promote_first.output
+        first_release_bytes = {
+            path.relative_to(first).as_posix(): path.read_bytes()
+            for path in first.rglob("*")
+            if path.is_file()
+        }
 
         verify_current = runner.invoke(
             app,
@@ -1025,6 +2006,1010 @@ class TestReleaseCommand:
         assert rollback.exit_code == 0
         assert "release_id=20260528_010000" in rollback.output
         assert os.readlink(releases_root / "prod" / "current") == "20260528_010000"
+        assert (first / "verify" / "release_verify.json").exists()
+        assert {
+            path.relative_to(first).as_posix(): path.read_bytes()
+            for path in first.rglob("*")
+            if path.is_file()
+        } == first_release_bytes
+        env_events = [
+            json.loads(line)
+            for line in (releases_root / "prod" / "release_events.jsonl").read_text(encoding="utf-8").splitlines()
+        ]
+        assert [event["action"] for event in env_events] == ["promote", "promote", "rollback"]
+        assert [event["release_id"] for event in env_events] == [
+            "20260528_010000",
+            "20260528_020000",
+            "20260528_010000",
+        ]
+        assert env_events[0]["previous_release_id"] is None
+        assert env_events[1]["previous_release_id"] == "20260528_010000"
+        assert env_events[2]["previous_release_id"] == "20260528_020000"
+        assert all(event["event"] == "release_changed" for event in env_events)
+        assert all(event["verification_ok"] is True for event in env_events)
+        first_release_events = [
+            json.loads(line)
+            for line in (releases_root / "prod" / "events" / f"{first.name}.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        second_release_events = [
+            json.loads(line)
+            for line in (releases_root / "prod" / "events" / f"{second.name}.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        assert [event["action"] for event in first_release_events] == ["promote", "rollback"]
+        assert [event["action"] for event in second_release_events] == ["promote"]
+        assert not (first / "verify" / "release_events.jsonl").exists()
+        assert not (second / "verify" / "release_events.jsonl").exists()
+        inspected = runner.invoke(
+            app,
+            [
+                "release",
+                "inspect",
+                first.name,
+                "--releases-root",
+                str(releases_root),
+                "--env",
+                "prod",
+                "--json",
+            ],
+        )
+        assert inspected.exit_code == 0, inspected.output
+        assert [event["action"] for event in json.loads(inspected.output)["events"]] == ["promote", "rollback"]
+
+    def test_release_promote_event_log_preflight_failure_preserves_current(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+    ):
+        releases_root = tmp_path / "releases"
+        env_root = releases_root / "prod"
+        old = env_root / "old-release"
+        target = env_root / "new-release"
+        for release_dir, release_id in ((old, "old-release"), (target, "new-release")):
+            _write_minimal_agent_index(release_dir / "indexes" / "agent_index.sqlite")
+            write_release_manifest(release_dir, release_id=release_id, env="prod")
+        current = env_root / "current"
+        current.symlink_to(old.name)
+
+        def fail_prepare(_paths):
+            raise OSError("event log path unwritable")
+
+        monkeypatch.setattr(release_helpers, "_prepare_release_event_log_paths", fail_prepare)
+
+        with pytest.raises(OSError, match="event log path unwritable"):
+            release_helpers.promote_local_release(releases_root, env="prod", release_id=target.name)
+
+        assert os.readlink(current) == old.name
+
+    def test_release_promote_event_log_append_failure_is_reported_after_switch(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+    ):
+        releases_root = tmp_path / "releases"
+        target = releases_root / "prod" / "new-release"
+        _write_minimal_agent_index(target / "indexes" / "agent_index.sqlite")
+        write_release_manifest(target, release_id=target.name, env="prod")
+
+        def fail_append(_path, _payload):
+            raise OSError("append failed")
+
+        monkeypatch.setattr(release_helpers, "_append_release_event", fail_append)
+
+        result = release_helpers.promote_local_release(releases_root, env="prod", release_id=target.name)
+
+        assert os.readlink(releases_root / "prod" / "current") == target.name
+        assert result["verify_report"] == str(target / "verify" / "release_verify.json")
+        assert (target / "verify" / "release_verify.json").exists()
+        assert len(result["event_log_errors"]) == 2
+        assert all("append failed" in error for error in result["event_log_errors"])
+
+    def test_release_promote_runs_local_reload_and_health_hooks(self, tmp_path: Path, monkeypatch):
+        releases_root = tmp_path / "releases"
+        target = releases_root / "prod" / "new-release"
+        _write_minimal_agent_index(target / "indexes" / "agent_index.sqlite")
+        write_release_manifest(target, release_id=target.name, env="prod")
+        calls: list[tuple[str, object]] = []
+
+        def fake_reload(command: str) -> None:
+            calls.append(("reload", command))
+
+        def fake_health(**kwargs) -> None:
+            calls.append(("health", kwargs))
+
+        monkeypatch.setattr(cli_main, "_run_local_reload_command", fake_reload)
+        monkeypatch.setattr(cli_main, "_check_local_release_health", fake_health)
+
+        result = runner.invoke(
+            app,
+            [
+                "release",
+                "promote",
+                target.name,
+                "--releases-root",
+                str(releases_root),
+                "--env",
+                "prod",
+                "--reload-command",
+                "systemctl reload krw-ontology-mcp",
+                "--health-url",
+                "http://127.0.0.1:8000/health",
+                "--health-timeout",
+                "2.5",
+            ],
+        )
+
+        assert result.exit_code == 0
+        assert os.readlink(releases_root / "prod" / "current") == target.name
+        assert calls[0] == ("reload", "systemctl reload krw-ontology-mcp")
+        assert calls[1][0] == "health"
+        assert calls[1][1]["expected_release_id"] == target.name
+        assert calls[1][1]["timeout"] == 2.5
+        assert "reload: ok" in result.output
+        assert "health: ok http://127.0.0.1:8000/health" in result.output
+
+    def test_release_rollback_runs_local_reload_and_health_hooks(self, tmp_path: Path, monkeypatch):
+        releases_root = tmp_path / "releases"
+        env_root = releases_root / "prod"
+        old = env_root / "old-release"
+        target = env_root / "new-release"
+        for release_dir, release_id in ((old, "old-release"), (target, "new-release")):
+            _write_minimal_agent_index(release_dir / "indexes" / "agent_index.sqlite")
+            write_release_manifest(release_dir, release_id=release_id, env="prod")
+        current = env_root / "current"
+        current.symlink_to(target.name)
+        calls: list[tuple[str, object]] = []
+
+        def fake_reload(command: str) -> None:
+            calls.append(("reload", command))
+
+        def fake_health(**kwargs) -> None:
+            calls.append(("health", kwargs))
+
+        monkeypatch.setattr(cli_main, "_run_local_reload_command", fake_reload)
+        monkeypatch.setattr(cli_main, "_check_local_release_health", fake_health)
+
+        result = runner.invoke(
+            app,
+            [
+                "release",
+                "rollback",
+                old.name,
+                "--releases-root",
+                str(releases_root),
+                "--env",
+                "prod",
+                "--reload-command",
+                "systemctl reload krw-ontology-mcp",
+                "--health-url",
+                "http://127.0.0.1:8000/health",
+            ],
+        )
+
+        assert result.exit_code == 0
+        assert os.readlink(current) == old.name
+        assert calls[0] == ("reload", "systemctl reload krw-ontology-mcp")
+        assert calls[1][0] == "health"
+        assert calls[1][1]["expected_release_id"] == old.name
+        assert "release_id=old-release" in result.output
+
+    def test_release_promote_hook_failure_restores_previous_current(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+    ):
+        releases_root = tmp_path / "releases"
+        env_root = releases_root / "prod"
+        old = env_root / "old-release"
+        target = env_root / "new-release"
+        for release_dir, release_id in ((old, "old-release"), (target, "new-release")):
+            _write_minimal_agent_index(release_dir / "indexes" / "agent_index.sqlite")
+            write_release_manifest(release_dir, release_id=release_id, env="prod")
+        current = env_root / "current"
+        current.symlink_to(old.name)
+        reload_calls: list[str] = []
+
+        def flaky_reload(_command: str) -> None:
+            reload_calls.append(os.readlink(current))
+            if len(reload_calls) == 1:
+                raise RuntimeError("reload failed once")
+
+        monkeypatch.setattr(cli_main, "_run_local_reload_command", flaky_reload)
+
+        result = runner.invoke(
+            app,
+            [
+                "release",
+                "promote",
+                target.name,
+                "--releases-root",
+                str(releases_root),
+                "--env",
+                "prod",
+                "--reload-command",
+                "systemctl reload krw-ontology-mcp",
+            ],
+        )
+
+        assert result.exit_code == 1
+        assert os.readlink(current) == old.name
+        assert reload_calls == [target.name, old.name]
+        assert "restored previous release old-release" in result.output
+
+    def test_release_promote_verification_report_failure_preserves_current(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+    ):
+        releases_root = tmp_path / "releases"
+        env_root = releases_root / "prod"
+        old = env_root / "old-release"
+        target = env_root / "new-release"
+        for release_dir, release_id in ((old, "old-release"), (target, "new-release")):
+            _write_minimal_agent_index(release_dir / "indexes" / "agent_index.sqlite")
+            write_release_manifest(release_dir, release_id=release_id, env="prod")
+        current = env_root / "current"
+        current.symlink_to(old.name)
+
+        def fail_report(*_args, **_kwargs):
+            return {"ok": False, "errors": ["report_failed"], "path": str(target / "verify" / "release_verify.json")}
+
+        monkeypatch.setattr(release_helpers, "write_release_verification_report", fail_report)
+
+        with pytest.raises(ValueError, match="Release verification report failed: report_failed"):
+            release_helpers.promote_local_release(releases_root, env="prod", release_id=target.name)
+
+        assert os.readlink(current) == old.name
+
+    def test_release_verify_rejects_invalid_sqlite_index(self, tmp_path: Path):
+        release_root = tmp_path / "releases" / "prod" / "bad"
+        (release_root / "indexes").mkdir(parents=True)
+        (release_root / "companies").mkdir(parents=True)
+        (release_root / "indexes" / "agent_index.sqlite").write_text("not-a-real-db")
+        write_release_manifest(release_root, release_id="bad", env="prod")
+
+        result = runner.invoke(
+            app,
+            ["release", "verify", "--root", str(release_root), "--env", "prod"],
+        )
+
+        assert result.exit_code == 1
+        assert "sqlite_error:file is not a database" in result.output
+
+    def test_release_verify_rejects_filesystem_gate_violations(self, tmp_path: Path):
+        release_root = tmp_path / "releases" / "prod" / "fs-bad"
+        _write_minimal_agent_index(release_root / "indexes" / "agent_index.sqlite")
+        write_release_manifest(release_root, release_id="fs-bad", env="prod")
+        (release_root / "indexes" / ".build").mkdir()
+        (release_root / "indexes" / "agent_index.sqlite.tmp").write_text("stale", encoding="utf-8")
+        (release_root / "companies" / "broken-link").symlink_to("missing-target")
+
+        result = runner.invoke(
+            app,
+            ["release", "verify", "--root", str(release_root), "--env", "prod"],
+        )
+
+        assert result.exit_code == 1
+        assert "release_temp_artifact:indexes/.build" in result.output
+        assert "release_temp_artifact:indexes/agent_index.sqlite.tmp" in result.output
+        assert "broken_symlink:companies/broken-link" in result.output
+
+    def test_release_verify_rejects_manifest_gate_violations(self, tmp_path: Path):
+        release_root = tmp_path / "releases" / "prod" / "manifest-bad"
+        _write_minimal_agent_index(release_root / "indexes" / "agent_index.sqlite")
+        write_release_manifest(release_root, release_id="different-id", env="prod")
+        manifest_path = release_root / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["format"] = "unsupported"
+        manifest["status"] = "building"
+        manifest["index_path"] = str(tmp_path / "outside.sqlite")
+        manifest["agent_index_schema_version"] = None
+        manifest_path.write_text(json.dumps(manifest, sort_keys=True) + "\n", encoding="utf-8")
+
+        result = runner.invoke(
+            app,
+            ["release", "verify", "--root", str(release_root), "--env", "prod"],
+        )
+
+        assert result.exit_code == 1
+        assert "manifest_format_unsupported" in result.output
+        assert "manifest_status_not_ready" in result.output
+        assert "manifest_release_id_directory_mismatch" in result.output
+        assert "manifest_agent_index_schema_version_missing" in result.output
+        assert "manifest_index_path_not_relative" in result.output
+        assert "manifest_index_path_outside_root" in result.output
+
+    def test_release_verify_rejects_manifest_index_digest_mismatch(self, tmp_path: Path):
+        release_root = tmp_path / "releases" / "prod" / "digest-bad"
+        index_path = release_root / "indexes" / "agent_index.sqlite"
+        _write_minimal_agent_index(index_path)
+        write_release_manifest(release_root, release_id="digest-bad", env="prod")
+        with sqlite3.connect(index_path) as conn:
+            conn.execute("INSERT INTO metadata(key, value) VALUES('post_manifest_change', 'changed')")
+
+        result = runner.invoke(
+            app,
+            ["release", "verify", "--root", str(release_root), "--env", "prod"],
+        )
+
+        assert result.exit_code == 1
+        assert "manifest_index_sha256_mismatch" in result.output
+        assert "manifest_index_output_sha256_mismatch:monolith" in result.output
+
+    def test_release_verify_rejects_manifest_v2_nested_output_tampering(self, tmp_path: Path):
+        release_root = tmp_path / "releases" / "prod" / "nested-output-bad"
+        _write_minimal_agent_index(release_root / "indexes" / "agent_index.sqlite")
+        write_release_manifest(release_root, release_id=release_root.name, env="prod")
+        manifest_path = release_root / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["indexes"]["monolith"]["path"] = "../outside.sqlite"
+        manifest["indexes"]["monolith"]["sha256"] = "0" * 64
+        manifest_path.write_text(json.dumps(manifest, sort_keys=True) + "\n", encoding="utf-8")
+
+        result = runner.invoke(
+            app,
+            ["release", "verify", "--root", str(release_root), "--env", "prod"],
+        )
+
+        assert result.exit_code == 1
+        assert "manifest_index_output_path_outside_root:monolith" in result.output
+        assert "manifest_indexes_monolith_path_mismatch" in result.output
+        assert "manifest_indexes_monolith_sha256_mismatch" in result.output
+
+    def test_release_verify_rejects_legacy_v1_manifest(self, tmp_path: Path):
+        release_root = tmp_path / "releases" / "prod" / "legacy-v1"
+        _write_minimal_agent_index(release_root / "indexes" / "agent_index.sqlite")
+        write_release_manifest(release_root, release_id=release_root.name, env="prod")
+        manifest_path = release_root / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["format"] = "krw-ontology-release/v1"
+        manifest.pop("indexes")
+        manifest_path.write_text(json.dumps(manifest, sort_keys=True) + "\n", encoding="utf-8")
+
+        result = runner.invoke(
+            app,
+            ["release", "verify", "--root", str(release_root), "--env", "prod"],
+        )
+
+        assert result.exit_code == 1
+        assert "FAIL manifest_format_unsupported" in result.output
+
+    def test_release_verify_rejects_artifact_manifest_missing_or_changed(self, tmp_path: Path):
+        release_root = tmp_path / "releases" / "prod" / "artifact-bad"
+        artifact_manifest_path = release_root / "indexes" / "artifact_manifest.json"
+        _write_minimal_agent_index(release_root / "indexes" / "agent_index.sqlite")
+        write_release_manifest(release_root, release_id="artifact-bad", env="prod")
+
+        artifact_manifest_path.unlink()
+        missing_result = runner.invoke(
+            app,
+            ["release", "verify", "--root", str(release_root), "--env", "prod"],
+        )
+
+        assert missing_result.exit_code == 1
+        assert "artifact_manifest_missing" in missing_result.output
+
+        _write_minimal_artifact_manifest(artifact_manifest_path)
+        artifact_manifest_path.write_text('{"format":"changed"}\n', encoding="utf-8")
+        mismatch_result = runner.invoke(
+            app,
+            ["release", "verify", "--root", str(release_root), "--env", "prod"],
+        )
+
+        assert mismatch_result.exit_code == 1
+        assert "manifest_artifact_manifest_sha256_mismatch" in mismatch_result.output
+
+    def test_release_promote_rejects_index_that_fails_serving_smoke(self, tmp_path: Path):
+        releases_root = tmp_path / "releases"
+        release_root = releases_root / "prod" / "bad-smoke"
+        index_path = release_root / "indexes" / "agent_index.sqlite"
+        index_path.parent.mkdir(parents=True)
+        (release_root / "companies").mkdir(parents=True)
+        with sqlite3.connect(index_path) as conn:
+            conn.executescript(
+                """
+                CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                CREATE TABLE documents(id TEXT);
+                CREATE TABLE objects(id TEXT);
+                CREATE TABLE edges(id TEXT);
+                CREATE TABLE quality_events(id TEXT);
+                CREATE VIRTUAL TABLE object_fts USING fts5(text);
+                CREATE TABLE object_text(id TEXT);
+                CREATE TABLE object_search_text(id TEXT);
+                CREATE TABLE object_traceability(id TEXT);
+                CREATE TABLE metric_lookup(id TEXT);
+                CREATE TABLE metric_dimension_lookup(id TEXT);
+                CREATE TABLE company_dimension_catalog(id TEXT);
+                CREATE TABLE exposure_lookup(id TEXT);
+                CREATE TABLE agreement_lookup(id TEXT);
+                CREATE TABLE event_lookup(id TEXT);
+                CREATE TABLE factor_lookup(id TEXT);
+                CREATE TABLE company_topic_index(id TEXT);
+                CREATE VIRTUAL TABLE company_topic_fts USING fts5(text);
+                CREATE TABLE company_topic_source_objects(id TEXT);
+                """
+            )
+            conn.execute(
+                "INSERT INTO metadata(key, value) VALUES('build', ?)",
+                (
+                    json.dumps(
+                        {
+                            "schema_version": AGENT_INDEX_SCHEMA_VERSION,
+                            "agent_index_schema_version": AGENT_INDEX_SCHEMA_VERSION,
+                        }
+                    ),
+                ),
+            )
+        _write_minimal_artifact_manifest(index_path.parent / "artifact_manifest.json")
+        write_release_manifest(release_root, release_id="bad-smoke", env="prod")
+
+        result = runner.invoke(
+            app,
+            ["release", "promote", "bad-smoke", "--releases-root", str(releases_root), "--env", "prod"],
+        )
+
+        report_path = release_root / "verify" / "release_verify.json"
+        assert result.exit_code == 1
+        assert "FAILED release promote" in result.output
+        assert "smoke:" in result.output
+        assert not (releases_root / "prod" / "current").exists()
+        assert report_path.exists()
+        report = json.loads(report_path.read_text())
+        assert report["ok"] is False
+        assert any(error.startswith("smoke:") for error in report["errors"])
+
+    def test_release_verify_writes_report_with_stable_reproducibility_hash(self, tmp_path: Path):
+        release_root = tmp_path / "releases" / "prod" / "rel-report"
+        _write_minimal_agent_index(release_root / "indexes" / "agent_index.sqlite")
+        (release_root / "companies" / "CVX" / "ontology").mkdir(parents=True)
+        (release_root / "companies" / "CVX" / "ontology" / "artifact.jsonl").write_text("{}\n")
+        write_release_manifest(release_root, release_id="rel-report", env="prod")
+
+        result = runner.invoke(
+            app,
+            ["release", "verify", "--root", str(release_root), "--env", "prod", "--write-report"],
+        )
+
+        report_path = release_root / "verify" / "release_verify.json"
+        smoke_path = release_root / "verify" / "smoke_queries.json"
+        ranking_quality_path = release_root / "verify" / "ranking_quality.json"
+        assert result.exit_code == 0, result.output
+        assert "ranking_quality_report:" in result.output
+        assert report_path.exists()
+        assert smoke_path.exists()
+        assert ranking_quality_path.exists()
+        report = json.loads(report_path.read_text())
+        smoke = json.loads(smoke_path.read_text())
+        ranking_quality = json.loads(ranking_quality_path.read_text())
+        assert report["format"] == "krw-ontology-release-verify/v1"
+        assert report["ok"] is True
+        assert report["smoke_queries_path"] == "verify/smoke_queries.json"
+        assert report["smoke_queries_hash"] == smoke["smoke_hash"]
+        assert report["ranking_quality_path"] == "verify/ranking_quality.json"
+        assert report["ranking_quality_hash"] == ranking_quality["ranking_quality_hash"]
+        assert smoke["format"] == "krw-ontology-release-smoke-queries/v1"
+        assert len(smoke["smoke_hash"]) == 64
+        assert ranking_quality["format"] == "krw-ontology-ranking-quality/v1"
+        assert len(ranking_quality["ranking_quality_hash"]) == 64
+        assert ranking_quality["summary"]["check_count"] == 1
+        assert ranking_quality["summary"]["status_counts"] == {"skipped": 1}
+        assert any(check["name"] == "index_context" for check in smoke["checks"])
+        assert any(check["name"] == "mcp_index_context" for check in smoke["checks"])
+        assert any(check["name"] == "mcp_catalog" for check in smoke["checks"])
+        assert report["verification"]["smoke_verification"]["ok"] is True
+        assert any(
+            check["name"] == "index_context"
+            for check in report["verification"]["smoke_verification"]["checks"]
+        )
+        assert len(report["reproducibility_hash"]) == 64
+        files_by_path = {item["path"]: item for item in report["files"]}
+        assert files_by_path["manifest.json"]["role"] == "release_manifest"
+        assert files_by_path["indexes/agent_index.sqlite"]["role"] == "agent_index"
+        assert len(files_by_path["indexes/agent_index.sqlite"]["sha256"]) == 64
+        assert all(not item["path"].startswith("verify/") for item in report["files"])
+
+        second = runner.invoke(
+            app,
+            ["release", "verify", "--root", str(release_root), "--env", "prod", "--write-report"],
+        )
+        second_report = json.loads(report_path.read_text())
+        second_smoke = json.loads(smoke_path.read_text())
+        second_ranking_quality = json.loads(ranking_quality_path.read_text())
+        assert second.exit_code == 0, second.output
+        assert second_report["reproducibility_hash"] == report["reproducibility_hash"]
+        assert second_smoke["smoke_hash"] == smoke["smoke_hash"]
+        assert second_report["smoke_queries_hash"] == report["smoke_queries_hash"]
+        assert second_ranking_quality["ranking_quality_hash"] == ranking_quality["ranking_quality_hash"]
+        assert second_report["ranking_quality_hash"] == report["ranking_quality_hash"]
+
+    def test_release_verify_smoke_baseline_compare_and_update(self, tmp_path: Path):
+        release_root = tmp_path / "releases" / "prod" / "rel-baseline"
+        _write_minimal_agent_index(release_root / "indexes" / "agent_index.sqlite")
+        write_release_manifest(release_root, release_id="rel-baseline", env="prod")
+        baseline_path = release_root / "verify" / "smoke_queries.baseline.json"
+
+        update = runner.invoke(
+            app,
+            [
+                "release",
+                "verify",
+                "--root",
+                str(release_root),
+                "--env",
+                "prod",
+                "--update-smoke-baseline",
+            ],
+        )
+
+        assert update.exit_code == 0, update.output
+        assert baseline_path.exists()
+        baseline = json.loads(baseline_path.read_text())
+        assert len(baseline["smoke_hash"]) == 64
+
+        baseline["smoke_hash"] = "not-current"
+        baseline_path.write_text(json.dumps(baseline, sort_keys=True), encoding="utf-8")
+        mismatch = runner.invoke(
+            app,
+            [
+                "release",
+                "verify",
+                "--root",
+                str(release_root),
+                "--env",
+                "prod",
+                "--smoke-baseline",
+                "verify/smoke_queries.baseline.json",
+            ],
+        )
+
+        assert mismatch.exit_code == 1
+        assert "smoke_baseline_mismatch" in mismatch.output
+        mismatch_report = json.loads((release_root / "verify" / "release_verify.json").read_text())
+        assert mismatch_report["ok"] is False
+        assert mismatch_report["smoke_baseline"]["ok"] is False
+
+        repaired = runner.invoke(
+            app,
+            [
+                "release",
+                "verify",
+                "--root",
+                str(release_root),
+                "--env",
+                "prod",
+                "--update-smoke-baseline",
+            ],
+        )
+        repaired_report = json.loads((release_root / "verify" / "release_verify.json").read_text())
+        repaired_baseline = json.loads(baseline_path.read_text())
+        assert repaired.exit_code == 0, repaired.output
+        assert repaired_report["smoke_baseline"]["ok"] is True
+        assert repaired_baseline["smoke_hash"] == repaired_report["smoke_queries_hash"]
+
+    def test_release_verify_smoke_runs_mcp_tool_layer_for_real_fixture(self, tmp_path: Path):
+        from tests.unit.test_mcp_server import _write_fixture
+
+        _write_fixture(tmp_path)
+        agent_index.build_agent_index(tmp_path)
+        write_release_manifest(tmp_path, release_id="rel-mcp-smoke", env="prod")
+
+        result = runner.invoke(
+            app,
+            ["release", "verify", "--root", str(tmp_path), "--env", "prod", "--write-report"],
+        )
+
+        smoke = json.loads((tmp_path / "verify" / "smoke_queries.json").read_text())
+        ranking_quality = json.loads((tmp_path / "verify" / "ranking_quality.json").read_text())
+        checks_by_name = {check["name"]: check for check in smoke["checks"]}
+        assert result.exit_code == 0, result.output
+        for check_name in [
+            "global_topic_ranking",
+            "mcp_index_context",
+            "mcp_catalog",
+            "mcp_query",
+            "mcp_query_context",
+            "mcp_topic_map",
+            "mcp_quality",
+            "mcp_retrieve",
+            "mcp_trace",
+        ]:
+            assert checks_by_name[check_name]["status"] == "passed"
+        assert checks_by_name["global_topic_ranking"]["route_mode"] == "global_topics"
+        assert checks_by_name["global_topic_ranking"]["overlap_count"] >= 1
+        assert checks_by_name["global_topic_ranking"]["overlap_ratio"] >= 0.5
+        assert checks_by_name["global_topic_ranking"]["min_overlap_ratio"] == 0.5
+        assert checks_by_name["global_topic_ranking"]["router_fallback_used"] is False
+        assert checks_by_name["global_topic_ranking"]["monolith_fallback_used"] is False
+        assert checks_by_name["global_topic_ranking"]["max_rank_delta"] <= checks_by_name["global_topic_ranking"]["max_allowed_rank_delta"]
+        assert checks_by_name["global_topic_ranking"]["top_topic_ids"]
+        assert checks_by_name["global_topic_ranking"]["overlap_topic_ids"]
+        assert isinstance(checks_by_name["global_topic_ranking"]["rank_deltas"], list)
+        assert ranking_quality["ok"] is True
+        assert ranking_quality["summary"]["status_counts"] == {"passed": 1}
+        assert ranking_quality["summary"]["route_modes"] == ["global_topics"]
+        assert ranking_quality["summary"]["min_overlap_ratio_observed"] >= 0.5
+        assert ranking_quality["summary"]["max_rank_delta_observed"] <= ranking_quality["summary"]["thresholds"]["max_allowed_rank_delta"]
+        assert ranking_quality["checks"][0]["overlap_topic_ids"]
+        assert checks_by_name["mcp_query"]["result_count"] >= 0
+        assert checks_by_name["mcp_catalog"]["company_count"] == 1
+        assert checks_by_name["mcp_catalog"]["document_count"] >= 1
+        assert checks_by_name["mcp_trace"]["response_keys"]
+
+    def test_release_verify_ranking_threshold_options_override_environment(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        from tests.unit.test_mcp_server import _write_fixture
+
+        _write_fixture(tmp_path)
+        agent_index.build_agent_index(tmp_path)
+        write_release_manifest(tmp_path, release_id="rel-ranking-thresholds", env="prod")
+        monkeypatch.setenv("KRW_RELEASE_SMOKE_GLOBAL_TOPIC_MIN_OVERLAP_RATIO", "0.95")
+
+        result = runner.invoke(
+            app,
+            [
+                "release",
+                "verify",
+                "--root",
+                str(tmp_path),
+                "--env",
+                "prod",
+                "--write-report",
+                "--ranking-top-k",
+                "4",
+                "--ranking-min-overlap-ratio",
+                "0.25",
+                "--ranking-min-overlap-count",
+                "1",
+                "--ranking-max-rank-delta",
+                "5",
+                "--ranking-sample-limit",
+                "2",
+            ],
+        )
+
+        smoke = json.loads((tmp_path / "verify" / "smoke_queries.json").read_text())
+        ranking_quality = json.loads((tmp_path / "verify" / "ranking_quality.json").read_text())
+        ranking_check = {check["name"]: check for check in smoke["checks"]}["global_topic_ranking"]
+        assert result.exit_code == 0, result.output
+        assert "ranking_thresholds: top_k=4 min_overlap_ratio=0.25" in result.output
+        assert "ranking_threshold_sources: top_k=argument min_overlap_ratio=argument" in result.output
+        assert ranking_check["top_k"] == 4
+        assert ranking_check["threshold_sources"]["top_k"] == "argument"
+        assert ranking_check["threshold_sources"]["min_overlap_ratio"] == "argument"
+        assert ranking_check["min_overlap_ratio"] == 0.25
+        assert ranking_check["min_overlap_count"] == 1
+        assert ranking_check["max_allowed_rank_delta"] == 5
+        assert ranking_check["sample_limit"] == 2
+        assert ranking_quality["summary"]["thresholds"]["top_k"] == 4
+        assert ranking_quality["summary"]["thresholds"]["min_overlap_ratio"] == 0.25
+        assert ranking_quality["summary"]["thresholds"]["sample_limit"] == 2
+        assert ranking_quality["summary"]["threshold_sources"]["min_overlap_ratio"] == "argument"
+
+    def test_release_verify_rejects_invalid_ranking_threshold(self, tmp_path: Path):
+        result = runner.invoke(
+            app,
+            [
+                "release",
+                "verify",
+                "--root",
+                str(tmp_path),
+                "--ranking-min-overlap-ratio",
+                "1.2",
+            ],
+        )
+
+        assert result.exit_code == 1
+        assert "min_overlap_ratio must be between 0 and 1" in result.output
+
+    def test_release_calibrate_ranking_thresholds_writes_recommendation(self, tmp_path: Path):
+        first = tmp_path / "rel-1" / "verify" / "ranking_quality.json"
+        second = tmp_path / "rel-2" / "verify" / "ranking_quality.json"
+        output = tmp_path / "ranking-threshold-calibration.json"
+        _write_ranking_quality_report(
+            first,
+            release_id="rel-1",
+            samples=[
+                {
+                    "status": "passed",
+                    "question": "Risk",
+                    "overlap_ratio": 0.8,
+                    "overlap_count": 3,
+                    "max_rank_delta": 2,
+                    "top_k": 5,
+                },
+                {
+                    "status": "passed",
+                    "question": "Capex",
+                    "overlap_ratio": 0.6,
+                    "overlap_count": 2,
+                    "max_rank_delta": 3,
+                    "top_k": 5,
+                },
+            ],
+        )
+        _write_ranking_quality_report(
+            second,
+            release_id="rel-2",
+            samples=[
+                {
+                    "status": "passed",
+                    "question": "Demand",
+                    "overlap_ratio": 0.7,
+                    "overlap_count": 2,
+                    "max_rank_delta": 1,
+                    "top_k": 5,
+                }
+            ],
+        )
+
+        result = runner.invoke(
+            app,
+            [
+                "release",
+                "calibrate-ranking-thresholds",
+                str(first),
+                str(second),
+                "--output",
+                str(output),
+                "--overlap-margin",
+                "0.05",
+                "--rank-delta-margin",
+                "1",
+                "--min-reports",
+                "2",
+            ],
+        )
+
+        payload = json.loads(output.read_text(encoding="utf-8"))
+        assert result.exit_code == 0, result.output
+        assert "Ranking threshold calibration: ok" in result.output
+        assert "--ranking-min-overlap-ratio 0.55" in result.output
+        assert payload["format"] == "krw-ontology-ranking-threshold-calibration/v1"
+        assert len(payload["calibration_hash"]) == 64
+        assert payload["recommendation"] == {
+            "top_k": 5,
+            "min_overlap_ratio": 0.55,
+            "min_overlap_count": 2,
+            "max_rank_delta": 4,
+            "sample_limit": 3,
+        }
+        assert payload["observation_count"] == 3
+        assert len(payload["inputs"][0]["sha256"]) == 64
+
+    def test_release_calibrate_ranking_thresholds_fails_min_reports(self, tmp_path: Path):
+        report = tmp_path / "rel-1" / "verify" / "ranking_quality.json"
+        _write_ranking_quality_report(
+            report,
+            release_id="rel-1",
+            samples=[
+                {
+                    "status": "passed",
+                    "question": "Risk",
+                    "overlap_ratio": 0.8,
+                    "overlap_count": 3,
+                    "max_rank_delta": 2,
+                    "top_k": 5,
+                }
+            ],
+        )
+
+        result = runner.invoke(
+            app,
+            [
+                "release",
+                "calibrate-ranking-thresholds",
+                str(report),
+                "--min-reports",
+                "2",
+            ],
+        )
+
+        assert result.exit_code == 1
+        assert "ranking_calibration_min_reports_not_met:1<2" in result.output
+
+    def test_release_global_topic_ranking_smoke_rejects_router_fallback(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        index_path = _write_global_topic_ranking_smoke_fixture(tmp_path)
+        router_payload = _topic_discovery_payload(
+            topic_ids=["topic:VG:risk"],
+            route_mode="monolith",
+        )
+        monolith_payload = _topic_discovery_payload(topic_ids=["topic:VG:risk"])
+
+        class FakeStore:
+            def __init__(self, payload: dict):
+                self.payload = payload
+
+            def discover_company_topics(self, **_kwargs):
+                return self.payload
+
+            def close(self):
+                return None
+
+        def fake_open_ontology_store(_index_path, *, routing="auto", **_kwargs):
+            return FakeStore(router_payload if routing == "auto" else monolith_payload)
+
+        monkeypatch.setattr(agent_index, "open_ontology_store", fake_open_ontology_store)
+        checks: list[dict] = []
+        errors: list[str] = []
+
+        release_helpers._run_global_topic_ranking_smoke_check(
+            index_path,
+            checks=checks,
+            errors=errors,
+            warnings=[],
+        )
+
+        assert any(error.startswith("global_topic_route_unexpected:monolith") for error in errors)
+        assert checks[-1]["status"] == "failed"
+        assert checks[-1]["route_mode"] == "monolith"
+
+    def test_release_global_topic_ranking_smoke_rejects_low_overlap(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        index_path = _write_global_topic_ranking_smoke_fixture(tmp_path)
+        router_payload = _topic_discovery_payload(
+            topic_ids=["topic:VG:risk"],
+            route_mode="global_topics",
+        )
+        monolith_payload = _topic_discovery_payload(
+            topic_ids=["topic:VG:risk", "topic:VG:capex", "topic:VG:margin", "topic:VG:demand"],
+        )
+
+        class FakeStore:
+            def __init__(self, payload: dict):
+                self.payload = payload
+
+            def discover_company_topics(self, **_kwargs):
+                return self.payload
+
+            def close(self):
+                return None
+
+        def fake_open_ontology_store(_index_path, *, routing="auto", **_kwargs):
+            return FakeStore(router_payload if routing == "auto" else monolith_payload)
+
+        monkeypatch.setattr(agent_index, "open_ontology_store", fake_open_ontology_store)
+        checks: list[dict] = []
+        errors: list[str] = []
+
+        release_helpers._run_global_topic_ranking_smoke_check(
+            index_path,
+            checks=checks,
+            errors=errors,
+            warnings=[],
+        )
+
+        assert errors == ["global_topic_topk_overlap_below_threshold"]
+        assert checks[-1]["status"] == "failed"
+        assert checks[-1]["overlap_ratio"] == 0.25
+        assert checks[-1]["min_overlap_ratio"] == 0.5
+
+    def test_release_global_topic_ranking_smoke_uses_threshold_overrides(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        index_path = _write_global_topic_ranking_smoke_fixture(tmp_path)
+        router_payload = _topic_discovery_payload(
+            topic_ids=["topic:VG:risk"],
+            route_mode="global_topics",
+        )
+        monolith_payload = _topic_discovery_payload(
+            topic_ids=["topic:VG:risk", "topic:VG:capex", "topic:VG:margin", "topic:VG:demand"],
+        )
+
+        class FakeStore:
+            def __init__(self, payload: dict):
+                self.payload = payload
+
+            def discover_company_topics(self, **_kwargs):
+                return self.payload
+
+            def close(self):
+                return None
+
+        def fake_open_ontology_store(_index_path, *, routing="auto", **_kwargs):
+            return FakeStore(router_payload if routing == "auto" else monolith_payload)
+
+        monkeypatch.setattr(agent_index, "open_ontology_store", fake_open_ontology_store)
+        monkeypatch.setenv("KRW_RELEASE_SMOKE_GLOBAL_TOPIC_MIN_OVERLAP_RATIO", "0.25")
+        checks: list[dict] = []
+        errors: list[str] = []
+
+        release_helpers._run_global_topic_ranking_smoke_check(
+            index_path,
+            checks=checks,
+            errors=errors,
+            warnings=[],
+        )
+
+        assert errors == []
+        assert checks[-1]["status"] == "passed"
+        assert checks[-1]["overlap_ratio"] == 0.25
+        assert checks[-1]["min_overlap_ratio"] == 0.25
+        assert checks[-1]["top_k"] == 5
+
+    def test_release_global_topic_ranking_smoke_samples_multiple_topics(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        index_path = _write_global_topic_ranking_smoke_fixture(tmp_path)
+        with sqlite3.connect(index_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO company_topic_index(
+                    topic_id,
+                    topic_label,
+                    topic_summary,
+                    ticker,
+                    boilerplate_score
+                )
+                VALUES(
+                    'topic:VG:capex',
+                    'Capex pressure',
+                    'Capital spending could pressure free cash flow.',
+                    'VG',
+                    0
+                )
+                """
+            )
+
+        payload = _topic_discovery_payload(
+            topic_ids=["topic:VG:risk", "topic:VG:capex"],
+            route_mode="global_topics",
+        )
+        questions: list[str] = []
+
+        class FakeStore:
+            def discover_company_topics(self, **kwargs):
+                questions.append(str(kwargs["question"]))
+                return payload
+
+            def close(self):
+                return None
+
+        monkeypatch.setattr(agent_index, "open_ontology_store", lambda *_args, **_kwargs: FakeStore())
+        monkeypatch.setenv("KRW_RELEASE_SMOKE_GLOBAL_TOPIC_SAMPLE_LIMIT", "2")
+        checks: list[dict] = []
+        errors: list[str] = []
+
+        release_helpers._run_global_topic_ranking_smoke_check(
+            index_path,
+            checks=checks,
+            errors=errors,
+            warnings=[],
+        )
+
+        check = checks[-1]
+        assert errors == []
+        assert check["status"] == "passed"
+        assert check["sample_limit"] == 2
+        assert check["sample_count"] == 2
+        assert check["passed_sample_count"] == 2
+        assert check["failed_sample_count"] == 0
+        assert [sample["question"] for sample in check["samples"]] == [
+            "Capex pressure",
+            "Regulatory risk",
+        ]
+        assert questions == [
+            "Capex pressure",
+            "Capex pressure",
+            "Regulatory risk",
+            "Regulatory risk",
+        ]
 
     def test_release_export_web_catalog_is_read_only_and_compact(
         self,
@@ -1049,6 +3034,8 @@ class TestReleaseCommand:
             ],
         )
         assert manifest_result.exit_code == 0
+        manifest = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
+        assert manifest["agent_index_schema_version"] is not None
 
         def fail_if_rebuilt(*args, **kwargs):
             raise AssertionError("export-web-catalog must not rebuild agent index")
@@ -1133,22 +3120,20 @@ class TestReleaseCommand:
     def test_release_prepare_dev_sets_config_and_retargets_pending_queue(self, tmp_path: Path):
         releases_root = tmp_path / "releases"
         base = releases_root / "dev" / "base"
-        (base / "indexes").mkdir(parents=True)
-        (base / "indexes" / "agent_index.sqlite").write_text("base-index")
+        _write_minimal_agent_index(base / "indexes" / "agent_index.sqlite")
         (base / "companies" / "VG").mkdir(parents=True)
         (base / "companies" / "VG" / "artifact.txt").write_text("base")
-        write_release_manifest(base, release_id="base", env="dev", write_legacy=True)
+        write_release_manifest(base, release_id="base", env="dev")
         os.symlink("base", releases_root / "dev" / "current")
 
         queue_root = tmp_path / "running"
-        legacy = tmp_path / "legacy"
+        old_publish_root = tmp_path / "old-publish-root"
         store = pipeline_queue.PipelineQueue(queue_root)
         job = store.add_job(
             "nflx",
             years=1,
             force=False,
-            publish_root=legacy,
-            publish_index_path=legacy / "indexes" / "agent_index.sqlite",
+            publish_root=old_publish_root,
         )
 
         result = runner.invoke(
@@ -1170,10 +3155,8 @@ class TestReleaseCommand:
         assert (release_root / "manifest.json").exists()
         config = load_cli_config()
         assert config.publish_root == str(release_root.resolve())
-        assert config.publish_index_path == str((release_root / "indexes" / "agent_index.sqlite").resolve())
         retargeted = store.load_job(job.job_id)
         assert retargeted.publish_root == str(release_root.resolve())
-        assert retargeted.publish_index_path == str((release_root / "indexes" / "agent_index.sqlite").resolve())
         assert "queue_jobs_changed: 1" in result.output
 
     def test_release_prepare_dev_refuses_running_queue_without_override(self, tmp_path: Path, monkeypatch):
@@ -1213,22 +3196,12 @@ class TestReleaseCommand:
         (release_root / "companies" / "CVX" / "ontology").mkdir(parents=True)
         (release_root / "companies" / "CVX" / "ontology" / "artifact.jsonl").write_text("{}\n")
         runner.invoke(app, ["config", "set", "publish-root", str(release_root)])
-        runner.invoke(
-            app,
-            [
-                "config",
-                "set",
-                "publish-index-path",
-                str(release_root / "indexes" / "agent_index.sqlite"),
-            ],
-        )
 
-        def fake_build_agent_index(root, *, index_path=None, force=True):
+        def fake_build_agent_index(root, *, index_path=None, force=True, source_manifest_path=None):
             assert root == release_root.resolve()
             assert force is True
             assert index_path == release_root / "indexes" / "agent_index.sqlite"
-            index_path.parent.mkdir(parents=True)
-            index_path.write_text("index")
+            _write_minimal_agent_index(index_path)
             return {
                 "index_path": index_path,
                 "totals": {"documents": 1, "objects": 2, "edges": 3, "quality_events": 0},
@@ -1248,16 +3221,14 @@ class TestReleaseCommand:
         assert manifest["env"] == "dev"
         config = load_cli_config()
         assert config.publish_root is None
-        assert config.publish_index_path is None
         assert "Dev release finalized: 20260528_070000" in result.output
 
     def test_release_materialize_prod_copies_dev_release_and_rewrites_manifest(self, tmp_path: Path):
         releases_root = tmp_path / "releases"
         source = releases_root / "dev" / "20260528_080000"
-        (source / "indexes").mkdir(parents=True)
-        (source / "indexes" / "agent_index.sqlite").write_text("index")
+        _write_minimal_agent_index(source / "indexes" / "agent_index.sqlite")
         (source / "companies" / "VG").mkdir(parents=True)
-        write_release_manifest(source, release_id="20260528_080000", env="dev", write_legacy=True)
+        write_release_manifest(source, release_id="20260528_080000", env="dev")
 
         result = runner.invoke(
             app,
@@ -1275,7 +3246,8 @@ class TestReleaseCommand:
         manifest = json.loads((prod / "manifest.json").read_text(encoding="utf-8"))
         assert manifest["release_id"] == "20260528_080000"
         assert manifest["env"] == "prod"
-        assert (prod / "indexes" / "agent_index.sqlite").read_text() == "index"
+        with sqlite3.connect(prod / "indexes" / "agent_index.sqlite") as conn:
+            assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         assert not (releases_root / "prod" / "current").exists()
         assert "npm run deploy:data -- --release-id 20260528_080000" in result.output
 
@@ -1369,22 +3341,20 @@ class TestQueueCommands:
 
     def test_queue_retarget_publish_updates_pending_jobs_only(self, tmp_path: Path):
         queue_root = tmp_path / "running"
-        legacy = tmp_path / "legacy"
+        old_publish_root = tmp_path / "old-publish-root"
         release_root = tmp_path / "releases" / "dev" / "20260528_090000"
         store = pipeline_queue.PipelineQueue(queue_root)
         pending = store.add_job(
             "cvx",
             years=1,
             force=False,
-            publish_root=legacy,
-            publish_index_path=legacy / "indexes" / "agent_index.sqlite",
+            publish_root=old_publish_root,
         )
         running = store.add_job(
             "xom",
             years=1,
             force=False,
-            publish_root=legacy,
-            publish_index_path=legacy / "indexes" / "agent_index.sqlite",
+            publish_root=old_publish_root,
         )
         store.mark_running(running)
 
@@ -1402,10 +3372,7 @@ class TestQueueCommands:
 
         assert result.exit_code == 0
         assert store.load_job(pending.job_id).publish_root == str(release_root.resolve())
-        assert store.load_job(pending.job_id).publish_index_path == str(
-            (release_root / "indexes" / "agent_index.sqlite").resolve()
-        )
-        assert store.load_job(running.job_id).publish_root == str(legacy)
+        assert store.load_job(running.job_id).publish_root == str(old_publish_root)
         assert "changed=1 scanned=1" in result.output
 
     def test_queue_add_skips_active_duplicate(self, tmp_path: Path):
@@ -1415,7 +3382,6 @@ class TestQueueCommands:
             years=3,
             force=False,
             publish_root=None,
-            publish_index_path=None,
         )
 
         result = runner.invoke(
@@ -1530,7 +3496,6 @@ class TestQueueCommands:
             years=1,
             force=False,
             publish_root=stable,
-            publish_index_path=None,
         )
         events = []
 
@@ -1560,10 +3525,11 @@ class TestQueueCommands:
                 "counts": {"company_business_profiles": 1},
             }
 
-        def fake_build_agent_index(root, *, index_path=None, force=True):
+        def fake_build_agent_index(root, *, index_path=None, force=True, source_manifest_path=None):
             events.append(("index", root, index_path, force))
+            _write_minimal_agent_index(index_path or root / "indexes" / "agent_index.sqlite")
             return {
-                "index_path": root / "indexes" / "agent_index.sqlite",
+                "index_path": index_path or root / "indexes" / "agent_index.sqlite",
                 "totals": {"documents": 1, "objects": 2, "edges": 0, "quality_events": 0},
             }
 
@@ -1579,28 +3545,34 @@ class TestQueueCommands:
 
         assert result.exit_code == 0
         assert store.load_job(job.job_id).status == pipeline_queue.SUCCEEDED
-        assert (stable / "companies" / "CVX" / "artifact.txt").read_text() == "FY2025"
-        assert events == [
+        current = stable.resolve() / "dev" / "current"
+        release_root = current.resolve()
+        assert (release_root / "companies" / "CVX" / "artifact.txt").read_text() == "FY2025"
+        assert events[:3] == [
             ("plan", "CVX", 1),
             ("pipeline", "CVX", "FY2025"),
             ("context", "CVX"),
         ]
+        assert events[3] == (
+            "index",
+            release_root,
+            release_root / "indexes" / "agent_index.sqlite",
+            True,
+        )
         assert "SUCCEEDED" in result.output
-        assert "agent index rebuild skipped by default" in result.output
+        assert "Queue release promoted" in result.output
 
     def test_queue_run_rebuilds_agent_index_when_explicit(
         self,
         tmp_path: Path,
         monkeypatch,
     ):
-        stable = tmp_path / "stable"
         store = pipeline_queue.PipelineQueue(tmp_path)
         job = store.add_job(
             "cvx",
             years=1,
             force=False,
-            publish_root=stable,
-            publish_index_path=None,
+            publish_root=None,
         )
         events = []
 
@@ -1627,10 +3599,11 @@ class TestQueueCommands:
                 "counts": {"company_business_profiles": 1},
             }
 
-        def fake_build_agent_index(root, *, index_path=None, force=True):
+        def fake_build_agent_index(root, *, index_path=None, force=True, source_manifest_path=None):
             events.append(("index", root, index_path, force))
+            _write_minimal_agent_index(index_path or root / "indexes" / "agent_index.sqlite")
             return {
-                "index_path": root / "indexes" / "agent_index.sqlite",
+                "index_path": index_path or root / "indexes" / "agent_index.sqlite",
                 "totals": {"documents": 1, "objects": 2, "edges": 0, "quality_events": 0},
             }
 
@@ -1646,7 +3619,7 @@ class TestQueueCommands:
 
         assert result.exit_code == 0
         assert store.load_job(job.job_id).status == pipeline_queue.SUCCEEDED
-        assert events == [("index", stable.resolve(), None, True)]
+        assert events == [("index", tmp_path.resolve(), None, True)]
         assert "Rebuilding 1 pending queue index root(s)" in result.output
 
     def test_queue_run_marks_failed_job_without_publish(
@@ -1661,7 +3634,6 @@ class TestQueueCommands:
             years=1,
             force=False,
             publish_root=stable,
-            publish_index_path=None,
         )
         index_calls = []
 
@@ -1680,7 +3652,7 @@ class TestQueueCommands:
         def fake_run_pipeline(**kwargs):
             raise RuntimeError("boom")
 
-        def fake_build_agent_index(root, *, index_path=None, force=True):
+        def fake_build_agent_index(root, *, index_path=None, force=True, source_manifest_path=None):
             index_calls.append(root)
 
         monkeypatch.setattr(research_plan, "discover_research_filing_targets", fake_discover)
@@ -1712,7 +3684,6 @@ class TestQueueCommands:
             years=1,
             force=False,
             publish_root=stable,
-            publish_index_path=None,
         )
         prod_calls = []
 
@@ -1739,9 +3710,10 @@ class TestQueueCommands:
                 "counts": {"company_business_profiles": 1},
             }
 
-        def fake_build_agent_index(root, *, index_path=None, force=True):
+        def fake_build_agent_index(root, *, index_path=None, force=True, source_manifest_path=None):
+            _write_minimal_agent_index(index_path or root / "indexes" / "agent_index.sqlite")
             return {
-                "index_path": root / "indexes" / "agent_index.sqlite",
+                "index_path": index_path or root / "indexes" / "agent_index.sqlite",
                 "totals": {"documents": 1, "objects": 2, "edges": 0, "quality_events": 0},
             }
 
@@ -1766,7 +3738,7 @@ class TestQueueCommands:
 
         assert result.exit_code == 0
         assert store.load_job(job.job_id).status == pipeline_queue.SUCCEEDED
-        assert prod_calls == [stable.resolve()]
+        assert prod_calls == [(stable.resolve() / "dev" / "current").resolve()]
         assert "Prod release activated: release=release-1" in result.output
 
     def test_queue_run_publish_prod_requires_publish_root(
@@ -1780,7 +3752,6 @@ class TestQueueCommands:
             years=1,
             force=False,
             publish_root=None,
-            publish_index_path=None,
         )
         pipeline_calls = []
         monkeypatch.setattr(
@@ -1797,7 +3768,7 @@ class TestQueueCommands:
         failed_job = store.load_job(job.job_id)
         assert result.exit_code == 0
         assert failed_job.status == pipeline_queue.FAILED
-        assert "--publish-prod requires jobs with a stable publish root" in failed_job.error
+        assert "--publish-prod requires jobs with a release publish root" in failed_job.error
         assert pipeline_calls == []
 
     def test_queue_run_processes_filing_update_job_and_publishes_once(
@@ -1814,7 +3785,6 @@ class TestQueueCommands:
             latest=False,
             force=True,
             publish_root=stable,
-            publish_index_path=None,
         )
         events = []
 
@@ -1843,10 +3813,11 @@ class TestQueueCommands:
                 "counts": {"company_business_profiles": 1},
             }
 
-        def fake_build_agent_index(root, *, index_path=None, force=True):
+        def fake_build_agent_index(root, *, index_path=None, force=True, source_manifest_path=None):
             events.append(("index", root, index_path, force))
+            _write_minimal_agent_index(index_path or root / "indexes" / "agent_index.sqlite")
             return {
-                "index_path": root / "indexes" / "agent_index.sqlite",
+                "index_path": index_path or root / "indexes" / "agent_index.sqlite",
                 "totals": {"documents": 1, "objects": 2, "edges": 0, "quality_events": 0},
             }
 
@@ -1862,14 +3833,22 @@ class TestQueueCommands:
 
         assert result.exit_code == 0
         assert store.load_job(job.job_id).status == pipeline_queue.SUCCEEDED
-        assert (stable / "companies" / "VG" / "artifact.txt").read_text() == "FY2026Q1"
-        assert events == [
+        current = stable.resolve() / "dev" / "current"
+        release_root = current.resolve()
+        assert (release_root / "companies" / "VG" / "artifact.txt").read_text() == "FY2026Q1"
+        assert events[:2] == [
             ("pipeline", "VG", "10-Q", "FY2026Q1", False, True),
             ("context", "VG"),
         ]
+        assert events[2] == (
+            "index",
+            release_root,
+            release_root / "indexes" / "agent_index.sqlite",
+            True,
+        )
         assert "START update VG 10-Q FY2026Q1" in result.output
         assert "SUCCEEDED" in result.output
-        assert "agent index rebuild skipped by default" in result.output
+        assert "Queue release promoted" in result.output
 
     def test_queue_start_launches_detached_worker(self, tmp_path: Path, monkeypatch):
         calls = []
@@ -1986,7 +3965,6 @@ class TestQueueCommands:
             years=1,
             force=False,
             publish_root=None,
-            publish_index_path=None,
         )
         store.mark_running(job)
         store.write_worker_pid(999999)
@@ -2013,7 +3991,6 @@ class TestQueueCommands:
             years=1,
             force=False,
             publish_root=None,
-            publish_index_path=None,
         )
         store.mark_running(job)
 
@@ -2043,7 +4020,6 @@ class TestQueueCommands:
             years=1,
             force=False,
             publish_root=None,
-            publish_index_path=None,
         )
         store.mark_running(job)
         store.write_worker_pid(os.getpid())
@@ -2064,7 +4040,6 @@ class TestQueueCommands:
             years=1,
             force=False,
             publish_root=None,
-            publish_index_path=None,
         )
         store.mark_running(job)
 
@@ -2093,7 +4068,6 @@ class TestQueueCommands:
             years=3,
             force=False,
             publish_root=None,
-            publish_index_path=None,
         )
         store.mark_running(running)
         store.add_job(
@@ -2101,14 +4075,12 @@ class TestQueueCommands:
             years=3,
             force=False,
             publish_root=None,
-            publish_index_path=None,
         )
         succeeded = store.add_job(
             "ge",
             years=3,
             force=False,
             publish_root=None,
-            publish_index_path=None,
         )
         store.mark_succeeded(succeeded)
         comma_failed = store.add_job(
@@ -2116,7 +4088,6 @@ class TestQueueCommands:
             years=3,
             force=False,
             publish_root=None,
-            publish_index_path=None,
         )
         store.mark_failed(comma_failed, "resolve_ticker: ticker 'AAPL,' not found")
         typo_failed = store.add_job(
@@ -2124,7 +4095,6 @@ class TestQueueCommands:
             years=3,
             force=False,
             publish_root=None,
-            publish_index_path=None,
         )
         store.mark_failed(
             typo_failed,
@@ -2150,14 +4120,12 @@ class TestQueueCommands:
         monkeypatch,
     ):
         stable = tmp_path / "stable"
-        index_path = stable / "indexes" / "agent_index.sqlite"
         store = pipeline_queue.PipelineQueue(tmp_path)
         pending = store.add_job(
             "nflx",
             years=1,
             force=False,
             publish_root=stable,
-            publish_index_path=index_path,
         )
         running = store.mark_running(pending)
         store.write_worker_pid(12345)
@@ -2183,7 +4151,6 @@ class TestQueueCommands:
         assert payload["worker"]["mode"]["rebuild_agent_index"] is False
         assert payload["counts"]["running"] == 1
         assert payload["active_publish_roots"] == [str(stable)]
-        assert payload["active_publish_index_paths"] == [str(index_path)]
         assert store.load_job(running.job_id).status == pipeline_queue.RUNNING
 
     def test_queue_cancel_marks_pending_job_cancelled(self, tmp_path: Path):
@@ -2193,7 +4160,6 @@ class TestQueueCommands:
             years=1,
             force=False,
             publish_root=None,
-            publish_index_path=None,
         )
 
         result = runner.invoke(
@@ -2214,7 +4180,6 @@ class TestQueueCommands:
             years=1,
             force=False,
             publish_root=None,
-            publish_index_path=None,
         )
         store.mark_running(job)
 
@@ -2235,7 +4200,6 @@ class TestQueueCommands:
             years=1,
             force=False,
             publish_root=None,
-            publish_index_path=None,
         )
         store.append_job_log(job.job_id, "first")
         store.append_job_log(job.job_id, "second")
@@ -2251,26 +4215,30 @@ class TestQueueCommands:
 
 
 class TestPublishTickerCommand:
-    def test_publish_ticker_replaces_ticker_tree_and_rebuilds_stable_index(
+    def test_publish_ticker_creates_release_overlay_and_promotes_current(
         self,
         tmp_path: Path,
         monkeypatch,
     ):
         running = tmp_path / "running"
-        stable = tmp_path / "stable"
+        releases_root = tmp_path / "releases"
+        base = releases_root / "dev" / "base"
+        _write_minimal_agent_index(base / "indexes" / "agent_index.sqlite")
+        (base / "companies" / "CVX").mkdir(parents=True)
+        (base / "companies" / "CVX" / "old.txt").write_text("old")
+        write_release_manifest(base, release_id="base", env="dev")
+        (releases_root / "dev" / "current").symlink_to("base")
         source = running / "companies" / "CVX" / "ontology"
-        target = stable / "companies" / "CVX"
         source.mkdir(parents=True)
-        target.mkdir(parents=True)
         (source / "new.txt").write_text("new")
         _write_company_context_artifact(running, "CVX")
-        (target / "old.txt").write_text("old")
         index_calls = []
 
-        def fake_build_agent_index(root, *, index_path=None, force=True):
+        def fake_build_agent_index(root, *, index_path=None, force=True, source_manifest_path=None):
             index_calls.append((root, index_path, force))
+            _write_minimal_agent_index(index_path or root / "indexes" / "agent_index.sqlite")
             return {
-                "index_path": root / "indexes" / "agent_index.sqlite",
+                "index_path": index_path or root / "indexes" / "agent_index.sqlite",
                 "totals": {"documents": 1, "objects": 2, "edges": 0, "quality_events": 0},
             }
 
@@ -2284,24 +4252,85 @@ class TestPublishTickerCommand:
                 "--from-root",
                 str(running),
                 "--to-root",
-                str(stable),
+                str(releases_root),
+                "--release-id",
+                "rel1",
             ],
         )
 
+        release_root = releases_root / "dev" / "rel1"
         assert result.exit_code == 0
-        assert (stable / "companies" / "CVX" / "ontology" / "new.txt").read_text() == "new"
-        assert not (stable / "companies" / "CVX" / "old.txt").exists()
-        assert index_calls == [(stable.resolve(), None, True)]
+        assert (release_root / "companies" / "CVX" / "ontology" / "new.txt").read_text() == "new"
+        assert not (release_root / "companies" / "CVX" / "old.txt").exists()
+        assert (base / "companies" / "CVX" / "old.txt").read_text() == "old"
+        assert index_calls == [(release_root, release_root / "indexes" / "agent_index.sqlite", True)]
+        assert (releases_root / "dev" / "current").readlink() == Path("rel1")
+        assert (release_root / "manifest.json").exists()
+        report_path = release_root / "verify" / "release_verify.json"
+        assert report_path.exists()
+        report = json.loads(report_path.read_text())
+        assert report["ok"] is True
+        assert report["reproducibility_hash"]
+        assert "Release verify report:" in result.output
+        assert "Release published: env=dev release_id=rel1" in result.output
         assert "Published CVX" in result.output
 
-    def test_publish_ticker_can_skip_index_rebuild(self, tmp_path: Path, monkeypatch):
+    def test_publish_ticker_noop_skips_identical_verified_release(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+    ):
         running = tmp_path / "running"
-        stable = tmp_path / "stable"
+        releases_root = tmp_path / "releases"
+        base = releases_root / "dev" / "base"
+        context_path = _write_company_context_artifact(running, "VG")
+        context_payload = json.loads(context_path.read_text(encoding="utf-8"))
+        context_payload.update(
+            {
+                "ticker": "VG",
+                "document_type": "company-context",
+                "doc_type_key": "company_context",
+                "period": "all",
+            }
+        )
+        context_path.write_text(json.dumps(context_payload, sort_keys=True), encoding="utf-8")
+        _write_minimal_agent_index(base / "indexes" / "agent_index.sqlite")
+        cli_main._materialize_release_root_from_source(running, base)
+        write_release_manifest(base, release_id=base.name, env="dev")
+        release_helpers.write_release_verification_report(base, env="dev")
+        (releases_root / "dev" / "current").symlink_to(base.name)
+
+        def fail_if_rebuilt(*_args, **_kwargs):
+            raise AssertionError("identical publish must not rebuild index")
+
+        monkeypatch.setattr(agent_index, "build_agent_index", fail_if_rebuilt)
+        no_op = runner.invoke(
+            app,
+            [
+                "publish-ticker",
+                "vg",
+                "--from-root",
+                str(running),
+                "--to-root",
+                str(releases_root),
+                "--release-id",
+                "rel-noop",
+            ],
+        )
+
+        assert no_op.exit_code == 0, no_op.output
+        assert "No-op release publish" in no_op.output
+        assert os.readlink(releases_root / "dev" / "current") == base.name
+        assert not (releases_root / "dev" / "rel-noop").exists()
+
+    def test_publish_ticker_rejects_index_rebuild_skip(self, tmp_path: Path, monkeypatch):
+        running = tmp_path / "running"
+        releases_root = tmp_path / "releases"
         (running / "companies" / "OXY").mkdir(parents=True)
         _write_company_context_artifact(running, "OXY")
         index_calls = []
 
-        def fake_build_agent_index(root, *, index_path=None, force=True):
+        def fake_build_agent_index(root, *, index_path=None, force=True, source_manifest_path=None):
             index_calls.append((root, index_path, force))
             return {
                 "index_path": root / "indexes" / "agent_index.sqlite",
@@ -2318,14 +4347,52 @@ class TestPublishTickerCommand:
                 "--from-root",
                 str(running),
                 "--to-root",
-                str(stable),
+                str(releases_root),
                 "--no-rebuild-agent-index",
             ],
         )
 
-        assert result.exit_code == 0
-        assert (stable / "companies" / "OXY").is_dir()
+        assert result.exit_code != 0
+        assert "No such option" in result.output
+        assert not (releases_root / "dev" / "current").exists()
         assert index_calls == []
+
+    def test_publish_ticker_quarantines_candidate_when_index_build_fails(self, tmp_path: Path, monkeypatch):
+        running = tmp_path / "running"
+        releases_root = tmp_path / "releases"
+        source = running / "companies" / "OXY" / "ontology"
+        source.mkdir(parents=True)
+        (source / "artifact.jsonl").write_text("{}\n")
+        _write_company_context_artifact(running, "OXY")
+
+        def fake_build_agent_index(root, *, index_path=None, force=True, source_manifest_path=None):
+            raise RuntimeError("index boom")
+
+        monkeypatch.setattr(agent_index, "build_agent_index", fake_build_agent_index)
+
+        result = runner.invoke(
+            app,
+            [
+                "publish-ticker",
+                "oxy",
+                "--from-root",
+                str(running),
+                "--to-root",
+                str(releases_root),
+                "--release-id",
+                "failed-rel",
+            ],
+        )
+
+        assert result.exit_code == 1
+        assert "FAILED release publish: index boom" in result.output
+        assert not (releases_root / "dev" / "failed-rel").exists()
+        quarantine = releases_root / "dev" / "failed" / "failed-rel"
+        assert quarantine.is_dir()
+        failure = json.loads((quarantine / "failure.json").read_text(encoding="utf-8"))
+        assert failure["action"] == "publish_tickers"
+        assert failure["error"] == "index boom"
+        assert not (releases_root / "dev" / "current").exists()
 
     def test_publish_ticker_dry_run_does_not_copy_or_rebuild_index(self, tmp_path: Path, monkeypatch):
         running = tmp_path / "running"
@@ -2333,7 +4400,7 @@ class TestPublishTickerCommand:
         (running / "companies" / "LNG").mkdir(parents=True)
         index_calls = []
 
-        def fake_build_agent_index(root, *, index_path=None, force=True):
+        def fake_build_agent_index(root, *, index_path=None, force=True, source_manifest_path=None):
             index_calls.append((root, index_path, force))
             return {
                 "index_path": root / "indexes" / "agent_index.sqlite",
@@ -2356,7 +4423,7 @@ class TestPublishTickerCommand:
         )
 
         assert result.exit_code == 0
-        assert not (stable / "companies" / "LNG").exists()
+        assert not (stable / "dev").exists()
         assert index_calls == []
         assert "Dry run complete" in result.output
 
@@ -2393,7 +4460,7 @@ class TestHelpOutput:
         assert "publish-ticker" in result.output
         assert "validate" in result.output
         assert "build-report" in result.output
-        assert "build-agent-index" in result.output
+        assert "build-agent-index" not in result.output
 
     def test_queue_help_shows_operator_commands(self):
         result = runner.invoke(app, ["queue", "--help"])
@@ -2419,22 +4486,21 @@ class TestHelpOutput:
         assert "operator summary" in result.output
 
 
-def test_release_finalize_dev_defaults_to_current_when_publish_root_unset(tmp_path: Path, monkeypatch):
+def test_release_finalize_dev_refuses_to_mutate_current_when_publish_root_unset(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("KRW_ONTOLOGY_CLI_CONFIG", str(tmp_path / "config.json"))
     releases_root = tmp_path / "releases"
     release_id = "20260528_090000"
     release_root = releases_root / "dev" / release_id
     (release_root / "companies" / "CVX" / "ontology").mkdir(parents=True)
     (release_root / "companies" / "CVX" / "ontology" / "artifact.jsonl").write_text("{}\n")
-    write_release_manifest(release_root, release_id=release_id, env="dev", write_legacy=True)
+    write_release_manifest(release_root, release_id=release_id, env="dev")
     (releases_root / "dev" / "current").symlink_to(release_id)
     calls = []
 
-    def fake_build_agent_index(root, *, index_path=None, force=True):
+    def fake_build_agent_index(root, *, index_path=None, force=True, source_manifest_path=None):
         calls.append((root, index_path, force))
         resolved_index_path = index_path or root / "indexes" / "agent_index.sqlite"
-        resolved_index_path.parent.mkdir(parents=True, exist_ok=True)
-        resolved_index_path.write_bytes(b"sqlite")
+        _write_minimal_agent_index(resolved_index_path)
         return {
             "index_path": resolved_index_path,
             "totals": {"documents": 1, "objects": 2, "edges": 0, "quality_events": 0},
@@ -2444,10 +4510,17 @@ def test_release_finalize_dev_defaults_to_current_when_publish_root_unset(tmp_pa
 
     result = runner.invoke(app, ["release", "finalize-dev", "--releases-root", str(releases_root)])
 
-    assert result.exit_code == 0, result.output
-    assert calls == [(release_root.resolve(), release_root / "indexes" / "agent_index.sqlite", True)]
-    assert f"Dev release finalized: {release_id}" in result.output
-    assert f"Release promoted: env=dev release_id={release_id}" in result.output
+    assert result.exit_code == 1
+    assert calls == []
+    assert "Missing release id. Pass a prepared non-current release id" in result.output
+
+    explicit_current = runner.invoke(
+        app,
+        ["release", "finalize-dev", release_id, "--releases-root", str(releases_root)],
+    )
+    assert explicit_current.exit_code == 1
+    assert "Refusing to finalize dev/current in place" in explicit_current.output
+    assert calls == []
 
 
 def test_release_finalize_dev_refuses_empty_release_root_before_index_build(tmp_path: Path, monkeypatch):
@@ -2456,10 +4529,10 @@ def test_release_finalize_dev_refuses_empty_release_root_before_index_build(tmp_
     release_id = "20260528_100000"
     release_root = releases_root / "dev" / release_id
     release_root.mkdir(parents=True)
-    write_release_manifest(release_root, release_id=release_id, env="dev", write_legacy=True)
+    write_release_manifest(release_root, release_id=release_id, env="dev")
     calls = []
 
-    def fake_build_agent_index(root, *, index_path=None, force=True):
+    def fake_build_agent_index(root, *, index_path=None, force=True, source_manifest_path=None):
         calls.append((root, index_path, force))
         return {
             "index_path": index_path or root / "indexes" / "agent_index.sqlite",
@@ -2479,6 +4552,19 @@ def test_release_finalize_dev_refuses_empty_release_root_before_index_build(tmp_
     assert "Refusing to finalize an empty index" in result.output
 
 
+def test_release_finalize_dev_rejects_index_build_skip(tmp_path: Path):
+    releases_root = tmp_path / "releases"
+
+    result = runner.invoke(
+        app,
+        ["release", "finalize-dev", "candidate", "--releases-root", str(releases_root), "--no-build-index"],
+    )
+
+    assert result.exit_code == 1
+    assert "Release finalize requires index build and verification" in result.output
+    assert not releases_root.exists()
+
+
 def test_release_publish_dev_builds_running_index_into_dev_release(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("KRW_ONTOLOGY_CLI_CONFIG", str(tmp_path / "config.json"))
     monkeypatch.setattr(cli_main, "_default_release_id", lambda: "20260603_110000")
@@ -2492,11 +4578,10 @@ def test_release_publish_dev_builds_running_index_into_dev_release(tmp_path: Pat
     runner.invoke(app, ["config", "set", "running-root", str(running_root)])
     calls = []
 
-    def fake_build_agent_index(root, *, index_path=None, force=True):
+    def fake_build_agent_index(root, *, index_path=None, force=True, source_manifest_path=None):
         calls.append((root, index_path, force))
         resolved_index_path = index_path or root / "indexes" / "agent_index.sqlite"
-        resolved_index_path.parent.mkdir(parents=True, exist_ok=True)
-        resolved_index_path.write_bytes(b"sqlite")
+        _write_minimal_agent_index(resolved_index_path)
         return {
             "index_path": resolved_index_path,
             "totals": {"documents": 7, "objects": 11, "edges": 3, "quality_events": 2},
@@ -2508,14 +4593,33 @@ def test_release_publish_dev_builds_running_index_into_dev_release(tmp_path: Pat
 
     release_root = releases_root / "dev" / "20260603_110000"
     assert result.exit_code == 0, result.output
-    assert calls == [(running_root.resolve(), release_root / "indexes" / "agent_index.sqlite", True)]
-    assert not (release_root / "companies" / "CVX" / "ontology" / "artifact.jsonl").exists()
+    assert calls == [(release_root, release_root / "indexes" / "agent_index.sqlite", True)]
+    assert (release_root / "companies" / "CVX" / "ontology" / "artifact.jsonl").read_text() == "{}\n"
     assert not (release_root / ".krw_pipeline").exists()
     assert (release_root / "manifest.json").exists()
+    report_path = release_root / "verify" / "release_verify.json"
+    assert report_path.exists()
+    report = json.loads(report_path.read_text())
+    assert report["ok"] is True
+    assert any(item["path"] == "indexes/agent_index.sqlite" for item in report["files"])
     assert (releases_root / "dev" / "current").readlink() == Path("20260603_110000")
     assert "Dev release published: 20260603_110000" in result.output
     assert "Agent index built: documents=7 objects=11 edges=3 quality_events=2" in result.output
+    assert "verify_report:" in result.output
     assert "promoted: True" in result.output
+
+
+def test_release_publish_dev_rejects_index_build_skip(tmp_path: Path):
+    releases_root = tmp_path / "releases"
+
+    result = runner.invoke(
+        app,
+        ["release", "publish-dev", "--releases-root", str(releases_root), "--no-build-index"],
+    )
+
+    assert result.exit_code == 1
+    assert "Release publish requires index build and verification" in result.output
+    assert not releases_root.exists()
 
 
 def test_release_publish_dev_refuses_empty_running_root(tmp_path: Path, monkeypatch):
@@ -2526,7 +4630,7 @@ def test_release_publish_dev_refuses_empty_running_root(tmp_path: Path, monkeypa
     runner.invoke(app, ["config", "set", "running-root", str(running_root)])
     calls = []
 
-    def fake_build_agent_index(root, *, index_path=None, force=True):
+    def fake_build_agent_index(root, *, index_path=None, force=True, source_manifest_path=None):
         calls.append((root, index_path, force))
         return {
             "index_path": index_path or root / "indexes" / "agent_index.sqlite",
@@ -2541,6 +4645,208 @@ def test_release_publish_dev_refuses_empty_running_root(tmp_path: Path, monkeypa
     assert calls == []
     assert "Source root has no ontology artifacts under companies/" in result.output
     assert not (releases_root / "dev").exists()
+
+
+class TestCurrentReleaseImmutability:
+    def _active_dev_release(self, tmp_path: Path) -> tuple[Path, Path]:
+        env_root = tmp_path / "releases" / "dev"
+        release_root = env_root / "active-release"
+        index_path = release_root / "indexes" / "agent_index.sqlite"
+        _write_minimal_agent_index(index_path)
+        write_release_manifest(release_root, release_id=release_root.name, env="dev")
+        current = env_root / "current"
+        current.symlink_to(release_root.name)
+        return current, release_root
+
+    def test_index_build_rejects_current_symlink_and_active_release_target(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        current, release_root = self._active_dev_release(tmp_path)
+        original_manifest = (release_root / "manifest.json").read_bytes()
+        calls = []
+
+        def fail_if_built(*args, **kwargs):
+            calls.append((args, kwargs))
+            raise AssertionError("active release index must not be rebuilt")
+
+        monkeypatch.setattr(agent_index, "build_agent_index", fail_if_built)
+
+        via_current = runner.invoke(app, ["index", "build", "--root", str(current)])
+        via_target = runner.invoke(app, ["index", "build", "--root", str(release_root)])
+
+        assert via_current.exit_code == 1
+        assert via_target.exit_code == 1
+        assert "current is an immutable release pointer" in via_current.output
+        assert "current is an immutable release pointer" in via_target.output
+        assert calls == []
+        assert (release_root / "manifest.json").read_bytes() == original_manifest
+
+    def test_index_build_and_manifest_write_reject_current(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        current, release_root = self._active_dev_release(tmp_path)
+        original_manifest = (release_root / "manifest.json").read_bytes()
+        calls = []
+
+        def fail_if_built(*args, **kwargs):
+            calls.append((args, kwargs))
+            raise AssertionError("active release index must not be rebuilt")
+
+        monkeypatch.setattr(agent_index, "build_agent_index", fail_if_built)
+
+        index_build = runner.invoke(app, ["index", "build", "--root", str(current)])
+        manifest_write = runner.invoke(
+            app,
+            ["release", "write-manifest", "--root", str(current), "--env", "dev"],
+        )
+
+        assert index_build.exit_code == 1
+        assert manifest_write.exit_code == 1
+        assert "current is an immutable release pointer" in index_build.output
+        assert "current is an immutable release pointer" in manifest_write.output
+        assert calls == []
+        assert (release_root / "manifest.json").read_bytes() == original_manifest
+        with pytest.raises(ValueError, match="current is an immutable release pointer"):
+            write_release_manifest(release_root, release_id=release_root.name, env="dev")
+        with pytest.raises(ValueError, match="current is an immutable release pointer"):
+            release_helpers.write_release_verification_report(current, env="dev", run_smoke=False)
+
+    def test_mutating_pipeline_command_rejects_current(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        current, _release_root = self._active_dev_release(tmp_path)
+        calls = []
+
+        def fail_if_built(*args, **kwargs):
+            calls.append((args, kwargs))
+            raise AssertionError("active release context must not be rebuilt")
+
+        monkeypatch.setattr(company_context_stage, "build_company_context", fail_if_built)
+
+        result = runner.invoke(
+            app,
+            ["build-company-context", "VG", "--root", str(current), "--no-rebuild-agent-index"],
+        )
+
+        assert result.exit_code == 1
+        assert "current is an immutable release pointer" in result.output
+        assert calls == []
+
+    def test_release_verify_is_read_only_on_current_unless_report_write_requested(self, tmp_path: Path):
+        current, release_root = self._active_dev_release(tmp_path)
+        report_path = release_root / "verify" / "release_verify.json"
+
+        read_only = runner.invoke(
+            app,
+            ["release", "verify", "--root", str(current), "--env", "dev", "--no-smoke"],
+        )
+        write_report = runner.invoke(
+            app,
+            [
+                "release",
+                "verify",
+                "--root",
+                str(current),
+                "--env",
+                "dev",
+                "--no-smoke",
+                "--write-report",
+            ],
+        )
+
+        assert read_only.exit_code == 0, read_only.output
+        assert write_report.exit_code == 1
+        assert "current is an immutable release pointer" in write_report.output
+        assert not report_path.exists()
+
+    def test_release_export_and_repromote_cannot_mutate_current(self, tmp_path: Path):
+        current, release_root = self._active_dev_release(tmp_path)
+        releases_root = tmp_path / "releases"
+        out = current / "web_catalog.json"
+
+        export = runner.invoke(
+            app,
+            ["release", "export-web-catalog", "--root", str(current), "--out", str(out)],
+        )
+        promote = runner.invoke(
+            app,
+            [
+                "release",
+                "promote",
+                release_root.name,
+                "--releases-root",
+                str(releases_root),
+                "--env",
+                "dev",
+            ],
+        )
+
+        assert export.exit_code == 1
+        assert "current is an immutable release pointer" in export.output
+        assert not out.exists()
+        assert promote.exit_code == 1
+        assert "already current" in promote.output
+        assert not (release_root / "verify" / "release_verify.json").exists()
+        with pytest.raises(ValueError, match="already current"):
+            release_helpers.promote_local_release(releases_root, env="dev", release_id=release_root.name)
+
+    def test_index_cache_write_paths_reject_current(self, tmp_path: Path):
+        current, release_root = self._active_dev_release(tmp_path)
+        cache_root = current / "fragment-cache"
+        marker = release_root / "fragment-cache" / "marker.txt"
+        marker.parent.mkdir()
+        marker.write_text("keep", encoding="utf-8")
+        running = tmp_path / "running"
+        running.mkdir()
+
+        build = runner.invoke(
+            app,
+            ["index", "build", "--root", str(running), "--cache-root", str(cache_root)],
+        )
+        gc = runner.invoke(
+            app,
+            ["index", "cache", "gc", "--root", str(running), "--cache-root", str(cache_root), "--yes"],
+        )
+
+        assert build.exit_code == 1
+        assert gc.exit_code == 1
+        assert "current is an immutable release pointer" in build.output
+        assert "current is an immutable release pointer" in gc.output
+        assert marker.read_text(encoding="utf-8") == "keep"
+
+
+def test_release_publish_dev_quarantines_new_release_candidate_when_index_build_fails(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("KRW_ONTOLOGY_CLI_CONFIG", str(tmp_path / "config.json"))
+    monkeypatch.setattr(cli_main, "_default_release_id", lambda: "20260603_failed")
+    running_root = tmp_path / "running"
+    releases_root = tmp_path / "releases"
+    artifact = running_root / "companies" / "CVX" / "ontology" / "artifact.jsonl"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_text("{}\n")
+    runner.invoke(app, ["config", "set", "running-root", str(running_root)])
+
+    def fake_build_agent_index(root, *, index_path=None, force=True, source_manifest_path=None):
+        raise RuntimeError("index boom")
+
+    monkeypatch.setattr(agent_index, "build_agent_index", fake_build_agent_index)
+
+    result = runner.invoke(app, ["release", "publish-dev", "--foreground", "--releases-root", str(releases_root)])
+
+    assert result.exit_code == 1
+    assert "index boom" in result.output
+    assert not (releases_root / "dev" / "20260603_failed").exists()
+    quarantine = releases_root / "dev" / "failed" / "20260603_failed"
+    assert quarantine.is_dir()
+    failure = json.loads((quarantine / "failure.json").read_text(encoding="utf-8"))
+    assert failure["action"] == "publish_dev"
+    assert failure["error"] == "index boom"
+    assert not (releases_root / "dev" / "current").exists()
 
 
 def test_release_publish_dev_defaults_to_background_worker(tmp_path: Path, monkeypatch):

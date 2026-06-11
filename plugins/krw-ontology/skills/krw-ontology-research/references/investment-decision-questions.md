@@ -246,13 +246,13 @@ Explain what future filing/earnings evidence would make the view more positive o
 ## 최종 판단
 Separate good company, good stock, and good entry timing.
 
-## 다음으로 파고들 질문
-End with exactly 3 action-oriented Korean follow-up prompts.
+## 이어서 볼 질문
+End with exactly 3 short Korean follow-up prompts the user can send immediately.
 ```
 
 Do not apply this report shape to ordinary research questions.
 
-For triggered buy/sell/hold-style questions, do not omit `판단 라벨`, `판단 대시보드`, `왜 이렇게 보나`, `판단이 바뀌는 조건`, `최종 판단`, or `다음으로 파고들 질문` unless the user explicitly asks for a short answer.
+For triggered buy/sell/hold-style questions, do not omit `판단 라벨`, `판단 대시보드`, `왜 이렇게 보나`, `판단이 바뀌는 조건`, `최종 판단`, or `이어서 볼 질문` unless the user explicitly asks for a short answer.
 
 Never start the final answer with `#`, `##`, a table, or a section label. The opening sentence must be visible first:
 
@@ -289,25 +289,68 @@ HBM 수주 가시성이 더 명확해지고, 고마진 제품 믹스가 유지�
 마진 회복이 지연되고 수요 개선이 가격/재고 개선으로 연결되지 않는 흐름이 반복되면 손절 판단이 강해진다.
 ```
 
-For these triggered questions, the three final follow-ups must be action-oriented decision continuations, not generic research questions or raw metric prompts. Each follow-up must stay on the same company and include one of these decision-action frames: `신규 매수 체크리스트`, `매도 신호`, `손절 판단`, `보유 조건`, `리스크 완화/악화 조건`, `판단이 바뀌는 조건`.
+For these triggered questions, the three final follow-ups must be direct prompts the user can send immediately, not abstract analyst research topics, generic research questions, raw metric prompts, or requests for personal inputs.
+
+The goal is to reduce the user's next-step burden and create a natural second question. Do not ask the user to provide investment period, risk tolerance, target price, position size, cost basis, allocation, or other personal inputs unless the user already supplied them.
+
+Default follow-up pattern:
+
+```text
+1. Continuation condition: what would keep, strengthen, weaken, or break the current judgment
+2. Scenario split: upside / downside / sideways, or positive / negative / neutral
+3. Opposite view: weak assumptions, downside risks, thesis-break signals, or conflicting company comments
+```
+
+Choose the set that matches the user's intent:
+
+General investment-decision follow-ups:
+
+```text
+- 이 판단이 유지되는 조건과 깨지는 조건을 나눠줘.
+- 상승·하락·횡보 시나리오별 체크포인트를 보여줘.
+- 반대로 봐야 할 리스크 신호만 따로 정리해줘.
+```
+
+Holder / stuck position / sell-risk follow-ups:
+
+```text
+- 보유자가 계속 봐도 되는 조건만 정리해줘.
+- 매도 판단이 강해지는 신호만 따로 뽑아줘.
+- 이 종목을 버티기 어려워지는 공시 코멘트가 있는지 봐줘.
+```
+
+New-buy follow-ups:
+
+```text
+- 지금 신규 매수자가 확인해야 할 조건만 정리해줘.
+- 기다려야 하는 이유와 지금 봐도 되는 이유를 나눠줘.
+- 이 종목이 비싸 보일 수 있는 가정만 점검해줘.
+```
 
 Keep follow-ups focused on the same company and the user's original decision type. Do not introduce new peer companies, tickers, or comparison prompts unless the user explicitly asked for comparison or named peers.
 
 Good follow-ups:
 
 ```text
-{Ticker} 신규 매수 체크리스트 5개만 볼까?
-{Ticker} 보유자 기준 매도 신호만 볼까?
-{Ticker} 손절 판단이 강해지는 신호만 따로 볼까?
-{Ticker} 신규 매수자는 어떤 조건 확인 후 접근하는 게 나은지 볼까?
-{Ticker} 리스크가 완화되는 조건과 악화되는 조건을 나눠볼까?
+- 보유자가 계속 봐도 되는 조건만 정리해줘.
+- 매도 판단이 강해지는 신호만 따로 뽑아줘.
+- 이 종목을 버티기 어려워지는 공시 코멘트가 있는지 봐줘.
+- 지금 신규 매수자가 확인해야 할 조건만 정리해줘.
+- 기다려야 하는 이유와 지금 봐도 되는 이유를 나눠줘.
+- 이 판단이 유지되는 조건과 깨지는 조건을 나눠줘.
+- 상승·하락·횡보 시나리오별 체크포인트를 보여줘.
+- 반대로 봐야 할 리스크 신호만 따로 정리해줘.
 ```
 
 Bad follow-ups:
 
 ```text
+내 투자기간과 리스크 기준을 알려주면 다시 정리해줄게.
 {Ticker} vs {Peer} 중 지금 더 나은 쪽을 비교해볼까?
 {Ticker}의 AI 수익화는 어떻게 봐야 하나요?
+FY2027 가이던스가 시장 기대에 부합할까?
+자사주 매입 규모와 자본 배분 정책을 분석해줘.
+데이터센터 매출 성장률 둔화 속도가 핵심인가?
 마진 영향은 무엇인가요?
 리스크는 무엇인가요?
 {Ticker}의 HBM 매출 비중은?

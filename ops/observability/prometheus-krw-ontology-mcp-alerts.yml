@@ -1,0 +1,63 @@
+groups:
+  - name: krw-ontology-mcp
+    interval: 30s
+    rules:
+      - alert: KRWOntologyMCPDown
+        expr: krw_ontology_mcp_health_ok == 0
+        for: 2m
+        labels:
+          severity: critical
+          service: krw-ontology-mcp
+        annotations:
+          summary: KRW Ontology MCP health check is failing
+          description: "MCP health for env={{ $labels.env }} release={{ $labels.release_id }} has reported unhealthy for more than 2 minutes."
+
+      - alert: KRWOntologyMCPIndexMissing
+        expr: krw_ontology_mcp_index_present == 0
+        for: 1m
+        labels:
+          severity: critical
+          service: krw-ontology-mcp
+        annotations:
+          summary: KRW Ontology MCP index is missing
+          description: "The configured agent index for env={{ $labels.env }} release={{ $labels.release_id }} is not present."
+
+      - alert: KRWOntologyMCPHotSwapStuck
+        expr: krw_ontology_mcp_store_rotation_pending == 1 and on(env, release_id) krw_ontology_mcp_store_retired_oldest_age_seconds > 300
+        for: 5m
+        labels:
+          severity: warning
+          service: krw-ontology-mcp
+        annotations:
+          summary: KRW Ontology MCP hot-swap has an old retired lease
+          description: "A retired store lease for env={{ $labels.env }} release={{ $labels.release_id }} has been pending for more than 5 minutes."
+
+      - alert: KRWOntologyMCPRetiredLeasesPresent
+        expr: krw_ontology_mcp_store_retired_leased > 0
+        for: 15m
+        labels:
+          severity: warning
+          service: krw-ontology-mcp
+        annotations:
+          summary: KRW Ontology MCP retired leases are still pinned
+          description: "MCP still has retired release leases for env={{ $labels.env }} release={{ $labels.release_id }}."
+
+      - alert: KRWOntologyMCPExcessiveRotations
+        expr: increase(krw_ontology_mcp_store_rotations_total[15m]) > 3
+        for: 5m
+        labels:
+          severity: warning
+          service: krw-ontology-mcp
+        annotations:
+          summary: KRW Ontology MCP store is rotating frequently
+          description: "MCP store rotations exceeded 3 events over 15 minutes for env={{ $labels.env }} release={{ $labels.release_id }}."
+
+      - alert: KRWOntologyMCPProdReleaseEmpty
+        expr: krw_ontology_mcp_release_documents{env="prod"} == 0 or krw_ontology_mcp_release_objects{env="prod"} == 0
+        for: 5m
+        labels:
+          severity: critical
+          service: krw-ontology-mcp
+        annotations:
+          summary: KRW Ontology production release has no indexed content
+          description: "Production release={{ $labels.release_id }} is reporting zero documents or zero objects."

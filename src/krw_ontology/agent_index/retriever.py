@@ -929,7 +929,6 @@ def _bundle_rank_score(
     question_type: str,
     promoted: bool,
 ) -> float:
-    bundle_type = bundle.get("type")
     score = 1_000.0 - base_rank
     if promoted:
         score += 180.0

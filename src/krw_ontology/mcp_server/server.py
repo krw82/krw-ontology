@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sqlite3
 from contextlib import closing
 from pathlib import Path
@@ -10,9 +11,15 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, PlainTextResponse
 
-from krw_ontology.config.paths import resolve_agent_index_path, resolve_ontology_root
+from krw_ontology.config.paths import (
+    ONTOLOGY_ENV_ENV,
+    ONTOLOGY_RELEASE_ROOT_ENV,
+    ONTOLOGY_ROOT_ENV,
+    resolve_agent_index_path,
+    resolve_ontology_root,
+)
 from krw_ontology.mcp_server.tools import (
     ResponseDetail,
     ResponseFormat,
@@ -30,7 +37,7 @@ from krw_ontology.mcp_server.tools import (
     topic_map_tool,
     trace_tool,
 )
-from krw_ontology.release import load_release_manifest, resolve_manifest_index_path
+from krw_ontology.release import load_release_manifest, normalize_ontology_env, resolve_manifest_index_path
 
 mcp = FastMCP("krw_ontology_mcp")
 
@@ -48,35 +55,217 @@ def health_payload(
     index_path: str | None = None,
 ) -> tuple[dict, int]:
     """Return lightweight health metadata for the configured ontology release."""
-    root_path = resolve_ontology_root(root, fallback_to_cwd=False)
+    supplied_root_path = _supplied_root_path(root)
+    root_path = supplied_root_path.resolve()
     release_manifest, release_manifest_path = load_release_manifest(root_path)
+    configured_env = _configured_env_name()
+    current_symlink = _current_symlink_metadata(supplied_root_path, root_path)
     resolved_index_path = (
         resolve_agent_index_path(root_path, index_path, fallback_to_cwd=False)
         if index_path is not None
         else resolve_manifest_index_path(root_path, release_manifest)
     )
+    cache_status = mcp_runtime_cache_status()
+    store_status = cache_status.get("store") if isinstance(cache_status.get("store"), dict) else {}
     payload = {
         "ok": False,
         "root": str(root_path),
+        "supplied_root": str(supplied_root_path.expanduser().absolute()),
         "index_path": str(resolved_index_path),
         "release_id": release_manifest.get("release_id"),
-        "env": release_manifest.get("env"),
+        "env": release_manifest.get("env") or configured_env,
+        "configured_env": configured_env,
         "manifest_path": str(release_manifest_path) if release_manifest_path else None,
         "manifest_valid": bool(release_manifest),
+        "current_symlink": current_symlink["current_symlink"],
+        "current_symlink_path": current_symlink["current_symlink_path"],
+        "current_symlink_target": current_symlink["current_symlink_target"],
+        "current_release_id": current_symlink["current_release_id"],
+        "root_is_current_symlink": current_symlink["root_is_current_symlink"],
         "agent_index_schema_version": release_manifest.get("agent_index_schema_version"),
         "index_generated_at": release_manifest.get("index_generated_at"),
-        "cache": mcp_runtime_cache_status(),
+        "index_layout": release_manifest.get("index_layout"),
+        "index_layout_version": release_manifest.get("index_layout_version"),
+        "index_shards_present": bool(release_manifest.get("index_shards_present")),
+        "global_catalog_path": release_manifest.get("global_catalog_path"),
+        "global_topics_path": release_manifest.get("global_topics_path"),
+        "global_topics_present": bool(release_manifest.get("global_topics_present")),
+        "global_topic_count": _manifest_non_negative_int(release_manifest.get("global_topic_count")),
+        "company_shards_dir": release_manifest.get("company_shards_dir"),
+        "company_shard_count": _manifest_non_negative_int(release_manifest.get("company_shard_count")),
+        "cache": cache_status,
+        "mcp_store_hot_swap": {
+            "mode": store_status.get("mode"),
+            "rotations": store_status.get("rotations"),
+            "active_stores": store_status.get("active_stores"),
+            "retired_stores": store_status.get("retired_stores"),
+            "leased": store_status.get("leased"),
+            "retired_leased": store_status.get("retired_leased"),
+            "rotation_pending": bool(store_status.get("rotation_pending")),
+            "retired_oldest_age_sec": store_status.get("retired_oldest_age_sec"),
+            "last_rotation": store_status.get("last_rotation"),
+            "retired_indexes": store_status.get("retired_indexes") or [],
+        },
         "documents": _manifest_non_negative_int(release_manifest.get("document_count")),
         "objects": _manifest_non_negative_int(release_manifest.get("object_count")),
         "sqlite_checked": False,
         "tools": sorted(tool.name for tool in mcp._tool_manager.list_tools()),
     }
+    if configured_env == "prod" and not current_symlink["root_is_current_symlink"]:
+        payload["error"] = "prod_current_symlink_required"
+        return payload, 503
     if not resolved_index_path.exists():
         payload["error"] = "agent_index_not_found"
         return payload, 503
 
     payload["ok"] = True
     return payload, 200
+
+
+def _supplied_root_path(root: str | None) -> Path:
+    if root is not None:
+        return Path(root).expanduser()
+    raw_root = os.environ.get(ONTOLOGY_RELEASE_ROOT_ENV) or os.environ.get(ONTOLOGY_ROOT_ENV)
+    if raw_root:
+        return Path(raw_root).expanduser()
+    return resolve_ontology_root(None, fallback_to_cwd=False)
+
+
+def _configured_env_name() -> str | None:
+    raw_env = os.environ.get(ONTOLOGY_ENV_ENV)
+    if raw_env is None or raw_env.strip() == "":
+        return None
+    return normalize_ontology_env(raw_env)
+
+
+def _current_symlink_metadata(supplied_root_path: Path, root_path: Path) -> dict[str, Any]:
+    supplied_absolute = supplied_root_path.expanduser().absolute()
+    root_is_current_symlink = supplied_absolute.name == "current" and supplied_absolute.is_symlink()
+    current_path = supplied_absolute if supplied_absolute.name == "current" else root_path.parent / "current"
+    current_target = os.readlink(current_path) if current_path.is_symlink() else None
+    return {
+        "current_symlink": current_path.is_symlink(),
+        "current_symlink_path": str(current_path),
+        "current_symlink_target": current_target,
+        "current_release_id": Path(current_target).name.rstrip("/") if current_target else None,
+        "root_is_current_symlink": root_is_current_symlink,
+    }
+
+
+def metrics_payload(
+    *,
+    root: str | None = None,
+    index_path: str | None = None,
+) -> tuple[str, int]:
+    """Return Prometheus-compatible text metrics for external monitors."""
+    payload, status_code = health_payload(root=root, index_path=index_path)
+    cache = payload.get("cache") if isinstance(payload.get("cache"), dict) else {}
+    store = cache.get("store") if isinstance(cache.get("store"), dict) else {}
+    labels = {
+        "env": payload.get("env") or "unknown",
+        "release_id": payload.get("release_id") or "unknown",
+    }
+    metrics: list[tuple[str, str, str, float | int | None, dict[str, Any] | None]] = [
+        (
+            "krw_ontology_mcp_health_ok",
+            "MCP health status, 1 when the configured release is serveable.",
+            "gauge",
+            1 if payload.get("ok") else 0,
+            labels,
+        ),
+        (
+            "krw_ontology_mcp_index_present",
+            "MCP configured agent index presence.",
+            "gauge",
+            1 if status_code == 200 else 0,
+            labels,
+        ),
+        (
+            "krw_ontology_mcp_release_documents",
+            "Document count from release manifest.",
+            "gauge",
+            payload.get("documents"),
+            labels,
+        ),
+        (
+            "krw_ontology_mcp_release_objects",
+            "Object count from release manifest.",
+            "gauge",
+            payload.get("objects"),
+            labels,
+        ),
+        (
+            "krw_ontology_mcp_company_shards",
+            "Company shard count from release manifest.",
+            "gauge",
+            payload.get("company_shard_count"),
+            labels,
+        ),
+        (
+            "krw_ontology_mcp_global_topics",
+            "Global topic count from release manifest.",
+            "gauge",
+            payload.get("global_topic_count"),
+            labels,
+        ),
+        (
+            "krw_ontology_mcp_store_active_stores",
+            "Active SQLite store handles in the MCP process.",
+            "gauge",
+            store.get("active_stores"),
+            labels,
+        ),
+        (
+            "krw_ontology_mcp_store_leased",
+            "Currently leased active SQLite store handles.",
+            "gauge",
+            store.get("leased"),
+            labels,
+        ),
+        (
+            "krw_ontology_mcp_store_retired_leased",
+            "Leased retired store handles pinned to a previous release.",
+            "gauge",
+            store.get("retired_leased"),
+            labels,
+        ),
+        (
+            "krw_ontology_mcp_store_rotation_pending",
+            "Whether any in-flight lease is still pinned to a retired release.",
+            "gauge",
+            1 if store.get("rotation_pending") else 0,
+            labels,
+        ),
+        (
+            "krw_ontology_mcp_store_retired_oldest_age_seconds",
+            "Oldest retired in-flight store age in seconds.",
+            "gauge",
+            store.get("retired_oldest_age_sec"),
+            labels,
+        ),
+        (
+            "krw_ontology_mcp_store_rotations_total",
+            "Process-local count of MCP store rotations.",
+            "counter",
+            store.get("rotations"),
+            labels,
+        ),
+        (
+            "krw_ontology_mcp_store_opened_total",
+            "Process-local count of opened MCP stores.",
+            "counter",
+            store.get("opened"),
+            labels,
+        ),
+        (
+            "krw_ontology_mcp_store_closed_total",
+            "Process-local count of closed MCP stores.",
+            "counter",
+            store.get("closed"),
+            labels,
+        ),
+    ]
+    return _render_prometheus_metrics(metrics), status_code
 
 
 def diagnostics_payload(
@@ -112,11 +301,45 @@ def _manifest_non_negative_int(value: Any) -> int | None:
     return value if value >= 0 else None
 
 
+def _render_prometheus_metrics(
+    metrics: list[tuple[str, str, str, float | int | None, dict[str, Any] | None]],
+) -> str:
+    lines: list[str] = []
+    for name, help_text, metric_type, value, labels in metrics:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        lines.append(f"# HELP {name} {help_text}")
+        lines.append(f"# TYPE {name} {metric_type}")
+        lines.append(f"{name}{_prometheus_labels(labels or {})} {value}")
+    return "\n".join(lines) + "\n"
+
+
+def _prometheus_labels(labels: dict[str, Any]) -> str:
+    if not labels:
+        return ""
+    parts = [
+        f'{key}="{_prometheus_escape(str(value))}"'
+        for key, value in sorted(labels.items())
+    ]
+    return "{" + ",".join(parts) + "}"
+
+
+def _prometheus_escape(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
+
+
 @mcp.custom_route("/health", methods=["GET"], include_in_schema=False)
 async def krw_ontology_health(_request: Request) -> JSONResponse:
     """Health endpoint for local web and agent clients."""
     payload, status_code = health_payload()
     return JSONResponse(payload, status_code=status_code)
+
+
+@mcp.custom_route("/metrics", methods=["GET"], include_in_schema=False)
+async def krw_ontology_metrics(_request: Request) -> PlainTextResponse:
+    """Prometheus-style metrics endpoint for release and hot-swap monitoring."""
+    payload, status_code = metrics_payload()
+    return PlainTextResponse(payload, status_code=status_code, media_type="text/plain; version=0.0.4")
 
 
 @mcp.custom_route("/diagnostics", methods=["GET"], include_in_schema=False)

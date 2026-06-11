@@ -48,7 +48,6 @@ class QueueJob:
     periods: list[str] | None = None
     latest: bool = False
     publish_root: str | None = None
-    publish_index_path: str | None = None
     status: str = PENDING
     attempts: int = 0
     created_at: str = ""
@@ -64,7 +63,6 @@ class QueueJob:
         years: int,
         force: bool,
         publish_root: Path | None,
-        publish_index_path: Path | None,
     ) -> "QueueJob":
         normalized_ticker = ticker.upper()
         stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
@@ -76,7 +74,6 @@ class QueueJob:
             job_type=FULL_REFRESH,
             force=force,
             publish_root=str(publish_root) if publish_root is not None else None,
-            publish_index_path=str(publish_index_path) if publish_index_path is not None else None,
             created_at=utc_now(),
         )
 
@@ -90,7 +87,6 @@ class QueueJob:
         latest: bool,
         force: bool,
         publish_root: Path | None,
-        publish_index_path: Path | None,
     ) -> "QueueJob":
         normalized_ticker = ticker.upper()
         stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
@@ -105,7 +101,6 @@ class QueueJob:
             periods=periods,
             latest=latest,
             publish_root=str(publish_root) if publish_root is not None else None,
-            publish_index_path=str(publish_index_path) if publish_index_path is not None else None,
             created_at=utc_now(),
         )
 
@@ -121,7 +116,6 @@ class QueueJob:
             periods=list(payload.get("periods") or []),
             latest=bool(payload.get("latest", False)),
             publish_root=payload.get("publish_root"),
-            publish_index_path=payload.get("publish_index_path"),
             status=payload.get("status", PENDING),
             attempts=int(payload.get("attempts", 0)),
             created_at=payload.get("created_at") or utc_now(),
@@ -218,7 +212,6 @@ class PipelineQueue:
         years: int,
         force: bool,
         publish_root: Path | None,
-        publish_index_path: Path | None = None,
     ) -> QueueJob:
         self.ensure_dirs()
         job = QueueJob.create(
@@ -226,7 +219,6 @@ class PipelineQueue:
             years=years,
             force=force,
             publish_root=publish_root,
-            publish_index_path=publish_index_path,
         )
         self.save_job(job)
         self.append_event("queued", job)
@@ -241,7 +233,6 @@ class PipelineQueue:
         latest: bool,
         force: bool,
         publish_root: Path | None,
-        publish_index_path: Path | None = None,
     ) -> QueueJob:
         self.ensure_dirs()
         job = QueueJob.create_update(
@@ -251,7 +242,6 @@ class PipelineQueue:
             latest=latest,
             force=force,
             publish_root=publish_root,
-            publish_index_path=publish_index_path,
         )
         self.save_job(job)
         self.append_event("queued", job)

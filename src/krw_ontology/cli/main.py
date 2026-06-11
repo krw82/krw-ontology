@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-import io
 import json
+import hashlib
+import io
 import os
 import signal
 import shutil
@@ -14,17 +15,18 @@ import tarfile
 import tempfile
 import time
 from collections import Counter
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+import httpx
 import typer
 
 from krw_ontology.cli.config import (
     CONFIG_KEYS,
     cli_config_path,
     load_cli_config,
-    resolve_publish_index_path,
     resolve_publish_root,
     resolve_running_root,
     save_cli_config,
@@ -33,6 +35,14 @@ from krw_ontology.cli.config import (
 )
 from krw_ontology.cli.init_workspace import init_workspace
 from krw_ontology.config.paths import ONTOLOGY_ROOT_ENV, resolve_ontology_root
+from krw_ontology.observability import (
+    DEFAULT_ALERTMANAGER_TEMPLATE_PATH,
+    DEFAULT_PROMETHEUS_ALERTS_TEMPLATE_PATH,
+    render_alertmanager_config,
+    render_prometheus_alerts_config,
+    validate_observability_configs,
+    write_observability_doctor_report,
+)
 from krw_ontology.pipeline.queue import (
     CANCELLED,
     FAILED,
@@ -48,16 +58,23 @@ from krw_ontology.pipeline.queue import (
     is_pid_running,
 )
 from krw_ontology.release import (
+    ALLOWED_ONTOLOGY_ENVS,
+    FAILED_RELEASE_DIRNAME,
     RELEASE_MANIFEST_FILENAME,
-    build_release_manifest,
+    calibrate_global_topic_ranking_thresholds,
     current_release_id,
     list_release_ids,
+    load_release_manifest,
     normalize_ontology_env,
     promote_local_release,
+    quarantine_local_release,
     release_env_root,
+    resolve_global_topic_ranking_threshold_metadata,
     rollback_local_release,
     verify_release_root,
+    write_release_verification_report,
     write_release_manifest,
+    write_ranking_threshold_calibration_report,
 )
 from krw_ontology.web_catalog import write_web_catalog
 from krw_ontology.quality.models import (
@@ -68,7 +85,6 @@ from krw_ontology.quality.models import (
     DOCS_MISSING as QUALITY_DOCS_MISSING,
     EXECUTABLE_REPAIR_KINDS as QUALITY_EXECUTABLE_REPAIR_KINDS,
     FAILED as QUALITY_FAILED,
-    NORMALIZE_NUMERIC as QUALITY_NORMALIZE_NUMERIC,
     PENDING as QUALITY_PENDING,
     REPAIR_REFERENCE as QUALITY_REPAIR_REFERENCE,
     RUNNING as QUALITY_RUNNING,
@@ -129,8 +145,7 @@ config_app = typer.Typer(
     epilog=(
         "Supported keys:\n"
         "  running-root        staging root where active pipeline artifacts are written\n"
-        "  publish-root        stable root published for research/MCP use\n"
-        "  publish-index-path  optional explicit stable SQLite index path\n"
+        "  publish-root        local releases root used for verified release publish\n"
         "  prod-host           SSH host for production data releases\n"
         "  prod-root           production data root containing releases/current\n"
         "  prod-reload-command command run on prod after current release activation\n"
@@ -146,7 +161,7 @@ config_app = typer.Typer(
 prod_app = typer.Typer(
     name="prod",
     help=(
-        "Publish stable ontology data to a production server using versioned releases, "
+        "Publish verified ontology data to a production server using versioned releases, "
         "an atomic current symlink swap, and optional MCP reload/health checks."
     ),
     epilog=(
@@ -159,6 +174,33 @@ prod_app = typer.Typer(
         "Queue automation:\n"
         "  krw-ontology queue start --publish-prod"
     ),
+    no_args_is_help=True,
+)
+index_app = typer.Typer(
+    name="index",
+    help=(
+        "Plan, build, and verify production agent index outputs. "
+        "These commands wrap the fragment-cache builder and shard verifier."
+    ),
+    epilog=(
+        "Typical flow:\n"
+        "  krw-ontology index plan --root /data/running\n"
+        "  krw-ontology release build --from-root /data/running --releases-root /data/releases --env dev\n"
+        "  krw-ontology release promote <release-id> --releases-root /data/releases --env dev\n"
+        "  krw-ontology index verify --root /data/releases/dev/current\n\n"
+        "`index build` is for mutable running roots or non-current candidates. "
+        "It refuses active current releases."
+    ),
+    no_args_is_help=True,
+)
+index_cache_app = typer.Typer(
+    name="cache",
+    help="Inspect and garbage-collect production agent index fragment cache files.",
+    no_args_is_help=True,
+)
+source_manifest_app = typer.Typer(
+    name="source-manifest",
+    help="Generate, verify, and diff canonical artifact source manifests.",
     no_args_is_help=True,
 )
 release_app = typer.Typer(
@@ -177,6 +219,27 @@ release_app = typer.Typer(
         "  krw-ontology release finalize-dev 20260529_020000\n"
         "  krw-ontology release materialize-prod 20260529_020000\n"
         "  export KRW_ONTOLOGY_RELEASE_ROOT=/data/releases/prod/current"
+    ),
+    no_args_is_help=True,
+)
+observability_app = typer.Typer(
+    name="observability",
+    help=(
+        "Render and validate deployable monitoring configs for the MCP release "
+        "serving process."
+    ),
+    epilog=(
+        "Typical flow:\n"
+        "  export KRW_PROMETHEUS_HOT_SWAP_RETIRED_AGE_SECONDS=600\n"
+        "  krw-ontology observability render-prometheus-alerts "
+        "--output /etc/prometheus/rules/krw-ontology-mcp-alerts.yml\n"
+        "  export KRW_ALERTMANAGER_DEFAULT_WEBHOOK_URL=https://alerts.example/default\n"
+        "  export KRW_ALERTMANAGER_CRITICAL_WEBHOOK_URL=https://alerts.example/critical\n"
+        "  export KRW_ALERTMANAGER_WARNING_WEBHOOK_URL=https://alerts.example/warning\n"
+        "  krw-ontology observability render-alertmanager --output /etc/alertmanager/krw-ontology-mcp.yml\n"
+        "  krw-ontology observability doctor "
+        "--prometheus-alerts /etc/prometheus/rules/krw-ontology-mcp-alerts.yml "
+        "--alertmanager /etc/alertmanager/krw-ontology-mcp.yml"
     ),
     no_args_is_help=True,
 )
@@ -208,12 +271,207 @@ quality_repair_app = typer.Typer(
 app.add_typer(queue_app, name="queue")
 app.add_typer(config_app, name="config")
 app.add_typer(prod_app, name="prod")
+index_app.add_typer(index_cache_app, name="cache")
+app.add_typer(index_app, name="index")
+app.add_typer(source_manifest_app, name="source-manifest")
 app.add_typer(release_app, name="release")
+app.add_typer(observability_app, name="observability")
 quality_app.add_typer(quality_repair_app, name="repair")
 app.add_typer(quality_app, name="quality")
 
 ACCEPTED_DOC_TYPES = {"10-K", "10-Q"}
 DEFAULT_E2E_TICKERS = ["AAPL", "NVDA", "JPM", "XOM"]
+
+
+@observability_app.command("render-alertmanager")
+def observability_render_alertmanager_cmd(
+    output: Path = typer.Option(
+        ...,
+        "--output",
+        help="Output Alertmanager YAML path to write atomically.",
+    ),
+    template: Path = typer.Option(
+        DEFAULT_ALERTMANAGER_TEMPLATE_PATH,
+        "--template",
+        help="Alertmanager YAML template path.",
+    ),
+    default_webhook_url: Optional[str] = typer.Option(
+        None,
+        "--default-webhook-url",
+        help="Default receiver webhook URL. Prefer KRW_ALERTMANAGER_DEFAULT_WEBHOOK_URL in production.",
+    ),
+    critical_webhook_url: Optional[str] = typer.Option(
+        None,
+        "--critical-webhook-url",
+        help="Critical receiver webhook URL. Prefer KRW_ALERTMANAGER_CRITICAL_WEBHOOK_URL in production.",
+    ),
+    warning_webhook_url: Optional[str] = typer.Option(
+        None,
+        "--warning-webhook-url",
+        help="Warning receiver webhook URL. Prefer KRW_ALERTMANAGER_WARNING_WEBHOOK_URL in production.",
+    ),
+) -> None:
+    """Render Alertmanager config with deployment-specific webhook receivers."""
+    try:
+        result = render_alertmanager_config(
+            template,
+            output,
+            receiver_urls={
+                "default": default_webhook_url,
+                "critical": critical_webhook_url,
+                "warning": warning_webhook_url,
+            },
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        typer.echo(f"FAIL {exc}")
+        raise typer.Exit(1) from exc
+
+    typer.echo(f"alertmanager_config: {result['path']}")
+    for kind, source in sorted(result["receiver_sources"].items()):
+        typer.echo(f"receiver_{kind}: {source}")
+
+
+@observability_app.command("render-prometheus-alerts")
+def observability_render_prometheus_alerts_cmd(
+    output: Path = typer.Option(
+        ...,
+        "--output",
+        help="Output Prometheus alert rules YAML path to write atomically.",
+    ),
+    template: Path = typer.Option(
+        DEFAULT_PROMETHEUS_ALERTS_TEMPLATE_PATH,
+        "--template",
+        help="Prometheus alert rules YAML template path.",
+    ),
+    mcp_down_for: Optional[str] = typer.Option(
+        None,
+        "--mcp-down-for",
+        help="Duration before KRWOntologyMCPDown fires. Env: KRW_PROMETHEUS_MCP_DOWN_FOR.",
+    ),
+    index_missing_for: Optional[str] = typer.Option(
+        None,
+        "--index-missing-for",
+        help="Duration before KRWOntologyMCPIndexMissing fires. Env: KRW_PROMETHEUS_INDEX_MISSING_FOR.",
+    ),
+    hot_swap_stuck_for: Optional[str] = typer.Option(
+        None,
+        "--hot-swap-stuck-for",
+        help="Duration before KRWOntologyMCPHotSwapStuck fires. Env: KRW_PROMETHEUS_HOT_SWAP_STUCK_FOR.",
+    ),
+    hot_swap_retired_age_seconds: Optional[int] = typer.Option(
+        None,
+        "--hot-swap-retired-age-seconds",
+        help=(
+            "Retired lease age threshold in seconds. "
+            "Env: KRW_PROMETHEUS_HOT_SWAP_RETIRED_AGE_SECONDS."
+        ),
+    ),
+    retired_leases_for: Optional[str] = typer.Option(
+        None,
+        "--retired-leases-for",
+        help="Duration before KRWOntologyMCPRetiredLeasesPresent fires. Env: KRW_PROMETHEUS_RETIRED_LEASES_FOR.",
+    ),
+    rotation_window: Optional[str] = typer.Option(
+        None,
+        "--rotation-window",
+        help="Prometheus range window for store rotation counting. Env: KRW_PROMETHEUS_ROTATION_WINDOW.",
+    ),
+    rotation_count: Optional[int] = typer.Option(
+        None,
+        "--rotation-count",
+        help="Rotation count threshold. Env: KRW_PROMETHEUS_ROTATION_COUNT.",
+    ),
+    excessive_rotations_for: Optional[str] = typer.Option(
+        None,
+        "--excessive-rotations-for",
+        help=(
+            "Duration before KRWOntologyMCPExcessiveRotations fires. "
+            "Env: KRW_PROMETHEUS_EXCESSIVE_ROTATIONS_FOR."
+        ),
+    ),
+    prod_empty_for: Optional[str] = typer.Option(
+        None,
+        "--prod-empty-for",
+        help="Duration before KRWOntologyMCPProdReleaseEmpty fires. Env: KRW_PROMETHEUS_PROD_EMPTY_FOR.",
+    ),
+) -> None:
+    """Render Prometheus alert rules with deployment-specific thresholds."""
+    try:
+        result = render_prometheus_alerts_config(
+            template,
+            output,
+            overrides={
+                "mcp_down_for": mcp_down_for,
+                "index_missing_for": index_missing_for,
+                "hot_swap_stuck_for": hot_swap_stuck_for,
+                "hot_swap_retired_age_seconds": hot_swap_retired_age_seconds,
+                "retired_leases_for": retired_leases_for,
+                "rotation_window": rotation_window,
+                "rotation_count": rotation_count,
+                "excessive_rotations_for": excessive_rotations_for,
+                "prod_empty_for": prod_empty_for,
+            },
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        typer.echo(f"FAIL {exc}")
+        raise typer.Exit(1) from exc
+
+    typer.echo(f"prometheus_alerts: {result['path']}")
+    for key, source in sorted(result["threshold_sources"].items()):
+        typer.echo(f"threshold_{key}: {result['thresholds'][key]} ({source})")
+
+
+@observability_app.command("doctor")
+def observability_doctor_cmd(
+    prometheus_alerts: Path = typer.Option(
+        DEFAULT_PROMETHEUS_ALERTS_TEMPLATE_PATH,
+        "--prometheus-alerts",
+        help="Rendered Prometheus alert rules YAML path.",
+    ),
+    alertmanager: Path = typer.Option(
+        DEFAULT_ALERTMANAGER_TEMPLATE_PATH,
+        "--alertmanager",
+        help="Rendered Alertmanager YAML path.",
+    ),
+    env: str = typer.Option(
+        "prod",
+        "--env",
+        help="Deployment environment. Prod rejects localhost/loopback receivers by default.",
+    ),
+    allow_local_receivers: bool = typer.Option(
+        False,
+        "--allow-local-receivers",
+        help="Allow localhost/loopback Alertmanager webhook URLs.",
+    ),
+    write_report: Optional[Path] = typer.Option(
+        None,
+        "--write-report",
+        help="Write observability doctor JSON audit report to this path.",
+    ),
+) -> None:
+    """Validate rendered observability configs before deployment."""
+    result = validate_observability_configs(
+        prometheus_alerts_path=prometheus_alerts,
+        alertmanager_path=alertmanager,
+        env_name=env,
+        allow_local_receivers=allow_local_receivers,
+    )
+    typer.echo("Observability doctor")
+    typer.echo(f"env: {result['env']}")
+    typer.echo(f"prometheus_alerts: {result['prometheus_alerts']['path']}")
+    typer.echo(f"prometheus_alert_count: {result['prometheus_alerts']['alert_count']}")
+    typer.echo(f"alertmanager: {result['alertmanager']['path']}")
+    typer.echo(f"alertmanager_receiver_count: {result['alertmanager']['receiver_count']}")
+    report = None
+    if write_report is not None:
+        report = write_observability_doctor_report(write_report, result)
+        typer.echo(f"observability_report: {report['path']}")
+        typer.echo(f"observability_audit_hash: {report['audit_hash']}")
+    if result["errors"]:
+        for error in result["errors"]:
+            typer.echo(f"FAIL {error}")
+        raise typer.Exit(1)
+    typer.echo("Observability doctor passed.")
 
 
 def validate_document_type(doc_type: str) -> str:
@@ -238,7 +496,7 @@ def _quality_index_context(
     index_path: Path | None,
     release_root: Path | None,
     release: str | None,
-    env: str,
+    env: str | None,
     releases_root: Path | None,
 ) -> tuple[Path, str, Path | None]:
     if index_path is not None:
@@ -254,7 +512,21 @@ def _quality_index_context(
         parts = release.split("/", 1)
         release_env = normalize_ontology_env(parts[0])
         release_id = parts[1] or "current"
-    root_base = (releases_root or _default_releases_root()).expanduser().resolve()
+    if releases_root is not None:
+        root_base = releases_root.expanduser().resolve()
+    else:
+        configured_publish_root = resolve_publish_root(None)
+        if configured_publish_root is not None:
+            configured_publish_root = configured_publish_root.expanduser().resolve()
+            if (configured_publish_root / RELEASE_MANIFEST_FILENAME).is_file() and release is None:
+                root = configured_publish_root
+                return root / "indexes" / "agent_index.sqlite", str(root), root
+            root_base, release_env = _resolve_release_publish_config(
+                configured_publish_root,
+                release_env,
+            )
+        else:
+            root_base = _default_releases_root().expanduser().resolve()
     root = release_env_root(root_base, release_env) / release_id
     return root / "indexes" / "agent_index.sqlite", f"{release_env}/{release_id}", root
 
@@ -264,7 +536,7 @@ def _quality_scanner(
     index_path: Path | None,
     release_root: Path | None,
     release: str | None,
-    env: str,
+    env: str | None,
     releases_root: Path | None,
 ) -> tuple[QualityScanner, str, Path | None]:
     resolved_index_path, label, root = _quality_index_context(
@@ -430,6 +702,7 @@ def _quality_selected_plan(store: QualityRepairStore, plan_id: str | None) -> Re
 
 def _quality_repair_store(root: Path | None) -> QualityRepairStore:
     output_root = resolve_running_root(root, fallback_to_cwd=False)
+    _assert_path_not_current_release(output_root, "--root")
     store = QualityRepairStore(output_root)
     store.ensure_dirs()
     return store
@@ -437,7 +710,7 @@ def _quality_repair_store(root: Path | None) -> QualityRepairStore:
 
 @quality_app.command("check")
 def quality_check_cmd(
-    env: str = typer.Option("dev", "--env", help="Release environment: dev, staging, or prod."),
+    env: Optional[str] = typer.Option(None, "--env", help="Release environment. Defaults to KRW_ONTOLOGY_ENV or dev."),
     release: Optional[str] = typer.Option(
         None,
         "--release",
@@ -496,7 +769,7 @@ def quality_check_cmd(
 
 @quality_app.command("summary", hidden=True)
 def quality_summary_cmd(
-    env: str = typer.Option("dev", "--env"),
+    env: Optional[str] = typer.Option(None, "--env"),
     release: Optional[str] = typer.Option(None, "--release"),
     releases_root: Optional[Path] = typer.Option(None, "--releases-root"),
     release_root: Optional[Path] = typer.Option(None, "--release-root"),
@@ -518,7 +791,7 @@ def quality_summary_cmd(
 
 @quality_app.command("tickers")
 def quality_tickers_cmd(
-    env: str = typer.Option("dev", "--env", help="Release environment: dev, staging, or prod."),
+    env: Optional[str] = typer.Option(None, "--env", help="Release environment. Defaults to KRW_ONTOLOGY_ENV or dev."),
     release: Optional[str] = typer.Option(None, "--release", help="Release id or env/release id."),
     releases_root: Optional[Path] = typer.Option(None, "--releases-root", help="Releases root."),
     release_root: Optional[Path] = typer.Option(None, "--release-root", help="Explicit release root."),
@@ -576,7 +849,7 @@ def quality_tickers_cmd(
 @quality_app.command("explain")
 def quality_explain_cmd(
     ticker: str = typer.Argument(..., help="Ticker to explain."),
-    env: str = typer.Option("dev", "--env", help="Release environment: dev, staging, or prod."),
+    env: Optional[str] = typer.Option(None, "--env", help="Release environment. Defaults to KRW_ONTOLOGY_ENV or dev."),
     release: Optional[str] = typer.Option(None, "--release", help="Release id or env/release id."),
     releases_root: Optional[Path] = typer.Option(None, "--releases-root", help="Releases root."),
     release_root: Optional[Path] = typer.Option(None, "--release-root", help="Explicit release root."),
@@ -631,7 +904,7 @@ def quality_events_cmd(
     ticker: Optional[str] = typer.Option(None, "--ticker", help="Filter by ticker."),
     category: Optional[str] = typer.Option(None, "--category", help="Filter by quality category."),
     stage: Optional[str] = typer.Option(None, "--stage", help="Filter by stage."),
-    env: str = typer.Option("dev", "--env", help="Release environment: dev, staging, or prod."),
+    env: Optional[str] = typer.Option(None, "--env", help="Release environment. Defaults to KRW_ONTOLOGY_ENV or dev."),
     release: Optional[str] = typer.Option(None, "--release", help="Release id or env/release id."),
     releases_root: Optional[Path] = typer.Option(None, "--releases-root", help="Releases root."),
     release_root: Optional[Path] = typer.Option(None, "--release-root", help="Explicit release root."),
@@ -669,7 +942,7 @@ def quality_events_cmd(
 
 @quality_app.command("gate")
 def quality_gate_cmd(
-    env: str = typer.Option("dev", "--env", help="Release environment: dev, staging, or prod."),
+    env: Optional[str] = typer.Option(None, "--env", help="Release environment. Defaults to KRW_ONTOLOGY_ENV or dev."),
     release: Optional[str] = typer.Option(None, "--release", help="Release id or env/release id."),
     releases_root: Optional[Path] = typer.Option(None, "--releases-root", help="Releases root."),
     release_root: Optional[Path] = typer.Option(None, "--release-root", help="Explicit release root."),
@@ -723,7 +996,7 @@ def quality_gate_cmd(
 @quality_repair_app.command("plan")
 def quality_repair_plan_cmd(
     root: Optional[Path] = typer.Option(None, "--root", help="Running root for quality repair state."),
-    env: str = typer.Option("dev", "--env", help="Release environment: dev, staging, or prod."),
+    env: Optional[str] = typer.Option(None, "--env", help="Release environment. Defaults to KRW_ONTOLOGY_ENV or dev."),
     release: Optional[str] = typer.Option(None, "--release", help="Release id or env/release id."),
     releases_root: Optional[Path] = typer.Option(None, "--releases-root", help="Releases root."),
     release_root: Optional[Path] = typer.Option(None, "--release-root", help="Explicit release root."),
@@ -1365,7 +1638,6 @@ def config_show_cmd() -> None:
     typer.echo(f"Config file: {path}")
     typer.echo(f"running-root: {config.running_root or '<unset>'}")
     typer.echo(f"publish-root: {config.publish_root or '<unset>'}")
-    typer.echo(f"publish-index-path: {config.publish_index_path or '<unset>'}")
     typer.echo(f"prod-host: {config.prod_host or '<unset>'}")
     typer.echo(f"prod-root: {config.prod_root or '<unset>'}")
     typer.echo(f"prod-reload-command: {config.prod_reload_command or '<unset>'}")
@@ -1384,7 +1656,7 @@ def config_set_cmd(
     """Set a persistent path default used by queue/update commands."""
     key = validate_config_key(key)
     set_config_value(key, value)
-    shown_value = str(Path(value).expanduser().resolve()) if key in {"running-root", "publish-root", "publish-index-path"} else value
+    shown_value = str(Path(value).expanduser().resolve()) if key in {"running-root", "publish-root"} else value
     typer.echo(f"Set {key}={shown_value}")
     typer.echo(f"Config file: {cli_config_path()}")
 
@@ -1447,7 +1719,12 @@ def prod_doctor_cmd(
     root: Optional[Path] = typer.Option(
         None,
         "--root",
-        help="Local stable publish root. Defaults to configured publish-root.",
+        help="Local verified release root to upload. Defaults to configured publish-root current release.",
+    ),
+    from_env: Optional[str] = typer.Option(
+        None,
+        "--from-env",
+        help="Local release env to upload when publish-root points at a releases root. Defaults to KRW_ONTOLOGY_ENV or dev.",
     ),
     host: Optional[str] = typer.Option(None, "--host", help="Override configured prod SSH host."),
     remote_root: Optional[str] = typer.Option(
@@ -1462,7 +1739,7 @@ def prod_doctor_cmd(
     ),
 ) -> None:
     """Check local and remote requirements before publishing to production."""
-    stable_root = resolve_publish_root(root)
+    stable_root = _resolve_local_release_upload_root(root, env=from_env)
     failures: list[str] = []
     warnings: list[str] = []
     typer.echo("Prod publish doctor")
@@ -1497,7 +1774,14 @@ def prod_doctor_cmd(
         if doctor.get("required_commands_missing"):
             failures.append(f"Missing remote commands: {doctor['required_commands_missing']}")
         else:
-            typer.echo("OK remote publish commands: tar ln mv rm mkdir ls readlink xargs")
+            typer.echo("OK remote publish commands: tar ln mv rm mkdir ls readlink xargs grep sed")
+        if doctor.get("python_sqlite3") == "yes":
+            typer.echo(f"OK remote Python sqlite3: {doctor.get('python_bin') or '<unknown>'}")
+        else:
+            failures.append(
+                "Remote Python sqlite3 unavailable. Install python3 with sqlite3 support "
+                "for prod publish/rollback SQLite verification."
+            )
         if doctor.get("root_state") == "exists" and doctor.get("root_writable") == "yes":
             typer.echo("OK remote root is writable")
         elif doctor.get("root_state") == "missing" and doctor.get("parent_writable") == "yes":
@@ -1590,7 +1874,12 @@ def prod_publish_cmd(
     root: Optional[Path] = typer.Option(
         None,
         "--root",
-        help="Local stable publish root. Defaults to configured publish-root.",
+        help="Local verified release root to upload. Defaults to configured publish-root current release.",
+    ),
+    from_env: Optional[str] = typer.Option(
+        None,
+        "--from-env",
+        help="Local release env to upload when publish-root points at a releases root. Defaults to KRW_ONTOLOGY_ENV or dev.",
     ),
     host: Optional[str] = typer.Option(None, "--host", help="Override configured prod SSH host."),
     remote_root: Optional[str] = typer.Option(
@@ -1619,9 +1908,14 @@ def prod_publish_cmd(
         "--dry-run",
         help="Show what would be published without uploading or activating.",
     ),
+    delta: bool = typer.Option(
+        False,
+        "--delta",
+        help="Upload only files changed from remote current and activate via a reconstructed release.",
+    ),
 ) -> None:
-    """Publish the local stable ontology root to production as a versioned release."""
-    stable_root = resolve_publish_root(root)
+    """Publish the local verified ontology root to production as a versioned release."""
+    stable_root = _resolve_local_release_upload_root(root, env=from_env)
     if stable_root is None:
         typer.echo("Set publish-root or pass --root before publishing to prod.")
         raise typer.Exit(1)
@@ -1639,6 +1933,7 @@ def prod_publish_cmd(
             health_url=health_url,
             keep_releases=keep_releases,
             dry_run=dry_run,
+            delta=delta,
         )
     except Exception as exc:
         typer.echo(f"FAILED prod publish: {exc}")
@@ -1692,6 +1987,47 @@ def _default_release_id() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
 
+def _resolve_release_command_defaults(
+    *,
+    source_root: Path | None,
+    releases_root: Path | None,
+    env: str | None,
+) -> tuple[Path, Path, str]:
+    resolved_source_root = resolve_running_root(source_root, fallback_to_cwd=False)
+    _exit_if_path_mutates_current(resolved_source_root, "--from-root")
+    if releases_root is not None:
+        resolved_releases_root = releases_root.expanduser().resolve()
+        resolved_env = normalize_ontology_env(env)
+    else:
+        configured_publish_root = resolve_publish_root(None)
+        if configured_publish_root is not None:
+            resolved_releases_root, resolved_env = _resolve_release_publish_config(
+                configured_publish_root,
+                env,
+            )
+        else:
+            resolved_releases_root = _default_releases_root().expanduser().resolve()
+            resolved_env = normalize_ontology_env(env)
+    return resolved_source_root, resolved_releases_root, resolved_env
+
+
+def _resolve_local_release_upload_root(root: Path | None, *, env: str | None = None) -> Path | None:
+    configured_root = resolve_publish_root(root)
+    if configured_root is None:
+        return None
+    resolved = configured_root.expanduser().resolve()
+    if (resolved / RELEASE_MANIFEST_FILENAME).is_file():
+        return resolved
+    resolved_env = normalize_ontology_env(env)
+    current = resolved / "current"
+    if current.exists():
+        return current.resolve()
+    env_current = release_env_root(resolved, resolved_env) / "current"
+    if env_current.exists():
+        return env_current.resolve()
+    return resolved
+
+
 def _default_release_index_path(root: Path) -> Path:
     return root / "indexes" / "agent_index.sqlite"
 
@@ -1704,11 +2040,7 @@ def _release_root_has_ontology_artifacts(root: Path) -> bool:
 
 
 def _resolve_release_id_for_finalize_dev(env: str, releases_root: Path) -> str | None:
-    release_id = _resolve_release_id_from_publish_config(env, releases_root)
-    if release_id:
-        return release_id
-    env_root = release_env_root(releases_root, env).expanduser().resolve()
-    return current_release_id(env_root)
+    return _resolve_release_id_from_publish_config(env, releases_root)
 
 
 def _release_publish_dev(
@@ -1723,6 +2055,8 @@ def _release_publish_dev(
     allow_prepared_release_root: bool = False,
 ) -> dict:
     env = "dev"
+    if not build_index:
+        raise ValueError("Release publish requires index build and verification; --no-build-index is not supported.")
     resolved_source_root = source_root.expanduser().resolve()
     if not resolved_source_root.is_dir():
         raise FileNotFoundError(f"Source root not found: {resolved_source_root}")
@@ -1761,31 +2095,54 @@ def _release_publish_dev(
             "totals": None,
         }
 
-    release_root.mkdir(parents=True, exist_ok=allow_prepared_release_root)
+    created_release_root = not release_root.exists()
+    promoted = False
+    try:
+        release_root.mkdir(parents=True, exist_ok=allow_prepared_release_root)
+        _materialize_release_root_from_source(resolved_source_root, release_root)
 
-    index_result = None
-    if build_index:
-        from krw_ontology.agent_index import build_agent_index
+        index_result = None
+        if build_index:
+            from krw_ontology.agent_index import build_agent_index, write_source_artifact_manifest
 
-        index_result = build_agent_index(resolved_source_root, index_path=index_path, force=True)
+            source_manifest = write_source_artifact_manifest(release_root)
+            index_result = _build_agent_index_for_release(
+                build_agent_index,
+                release_root,
+                index_path=index_path,
+                source_manifest_path=Path(str(source_manifest["path"])),
+            )
 
-    manifest = write_release_manifest(
-        release_root,
-        release_id=release_id,
-        env=env,
-        source_root=resolved_source_root,
-        index_path=index_path,
-        write_legacy=True,
-    )
-    if build_index:
-        verification = verify_release_root(release_root, env=env, index_path=index_path)
+        manifest = write_release_manifest(
+            release_root,
+            release_id=release_id,
+            env=env,
+            source_root=resolved_source_root,
+            index_path=index_path,
+        )
+        verification = verify_release_root(release_root, env=env, index_path=index_path, run_smoke=True)
         if not verification["ok"]:
             raise RuntimeError(f"Release verify failed: {', '.join(verification['errors'])}")
+        verify_report = write_release_verification_report(
+            release_root,
+            env=env,
+            index_path=index_path,
+            verification=verification,
+        )
 
-    promoted = False
-    if promote:
-        promote_local_release(releases_root, env=env, release_id=release_id)
-        promoted = True
+        if promote:
+            promote_local_release(releases_root, env=env, release_id=release_id)
+            promoted = True
+    except Exception as exc:
+        if created_release_root and not promoted:
+            quarantine_local_release(
+                releases_root,
+                env=env,
+                release_path=release_root,
+                action="publish_dev",
+                error=str(exc),
+            )
+        raise
 
     return {
         "release_id": release_id,
@@ -1796,8 +2153,351 @@ def _release_publish_dev(
         "index_present": manifest["index_present"],
         "build_index": build_index,
         "promoted": promoted,
+        "verify_report": verify_report["path"],
         "totals": index_result["totals"] if index_result is not None else None,
     }
+
+
+def _publish_tickers_as_release(
+    *,
+    source_root: Path,
+    releases_root: Path,
+    tickers: list[str],
+    env: str = "dev",
+    release_id: str | None = None,
+    promote: bool = True,
+    force_release: bool = False,
+) -> dict:
+    """Publish ticker overlays as a verified immutable local release."""
+    from krw_ontology.agent_index import build_agent_index
+    from krw_ontology.agent_index import write_source_artifact_manifest
+
+    resolved_source_root = source_root.expanduser().resolve()
+    resolved_releases_root = releases_root.expanduser().resolve()
+    resolved_env = normalize_ontology_env(env)
+    env_root = release_env_root(resolved_releases_root, resolved_env).expanduser().resolve()
+    selected_tickers = [ticker.upper() for ticker in tickers]
+    if not selected_tickers:
+        raise ValueError("At least one ticker is required for release publish")
+
+    release_id = release_id or _default_release_id()
+    release_root = env_root / release_id
+    index_path = _default_release_index_path(release_root)
+    if release_root.exists():
+        raise FileExistsError(f"Release directory already exists: {release_root}")
+
+    lock_path = env_root / "locks" / "release_transaction.lock"
+    promoted = False
+    with FileProcessLock(lock_path):
+        if release_root.exists():
+            raise FileExistsError(f"Release directory already exists: {release_root}")
+        current_root = env_root / "current"
+        current_verification: dict | None = None
+        try:
+            release_root.mkdir(parents=True)
+            if current_root.exists() or current_root.is_symlink():
+                current_verification = verify_release_root(
+                    current_root,
+                    env=resolved_env,
+                    require_current_symlink=current_root.is_symlink(),
+                    run_smoke=True,
+                )
+                if not current_verification["ok"]:
+                    errors = ", ".join(current_verification["errors"])
+                    raise RuntimeError(f"Current release verify failed before publish: {errors}")
+                _materialize_release_root_from_source(current_root.resolve(), release_root)
+
+            for ticker in selected_tickers:
+                _publish_ticker_tree(resolved_source_root, release_root, ticker)
+
+            if (
+                current_verification is not None
+                and not force_release
+                and _release_verification_artifacts_ok(current_root.resolve())
+            ):
+                candidate_signature = _try_release_index_content_signature(release_root)
+                current_signature = _try_release_index_content_signature(current_root.resolve())
+                if candidate_signature is not None and candidate_signature == current_signature:
+                    shutil.rmtree(release_root)
+                    current_release_root = current_root.resolve()
+                    current_manifest = current_verification.get("manifest") or {}
+                    current_counts = (current_verification.get("index_verification") or {}).get("counts") or {}
+                    return {
+                        "release_id": current_verification.get("release_id"),
+                        "env": resolved_env,
+                        "source_root": str(resolved_source_root),
+                        "releases_root": str(resolved_releases_root),
+                        "release_root": str(current_release_root),
+                        "index_path": str(current_verification["index_path"]),
+                        "manifest": str(current_release_root / RELEASE_MANIFEST_FILENAME),
+                        "manifest_payload": current_manifest,
+                        "verification": current_verification,
+                        "verify_report": str(
+                            current_release_root / "verify" / "release_verify.json"
+                        ),
+                        "promoted": False,
+                        "no_op": True,
+                        "tickers": selected_tickers,
+                        "totals": current_counts,
+                    }
+
+            source_manifest = write_source_artifact_manifest(release_root)
+            index_result = _build_agent_index_for_release(
+                build_agent_index,
+                release_root,
+                index_path=index_path,
+                source_manifest_path=Path(str(source_manifest["path"])),
+            )
+            manifest = write_release_manifest(
+                release_root,
+                release_id=release_id,
+                env=resolved_env,
+                source_root=resolved_source_root,
+                index_path=index_path,
+            )
+            verification = verify_release_root(release_root, env=resolved_env, index_path=index_path, run_smoke=True)
+            if not verification["ok"]:
+                errors = ", ".join(verification["errors"])
+                raise RuntimeError(f"Release verify failed: {errors}")
+            verify_report = write_release_verification_report(
+                release_root,
+                env=resolved_env,
+                index_path=index_path,
+                verification=verification,
+            )
+
+            if promote:
+                promote_local_release(resolved_releases_root, env=resolved_env, release_id=release_id)
+                promoted = True
+        except Exception as exc:
+            if not promoted:
+                quarantine_local_release(
+                    resolved_releases_root,
+                    env=resolved_env,
+                    release_path=release_root,
+                    action="publish_tickers",
+                    error=str(exc),
+                )
+            raise
+
+    return {
+        "release_id": release_id,
+        "env": resolved_env,
+        "source_root": str(resolved_source_root),
+        "releases_root": str(resolved_releases_root),
+        "release_root": str(release_root),
+        "index_path": str(index_path),
+        "manifest": str(release_root / RELEASE_MANIFEST_FILENAME),
+        "manifest_payload": manifest,
+        "verification": verification,
+        "verify_report": verify_report["path"],
+        "promoted": promoted,
+        "no_op": False,
+        "tickers": selected_tickers,
+        "totals": index_result["totals"],
+    }
+
+
+def _publish_root_as_local_release(
+    *,
+    source_root: Path,
+    releases_root: Path,
+    env: str,
+    release_id: str,
+    promote: bool,
+    force_release: bool,
+) -> dict[str, object]:
+    """Materialize, build, verify, and optionally promote a full-root local release."""
+    from krw_ontology.agent_index import build_agent_index
+    from krw_ontology.agent_index import write_source_artifact_manifest
+
+    resolved_source_root = source_root.expanduser().resolve()
+    resolved_releases_root = releases_root.expanduser().resolve()
+    resolved_env = normalize_ontology_env(env)
+    if not resolved_source_root.is_dir():
+        raise FileNotFoundError(f"Source root not found: {resolved_source_root}")
+    if not _release_root_has_ontology_artifacts(resolved_source_root):
+        raise RuntimeError(f"Source root has no ontology artifacts under companies/: {resolved_source_root}")
+
+    env_root = release_env_root(resolved_releases_root, resolved_env).expanduser().resolve()
+    release_root = env_root / release_id
+    index_path = _default_release_index_path(release_root)
+    lock_path = env_root / "locks" / "release_transaction.lock"
+    with FileProcessLock(lock_path):
+        if release_root.exists():
+            raise FileExistsError(f"Release directory already exists: {release_root}")
+        current_root = env_root / "current"
+        current_verification: dict | None = None
+        if current_root.exists() or current_root.is_symlink():
+            current_verification = verify_release_root(
+                current_root,
+                env=resolved_env,
+                require_current_symlink=current_root.is_symlink(),
+                run_smoke=True,
+            )
+            if not current_verification["ok"]:
+                raise RuntimeError(
+                    "Current release verify failed before publish: "
+                    + ", ".join(current_verification["errors"])
+                )
+            source_signature = _try_release_index_content_signature(resolved_source_root)
+            current_signature = _try_release_index_content_signature(current_root.resolve())
+            if (
+                not force_release
+                and _release_verification_artifacts_ok(current_root.resolve())
+                and source_signature is not None
+                and source_signature == current_signature
+            ):
+                current_release_root = current_root.resolve()
+                return {
+                    "release_id": current_verification.get("release_id"),
+                    "env": resolved_env,
+                    "source_root": str(resolved_source_root),
+                    "releases_root": str(resolved_releases_root),
+                    "release_root": str(current_release_root),
+                    "index_path": str(current_verification["index_path"]),
+                    "manifest": str(current_release_root / RELEASE_MANIFEST_FILENAME),
+                    "verification": current_verification,
+                    "verify_report": str(current_release_root / "verify" / "release_verify.json"),
+                    "promoted": False,
+                    "no_op": True,
+                    "totals": (current_verification.get("index_verification") or {}).get("counts") or {},
+                }
+
+        promoted = False
+        try:
+            release_root.mkdir(parents=True)
+            _materialize_release_root_from_source(resolved_source_root, release_root)
+            source_manifest = write_source_artifact_manifest(release_root)
+            index_result = _build_agent_index_for_release(
+                build_agent_index,
+                release_root,
+                index_path=index_path,
+                source_manifest_path=Path(str(source_manifest["path"])),
+            )
+            write_release_manifest(
+                release_root,
+                release_id=release_id,
+                env=resolved_env,
+                source_root=resolved_source_root,
+                index_path=index_path,
+            )
+            verification = verify_release_root(
+                release_root,
+                env=resolved_env,
+                index_path=index_path,
+                run_smoke=True,
+            )
+            if not verification["ok"]:
+                raise RuntimeError(f"Release verify failed: {', '.join(verification['errors'])}")
+            verify_report = write_release_verification_report(
+                release_root,
+                env=resolved_env,
+                index_path=index_path,
+                verification=verification,
+            )
+            if not verify_report["ok"]:
+                raise RuntimeError(f"Release verify report failed: {', '.join(verify_report['errors'])}")
+            if promote:
+                promote_local_release(
+                    resolved_releases_root,
+                    env=resolved_env,
+                    release_id=release_id,
+                )
+                promoted = True
+        except Exception as exc:
+            if not promoted:
+                quarantine_local_release(
+                    resolved_releases_root,
+                    env=resolved_env,
+                    release_path=release_root,
+                    action="publish_root",
+                    error=str(exc),
+                )
+            raise
+
+    return {
+        "release_id": release_id,
+        "env": resolved_env,
+        "source_root": str(resolved_source_root),
+        "releases_root": str(resolved_releases_root),
+        "release_root": str(release_root),
+        "index_path": str(index_path),
+        "manifest": str(release_root / RELEASE_MANIFEST_FILENAME),
+        "verification": verification,
+        "verify_report": verify_report["path"],
+        "promoted": promoted,
+        "no_op": False,
+        "totals": index_result["totals"],
+    }
+
+
+def _build_agent_index_for_release(
+    build_agent_index_fn,
+    release_root: Path,
+    *,
+    index_path: Path,
+    source_manifest_path: Path,
+) -> dict:
+    return build_agent_index_fn(
+        release_root,
+        index_path=index_path,
+        force=True,
+        source_manifest_path=source_manifest_path,
+    )
+
+
+def _release_index_content_signature(root: Path) -> tuple[str, str, tuple[tuple[str, str], ...]]:
+    """Return the deterministic serving-content signature used for no-op publish detection."""
+    from krw_ontology.agent_index import plan_agent_index
+
+    plan = plan_agent_index(root.expanduser().resolve(), layout="monolith-and-shards")
+    items = tuple(sorted((item.relative_path, item.cache_key) for item in plan.items))
+    return plan.plan_format_version, plan.layout, items
+
+
+def _try_release_index_content_signature(
+    root: Path,
+) -> tuple[str, str, tuple[tuple[str, str], ...]] | None:
+    try:
+        return _release_index_content_signature(root)
+    except (KeyError, OSError, TypeError, ValueError):
+        return None
+
+
+def _release_verification_artifacts_ok(root: Path) -> bool:
+    for name in ("release_verify.json", "smoke_queries.json", "ranking_quality.json"):
+        path = root / "verify" / name
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return False
+        if not isinstance(payload, dict) or payload.get("ok") is not True:
+            return False
+    return True
+
+
+def _materialize_release_root_from_source(source_root: Path, release_root: Path) -> None:
+    """Copy source ontology artifacts into an immutable release root candidate."""
+    ignored_names = {".krw_pipeline"}
+    release_root.mkdir(parents=True, exist_ok=True)
+    for source_path in source_root.iterdir():
+        if source_path.name in ignored_names:
+            continue
+        target_path = release_root / source_path.name
+        if target_path.exists() or target_path.is_symlink():
+            if target_path.is_dir() and not target_path.is_symlink():
+                shutil.rmtree(target_path)
+            else:
+                target_path.unlink()
+        if source_path.is_dir() and not source_path.is_symlink():
+            shutil.copytree(
+                source_path,
+                target_path,
+                ignore=shutil.ignore_patterns(".krw_pipeline"),
+            )
+        else:
+            shutil.copy2(source_path, target_path)
 
 
 def _dev_publish_paths(releases_root: Path, release_id: str) -> dict[str, Path]:
@@ -1904,7 +2604,6 @@ def _retarget_queue_publish_jobs(
     *,
     store: PipelineQueue,
     publish_root: Path,
-    publish_index_path: Path | None,
     statuses: set[str],
     dry_run: bool = False,
 ) -> dict[str, int]:
@@ -1912,21 +2611,18 @@ def _retarget_queue_publish_jobs(
     changed = 0
     for job in jobs:
         next_publish_root = str(publish_root)
-        next_publish_index_path = str(publish_index_path) if publish_index_path is not None else None
-        if job.publish_root == next_publish_root and job.publish_index_path == next_publish_index_path:
+        if job.publish_root == next_publish_root:
             continue
         changed += 1
         if dry_run:
             continue
         job.publish_root = next_publish_root
-        job.publish_index_path = next_publish_index_path
         store.save_job(job)
         store.append_event(
             "publish_retargeted",
             job,
             {
                 "publish_root": next_publish_root,
-                "publish_index_path": next_publish_index_path,
             },
         )
     return {"scanned": len(jobs), "changed": changed}
@@ -2006,12 +2702,10 @@ def _release_prepare_dev(
         env=env,
         source_root=resolved_source_root or release_root,
         index_path=index_path,
-        write_legacy=True,
     )
 
     if set_config:
         set_config_value("publish-root", str(release_root))
-        set_config_value("publish-index-path", str(index_path))
 
     queue_jobs_changed = 0
     queue_retargeted = False
@@ -2020,7 +2714,6 @@ def _release_prepare_dev(
         retarget_result = _retarget_queue_publish_jobs(
             store=retarget_store,
             publish_root=release_root,
-            publish_index_path=index_path,
             statuses={PENDING},
         )
         queue_jobs_changed = retarget_result["changed"]
@@ -2060,7 +2753,7 @@ def release_prepare_dev_cmd(
     set_config: bool = typer.Option(
         True,
         "--set-config/--no-set-config",
-        help="Point CLI publish-root and publish-index-path at the new dev release.",
+        help="Point CLI publish-root at the new dev release.",
     ),
     retarget_queue: bool = typer.Option(
         True,
@@ -2079,7 +2772,7 @@ def release_prepare_dev_cmd(
     ),
     dry_run: bool = typer.Option(False, "--dry-run", help="Show the release that would be prepared."),
 ) -> None:
-    """Create a mutable dev release workspace and point queue publishing at it."""
+    """Prepare a dev release seed and optionally retarget queued publish jobs."""
     resolved_release_id = release_id or _default_release_id()
     try:
         result = _release_prepare_dev(
@@ -2142,6 +2835,9 @@ def release_publish_dev_cmd(
     dry_run: bool = typer.Option(False, "--dry-run", help="Show what would be published."),
 ) -> None:
     """Rebuild the running-root index into a new dev release and promote dev/current."""
+    if not build_index:
+        typer.echo("Release publish requires index build and verification; --no-build-index is not supported.")
+        raise typer.Exit(1)
     resolved_release_id = release_id or _default_release_id()
     try:
         resolved_source_root = (
@@ -2240,6 +2936,7 @@ def release_publish_dev_cmd(
     typer.echo(f"promoted: {result['promoted']}")
     if not dry_run:
         typer.echo(f"manifest: {result['manifest']}")
+        typer.echo(f"verify_report: {result['verify_report']}")
         typer.echo("Next: krw-ontology release materialize-prod " + result["release_id"])
 
 
@@ -2292,6 +2989,7 @@ def release_publish_dev_worker_cmd(
             typer.echo("Agent index rebuild skipped.")
         typer.echo(f"promoted: {result['promoted']}")
         typer.echo(f"manifest: {result['manifest']}")
+        typer.echo(f"verify_report: {result['verify_report']}")
         typer.echo("Next: krw-ontology release materialize-prod " + result["release_id"])
     except Exception as exc:
         typer.echo(f"FAILED publish-dev worker: {exc}")
@@ -2325,6 +3023,7 @@ def release_publish_dev_status_cmd(
     typer.echo(f"release_root: {paths['release_root']}")
     typer.echo(f"index: {'present' if paths['index_path'].exists() else 'missing'} {paths['index_path']}")
     typer.echo(f"manifest: {'present' if (paths['release_root'] / RELEASE_MANIFEST_FILENAME).exists() else 'missing'}")
+    typer.echo(f"verify_report: {'present' if (paths['release_root'] / 'verify' / 'release_verify.json').exists() else 'missing'}")
     typer.echo(f"log: {paths['log_path']}")
     typer.echo(f"progress: {paths['progress_path']}")
 
@@ -2391,12 +3090,22 @@ def release_finalize_dev_cmd(
     ),
 ) -> None:
     """Rebuild, verify, and promote a completed dev release."""
+    if not build_index:
+        typer.echo("Release finalize requires index build and verification; --no-build-index is not supported.")
+        raise typer.Exit(1)
     env = "dev"
     release_id = release_id or _resolve_release_id_for_finalize_dev(env, releases_root)
     if release_id is None:
-        typer.echo("Missing release id. Pass one, run prepare-dev first, or promote dev/current.")
+        typer.echo("Missing release id. Pass a prepared non-current release id or run prepare-dev first.")
         raise typer.Exit(1)
-    release_root = release_env_root(releases_root, env).expanduser().resolve() / release_id
+    env_root = release_env_root(releases_root, env).expanduser().resolve()
+    if release_id == current_release_id(env_root):
+        typer.echo(
+            "Refusing to finalize dev/current in place. "
+            "Create a new candidate with release prepare-dev or release publish."
+        )
+        raise typer.Exit(1)
+    release_root = env_root / release_id
     index_path = _default_release_index_path(release_root)
     if not release_root.is_dir():
         typer.echo(f"Release directory not found: {release_root}")
@@ -2409,9 +3118,15 @@ def release_finalize_dev_cmd(
         raise typer.Exit(1)
 
     if build_index:
-        from krw_ontology.agent_index import build_agent_index
+        from krw_ontology.agent_index import build_agent_index, write_source_artifact_manifest
 
-        index_result = build_agent_index(release_root, index_path=index_path, force=True)
+        source_manifest = write_source_artifact_manifest(release_root)
+        index_result = _build_agent_index_for_release(
+            build_agent_index,
+            release_root,
+            index_path=index_path,
+            source_manifest_path=Path(str(source_manifest["path"])),
+        )
         totals = index_result["totals"]
         typer.echo(
             "Agent index built: "
@@ -2427,12 +3142,17 @@ def release_finalize_dev_cmd(
         release_id=release_id,
         env=env,
         index_path=index_path,
-        write_legacy=True,
     )
-    verification = verify_release_root(release_root, env=env, index_path=index_path)
+    verification = verify_release_root(release_root, env=env, index_path=index_path, run_smoke=True)
     if not verification["ok"]:
         typer.echo(f"Release verify failed: {', '.join(verification['errors'])}")
         raise typer.Exit(1)
+    verify_report = write_release_verification_report(
+        release_root,
+        env=env,
+        index_path=index_path,
+        verification=verification,
+    )
 
     if promote:
         promote_local_release(releases_root, env=env, release_id=release_id)
@@ -2442,12 +3162,11 @@ def release_finalize_dev_cmd(
         config = load_cli_config()
         if config.publish_root == str(release_root):
             unset_config_value("publish-root")
-        if config.publish_index_path == str(index_path):
-            unset_config_value("publish-index-path")
 
     typer.echo(f"Dev release finalized: {release_id}")
     typer.echo(f"release_root: {release_root}")
     typer.echo(f"manifest: {release_root / RELEASE_MANIFEST_FILENAME}")
+    typer.echo(f"verify_report: {verify_report['path']}")
     typer.echo(f"index_present: {manifest['index_present']}")
     typer.echo("Next: krw-ontology release materialize-prod " + release_id)
 
@@ -2480,7 +3199,7 @@ def release_materialize_prod_cmd(
     target_id = prod_release_id or release_id
     source_root = release_env_root(releases_root, source_env).expanduser().resolve() / release_id
     prod_root = release_env_root(releases_root, "prod").expanduser().resolve() / target_id
-    source_verification = verify_release_root(source_root, env=source_env)
+    source_verification = verify_release_root(source_root, env=source_env, run_smoke=True)
     if not source_verification["ok"]:
         typer.echo(f"Source release verify failed: {', '.join(source_verification['errors'])}")
         raise typer.Exit(1)
@@ -2502,15 +3221,21 @@ def release_materialize_prod_cmd(
         env="prod",
         source_root=source_root,
         index_path=index_path,
-        write_legacy=True,
     )
-    prod_verification = verify_release_root(prod_root, env="prod", index_path=index_path)
+    prod_verification = verify_release_root(prod_root, env="prod", index_path=index_path, run_smoke=True)
     if not prod_verification["ok"]:
         typer.echo(f"Prod release verify failed: {', '.join(prod_verification['errors'])}")
         raise typer.Exit(1)
+    verify_report = write_release_verification_report(
+        prod_root,
+        env="prod",
+        index_path=index_path,
+        verification=prod_verification,
+    )
 
     typer.echo(f"Prod release materialized: {target_id}")
     typer.echo(f"prod_root: {prod_root}")
+    typer.echo(f"verify_report: {verify_report['path']}")
     typer.echo(f"Next: npm run deploy:data -- --release-id {target_id}")
 
 
@@ -2534,13 +3259,14 @@ def release_write_manifest_cmd(
     ),
 ) -> None:
     """Write canonical manifest.json for a local immutable release root."""
+    _exit_if_path_mutates_current(root, "--root")
+    _exit_if_path_mutates_current(index_path, "--index-path")
     resolved_release_id = release_id or _new_release_id()
     manifest = write_release_manifest(
         root,
         release_id=resolved_release_id,
         env=env,
         index_path=index_path,
-        write_legacy=True,
     )
     typer.echo(f"Release manifest written: {Path(root).expanduser().resolve() / RELEASE_MANIFEST_FILENAME}")
     typer.echo(f"env: {manifest['env']}")
@@ -2562,30 +3288,689 @@ def release_verify_cmd(
         "--index-path",
         help="Optional explicit agent_index.sqlite path.",
     ),
+    write_report: bool = typer.Option(
+        False,
+        "--write-report",
+        help="Write verify/release_verify.json inside the resolved release root.",
+    ),
+    smoke: bool = typer.Option(
+        True,
+        "--smoke/--no-smoke",
+        help="Run serving SDK smoke checks against the release index.",
+    ),
+    smoke_baseline: Optional[Path] = typer.Option(
+        None,
+        "--smoke-baseline",
+        help="Optional smoke query baseline JSON path. Relative paths are resolved inside the release root.",
+    ),
+    update_smoke_baseline: bool = typer.Option(
+        False,
+        "--update-smoke-baseline",
+        help="Write or replace the smoke query baseline after successful smoke execution.",
+    ),
+    ranking_top_k: Optional[int] = typer.Option(
+        None,
+        "--ranking-top-k",
+        help="Global topic ranking smoke top-k. Overrides KRW_RELEASE_SMOKE_GLOBAL_TOPIC_TOP_K.",
+    ),
+    ranking_min_overlap_ratio: Optional[float] = typer.Option(
+        None,
+        "--ranking-min-overlap-ratio",
+        help=(
+            "Minimum router/monolith top-k overlap ratio for global topic ranking smoke. "
+            "Overrides KRW_RELEASE_SMOKE_GLOBAL_TOPIC_MIN_OVERLAP_RATIO."
+        ),
+    ),
+    ranking_min_overlap_count: Optional[int] = typer.Option(
+        None,
+        "--ranking-min-overlap-count",
+        help=(
+            "Minimum router/monolith overlapping topic count for global topic ranking smoke. "
+            "Overrides KRW_RELEASE_SMOKE_GLOBAL_TOPIC_MIN_OVERLAP_COUNT."
+        ),
+    ),
+    ranking_max_rank_delta: Optional[int] = typer.Option(
+        None,
+        "--ranking-max-rank-delta",
+        help=(
+            "Maximum allowed rank delta for overlapping global topics. "
+            "Overrides KRW_RELEASE_SMOKE_GLOBAL_TOPIC_MAX_RANK_DELTA."
+        ),
+    ),
+    ranking_sample_limit: Optional[int] = typer.Option(
+        None,
+        "--ranking-sample-limit",
+        help=(
+            "Maximum global topic samples to verify. "
+            "Overrides KRW_RELEASE_SMOKE_GLOBAL_TOPIC_SAMPLE_LIMIT."
+        ),
+    ),
 ) -> None:
     """Verify release manifest, env, release id, and index presence."""
-    verification = verify_release_root(
-        root,
-        env=env,
-        index_path=index_path,
-        require_current_symlink=require_current_symlink,
-    )
+    write_report = write_report or smoke_baseline is not None or update_smoke_baseline
+    if write_report:
+        _exit_if_path_mutates_current(root, "--root")
+    if update_smoke_baseline:
+        _exit_if_path_mutates_current(smoke_baseline, "--smoke-baseline")
+    ranking_thresholds = {
+        "top_k": ranking_top_k,
+        "min_overlap_ratio": ranking_min_overlap_ratio,
+        "min_overlap_count": ranking_min_overlap_count,
+        "max_rank_delta": ranking_max_rank_delta,
+        "sample_limit": ranking_sample_limit,
+    }
+    try:
+        ranking_threshold_metadata = resolve_global_topic_ranking_threshold_metadata(ranking_thresholds)
+        resolved_ranking_thresholds = ranking_threshold_metadata["thresholds"]
+        resolved_ranking_threshold_sources = ranking_threshold_metadata["sources"]
+        verification = verify_release_root(
+            root,
+            env=env,
+            index_path=index_path,
+            require_current_symlink=require_current_symlink,
+            run_smoke=smoke,
+            ranking_thresholds=ranking_thresholds,
+        )
+    except ValueError as exc:
+        typer.echo(f"FAIL {exc}")
+        raise typer.Exit(1) from exc
+    verify_report = None
+    if write_report:
+        verify_report = write_release_verification_report(
+            root,
+            env=env,
+            index_path=index_path,
+            require_current_symlink=require_current_symlink,
+            run_smoke=smoke,
+            smoke_baseline_path=smoke_baseline,
+            update_smoke_baseline=update_smoke_baseline,
+            ranking_thresholds=ranking_thresholds,
+            verification=verification,
+        )
     typer.echo(f"Release verify: {'ok' if verification['ok'] else 'failed'}")
     typer.echo(f"root: {verification['root']}")
     typer.echo(f"env: {verification.get('env') or '<missing>'}")
     typer.echo(f"release_id: {verification.get('release_id') or '<missing>'}")
     typer.echo(f"manifest: {verification.get('manifest_path') or '<missing>'}")
     typer.echo(f"index: {'present' if verification.get('index_present') else 'missing'}")
-    if verification["errors"]:
-        for error in verification["errors"]:
+    if verify_report is not None:
+        typer.echo(f"verify_report: {verify_report['path']}")
+        if verify_report.get("ranking_quality_path"):
+            ranking_quality_path = Path(str(verify_report["ranking_quality_path"]))
+            if not ranking_quality_path.is_absolute():
+                ranking_quality_path = Path(str(verify_report["root"])) / ranking_quality_path
+            typer.echo(f"ranking_quality_report: {ranking_quality_path}")
+    if smoke:
+        typer.echo(
+            "ranking_thresholds: "
+            f"top_k={resolved_ranking_thresholds['top_k']} "
+            f"min_overlap_ratio={resolved_ranking_thresholds['min_overlap_ratio']} "
+            f"min_overlap_count={resolved_ranking_thresholds['min_overlap_count']} "
+            f"max_rank_delta={resolved_ranking_thresholds['max_rank_delta']} "
+            f"sample_limit={resolved_ranking_thresholds['sample_limit']}"
+        )
+        typer.echo(
+            "ranking_threshold_sources: "
+            f"top_k={resolved_ranking_threshold_sources['top_k']} "
+            f"min_overlap_ratio={resolved_ranking_threshold_sources['min_overlap_ratio']} "
+            f"min_overlap_count={resolved_ranking_threshold_sources['min_overlap_count']} "
+            f"max_rank_delta={resolved_ranking_threshold_sources['max_rank_delta']} "
+            f"sample_limit={resolved_ranking_threshold_sources['sample_limit']}"
+        )
+    effective_errors = list((verify_report or verification).get("errors") or [])
+    if effective_errors:
+        for error in effective_errors:
             typer.echo(f"FAIL {error}")
         raise typer.Exit(1)
+
+
+@release_app.command("calibrate-ranking-thresholds")
+def release_calibrate_ranking_thresholds_cmd(
+    reports: list[Path] = typer.Argument(
+        ...,
+        help="One or more verify/ranking_quality.json files from accepted releases.",
+    ),
+    output: Optional[Path] = typer.Option(
+        None,
+        "--output",
+        help="Optional JSON report path. Defaults to the first report directory.",
+    ),
+    overlap_margin: float = typer.Option(
+        0.0,
+        "--overlap-margin",
+        help="Subtract this margin from the observed minimum overlap ratio.",
+    ),
+    rank_delta_margin: int = typer.Option(
+        0,
+        "--rank-delta-margin",
+        help="Add this margin to the observed maximum rank delta.",
+    ),
+    min_reports: int = typer.Option(
+        1,
+        "--min-reports",
+        help="Minimum number of valid ok ranking quality reports required.",
+    ),
+) -> None:
+    """Recommend global-topic ranking thresholds from ranking quality reports."""
+    try:
+        calibration = calibrate_global_topic_ranking_thresholds(
+            reports,
+            overlap_margin=overlap_margin,
+            rank_delta_margin=rank_delta_margin,
+            min_reports=min_reports,
+        )
+    except ValueError as exc:
+        typer.echo(f"FAIL {exc}")
+        raise typer.Exit(1) from exc
+    output_path = output
+    if output_path is None:
+        first_report = Path(reports[0]).expanduser()
+        output_path = first_report.parent / "ranking_threshold_calibration.json"
+    _exit_if_path_mutates_current(output_path, "--output")
+    report = write_ranking_threshold_calibration_report(output_path, calibration)
+    recommendation = report["recommendation"]
+    typer.echo(f"Ranking threshold calibration: {'ok' if report['ok'] else 'failed'}")
+    typer.echo(f"report: {report['path']}")
+    typer.echo(f"calibration_hash: {report['calibration_hash']}")
+    typer.echo(f"input_reports: {len(report['inputs'])}")
+    typer.echo(f"observation_count: {report['observation_count']}")
+    typer.echo(
+        "recommended: "
+        f"--ranking-top-k {recommendation['top_k']} "
+        f"--ranking-min-overlap-ratio {recommendation['min_overlap_ratio']} "
+        f"--ranking-min-overlap-count {recommendation['min_overlap_count']} "
+        f"--ranking-max-rank-delta {recommendation['max_rank_delta']} "
+        f"--ranking-sample-limit {recommendation['sample_limit']}"
+    )
+    for warning in report.get("warnings") or []:
+        typer.echo(f"WARN {warning}")
+    for error in report.get("errors") or []:
+        typer.echo(f"FAIL {error}")
+    if report.get("errors"):
+        raise typer.Exit(1)
+
+
+@source_manifest_app.command("generate")
+def source_manifest_generate_cmd(
+    root: Path = typer.Option(..., "--root", help="Ontology artifact root."),
+    output: Optional[Path] = typer.Option(
+        None,
+        "--output",
+        help="Manifest output path. Defaults to <root>/indexes/source_manifest.json.",
+    ),
+) -> None:
+    """Generate the canonical source manifest used by production index builds."""
+    from krw_ontology.agent_index import write_source_artifact_manifest
+
+    _exit_if_path_mutates_current(root, "--root")
+    _exit_if_path_mutates_current(output, "--output")
+    try:
+        manifest = write_source_artifact_manifest(root, manifest_path=output)
+    except Exception as exc:
+        typer.echo(f"FAILED source-manifest generate: {exc}")
+        raise typer.Exit(1) from exc
+    typer.echo(f"Source manifest written: {manifest['path']}")
+    typer.echo(f"manifest_hash: {manifest['manifest_hash']}")
+    typer.echo(f"artifacts: {manifest['artifact_count']}")
+
+
+@source_manifest_app.command("verify")
+def source_manifest_verify_cmd(
+    root: Path = typer.Option(..., "--root", help="Ontology artifact root."),
+    manifest: Optional[Path] = typer.Option(
+        None,
+        "--manifest",
+        help="Source manifest path. Defaults to <root>/indexes/source_manifest.json.",
+    ),
+) -> None:
+    """Verify a canonical source manifest against current artifact bytes."""
+    from krw_ontology.agent_index import verify_source_artifact_manifest
+
+    result = verify_source_artifact_manifest(root, manifest_path=manifest)
+    typer.echo(f"Source manifest verify: {'ok' if result['ok'] else 'failed'}")
+    typer.echo(f"path: {result['path']}")
+    typer.echo(f"manifest_hash: {result.get('manifest_hash') or '<missing>'}")
+    typer.echo(f"artifacts: {result['artifact_count']}")
+    for error in result.get("errors") or []:
+        typer.echo(f"FAIL {error}")
+    if not result["ok"]:
+        raise typer.Exit(1)
+
+
+@source_manifest_app.command("diff")
+def source_manifest_diff_cmd(
+    left: Path = typer.Argument(..., help="Older source manifest path."),
+    right: Path = typer.Argument(..., help="Newer source manifest path."),
+    json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
+) -> None:
+    """Diff two source manifests by artifact content hash."""
+    from krw_ontology.agent_index import diff_source_artifact_manifests
+
+    try:
+        diff = diff_source_artifact_manifests(left, right)
+    except Exception as exc:
+        typer.echo(f"FAILED source-manifest diff: {exc}")
+        raise typer.Exit(1) from exc
+    if json_output:
+        typer.echo(json.dumps(diff, sort_keys=True))
+        return
+    summary = diff["summary"]
+    typer.echo("Source manifest diff")
+    typer.echo(f"left: {diff['left_path']}")
+    typer.echo(f"right: {diff['right_path']}")
+    typer.echo(
+        "changes: "
+        f"added={summary['added']} removed={summary['removed']} "
+        f"changed={summary['changed']} unchanged={summary['unchanged']}"
+    )
+    for path in diff["added"][:20]:
+        typer.echo(f"added: {path}")
+    for path in diff["removed"][:20]:
+        typer.echo(f"removed: {path}")
+    for path in diff["changed"][:20]:
+        typer.echo(f"changed: {path}")
+
+
+@release_app.command("preview")
+def release_preview_cmd(
+    source_root: Optional[Path] = typer.Option(
+        None,
+        "--from-root",
+        help="Source ontology root. Defaults to configured running-root.",
+    ),
+    releases_root: Optional[Path] = typer.Option(
+        None,
+        "--releases-root",
+        help="Local releases root. Defaults to configured publish-root or the built-in releases root.",
+    ),
+    env: Optional[str] = typer.Option(None, "--env", help="Ontology environment. Defaults to KRW_ONTOLOGY_ENV or dev."),
+    json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
+) -> None:
+    """Preview the production release transaction without materializing a candidate."""
+    try:
+        resolved_source_root, resolved_releases_root, resolved_env = _resolve_release_command_defaults(
+            source_root=source_root,
+            releases_root=releases_root,
+            env=env,
+        )
+        preview = _release_preview_payload(
+            source_root=resolved_source_root,
+            releases_root=resolved_releases_root,
+            env=resolved_env,
+        )
+    except Exception as exc:
+        typer.echo(f"FAILED release preview: {exc}")
+        raise typer.Exit(1) from exc
+    if json_output:
+        typer.echo(json.dumps(preview, sort_keys=True))
+        return
+    plan = preview["plan"]
+    typer.echo("Release preview")
+    typer.echo(f"env: {preview['env']}")
+    typer.echo(f"source_root: {preview['source_root']}")
+    typer.echo(f"current: {preview['current'] or '<missing>'}")
+    typer.echo(f"no_op: {preview['no_op']}")
+    typer.echo(f"source_manifest_hash: {preview['source_manifest']['manifest_hash']}")
+    typer.echo(f"artifacts: {plan['artifact_count']}")
+    typer.echo(f"dirty_artifacts: {plan['dirty_artifact_count']}")
+    typer.echo(f"cached_fragments: {plan['cached_artifact_count']}")
+    typer.echo(f"companies: {plan['company_count']}")
+    typer.echo(f"cached_companies: {plan['cached_company_count']}")
+    typer.echo(f"dirty_companies: {plan['dirty_company_count']}")
+    typer.echo(f"dirty_tickers: {', '.join(plan['dirty_tickers']) if plan['dirty_tickers'] else '<none>'}")
+    typer.echo(f"layout: {plan['layout']}")
+
+
+@release_app.command("deploy")
+def release_deploy_cmd(
+    source_root: Optional[Path] = typer.Option(
+        None,
+        "--from-root",
+        help="Source ontology root. Defaults to configured running-root.",
+    ),
+    releases_root: Optional[Path] = typer.Option(
+        None,
+        "--releases-root",
+        help="Local releases root. Defaults to configured publish-root or the built-in releases root.",
+    ),
+    env: Optional[str] = typer.Option(None, "--env", help="Ontology environment. Defaults to KRW_ONTOLOGY_ENV or dev."),
+    release_id: Optional[str] = typer.Option(None, "--release-id", help="Release id. Defaults to a timestamp id."),
+    force_release: bool = typer.Option(
+        False,
+        "--force-release",
+        "--force",
+        help="Create a release even when indexed artifact content matches current.",
+    ),
+) -> None:
+    """Run the full production-safe local release pipeline and promote current."""
+    resolved_source_root, resolved_releases_root, resolved_env = _resolve_release_command_defaults(
+        source_root=source_root,
+        releases_root=releases_root,
+        env=env,
+    )
+    _run_full_root_release_command(
+        source_root=resolved_source_root,
+        releases_root=resolved_releases_root,
+        env=resolved_env,
+        release_id=release_id or _default_release_id(),
+        promote=True,
+        force_release=force_release,
+        label="deploy",
+    )
+
+
+@release_app.command("force")
+def release_force_cmd(
+    source_root: Optional[Path] = typer.Option(
+        None,
+        "--from-root",
+        help="Source ontology root. Defaults to configured running-root.",
+    ),
+    releases_root: Optional[Path] = typer.Option(
+        None,
+        "--releases-root",
+        help="Local releases root. Defaults to configured publish-root or the built-in releases root.",
+    ),
+    env: Optional[str] = typer.Option(None, "--env", help="Ontology environment. Defaults to KRW_ONTOLOGY_ENV or dev."),
+    release_id: Optional[str] = typer.Option(None, "--release-id", help="Release id. Defaults to a timestamp id."),
+) -> None:
+    """Force a canonical local release from configured roots and promote current."""
+    resolved_source_root, resolved_releases_root, resolved_env = _resolve_release_command_defaults(
+        source_root=source_root,
+        releases_root=releases_root,
+        env=env,
+    )
+    _run_full_root_release_command(
+        source_root=resolved_source_root,
+        releases_root=resolved_releases_root,
+        env=resolved_env,
+        release_id=release_id or _default_release_id(),
+        promote=True,
+        force_release=True,
+        label="force",
+    )
+
+
+@release_app.command("history")
+def release_history_cmd(
+    releases_root: Path = typer.Option(
+        _default_releases_root(),
+        "--releases-root",
+        help="Local releases root.",
+    ),
+    env: str = typer.Option("dev", "--env", help="Ontology environment: dev, staging, or prod."),
+    limit: int = typer.Option(20, "--limit", min=1, help="Maximum releases to print."),
+    include_failed: bool = typer.Option(False, "--include-failed", help="Also show quarantined failed candidates."),
+) -> None:
+    """Show recent release history with the current release marked."""
+    resolved_env = normalize_ontology_env(env)
+    env_root = release_env_root(releases_root, resolved_env).expanduser().resolve()
+    current_id = current_release_id(env_root)
+    releases = list_release_ids(env_root)[:limit]
+    typer.echo(f"Release history: env={resolved_env} current={current_id or '<missing>'}")
+    for release_id in releases:
+        marker = " current" if release_id == current_id else ""
+        typer.echo(f"release: {release_id}{marker}")
+    if include_failed:
+        failed_root = env_root / FAILED_RELEASE_DIRNAME
+        failed = (
+            [path.name for path in sorted(failed_root.iterdir(), key=lambda item: item.stat().st_mtime, reverse=True) if path.is_dir()]
+            if failed_root.is_dir()
+            else []
+        )
+        for release_id in failed[:limit]:
+            typer.echo(f"failed: {release_id}")
+
+
+@release_app.command("plan")
+def release_plan_cmd(
+    source_root: Optional[Path] = typer.Option(
+        None,
+        "--from-root",
+        help="Source ontology root. Defaults to configured running-root.",
+    ),
+    releases_root: Optional[Path] = typer.Option(
+        None,
+        "--releases-root",
+        help="Local releases root. Defaults to configured publish-root or the built-in releases root.",
+    ),
+    env: Optional[str] = typer.Option(None, "--env", help="Ontology environment. Defaults to KRW_ONTOLOGY_ENV or dev."),
+) -> None:
+    """Plan a full-root immutable release transaction without writing outputs."""
+    try:
+        resolved_source_root, resolved_releases_root, resolved_env = _resolve_release_command_defaults(
+            source_root=source_root,
+            releases_root=releases_root,
+            env=env,
+        )
+        preview = _release_preview_payload(
+            source_root=resolved_source_root,
+            releases_root=resolved_releases_root,
+            env=resolved_env,
+        )
+    except Exception as exc:
+        typer.echo(f"FAILED release plan: {exc}")
+        raise typer.Exit(1) from exc
+    plan = preview["plan"]
+    typer.echo("Release plan")
+    typer.echo(f"env: {preview['env']}")
+    typer.echo(f"source_root: {preview['source_root']}")
+    typer.echo(f"current: {preview['current'] or '<missing>'}")
+    typer.echo(f"no_op: {preview['no_op']}")
+    typer.echo(f"artifacts: {plan['artifact_count']}")
+    typer.echo(f"dirty_artifacts: {plan['dirty_artifact_count']}")
+    typer.echo(f"cached_fragments: {plan['cached_artifact_count']}")
+    typer.echo(f"dirty_tickers: {', '.join(plan['dirty_tickers']) if plan['dirty_tickers'] else '<none>'}")
+    typer.echo(f"workers: {plan['workers']}")
+    typer.echo(f"layout: {plan['layout']}")
+
+
+@release_app.command("build")
+def release_build_cmd(
+    source_root: Optional[Path] = typer.Option(
+        None,
+        "--from-root",
+        help="Source ontology root. Defaults to configured running-root.",
+    ),
+    releases_root: Optional[Path] = typer.Option(
+        None,
+        "--releases-root",
+        help="Local releases root. Defaults to configured publish-root or the built-in releases root.",
+    ),
+    env: Optional[str] = typer.Option(None, "--env", help="Ontology environment. Defaults to KRW_ONTOLOGY_ENV or dev."),
+    release_id: Optional[str] = typer.Option(None, "--release-id", help="Release id. Defaults to a timestamp id."),
+    force_release: bool = typer.Option(
+        False,
+        "--force-release",
+        "--force",
+        help="Build a release even when indexed artifact content matches current.",
+    ),
+) -> None:
+    """Build and verify a full-root immutable release without promoting current."""
+    resolved_source_root, resolved_releases_root, resolved_env = _resolve_release_command_defaults(
+        source_root=source_root,
+        releases_root=releases_root,
+        env=env,
+    )
+    _run_full_root_release_command(
+        source_root=resolved_source_root,
+        releases_root=resolved_releases_root,
+        env=resolved_env,
+        release_id=release_id or _default_release_id(),
+        promote=False,
+        force_release=force_release,
+        label="build",
+    )
+
+
+@release_app.command("publish")
+def release_publish_cmd(
+    source_root: Optional[Path] = typer.Option(
+        None,
+        "--from-root",
+        help="Source ontology root. Defaults to configured running-root.",
+    ),
+    releases_root: Optional[Path] = typer.Option(
+        None,
+        "--releases-root",
+        help="Local releases root. Defaults to configured publish-root or the built-in releases root.",
+    ),
+    env: Optional[str] = typer.Option(None, "--env", help="Ontology environment. Defaults to KRW_ONTOLOGY_ENV or dev."),
+    release_id: Optional[str] = typer.Option(None, "--release-id", help="Release id. Defaults to a timestamp id."),
+    promote: bool = typer.Option(True, "--promote/--no-promote", help="Promote current after verification."),
+    force_release: bool = typer.Option(
+        False,
+        "--force-release",
+        "--force",
+        help="Create a release even when indexed artifact content matches current.",
+    ),
+) -> None:
+    """Publish a full ontology root through one verified immutable transaction."""
+    resolved_source_root, resolved_releases_root, resolved_env = _resolve_release_command_defaults(
+        source_root=source_root,
+        releases_root=releases_root,
+        env=env,
+    )
+    _run_full_root_release_command(
+        source_root=resolved_source_root,
+        releases_root=resolved_releases_root,
+        env=resolved_env,
+        release_id=release_id or _default_release_id(),
+        promote=promote,
+        force_release=force_release,
+        label="publish",
+    )
+
+
+@release_app.command("import-current")
+def release_import_current_cmd(
+    source_root: Optional[Path] = typer.Option(
+        None,
+        "--from-root",
+        help="Existing mutable/stable ontology root. Defaults to configured running-root.",
+    ),
+    releases_root: Optional[Path] = typer.Option(
+        None,
+        "--releases-root",
+        help="Local releases root. Defaults to configured publish-root or the built-in releases root.",
+    ),
+    env: Optional[str] = typer.Option(None, "--env", help="Ontology environment. Defaults to KRW_ONTOLOGY_ENV or dev."),
+    release_id: Optional[str] = typer.Option(None, "--release-id", help="Release id. Defaults to a timestamp id."),
+) -> None:
+    """Import an existing mutable root into a verified immutable release and promote it."""
+    resolved_source_root, resolved_releases_root, resolved_env = _resolve_release_command_defaults(
+        source_root=source_root,
+        releases_root=releases_root,
+        env=env,
+    )
+    _run_full_root_release_command(
+        source_root=resolved_source_root,
+        releases_root=resolved_releases_root,
+        env=resolved_env,
+        release_id=release_id or _default_release_id(),
+        promote=True,
+        force_release=True,
+        label="import-current",
+    )
+
+
+def _run_full_root_release_command(
+    *,
+    source_root: Path,
+    releases_root: Path,
+    env: str,
+    release_id: str,
+    promote: bool,
+    force_release: bool,
+    label: str,
+) -> None:
+    try:
+        result = _publish_root_as_local_release(
+            source_root=source_root,
+            releases_root=releases_root,
+            env=env,
+            release_id=release_id,
+            promote=promote,
+            force_release=force_release,
+        )
+    except Exception as exc:
+        typer.echo(f"FAILED release {label}: {exc}")
+        raise typer.Exit(1) from exc
+    if result["no_op"]:
+        typer.echo(
+            f"No-op release {label}: indexed artifact content is unchanged; "
+            f"current remains {result['release_id']}"
+        )
+        return
+    typer.echo(
+        f"Release {label} completed: env={result['env']} "
+        f"release_id={result['release_id']} promoted={result['promoted']}"
+    )
+    typer.echo(f"release_root: {result['release_root']}")
+    typer.echo(f"index_path: {result['index_path']}")
+    typer.echo(f"verify_report: {result['verify_report']}")
+
+
+def _release_preview_payload(
+    *,
+    source_root: Path,
+    releases_root: Path,
+    env: str,
+) -> dict[str, object]:
+    from krw_ontology.agent_index import plan_agent_index, write_source_artifact_manifest
+
+    resolved_source = source_root.expanduser().resolve()
+    resolved_env = normalize_ontology_env(env)
+    env_root = release_env_root(releases_root, resolved_env).expanduser().resolve()
+    current = env_root / "current"
+    with tempfile.TemporaryDirectory(prefix="krw-source-manifest-preview-") as tmp_dir:
+        manifest_path = Path(tmp_dir) / "source_manifest.json"
+        source_manifest = write_source_artifact_manifest(resolved_source, manifest_path=manifest_path)
+        plan = plan_agent_index(
+            resolved_source,
+            layout="monolith-and-shards",
+            source_manifest_path=manifest_path,
+        )
+        source_signature = _try_release_index_content_signature(resolved_source)
+        current_signature = (
+            _try_release_index_content_signature(current.resolve())
+            if current.exists() or current.is_symlink()
+            else None
+        )
+        return {
+            "env": resolved_env,
+            "source_root": str(resolved_source),
+            "releases_root": str(releases_root.expanduser().resolve()),
+            "current": current_release_id(env_root),
+            "no_op": source_signature is not None and source_signature == current_signature,
+            "source_manifest": {
+                "manifest_hash": source_manifest["manifest_hash"],
+                "artifact_count": source_manifest["artifact_count"],
+            },
+            "plan": _plan_preview_dict(plan),
+        }
+
+
+def _plan_preview_dict(plan) -> dict[str, object]:
+    return {
+        "artifact_count": len(plan.items),
+        "dirty_artifact_count": len(plan.dirty_items),
+        "cached_artifact_count": len(plan.cached_items),
+        "company_count": len(plan.company_items),
+        "dirty_company_count": len(plan.dirty_company_items),
+        "cached_company_count": len(plan.cached_company_items),
+        "dirty_tickers": list(plan.dirty_tickers),
+        "workers": plan.workers,
+        "layout": plan.layout,
+        "discovery_mode": plan.discovery_mode,
+        "source_manifest_hash": plan.source_manifest_hash,
+    }
 
 
 @release_app.command("status")
 def release_status_cmd(
     releases_root: Path = typer.Option(
-        ...,
+        _default_releases_root(),
         "--releases-root",
         help="Path to releases root. Accepts either /data/releases or /data/releases/<env>.",
     ),
@@ -2609,6 +3994,163 @@ def release_status_cmd(
         typer.echo("releases: <none>")
 
 
+@release_app.command("list")
+def release_list_cmd(
+    releases_root: Path = typer.Option(..., "--releases-root", help="Local releases root."),
+    env: str = typer.Option("dev", "--env", help="Ontology environment: dev, staging, or prod."),
+    include_failed: bool = typer.Option(
+        False,
+        "--include-failed",
+        help="Also list quarantined failed candidates.",
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
+) -> None:
+    """List immutable releases and optionally quarantined failed candidates."""
+    resolved_env = normalize_ontology_env(env)
+    env_root = release_env_root(releases_root, resolved_env).expanduser().resolve()
+    current_id = current_release_id(env_root)
+    releases = list_release_ids(env_root)
+    failed_root = env_root / FAILED_RELEASE_DIRNAME
+    failed = (
+        [path.name for path in sorted(failed_root.iterdir(), key=lambda item: item.stat().st_mtime, reverse=True) if path.is_dir()]
+        if include_failed and failed_root.is_dir()
+        else []
+    )
+    payload = {
+        "env": resolved_env,
+        "env_root": str(env_root),
+        "current": current_id,
+        "releases": releases,
+        "failed": failed,
+    }
+    if json_output:
+        typer.echo(json.dumps(payload, sort_keys=True))
+        return
+    typer.echo(f"Release list: env={resolved_env} current={current_id or '<missing>'}")
+    for release_id in releases:
+        marker = " current" if release_id == current_id else ""
+        typer.echo(f"release: {release_id}{marker}")
+    for release_id in failed:
+        typer.echo(f"failed: {release_id}")
+
+
+@release_app.command("inspect")
+def release_inspect_cmd(
+    release_id: Optional[str] = typer.Argument(None, help="Release id. Defaults to current."),
+    releases_root: Path = typer.Option(..., "--releases-root", help="Local releases root."),
+    env: str = typer.Option("dev", "--env", help="Ontology environment: dev, staging, or prod."),
+    failed: bool = typer.Option(False, "--failed", help="Inspect a quarantined failed candidate."),
+    json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
+) -> None:
+    """Inspect release manifest, verification reports, and build summary."""
+    resolved_env = normalize_ontology_env(env)
+    env_root = release_env_root(releases_root, resolved_env).expanduser().resolve()
+    selected_id = release_id or current_release_id(env_root)
+    if selected_id is None:
+        typer.echo("No current release found.")
+        raise typer.Exit(1)
+    root = env_root / FAILED_RELEASE_DIRNAME / selected_id if failed else env_root / selected_id
+    if not root.is_dir():
+        typer.echo(f"Release not found: {root}")
+        raise typer.Exit(1)
+    manifest, manifest_path = load_release_manifest(root)
+    verification = None if failed else verify_release_root(root, env=resolved_env, run_smoke=False)
+    payload = {
+        "env": resolved_env,
+        "release_id": selected_id,
+        "root": str(root),
+        "failed": failed,
+        "failure": _read_json_object(root / "failure.json"),
+        "manifest_path": str(manifest_path) if manifest_path else None,
+        "manifest": manifest,
+        "verification": verification,
+        "release_verify": _read_json_object(root / "verify" / "release_verify.json"),
+        "smoke_queries": _read_json_object(root / "verify" / "smoke_queries.json"),
+        "ranking_quality": _read_json_object(root / "verify" / "ranking_quality.json"),
+        "build_summary": _read_json_object(root / "indexes" / "build_summary.json"),
+        "events": _read_jsonl_objects(env_root / "events" / f"{selected_id}.jsonl"),
+    }
+    if json_output:
+        typer.echo(json.dumps(payload, sort_keys=True))
+        return
+    typer.echo(f"Release inspect: env={resolved_env} release_id={selected_id}")
+    typer.echo(f"root: {root}")
+    typer.echo(f"failed: {failed}")
+    typer.echo(f"manifest_format: {manifest.get('format') or '<missing>'}")
+    typer.echo(f"manifest_status: {manifest.get('status') or '<missing>'}")
+    if verification is not None:
+        typer.echo(f"verification: {'ok' if verification['ok'] else 'failed'}")
+        for error in verification.get("errors") or []:
+            typer.echo(f"FAIL {error}")
+    failure_payload = payload["failure"]
+    if isinstance(failure_payload, dict):
+        typer.echo(f"failure_action: {failure_payload.get('action')}")
+        typer.echo(f"failure_error: {failure_payload.get('error')}")
+
+
+@release_app.command("gc")
+def release_gc_cmd(
+    releases_root: Path = typer.Option(..., "--releases-root", help="Local releases root."),
+    env: str = typer.Option("dev", "--env", help="Ontology environment: dev, staging, or prod."),
+    keep: int = typer.Option(5, "--keep", min=1, help="Number of newest successful releases to retain."),
+    include_failed: bool = typer.Option(
+        False,
+        "--include-failed",
+        help="Also delete quarantined failed candidates.",
+    ),
+    yes: bool = typer.Option(False, "--yes", help="Delete candidates. Without this flag, only print a dry run."),
+) -> None:
+    """Garbage-collect old local releases while always preserving current."""
+    resolved_env = normalize_ontology_env(env)
+    env_root = release_env_root(releases_root, resolved_env).expanduser().resolve()
+    current_id = current_release_id(env_root)
+    releases = list_release_ids(env_root)
+    protected = set(releases[:keep])
+    if current_id:
+        protected.add(current_id)
+    candidates = [env_root / release_id for release_id in releases if release_id not in protected]
+    failed_root = env_root / FAILED_RELEASE_DIRNAME
+    if include_failed and failed_root.is_dir():
+        candidates.extend(path for path in failed_root.iterdir() if path.is_dir())
+    typer.echo(f"Release GC: {'delete' if yes else 'dry-run'} env={resolved_env}")
+    typer.echo(f"current: {current_id or '<missing>'}")
+    typer.echo(f"protected: {len(protected)}")
+    typer.echo(f"candidates: {len(candidates)}")
+    for path in candidates:
+        typer.echo(f"candidate: {path}")
+    if not yes:
+        return
+    for path in candidates:
+        if path.is_symlink() or not path.is_dir():
+            raise RuntimeError(f"Refusing to delete non-directory release candidate: {path}")
+        shutil.rmtree(path)
+    typer.echo(f"deleted: {len(candidates)}")
+
+
+def _read_json_object(path: Path) -> dict[str, object] | None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _read_jsonl_objects(path: Path) -> list[dict[str, object]]:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    payloads: list[dict[str, object]] = []
+    for line in lines:
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            payloads.append(payload)
+    return payloads
+
+
 @release_app.command("promote")
 def release_promote_cmd(
     release_id: str = typer.Argument(..., help="Release id to promote to env current."),
@@ -2618,11 +4160,52 @@ def release_promote_cmd(
         help="Path to releases root. Accepts either /data/releases or /data/releases/<env>.",
     ),
     env: str = typer.Option("dev", "--env", help="Ontology environment: dev, staging, or prod."),
+    reload_command: Optional[str] = typer.Option(
+        None,
+        "--reload-command",
+        help="Optional local command to run after current is switched.",
+    ),
+    health_url: Optional[str] = typer.Option(
+        None,
+        "--health-url",
+        help="Optional local health URL. JSON must include ok=true and the promoted release_id.",
+    ),
+    health_timeout: float = typer.Option(
+        10.0,
+        "--health-timeout",
+        min=0.1,
+        help="Seconds to wait for the local health URL.",
+    ),
 ) -> None:
     """Atomically point env current to a verified release."""
-    result = promote_local_release(releases_root, env=env, release_id=release_id)
+    env_root = release_env_root(releases_root, env)
+    previous_release_id = current_release_id(env_root)
+    if previous_release_id == release_id:
+        typer.echo(f"FAILED release promote: release {release_id} is already current")
+        raise typer.Exit(1)
+    try:
+        result = promote_local_release(releases_root, env=env, release_id=release_id)
+        hook_result = _run_local_release_post_switch_hooks(
+            releases_root=releases_root,
+            env=env,
+            activated_release_id=result["release_id"],
+            previous_release_id=previous_release_id,
+            action="promote",
+            reload_command=reload_command,
+            health_url=health_url,
+            health_timeout=health_timeout,
+        )
+    except Exception as exc:
+        typer.echo(f"FAILED release promote: {exc}")
+        raise typer.Exit(1) from exc
     typer.echo(f"Release promoted: env={result['env']} release_id={result['release_id']}")
     typer.echo(f"current: {result['current']}")
+    typer.echo(f"verify_report: {result['verify_report']}")
+    typer.echo(f"event_log: {result['event_log']}")
+    typer.echo(f"release_event_log: {result['release_event_log']}")
+    _print_local_release_hook_result(hook_result)
+    for error in result.get("event_log_errors") or []:
+        typer.echo(f"WARN event_log: {error}")
 
 
 @release_app.command("rollback")
@@ -2637,11 +4220,156 @@ def release_rollback_cmd(
         help="Path to releases root. Accepts either /data/releases or /data/releases/<env>.",
     ),
     env: str = typer.Option("dev", "--env", help="Ontology environment: dev, staging, or prod."),
+    reload_command: Optional[str] = typer.Option(
+        None,
+        "--reload-command",
+        help="Optional local command to run after current is switched.",
+    ),
+    health_url: Optional[str] = typer.Option(
+        None,
+        "--health-url",
+        help="Optional local health URL. JSON must include ok=true and the rollback release_id.",
+    ),
+    health_timeout: float = typer.Option(
+        10.0,
+        "--health-timeout",
+        min=0.1,
+        help="Seconds to wait for the local health URL.",
+    ),
 ) -> None:
     """Rollback local env current to a requested or previous release."""
-    result = rollback_local_release(releases_root, env=env, release_id=release_id)
+    previous_release_id = current_release_id(release_env_root(releases_root, env))
+    try:
+        result = rollback_local_release(releases_root, env=env, release_id=release_id)
+        hook_result = _run_local_release_post_switch_hooks(
+            releases_root=releases_root,
+            env=env,
+            activated_release_id=result["release_id"],
+            previous_release_id=previous_release_id,
+            action="rollback",
+            reload_command=reload_command,
+            health_url=health_url,
+            health_timeout=health_timeout,
+        )
+    except Exception as exc:
+        typer.echo(f"FAILED release rollback: {exc}")
+        raise typer.Exit(1) from exc
     typer.echo(f"Release rollback activated: env={result['env']} release_id={result['release_id']}")
     typer.echo(f"current: {result['current']}")
+    typer.echo(f"verify_report: {result['verify_report']}")
+    typer.echo(f"event_log: {result['event_log']}")
+    typer.echo(f"release_event_log: {result['release_event_log']}")
+    _print_local_release_hook_result(hook_result)
+    for error in result.get("event_log_errors") or []:
+        typer.echo(f"WARN event_log: {error}")
+
+
+def _run_local_release_post_switch_hooks(
+    *,
+    releases_root: Path,
+    env: str,
+    activated_release_id: str,
+    previous_release_id: str | None,
+    action: str,
+    reload_command: str | None,
+    health_url: str | None,
+    health_timeout: float,
+) -> dict[str, object]:
+    try:
+        return _run_local_release_hooks(
+            release_id=activated_release_id,
+            reload_command=reload_command,
+            health_url=health_url,
+            health_timeout=health_timeout,
+        )
+    except Exception as exc:
+        if previous_release_id and previous_release_id != activated_release_id:
+            try:
+                promote_local_release(
+                    releases_root,
+                    env=env,
+                    release_id=previous_release_id,
+                    action=f"{action}_hook_failure_restore",
+                )
+                _run_local_release_hooks(
+                    release_id=previous_release_id,
+                    reload_command=reload_command,
+                    health_url=health_url,
+                    health_timeout=health_timeout,
+                )
+            except Exception as restore_exc:
+                raise RuntimeError(
+                    f"{action} hook failed after activating {activated_release_id}; "
+                    f"restore to previous release {previous_release_id} also failed: {restore_exc}; "
+                    f"original hook failure: {exc}"
+                ) from exc
+            raise RuntimeError(
+                f"{action} hook failed after activating {activated_release_id}; "
+                f"restored previous release {previous_release_id}: {exc}"
+            ) from exc
+        raise RuntimeError(
+            f"{action} hook failed after activating {activated_release_id}; "
+            f"no previous release was available to restore: {exc}"
+        ) from exc
+
+
+def _run_local_release_hooks(
+    *,
+    release_id: str,
+    reload_command: str | None,
+    health_url: str | None,
+    health_timeout: float,
+) -> dict[str, object]:
+    result: dict[str, object] = {
+        "reload_ran": False,
+        "health_checked": False,
+        "health_url": health_url,
+    }
+    if reload_command:
+        _run_local_reload_command(reload_command)
+        result["reload_ran"] = True
+    if health_url:
+        _check_local_release_health(
+            health_url=health_url,
+            expected_release_id=release_id,
+            timeout=health_timeout,
+        )
+        result["health_checked"] = True
+    return result
+
+
+def _run_local_reload_command(command: str) -> None:
+    result = subprocess.run(
+        command,
+        shell=True,
+        text=True,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError("reload command failed" + (f": {detail}" if detail else ""))
+
+
+def _check_local_release_health(*, health_url: str, expected_release_id: str, timeout: float) -> None:
+    response = httpx.get(health_url, timeout=timeout, follow_redirects=True)
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise RuntimeError("health response must be a JSON object")
+    if payload.get("ok") is not True:
+        raise RuntimeError("health response ok is not true")
+    actual_release_id = payload.get("release_id")
+    if actual_release_id != expected_release_id:
+        raise RuntimeError(
+            f"health release_id mismatch: expected={expected_release_id} actual={actual_release_id}"
+        )
+
+
+def _print_local_release_hook_result(result: dict[str, object]) -> None:
+    if result.get("reload_ran"):
+        typer.echo("reload: ok")
+    if result.get("health_checked"):
+        typer.echo(f"health: ok {result.get('health_url')}")
 
 
 @release_app.command("export-web-catalog")
@@ -2656,6 +4384,7 @@ def release_export_web_catalog_cmd(
     ),
 ) -> None:
     """Export a read-only compact web catalog JSON from an existing release."""
+    _exit_if_path_mutates_current(out, "--out")
     try:
         catalog = write_web_catalog(root, out, env=env, index_path=index_path)
     except Exception as exc:
@@ -2698,6 +4427,7 @@ def build_evidence_ontology(
     from krw_ontology.pipeline.orchestrator import run_pipeline
 
     output_root = resolve_ontology_root(output_dir)
+    _exit_if_path_mutates_current(output_root, "--output-dir")
     run_pipeline(
         ticker=ticker,
         document_type=document_type,
@@ -2747,6 +4477,7 @@ def e2e_matrix_cmd(
         if output_dir or os.environ.get(ONTOLOGY_ROOT_ENV)
         else Path(tempfile.gettempdir()) / f"krw-e2e-refactor-{timestamp}"
     )
+    _exit_if_path_mutates_current(root, "--output-dir")
     root.mkdir(parents=True, exist_ok=True)
 
     typer.echo(f"OUTPUT_ROOT={root}")
@@ -2823,14 +4554,23 @@ def build_research_pipeline_cmd(
         None,
         "--publish-root",
         help=(
-            "Stable ontology data root to publish each completed ticker into. "
-            "When set, companies/<TICKER> is copied there after ticker context is built."
+            "Local releases root for publishing completed tickers through a release transaction."
         ),
     ),
-    publish_index_path: Optional[Path] = typer.Option(
+    publish_env: str = typer.Option(
+        "dev",
+        "--publish-env",
+        help="Release environment for publish: dev, staging, or prod.",
+    ),
+    release_id: Optional[str] = typer.Option(
         None,
-        "--publish-index-path",
-        help="Stable SQLite index path. Defaults to <publish-root>/indexes/agent_index.sqlite.",
+        "--release-id",
+        help="Release id to create when publishing. Defaults to a timestamp id.",
+    ),
+    force_release: bool = typer.Option(
+        False,
+        "--force-release",
+        help="Create and promote a release even when indexed artifact content is unchanged.",
     ),
     continue_on_error: bool = typer.Option(
         False,
@@ -2852,22 +4592,32 @@ def build_research_pipeline_cmd(
 
     run_tickers = [ticker.upper() for ticker in tickers]
     output_root = resolve_running_root(root, fallback_to_cwd=False)
-    stable_root = resolve_publish_root(publish_root)
-    resolved_publish_index_path = resolve_publish_index_path(publish_index_path)
-    if pilot and stable_root is not None:
+    _exit_if_path_mutates_current(output_root, "--root")
+    _exit_if_path_mutates_current(index_path, "--index-path")
+    resolved_publish_root = resolve_publish_root(publish_root)
+    publish_releases_root: Path | None = None
+    publish_target_env = normalize_ontology_env(publish_env)
+    if resolved_publish_root is not None:
+        publish_releases_root, publish_target_env = _resolve_release_publish_config(
+            resolved_publish_root,
+            publish_env,
+        )
+    if pilot and publish_releases_root is not None:
         typer.echo("Refusing --pilot with --publish-root. Pilot artifacts are for development only.")
         raise typer.Exit(1)
     output_root.mkdir(parents=True, exist_ok=True)
-    if stable_root is not None:
-        stable_root.mkdir(parents=True, exist_ok=True)
+    if publish_releases_root is not None:
+        publish_releases_root.mkdir(parents=True, exist_ok=True)
     config = PipelineConfig.load()
     failures: list[tuple[str, str, str]] = []
     stopped_after_failure = False
     index_failure: Exception | None = None
+    publish_ready_tickers: list[str] = []
 
     typer.echo(f"OUTPUT_ROOT={output_root}")
-    if stable_root is not None:
-        typer.echo(f"PUBLISH_ROOT={stable_root}")
+    if publish_releases_root is not None:
+        typer.echo(f"PUBLISH_ROOT={publish_releases_root}")
+        typer.echo(f"PUBLISH_ENV={publish_target_env}")
     if pilot:
         typer.echo("EXECUTION_MODE=pilot")
     typer.echo(f"Research scope: {years} latest 10-K filings + current calendar year 10-Q periods")
@@ -2943,37 +4693,57 @@ def build_research_pipeline_cmd(
             if stopped_after_failure:
                 break
 
-            if stable_root is not None:
+            if publish_releases_root is not None:
                 if ticker_failed:
                     typer.echo(f"Skipping publish for {ticker} because the ticker had failures.")
                     continue
-                typer.echo("")
-                typer.echo(f"Publishing completed ticker {ticker} to stable root...")
-                try:
-                    with FileProcessLock(PipelineQueue(stable_root).publish_lock_path):
-                        _publish_ticker_tree(output_root, stable_root, ticker)
-                        publish_index_result = build_agent_index(
-                            stable_root,
-                            index_path=resolved_publish_index_path,
-                            force=True,
-                        )
-                except Exception as exc:
-                    failures.append((ticker, "publish", str(exc)))
-                    typer.echo(f"FAILED ticker={ticker} stage=publish: {exc}")
-                    if not continue_on_error:
-                        stopped_after_failure = True
-                        break
-                    continue
-                totals = publish_index_result["totals"]
-                typer.echo(f"Published {ticker} to {stable_root}")
-                typer.echo(f"Stable agent index built: {publish_index_result['index_path']}")
-                typer.echo(
-                    "Stable index contains "
-                    f"{totals['documents']} documents, "
-                    f"{totals['objects']} objects, "
-                    f"{totals['edges']} edges, "
-                    f"{totals['quality_events']} quality events"
+                publish_ready_tickers.append(ticker)
+                typer.echo(f"Queued completed ticker {ticker} for release publish.")
+
+        if publish_releases_root is not None and publish_ready_tickers and not stopped_after_failure:
+            typer.echo("")
+            typer.echo(
+                "Publishing completed ticker batch through release transaction: "
+                + ", ".join(publish_ready_tickers)
+            )
+            try:
+                publish_result = _publish_tickers_as_release(
+                    source_root=output_root,
+                    releases_root=publish_releases_root,
+                    tickers=publish_ready_tickers,
+                    env=publish_target_env,
+                    release_id=release_id,
+                    promote=True,
+                    force_release=force_release,
                 )
+            except Exception as exc:
+                failures.append((",".join(publish_ready_tickers), "publish", str(exc)))
+                typer.echo(f"FAILED ticker batch stage=publish: {exc}")
+                if not continue_on_error:
+                    stopped_after_failure = True
+            else:
+                totals = publish_result["totals"]
+                if publish_result["no_op"]:
+                    typer.echo(
+                        f"No-op release publish: indexed artifact content is unchanged; "
+                        f"current remains {publish_result['release_id']}"
+                    )
+                else:
+                    for ticker in publish_ready_tickers:
+                        typer.echo(f"Published {ticker} to {publish_result['release_root']}")
+                    typer.echo(
+                        f"Release promoted: env={publish_result['env']} "
+                        f"release_id={publish_result['release_id']}"
+                    )
+                    typer.echo(f"Stable agent index built: {publish_result['index_path']}")
+                    typer.echo(f"Release verify report: {publish_result['verify_report']}")
+                    typer.echo(
+                        "Stable index contains "
+                        f"{totals['documents']} documents, "
+                        f"{totals['objects']} objects, "
+                        f"{totals['edges']} edges, "
+                        f"{totals['quality_events']} quality events"
+                    )
     finally:
         typer.echo("")
         typer.echo("Rebuilding agent index...")
@@ -3013,6 +4783,28 @@ def _queue_emit(store: PipelineQueue, job: QueueJob, message: str) -> None:
     store.append_job_log(job.job_id, line)
 
 
+@dataclass(frozen=True)
+class _QueueIndexRebuildTarget:
+    root: Path
+    index_path: Path | None
+
+
+@dataclass(frozen=True)
+class _QueueReleasePublishTarget:
+    releases_root: Path
+    env: str
+    ticker: str
+    job_id: str
+
+
+@dataclass
+class _QueueReleasePublishBatch:
+    releases_root: Path
+    env: str
+    tickers: list[str]
+    job_ids: list[str]
+
+
 def _path_points_at_prod_current(path: Path) -> bool:
     expanded = path.expanduser()
     candidates = [expanded, *expanded.parents]
@@ -3037,15 +4829,45 @@ def _path_points_at_prod_current(path: Path) -> bool:
     return False
 
 
+def _path_points_at_current_release(path: Path) -> bool:
+    """Return whether a path addresses an active immutable release."""
+    expanded = path.expanduser().absolute()
+    candidates = [expanded, *expanded.parents]
+    for candidate in candidates:
+        if candidate.name == "current" and candidate.parent.name in ALLOWED_ONTOLOGY_ENVS:
+            return True
+
+        env_root = candidate.parent
+        if env_root.name not in ALLOWED_ONTOLOGY_ENVS:
+            continue
+        current = env_root / "current"
+        try:
+            if current.is_symlink() and candidate.exists() and candidate.resolve() == current.resolve():
+                return True
+        except OSError:
+            pass
+
+    return False
+
+
+def _assert_path_not_current_release(path: Path | None, label: str) -> None:
+    if path is None or not _path_points_at_current_release(path):
+        return
+    raise ValueError(
+        f"Refusing {label}={path}: current is an immutable release pointer. "
+        "Build a candidate release and promote the verified release instead."
+    )
+
+
 def _assert_queue_path_not_prod_current(path: Path | None, label: str) -> None:
     if path is None:
         return
-    if not _path_points_at_prod_current(path):
-        return
-    raise ValueError(
-        f"Refusing queue {label}={path}: prod/current is an immutable release pointer. "
-        "Build in a dev/staging release directory and promote the verified release instead."
-    )
+    if _path_points_at_prod_current(path):
+        raise ValueError(
+            f"Refusing {label}={path}: prod/current is an immutable release pointer. "
+            "Build in a dev/staging release directory and promote the verified release instead."
+        )
+    _assert_path_not_current_release(path, label)
 
 
 def _exit_if_queue_path_mutates_prod_current(path: Path | None, label: str) -> None:
@@ -3056,36 +4878,58 @@ def _exit_if_queue_path_mutates_prod_current(path: Path | None, label: str) -> N
         raise typer.Exit(1) from exc
 
 
+def _exit_if_path_mutates_current(path: Path | None, label: str) -> None:
+    try:
+        _assert_path_not_current_release(path, label)
+    except ValueError as exc:
+        typer.echo(str(exc))
+        raise typer.Exit(1) from exc
+
+
+def _resolve_release_publish_config(publish_root: Path, env: str | None = "dev") -> tuple[Path, str]:
+    """Resolve publish config to (releases_root, env).
+
+    Queue jobs historically stored either a stable root or a concrete prepared
+    release root. The release transaction path treats --publish-root as the
+    releases root, but this resolver keeps existing jobs usable by recognizing
+    <releases-root>/<env> and <releases-root>/<env>/<release-id> shapes.
+    """
+    resolved = publish_root.expanduser().resolve()
+    _assert_queue_path_not_prod_current(resolved, "--publish-root")
+    requested_env = normalize_ontology_env(env)
+    inferred_env = "dev"
+    releases_root = resolved
+    if resolved.name in ALLOWED_ONTOLOGY_ENVS:
+        releases_root = resolved.parent
+        inferred_env = normalize_ontology_env(resolved.name)
+    elif resolved.parent.name in ALLOWED_ONTOLOGY_ENVS:
+        releases_root = resolved.parent.parent
+        inferred_env = normalize_ontology_env(resolved.parent.name)
+    resolved_env = inferred_env if requested_env == "dev" else requested_env
+    return releases_root, resolved_env
+
+
 def _queue_publish_and_defer_index(
     *,
     store: PipelineQueue,
     job: QueueJob,
     output_root: Path,
     rebuild_agent_index: bool,
-) -> tuple[Path, Path | None] | None:
+) -> _QueueReleasePublishTarget | _QueueIndexRebuildTarget | None:
     _assert_queue_path_not_prod_current(output_root, "--root")
     if job.publish_root:
-        stable_root = resolve_ontology_root(Path(job.publish_root), fallback_to_cwd=False)
-        _assert_queue_path_not_prod_current(stable_root, "--publish-root")
-        stable_root.mkdir(parents=True, exist_ok=True)
-        publish_index_path = Path(job.publish_index_path) if job.publish_index_path is not None else None
-        _assert_queue_path_not_prod_current(publish_index_path, "--publish-index-path")
-        _queue_emit(store, job, f"Publishing {job.ticker} to stable root {stable_root}")
-        with FileProcessLock(PipelineQueue(stable_root).publish_lock_path):
-            _publish_ticker_tree(output_root, stable_root, job.ticker)
-        if not rebuild_agent_index:
-            _queue_emit(
-                store,
-                job,
-                f"Published {job.ticker} to stable root; agent index rebuild skipped by default",
-            )
-            return None
+        releases_root, env = _resolve_release_publish_config(Path(job.publish_root))
         _queue_emit(
             store,
             job,
-            f"Published {job.ticker} to stable root; stable index rebuild deferred until batch completion",
+            f"Queued {job.ticker} for release publish env={env} releases_root={releases_root}",
         )
-        return stable_root, publish_index_path
+        return _QueueReleasePublishTarget(
+            releases_root=releases_root,
+            env=env,
+            ticker=job.ticker,
+            job_id=job.job_id,
+        )
 
     _queue_emit(
         store,
@@ -3096,7 +4940,7 @@ def _queue_publish_and_defer_index(
             else "No publish root configured; staging agent index rebuild skipped by default"
         ),
     )
-    return (output_root, None) if rebuild_agent_index else None
+    return _QueueIndexRebuildTarget(root=output_root, index_path=None) if rebuild_agent_index else None
 
 
 def _queue_rebuild_pending_indexes(
@@ -3124,7 +4968,7 @@ def _queue_rebuild_pending_indexes(
             f"quality_events={totals['quality_events']}"
         )
         if publish_prod:
-            typer.echo(f"[{_now_label()}] Publishing stable root to prod from {root}")
+            typer.echo(f"[{_now_label()}] Publishing rebuilt root to prod from {root}")
             prod_result = _publish_prod_root(stable_root=root)
             typer.echo(
                 f"[{_now_label()}] Prod release activated: "
@@ -3133,6 +4977,105 @@ def _queue_rebuild_pending_indexes(
                 f"remote_root={prod_result['remote_root']}"
             )
     rebuild_targets.clear()
+
+
+def _queue_rebuild_pending_staging_indexes(
+    *,
+    rebuild_targets: dict[str, _QueueIndexRebuildTarget],
+    build_agent_index,
+) -> None:
+    staging_targets = {
+        key: (target.root, target.index_path)
+        for key, target in rebuild_targets.items()
+    }
+    _queue_rebuild_pending_indexes(
+        rebuild_targets=staging_targets,
+        publish_prod=False,
+        build_agent_index=build_agent_index,
+    )
+    rebuild_targets.clear()
+
+
+def _queue_publish_pending_releases(
+    *,
+    store: PipelineQueue,
+    publish_targets: dict[str, _QueueReleasePublishBatch],
+    publish_prod: bool,
+) -> None:
+    if not publish_targets:
+        return
+    typer.echo(f"[{_now_label()}] Publishing {len(publish_targets)} pending queue release batch(es)")
+    for batch in list(publish_targets.values()):
+        unique_tickers = list(dict.fromkeys(batch.tickers))
+        typer.echo(
+            f"[{_now_label()}] Publishing queue release "
+            f"env={batch.env} releases_root={batch.releases_root} tickers={','.join(unique_tickers)}"
+        )
+        try:
+            result = _publish_tickers_as_release(
+                source_root=store.root,
+                releases_root=batch.releases_root,
+                tickers=unique_tickers,
+                env=batch.env,
+                promote=True,
+            )
+        except Exception as exc:
+            for job_id in batch.job_ids:
+                job = store.load_job(job_id)
+                _queue_emit(store, job, f"FAILED release publish: {exc}")
+                store.append_event("publish_failed", job, {"error": str(exc)})
+            raise
+
+        totals = result["totals"]
+        if result["no_op"]:
+            typer.echo(
+                f"[{_now_label()}] Queue release no-op: indexed artifact content unchanged; "
+                f"current remains {result['release_id']}"
+            )
+        else:
+            typer.echo(
+                f"[{_now_label()}] Queue release promoted: "
+                f"env={result['env']} release={result['release_id']} root={result['release_root']}"
+            )
+            typer.echo(
+                f"[{_now_label()}] Agent index built: "
+                f"{result['index_path']} "
+                f"documents={totals['documents']} "
+                f"objects={totals['objects']} "
+                f"edges={totals['edges']} "
+                f"quality_events={totals['quality_events']}"
+            )
+            typer.echo(f"[{_now_label()}] Release verify report: {result['verify_report']}")
+        for job_id in batch.job_ids:
+            job = store.load_job(job_id)
+            _queue_emit(
+                store,
+                job,
+                f"Release {'no-op' if result['no_op'] else 'published'} "
+                f"env={result['env']} release={result['release_id']} "
+                f"root={result['release_root']} verify_report={result['verify_report']}",
+            )
+            store.append_event(
+                "publish_noop" if result["no_op"] else "publish_succeeded",
+                job,
+                {
+                    "env": result["env"],
+                    "release_id": result["release_id"],
+                    "release_root": result["release_root"],
+                    "index_path": result["index_path"],
+                    "verify_report": result["verify_report"],
+                },
+            )
+        if publish_prod and not result["no_op"]:
+            typer.echo(f"[{_now_label()}] Publishing verified release to prod from {result['release_root']}")
+            prod_result = _publish_prod_root(stable_root=Path(str(result["release_root"])))
+            typer.echo(
+                f"[{_now_label()}] Prod release activated: "
+                f"release={prod_result['release_id']} "
+                f"host={prod_result['host']} "
+                f"remote_root={prod_result['remote_root']}"
+            )
+    publish_targets.clear()
 
 
 def _queue_build_company_context(
@@ -3159,7 +5102,7 @@ def _process_queue_job(
     *,
     publish_prod: bool = False,
     rebuild_agent_index: bool = False,
-) -> tuple[Path, Path | None] | None:
+) -> _QueueReleasePublishTarget | _QueueIndexRebuildTarget | None:
     from krw_ontology.config.settings import PipelineConfig
     from krw_ontology.pipeline.orchestrator import run_pipeline
     from krw_ontology.pipeline.research_plan import discover_research_filing_targets
@@ -3167,12 +5110,12 @@ def _process_queue_job(
 
     job = store.mark_running(job)
     _queue_emit(store, job, f"START job={job.job_id} type={job.job_type} ticker={job.ticker}")
-    rebuild_target: tuple[Path, Path | None] | None = None
+    deferred_target: _QueueReleasePublishTarget | _QueueIndexRebuildTarget | None = None
     try:
         _assert_queue_path_not_prod_current(output_root, "--root")
         if publish_prod and not job.publish_root:
             raise ValueError(
-                "--publish-prod requires jobs with a stable publish root. "
+                "--publish-prod requires jobs with a release publish root. "
                 "Set `krw-ontology config set publish-root ...` before adding jobs, "
                 "or add jobs with --publish-root."
             )
@@ -3218,7 +5161,7 @@ def _process_queue_job(
             output_root=output_root,
             build_company_context=build_company_context,
         )
-        rebuild_target = _queue_publish_and_defer_index(
+        deferred_target = _queue_publish_and_defer_index(
             store=store,
             job=job,
             output_root=output_root,
@@ -3231,7 +5174,7 @@ def _process_queue_job(
 
     store.mark_succeeded(job)
     _queue_emit(store, job, f"SUCCEEDED job={job.job_id} ticker={job.ticker}")
-    return rebuild_target
+    return deferred_target
 
 
 @queue_app.command(
@@ -3240,9 +5183,9 @@ def _process_queue_job(
         "Examples:\n"
         "  krw-ontology queue add CVX XOM COP\n"
         "  krw-ontology queue add CVX --years 3 --force\n"
-        "  krw-ontology queue add LNG --root /path/to/running --publish-root /path/to/stable\n\n"
+        "  krw-ontology queue add LNG --root /path/to/running --publish-root /path/to/releases\n\n"
         "A job is ticker-level: one queued ticker expands to the configured 10-K/10-Q research set, "
-        "then builds company context and publishes once after the ticker succeeds."
+        "then builds company context and publishes through a verified release transaction."
     ),
 )
 @app.command("queue-add", hidden=True)
@@ -3268,12 +5211,7 @@ def queue_add_cmd(
     publish_root: Optional[Path] = typer.Option(
         None,
         "--publish-root",
-        help="Stable ontology data root to publish each completed ticker into.",
-    ),
-    publish_index_path: Optional[Path] = typer.Option(
-        None,
-        "--publish-index-path",
-        help="Stable SQLite index path. Defaults to <publish-root>/indexes/agent_index.sqlite.",
+        help="Local releases root for verified queue publish batches.",
     ),
     allow_duplicate: bool = typer.Option(
         False,
@@ -3284,10 +5222,8 @@ def queue_add_cmd(
     """Append ticker-level research jobs to the local queue."""
     output_root = resolve_running_root(root, fallback_to_cwd=False)
     stable_root = resolve_publish_root(publish_root)
-    resolved_publish_index_path = resolve_publish_index_path(publish_index_path)
     _exit_if_queue_path_mutates_prod_current(output_root, "--root")
     _exit_if_queue_path_mutates_prod_current(stable_root, "--publish-root")
-    _exit_if_queue_path_mutates_prod_current(resolved_publish_index_path, "--publish-index-path")
     store = PipelineQueue(output_root)
     store.ensure_dirs()
 
@@ -3307,7 +5243,6 @@ def queue_add_cmd(
             years=years,
             force=force,
             publish_root=stable_root,
-            publish_index_path=resolved_publish_index_path,
         )
         added += 1
         typer.echo(f"Queued {job.ticker} job={job.job_id} years={job.years}")
@@ -3321,9 +5256,9 @@ def queue_add_cmd(
         "  krw-ontology queue update VG --document-type 10-Q --period FY2026Q1\n"
         "  krw-ontology queue update VG --document-type 10-Q --latest\n"
         "  krw-ontology queue update VG --period FY2026Q1 --root /path/to/running "
-        "--publish-root /path/to/stable\n\n"
+        "--publish-root /path/to/releases\n\n"
         "A filing update job runs only the selected filing(s), then rebuilds company context "
-        "and publishes the ticker once."
+        "and publishes through a verified release transaction."
     ),
 )
 @app.command("queue-update", hidden=True)
@@ -3361,12 +5296,7 @@ def queue_update_cmd(
     publish_root: Optional[Path] = typer.Option(
         None,
         "--publish-root",
-        help="Stable ontology data root to publish the completed ticker into.",
-    ),
-    publish_index_path: Optional[Path] = typer.Option(
-        None,
-        "--publish-index-path",
-        help="Stable SQLite index path. Defaults to <publish-root>/indexes/agent_index.sqlite.",
+        help="Local releases root for verified queue publish batches.",
     ),
     allow_duplicate: bool = typer.Option(
         False,
@@ -3386,10 +5316,8 @@ def queue_update_cmd(
 
     output_root = resolve_running_root(root, fallback_to_cwd=False)
     stable_root = resolve_publish_root(publish_root)
-    resolved_publish_index_path = resolve_publish_index_path(publish_index_path)
     _exit_if_queue_path_mutates_prod_current(output_root, "--root")
     _exit_if_queue_path_mutates_prod_current(stable_root, "--publish-root")
-    _exit_if_queue_path_mutates_prod_current(resolved_publish_index_path, "--publish-index-path")
     store = PipelineQueue(output_root)
     store.ensure_dirs()
 
@@ -3411,7 +5339,6 @@ def queue_update_cmd(
         latest=latest,
         force=force,
         publish_root=stable_root,
-        publish_index_path=resolved_publish_index_path,
     )
     target_label = "latest" if latest else ", ".join(selected_periods)
     typer.echo(
@@ -3425,10 +5352,10 @@ def queue_update_cmd(
     "retarget-publish",
     epilog=(
         "Examples:\n"
-        "  krw-ontology queue retarget-publish --publish-root /data/releases/dev/20260529_010000\n"
+        "  krw-ontology queue retarget-publish --publish-root /data/releases\n"
         "  krw-ontology queue retarget-publish --dry-run\n\n"
-        "By default this rewrites pending jobs only. It is intended for moving old queue jobs "
-        "from a legacy stable root onto a new dev release directory."
+        "By default this rewrites pending jobs only. It moves queued publish intent "
+        "onto a release-native publish root."
     ),
 )
 def queue_retarget_publish_cmd(
@@ -3441,12 +5368,7 @@ def queue_retarget_publish_cmd(
     publish_root: Optional[Path] = typer.Option(
         None,
         "--publish-root",
-        help="New publish root. Defaults to configured publish-root.",
-    ),
-    publish_index_path: Optional[Path] = typer.Option(
-        None,
-        "--publish-index-path",
-        help="New publish index path. Defaults to configured publish-index-path or <publish-root>/indexes/agent_index.sqlite.",
+        help="New local releases root. Defaults to configured publish-root.",
     ),
     statuses: Optional[list[str]] = typer.Option(
         None,
@@ -3466,12 +5388,8 @@ def queue_retarget_publish_cmd(
     if stable_root is None:
         typer.echo("Set publish-root or pass --publish-root.")
         raise typer.Exit(1)
-    resolved_publish_index_path = resolve_publish_index_path(publish_index_path)
-    if resolved_publish_index_path is None:
-        resolved_publish_index_path = _default_release_index_path(stable_root)
     _exit_if_queue_path_mutates_prod_current(output_root, "--root")
     _exit_if_queue_path_mutates_prod_current(stable_root, "--publish-root")
-    _exit_if_queue_path_mutates_prod_current(resolved_publish_index_path, "--publish-index-path")
 
     wanted_statuses = set(statuses or [PENDING])
     supported_statuses = {PENDING, RUNNING, SUCCEEDED, FAILED, CANCELLED}
@@ -3489,14 +5407,12 @@ def queue_retarget_publish_cmd(
     result = _retarget_queue_publish_jobs(
         store=store,
         publish_root=stable_root,
-        publish_index_path=resolved_publish_index_path,
         statuses=wanted_statuses,
         dry_run=dry_run,
     )
     action = "would retarget" if dry_run else "retargeted"
     typer.echo(f"Queue publish paths {action}: changed={result['changed']} scanned={result['scanned']}")
     typer.echo(f"publish_root: {stable_root}")
-    typer.echo(f"publish_index_path: {resolved_publish_index_path}")
 
 
 @queue_app.command(
@@ -3540,17 +5456,16 @@ def queue_run_cmd(
         False,
         "--publish-prod/--no-publish-prod",
         help=(
-            "After the queue batch publish and one agent-index rebuild, upload the stable root "
-            "to prod and atomically activate a release."
+            "After the queue batch creates and verifies a local release, upload that release "
+            "to prod and atomically activate it."
         ),
     ),
     rebuild_agent_index: bool = typer.Option(
         False,
         "--rebuild-agent-index/--no-rebuild-agent-index",
         help=(
-            "Rebuild pending agent indexes after a drained/stopped queue batch. Disabled by "
-            "default so queue processing only updates artifacts; use build-agent-index or release "
-            "publish explicitly when ready."
+            "Rebuild the staging root index after drained/stopped batches that do not publish. "
+            "Release publish batches always build and verify their release index."
         ),
     ),
 ) -> None:
@@ -3561,7 +5476,7 @@ def queue_run_cmd(
     store = PipelineQueue(output_root)
     store.ensure_dirs()
     from krw_ontology.agent_index import build_agent_index
-    effective_rebuild_agent_index = rebuild_agent_index or publish_prod
+    effective_rebuild_agent_index = rebuild_agent_index
 
     try:
         with FileProcessLock(store.worker_lock_path):
@@ -3579,45 +5494,59 @@ def queue_run_cmd(
             )
             typer.echo(f"[{_now_label()}] Queue worker started root={output_root}")
             processed = 0
-            pending_rebuild_targets: dict[str, tuple[Path, Path | None]] = {}
+            pending_rebuild_targets: dict[str, _QueueIndexRebuildTarget] = {}
+            pending_publish_targets: dict[str, _QueueReleasePublishBatch] = {}
+
+            def flush_pending_targets() -> None:
+                _queue_publish_pending_releases(
+                    store=store,
+                    publish_targets=pending_publish_targets,
+                    publish_prod=publish_prod,
+                )
+                _queue_rebuild_pending_staging_indexes(
+                    rebuild_targets=pending_rebuild_targets,
+                    build_agent_index=build_agent_index,
+                )
+
             while True:
                 if store.stop_requested():
-                    _queue_rebuild_pending_indexes(
-                        rebuild_targets=pending_rebuild_targets,
-                        publish_prod=publish_prod,
-                        build_agent_index=build_agent_index,
-                    )
+                    flush_pending_targets()
                     typer.echo(f"[{_now_label()}] Stop requested; worker exiting")
                     break
                 job = store.next_pending_job()
                 if job is None:
-                    _queue_rebuild_pending_indexes(
-                        rebuild_targets=pending_rebuild_targets,
-                        publish_prod=publish_prod,
-                        build_agent_index=build_agent_index,
-                    )
+                    flush_pending_targets()
                     if not watch:
                         typer.echo(f"[{_now_label()}] Queue drained")
                         break
                     time.sleep(poll_interval)
                     continue
 
-                rebuild_target = _process_queue_job(
+                deferred_target = _process_queue_job(
                     store,
                     job,
                     output_root,
                     publish_prod=publish_prod,
                     rebuild_agent_index=effective_rebuild_agent_index,
                 )
-                if rebuild_target is not None:
-                    pending_rebuild_targets[str(rebuild_target[0])] = rebuild_target
+                if isinstance(deferred_target, _QueueReleasePublishTarget):
+                    key = f"{deferred_target.env}:{deferred_target.releases_root}"
+                    batch = pending_publish_targets.setdefault(
+                        key,
+                        _QueueReleasePublishBatch(
+                            releases_root=deferred_target.releases_root,
+                            env=deferred_target.env,
+                            tickers=[],
+                            job_ids=[],
+                        ),
+                    )
+                    batch.tickers.append(deferred_target.ticker)
+                    batch.job_ids.append(deferred_target.job_id)
+                elif isinstance(deferred_target, _QueueIndexRebuildTarget):
+                    pending_rebuild_targets[str(deferred_target.root)] = deferred_target
                 processed += 1
                 if max_jobs is not None and processed >= max_jobs:
-                    _queue_rebuild_pending_indexes(
-                        rebuild_targets=pending_rebuild_targets,
-                        publish_prod=publish_prod,
-                        build_agent_index=build_agent_index,
-                    )
+                    flush_pending_targets()
                     typer.echo(f"[{_now_label()}] Reached --max-jobs={max_jobs}")
                     break
     except LockHeldError as exc:
@@ -3658,15 +5587,14 @@ def queue_start_cmd(
         False,
         "--publish-prod/--no-publish-prod",
         help=(
-            "Start the worker in mode that publishes prod after batch stable publish/index rebuild."
+            "Start the worker in mode that uploads each verified local queue release to prod."
         ),
     ),
     rebuild_agent_index: bool = typer.Option(
         False,
         "--rebuild-agent-index/--no-rebuild-agent-index",
         help=(
-            "Start the worker in mode that rebuilds pending agent indexes after each drained "
-            "batch. Disabled by default."
+            "Start the worker in mode that rebuilds the staging root index after non-publish batches."
         ),
     ),
 ) -> None:
@@ -4106,9 +6034,6 @@ def queue_status_cmd(
             "active_publish_roots": sorted(
                 {job.publish_root for job in active_jobs if job.publish_root}
             ),
-            "active_publish_index_paths": sorted(
-                {job.publish_index_path for job in active_jobs if job.publish_index_path}
-            ),
         }
         typer.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True))
         return
@@ -4259,6 +6184,7 @@ def build_company_context_cmd(
 
     ticker = ticker.upper()
     output_root = resolve_ontology_root(root)
+    _exit_if_path_mutates_current(output_root, "--root")
     result = build_company_context(output_root, ticker)
     typer.echo(f"Company context built: {result['artifact_index_path']}")
     typer.echo(f"Counts: {result['counts']}")
@@ -4301,17 +6227,27 @@ def update_ticker_cmd(
     publish: bool = typer.Option(
         True,
         "--publish/--no-publish",
-        help="Publish the completed ticker to the stable root after context rebuild.",
+        help="Publish the completed ticker through a verified release transaction after context rebuild.",
     ),
     publish_root: Optional[Path] = typer.Option(
         None,
         "--publish-root",
-        help="Stable ontology data root. Required unless --no-publish is set.",
+        help="Local releases root. Required unless --no-publish is set.",
     ),
-    publish_index_path: Optional[Path] = typer.Option(
+    publish_env: str = typer.Option(
+        "dev",
+        "--publish-env",
+        help="Release environment for publish: dev, staging, or prod.",
+    ),
+    release_id: Optional[str] = typer.Option(
         None,
-        "--publish-index-path",
-        help="Stable SQLite index path. Defaults to <publish-root>/indexes/agent_index.sqlite.",
+        "--release-id",
+        help="Release id to create when publishing. Defaults to a timestamp id.",
+    ),
+    force_release: bool = typer.Option(
+        False,
+        "--force-release",
+        help="Create and promote a release even when indexed artifact content is unchanged.",
     ),
 ) -> None:
     """Update one ticker with one or more new filings, rebuild context, then optionally publish."""
@@ -4328,24 +6264,29 @@ def update_ticker_cmd(
         typer.echo("Specify --publish-root when publishing, or pass --no-publish.")
         raise typer.Exit(1)
 
-    from krw_ontology.agent_index import build_agent_index
     from krw_ontology.pipeline.orchestrator import run_pipeline
     from krw_ontology.pipeline.stages.build_company_context import build_company_context
 
     ticker = ticker.upper()
     output_root = resolve_running_root(root, fallback_to_cwd=False)
-    stable_root = resolved_publish_root
-    resolved_publish_index_path = resolve_publish_index_path(publish_index_path)
+    _exit_if_path_mutates_current(output_root, "--root")
+    publish_releases_root: Path | None = None
+    publish_target_env = normalize_ontology_env(publish_env)
+    if resolved_publish_root is not None:
+        publish_releases_root, publish_target_env = _resolve_release_publish_config(
+            resolved_publish_root,
+            publish_env,
+        )
     output_root.mkdir(parents=True, exist_ok=True)
-    if stable_root is not None:
-        stable_root.mkdir(parents=True, exist_ok=True)
-
+    if publish_releases_root is not None:
+        publish_releases_root.mkdir(parents=True, exist_ok=True)
     filing_periods: list[Optional[str]] = [None] if latest else selected_periods
     target_label = "latest" if latest else ", ".join(selected_periods)
     label = f"{ticker} {document_type} {target_label}"
     typer.echo(f"OUTPUT_ROOT={output_root}")
-    if stable_root is not None:
-        typer.echo(f"PUBLISH_ROOT={stable_root}")
+    if publish_releases_root is not None:
+        typer.echo(f"PUBLISH_ROOT={publish_releases_root}")
+        typer.echo(f"PUBLISH_ENV={publish_target_env}")
     typer.echo(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] START update {label}")
 
     for filing_period in filing_periods:
@@ -4383,23 +6324,34 @@ def update_ticker_cmd(
         typer.echo(f"Updated {ticker} in staging root only; publish skipped.")
         return
 
-    assert stable_root is not None
-    typer.echo(f"Publishing {ticker} to stable root...")
+    assert publish_releases_root is not None
+    typer.echo(f"Publishing {ticker} through release transaction...")
     try:
-        with FileProcessLock(PipelineQueue(stable_root).publish_lock_path):
-            _publish_ticker_tree(output_root, stable_root, ticker)
-            index_result = build_agent_index(
-                stable_root,
-                index_path=resolved_publish_index_path,
-                force=True,
-            )
+        publish_result = _publish_tickers_as_release(
+            source_root=output_root,
+            releases_root=publish_releases_root,
+            tickers=[ticker],
+            env=publish_target_env,
+            release_id=release_id,
+            promote=True,
+            force_release=force_release,
+        )
     except Exception as exc:
         typer.echo(f"FAILED {ticker} stage=publish: {exc}")
         raise typer.Exit(1) from exc
 
-    totals = index_result["totals"]
-    typer.echo(f"Published {ticker} to {stable_root}")
-    typer.echo(f"Stable agent index built: {index_result['index_path']}")
+    totals = publish_result["totals"]
+    if publish_result["no_op"]:
+        typer.echo(
+            f"No-op release publish: indexed artifact content is unchanged; "
+            f"current remains {publish_result['release_id']}"
+        )
+        typer.echo(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] END update {label}")
+        return
+    typer.echo(f"Published {ticker} to {publish_result['release_root']}")
+    typer.echo(f"Release promoted: env={publish_result['env']} release_id={publish_result['release_id']}")
+    typer.echo(f"Stable agent index built: {publish_result['index_path']}")
+    typer.echo(f"Release verify report: {publish_result['verify_report']}")
     typer.echo(
         "Stable index contains "
         f"{totals['documents']} documents, "
@@ -4421,17 +6373,18 @@ def publish_ticker_cmd(
     to_root: Path = typer.Option(
         ...,
         "--to-root",
-        help="Stable/published ontology data root to copy into.",
+        help="Local releases root. The command creates <to-root>/<env>/<release-id> and promotes current.",
     ),
-    rebuild_agent_index: bool = typer.Option(
-        True,
-        "--rebuild-agent-index/--no-rebuild-agent-index",
-        help="Rebuild the stable root agent index after publishing.",
-    ),
-    index_path: Optional[Path] = typer.Option(
+    env: Optional[str] = typer.Option(None, "--env", help="Release environment. Defaults to KRW_ONTOLOGY_ENV or dev."),
+    release_id: Optional[str] = typer.Option(
         None,
-        "--index-path",
-        help="Stable SQLite index path. Defaults to <to-root>/indexes/agent_index.sqlite.",
+        "--release-id",
+        help="Release id to create. Defaults to a timestamp id.",
+    ),
+    force_release: bool = typer.Option(
+        False,
+        "--force-release",
+        help="Create and promote a release even when indexed artifact content is unchanged.",
     ),
     dry_run: bool = typer.Option(
         False,
@@ -4439,44 +6392,58 @@ def publish_ticker_cmd(
         help="Show what would be published without copying files.",
     ),
 ) -> None:
-    """Publish completed ticker artifacts from a staging root into a stable root."""
-    from krw_ontology.agent_index import build_agent_index
-
+    """Publish completed ticker artifacts through an immutable release transaction."""
     source_root = resolve_ontology_root(from_root)
-    stable_root = resolve_ontology_root(to_root)
+    releases_root, target_env = _resolve_release_publish_config(to_root, env)
     run_tickers = [ticker.upper() for ticker in tickers]
 
     if dry_run:
         for ticker in run_tickers:
             source_dir = source_root / "companies" / ticker
-            target_dir = stable_root / "companies" / ticker
-            typer.echo(f"Publishing {ticker}: {source_dir} -> {target_dir}")
+            typer.echo(
+                f"Publishing {ticker}: {source_dir} -> "
+                f"{release_env_root(releases_root, target_env) / '<release-id>' / 'companies' / ticker}"
+            )
         typer.echo("Dry run complete; no files changed.")
         return
 
     try:
-        with FileProcessLock(PipelineQueue(stable_root).publish_lock_path):
-            for ticker in run_tickers:
-                source_dir = source_root / "companies" / ticker
-                target_dir = stable_root / "companies" / ticker
-                typer.echo(f"Publishing {ticker}: {source_dir} -> {target_dir}")
-                _publish_ticker_tree(source_root, stable_root, ticker)
-
-            if rebuild_agent_index:
-                result = build_agent_index(stable_root, index_path=index_path, force=True)
-                totals = result["totals"]
-                typer.echo(f"Agent index built: {result['index_path']}")
-                typer.echo(
-                    "Indexed "
-                    f"{totals['documents']} documents, "
-                    f"{totals['objects']} objects, "
-                    f"{totals['edges']} edges, "
-                    f"{totals['quality_events']} quality events"
-                )
+        result = _publish_tickers_as_release(
+            source_root=source_root,
+            releases_root=releases_root,
+            tickers=run_tickers,
+            env=target_env,
+            release_id=release_id,
+            promote=True,
+            force_release=force_release,
+        )
     except FileNotFoundError as exc:
         typer.echo(str(exc))
         raise typer.Exit(1) from exc
-    typer.echo(f"Published {', '.join(run_tickers)} to {stable_root}")
+    except Exception as exc:
+        typer.echo(f"FAILED release publish: {exc}")
+        raise typer.Exit(1) from exc
+
+    totals = result["totals"]
+    if result["no_op"]:
+        typer.echo(
+            f"No-op release publish: indexed artifact content is unchanged; "
+            f"current remains {result['release_id']}"
+        )
+        typer.echo(f"Current release root: {result['release_root']}")
+        return
+    typer.echo(f"Release published: env={result['env']} release_id={result['release_id']}")
+    typer.echo(f"Release root: {result['release_root']}")
+    typer.echo(f"Agent index built: {result['index_path']}")
+    typer.echo(f"Release verify report: {result['verify_report']}")
+    typer.echo(
+        "Indexed "
+        f"{totals['documents']} documents, "
+        f"{totals['objects']} objects, "
+        f"{totals['edges']} edges, "
+        f"{totals['quality_events']} quality events"
+    )
+    typer.echo(f"Published {', '.join(run_tickers)} to {result['release_root']}")
 
 
 @app.command("validate")
@@ -4498,6 +6465,7 @@ def validate_cmd(
     ticker = ticker.upper()
     doc_type_key = normalize_doc_type(document_type)
     output_root = resolve_ontology_root(root)
+    _exit_if_path_mutates_current(output_root, "--root")
 
     if period is None:
         ontology_base = output_root / "companies" / ticker / "ontology" / doc_type_key
@@ -4545,6 +6513,7 @@ def build_report_cmd(
     ticker = ticker.upper()
     doc_type_key = normalize_doc_type(document_type)
     output_root = resolve_ontology_root(root)
+    _exit_if_path_mutates_current(output_root, "--root")
 
     if period is None:
         ontology_base = output_root / "companies" / ticker / "ontology" / doc_type_key
@@ -4633,7 +6602,7 @@ def _bundle_filter(path: Path) -> bool:
         "current.next",
         "current.rollback",
         "manifest.json",
-        "release_manifest.json",
+        "verify",
     }
     if path.name in ignored_names:
         return False
@@ -4646,18 +6615,111 @@ def _build_prod_release_bundle(stable_root: Path, bundle_path: Path, release_id:
     if not stable_root.exists() or not stable_root.is_dir():
         raise FileNotFoundError(f"Stable publish root not found: {stable_root}")
     bundle_path.parent.mkdir(parents=True, exist_ok=True)
-    manifest = build_release_manifest(stable_root, release_id=release_id, env="prod", source_root=stable_root)
+    with tempfile.TemporaryDirectory(prefix="krw-prod-release-") as tmp_dir:
+        candidate_root = Path(tmp_dir) / release_id
+        _materialize_verified_prod_release(stable_root, candidate_root, release_id)
+        with tarfile.open(bundle_path, "w:gz") as archive:
+            for child in sorted(candidate_root.iterdir()):
+                archive.add(child, arcname=child.name, recursive=True)
+
+
+def _materialize_verified_prod_release(stable_root: Path, candidate_root: Path, release_id: str) -> None:
+    _materialize_prod_bundle_root(stable_root, candidate_root)
+    write_release_manifest(
+        candidate_root,
+        release_id=release_id,
+        env="prod",
+        source_root=stable_root,
+        index_path=_default_release_index_path(candidate_root),
+    )
+    verification = verify_release_root(
+        candidate_root,
+        env="prod",
+        index_path=_default_release_index_path(candidate_root),
+        run_smoke=True,
+    )
+    if not verification["ok"]:
+        raise RuntimeError(f"Prod bundle release verify failed: {', '.join(verification['errors'])}")
+    write_release_verification_report(
+        candidate_root,
+        env="prod",
+        index_path=_default_release_index_path(candidate_root),
+        verification=verification,
+    )
+
+
+def _build_prod_release_delta_bundle(
+    candidate_root: Path,
+    bundle_path: Path,
+    *,
+    remote_files: dict[str, dict[str, object]],
+) -> dict[str, object]:
+    candidate_files = _local_release_file_map(candidate_root)
+    changed_paths = sorted(
+        path
+        for path, metadata in candidate_files.items()
+        if (remote_files.get(path) or {}).get("sha256") != metadata.get("sha256")
+    )
+    removed_paths = sorted(set(remote_files) - set(candidate_files))
+    delta_manifest = {
+        "format": "krw-ontology-release-delta/v1",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "changed": changed_paths,
+        "removed": removed_paths,
+        "candidate_file_count": len(candidate_files),
+        "remote_file_count": len(remote_files),
+    }
+    bundle_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_bytes = json.dumps(delta_manifest, ensure_ascii=False, sort_keys=True).encode("utf-8")
     with tarfile.open(bundle_path, "w:gz") as archive:
-        for child in sorted(stable_root.iterdir()):
-            if not _bundle_filter(child):
-                continue
-            archive.add(child, arcname=child.name, recursive=True)
-        manifest_bytes = json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8")
-        for manifest_name in (RELEASE_MANIFEST_FILENAME, "release_manifest.json"):
-            info = tarfile.TarInfo(manifest_name)
-            info.size = len(manifest_bytes)
-            info.mtime = time.time()
-            archive.addfile(info, io.BytesIO(manifest_bytes))
+        manifest_info = tarfile.TarInfo(".krw_delta_manifest.json")
+        manifest_info.size = len(manifest_bytes)
+        manifest_info.mtime = int(time.time())
+        archive.addfile(manifest_info, io.BytesIO(manifest_bytes))
+        for relative_path in changed_paths:
+            archive.add(candidate_root / relative_path, arcname=relative_path, recursive=False)
+    return {
+        "bundle_path": str(bundle_path),
+        "changed_file_count": len(changed_paths),
+        "removed_file_count": len(removed_paths),
+        "candidate_file_count": len(candidate_files),
+        "remote_file_count": len(remote_files),
+        "changed_paths": changed_paths,
+        "removed_paths": removed_paths,
+    }
+
+
+def _local_release_file_map(root: Path) -> dict[str, dict[str, object]]:
+    files: dict[str, dict[str, object]] = {}
+    for path in sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()):
+        if not path.is_file():
+            continue
+        relative_path = path.relative_to(root).as_posix()
+        files[relative_path] = {
+            "sha256": _file_sha256(path),
+            "size_bytes": path.stat().st_size,
+        }
+    return files
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _materialize_prod_bundle_root(stable_root: Path, candidate_root: Path) -> None:
+    candidate_root.mkdir(parents=True, exist_ok=True)
+    for child in sorted(stable_root.iterdir()):
+        if not _bundle_filter(child):
+            continue
+        target = candidate_root / child.name
+        if child.is_dir() and not child.is_symlink():
+            shutil.copytree(child, target)
+        else:
+            shutil.copy2(child, target)
 
 
 def _run_checked(command: list[str], *, input_text: str | None = None) -> subprocess.CompletedProcess:
@@ -4720,15 +6782,12 @@ if [ -f "$ROOT/current/indexes/agent_index.sqlite" ]; then
 else
   printf 'index_present=no\\n'
 fi
-if [ -f "$ROOT/current/manifest.json" ]; then
-  printf 'manifest_present=yes\\n'
-  printf 'manifest_file=manifest.json\\n'
-elif [ -f "$ROOT/current/release_manifest.json" ]; then
-  printf 'manifest_present=yes\\n'
-  printf 'manifest_file=release_manifest.json\\n'
-else
-  printf 'manifest_present=no\\n'
-  printf 'manifest_file=\\n'
+	if [ -f "$ROOT/current/manifest.json" ]; then
+	  printf 'manifest_present=yes\\n'
+	  printf 'manifest_file=manifest.json\\n'
+	else
+	  printf 'manifest_present=no\\n'
+	  printf 'manifest_file=\\n'
 fi
 if [ -d "$ROOT/releases" ]; then
   for release_dir in $(cd "$ROOT/releases" && ls -1dt */ 2>/dev/null || true); do
@@ -4740,7 +6799,7 @@ fi
 
 def _prod_doctor_script(*, remote_root: str, need_curl: bool) -> str:
     root_q = shlex.quote(remote_root)
-    required = "tar ln mv rm mkdir ls readlink xargs grep" + (" curl" if need_curl else "")
+    required = "tar ln mv rm mkdir ls readlink xargs grep sed" + (" curl" if need_curl else "")
     return f"""set -eu
 ROOT={root_q}
 REQUIRED={shlex.quote(required)}
@@ -4749,6 +6808,16 @@ for cmd in $REQUIRED; do
   command -v "$cmd" >/dev/null 2>&1 || MISSING="$MISSING $cmd"
 done
 printf 'required_commands_missing=%s\\n' "${{MISSING# }}"
+PYTHON_BIN="$(command -v python3 || command -v python || true)"
+printf 'python_bin=%s\\n' "$PYTHON_BIN"
+if [ -n "$PYTHON_BIN" ] && "$PYTHON_BIN" - <<'PY' >/dev/null 2>&1
+import sqlite3
+PY
+then
+  printf 'python_sqlite3=yes\\n'
+else
+  printf 'python_sqlite3=no\\n'
+fi
 if [ -d "$ROOT" ]; then
   printf 'root_state=exists\\n'
   if [ -w "$ROOT" ]; then printf 'root_writable=yes\\n'; else printf 'root_writable=no\\n'; fi
@@ -4804,6 +6873,61 @@ def _try_get_prod_status(
         )
     except Exception as exc:
         return {"error": str(exc), "releases": []}
+
+
+def _fetch_remote_current_file_map(
+    *,
+    host: str,
+    remote_root: str,
+) -> dict[str, dict[str, object]]:
+    script = f"""set -eu
+ROOT={shlex.quote(remote_root)}
+PYTHON_BIN="$(command -v python3 || command -v python || true)"
+if [ -z "$PYTHON_BIN" ]; then echo '{{"files":{{}}}}'; exit 0; fi
+"$PYTHON_BIN" - "$ROOT" <<'PY'
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+current = root / "current"
+if not current.exists():
+    print(json.dumps({{"files": {{}}}}, sort_keys=True))
+    sys.exit(0)
+try:
+    target = current.resolve()
+except OSError:
+    print(json.dumps({{"files": {{}}}}, sort_keys=True))
+    sys.exit(0)
+if not target.is_dir():
+    print(json.dumps({{"files": {{}}}}, sort_keys=True))
+    sys.exit(0)
+files = {{}}
+for path in sorted(target.rglob("*"), key=lambda item: item.relative_to(target).as_posix()):
+    if not path.is_file():
+        continue
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    files[path.relative_to(target).as_posix()] = {{
+        "sha256": digest.hexdigest(),
+        "size_bytes": path.stat().st_size,
+    }}
+print(json.dumps({{"files": files}}, sort_keys=True))
+PY
+"""
+    completed = _run_checked(["ssh", host, "sh", "-s"], input_text=script)
+    payload = json.loads(completed.stdout or '{"files":{}}')
+    files = payload.get("files") if isinstance(payload, dict) else {}
+    if not isinstance(files, dict):
+        return {}
+    return {
+        str(path): dict(metadata)
+        for path, metadata in files.items()
+        if isinstance(metadata, dict)
+    }
 
 
 def _run_prod_doctor_checks(
@@ -4874,12 +6998,22 @@ def _print_prod_publish_result(
 ) -> None:
     release_path = f"releases/{result['release_id']}"
     typer.echo("Prod publish dry run" if dry_run else "Prod publish completed")
-    typer.echo(f"Local stable root: {result['stable_root']}")
+    typer.echo(f"Local source root: {result['stable_root']}")
     typer.echo(f"Host: {result['host']}")
     typer.echo(f"Remote root: {result['remote_root']}")
     typer.echo(f"Current release: {_current_status_label(pre_status)}")
     typer.echo(f"New release: {release_path}")
-    typer.echo("Action: upload bundle, extract new release, atomically point current to new release")
+    upload_mode = result.get("upload_mode") or "bundle"
+    if upload_mode == "delta":
+        typer.echo("Action: upload delta bundle, reconstruct new release, atomically point current to new release")
+        if result.get("changed_file_count") is not None:
+            typer.echo(
+                "Delta: "
+                f"changed_files={result['changed_file_count']} "
+                f"removed_files={result.get('removed_file_count') or 0}"
+            )
+    else:
+        typer.echo("Action: upload bundle, extract new release, atomically point current to new release")
     typer.echo(f"Keep releases: {result['keep_releases']}")
     if dry_run:
         typer.echo("No upload performed.")
@@ -4907,18 +7041,301 @@ RELOAD_COMMAND={reload_q}
 HEALTH_URL={health_q}
 KEEP_RELEASES={keep_releases}
 BUNDLE="$ROOT/incoming/$RELEASE_ID.tar.gz"
+DELTA_BUNDLE="$ROOT/incoming/$RELEASE_ID.delta.tar.gz"
 mkdir -p "$ROOT/incoming" "$ROOT/releases"
 rm -rf "$ROOT/releases/$RELEASE_ID.tmp" "$ROOT/releases/$RELEASE_ID"
 mkdir -p "$ROOT/releases/$RELEASE_ID.tmp"
-tar -xzf "$BUNDLE" -C "$ROOT/releases/$RELEASE_ID.tmp"
+if [ -f "$DELTA_BUNDLE" ]; then
+  CURRENT_TARGET="$(readlink "$ROOT/current" 2>/dev/null || true)"
+  if [ -n "$CURRENT_TARGET" ] && [ -d "$ROOT/$CURRENT_TARGET" ]; then
+    tar -C "$ROOT/$CURRENT_TARGET" -cf - . | tar -C "$ROOT/releases/$RELEASE_ID.tmp" -xf -
+  fi
+  if tar -tzf "$DELTA_BUNDLE" .krw_delta_manifest.json >/dev/null 2>&1; then
+    tar -xzf "$DELTA_BUNDLE" -C "$ROOT/releases/$RELEASE_ID.tmp" .krw_delta_manifest.json
+    PYTHON_BIN="$(command -v python3 || command -v python || true)"
+    if [ -z "$PYTHON_BIN" ]; then echo "python3 missing for remote delta application" >&2; exit 1; fi
+    "$PYTHON_BIN" - "$ROOT/releases/$RELEASE_ID.tmp" <<'PY'
+import json
+import shutil
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1]).resolve()
+manifest_path = root / ".krw_delta_manifest.json"
+try:
+    manifest = json.loads(manifest_path.read_text())
+except FileNotFoundError:
+    manifest = {{}}
+for raw_path in manifest.get("removed", []):
+    if not isinstance(raw_path, str) or not raw_path:
+        continue
+    target = (root / raw_path).resolve()
+    try:
+        target.relative_to(root)
+    except ValueError:
+        print("delta remove path escapes release root: %s" % raw_path, file=sys.stderr)
+        sys.exit(1)
+    if target.is_dir() and not target.is_symlink():
+        shutil.rmtree(target)
+    elif target.exists() or target.is_symlink():
+        target.unlink()
+PY
+  fi
+  tar -xzf "$DELTA_BUNDLE" -C "$ROOT/releases/$RELEASE_ID.tmp"
+  rm -f "$ROOT/releases/$RELEASE_ID.tmp/.krw_delta_manifest.json"
+else
+  tar -xzf "$BUNDLE" -C "$ROOT/releases/$RELEASE_ID.tmp"
+fi
 mv "$ROOT/releases/$RELEASE_ID.tmp" "$ROOT/releases/$RELEASE_ID"
-MANIFEST="$ROOT/releases/$RELEASE_ID/manifest.json"
-if [ ! -f "$MANIFEST" ]; then MANIFEST="$ROOT/releases/$RELEASE_ID/release_manifest.json"; fi
-if [ ! -f "$MANIFEST" ]; then echo "Release manifest missing" >&2; exit 1; fi
+ACTIVATION_SUCCEEDED=0
+quarantine_failed_release() {{
+  CODE="$?"
+  trap - EXIT
+  if [ "$CODE" -ne 0 ] && [ "$ACTIVATION_SUCCEEDED" -ne 1 ]; then
+    CURRENT_TARGET="$(readlink "$ROOT/current" 2>/dev/null || true)"
+    if [ "$CURRENT_TARGET" != "releases/$RELEASE_ID" ]; then
+      mkdir -p "$ROOT/failed"
+      FAILED_TARGET="$ROOT/failed/$RELEASE_ID"
+      if [ -e "$FAILED_TARGET" ]; then
+        FAILED_TARGET="$ROOT/failed/$RELEASE_ID-$(date -u +%Y%m%dT%H%M%SZ 2>/dev/null || echo failed)-$$"
+      fi
+      if [ -e "$ROOT/releases/$RELEASE_ID" ]; then
+        mv "$ROOT/releases/$RELEASE_ID" "$FAILED_TARGET"
+      fi
+    fi
+  fi
+  exit "$CODE"
+}}
+	trap quarantine_failed_release EXIT
+	MANIFEST="$ROOT/releases/$RELEASE_ID/manifest.json"
+	if [ ! -f "$MANIFEST" ]; then echo "Release manifest missing" >&2; exit 1; fi
 if ! grep -q '"env": "prod"' "$MANIFEST"; then echo "Release manifest env is not prod" >&2; exit 1; fi
 if ! grep -q '"release_id": "'"$RELEASE_ID"'"' "$MANIFEST"; then echo "Release manifest release_id mismatch" >&2; exit 1; fi
 if [ ! -f "$ROOT/releases/$RELEASE_ID/indexes/agent_index.sqlite" ]; then echo "agent_index.sqlite missing" >&2; exit 1; fi
+PYTHON_BIN="$(command -v python3 || command -v python || true)"
+if [ -z "$PYTHON_BIN" ]; then echo "python3 missing for remote SQLite verification" >&2; exit 1; fi
+"$PYTHON_BIN" - "$ROOT/releases/$RELEASE_ID" <<'PY'
+import hashlib
+import json
+import sqlite3
+import sys
+from pathlib import Path
+
+	release_root = Path(sys.argv[1])
+	manifest_path = release_root / "manifest.json"
+	try:
+	    manifest = json.loads(manifest_path.read_text())
+except Exception as exc:
+    print("remote manifest JSON invalid: %s" % exc, file=sys.stderr)
+    sys.exit(1)
+
+index_rel = manifest.get("index_path")
+if not isinstance(index_rel, str) or not index_rel:
+    print("remote manifest missing index_path", file=sys.stderr)
+    sys.exit(1)
+index_path = Path(index_rel)
+if index_path.is_absolute():
+    print("remote index_path must be relative: %s" % index_rel, file=sys.stderr)
+    sys.exit(1)
+index_path = (release_root / index_path).resolve()
+try:
+    index_path.relative_to(release_root)
+except ValueError:
+    print("remote index_path escapes release root: %s" % index_path, file=sys.stderr)
+    sys.exit(1)
+if not index_path.is_file():
+    print("remote manifest index_path missing: %s" % index_path, file=sys.stderr)
+    sys.exit(1)
+expected_index_sha256 = manifest.get("index_sha256")
+if not isinstance(expected_index_sha256, str) or not expected_index_sha256:
+    print("remote manifest missing index_sha256", file=sys.stderr)
+    sys.exit(1)
+actual_index_sha256 = hashlib.sha256(index_path.read_bytes()).hexdigest()
+if actual_index_sha256 != expected_index_sha256:
+    print("remote index_sha256 mismatch", file=sys.stderr)
+    sys.exit(1)
+
+artifact_manifest_rel = manifest.get("artifact_manifest_path")
+if not isinstance(artifact_manifest_rel, str) or not artifact_manifest_rel:
+    print("remote manifest missing artifact_manifest_path", file=sys.stderr)
+    sys.exit(1)
+artifact_manifest_path = Path(artifact_manifest_rel)
+if artifact_manifest_path.is_absolute():
+    print("remote artifact_manifest_path must be relative: %s" % artifact_manifest_rel, file=sys.stderr)
+    sys.exit(1)
+artifact_manifest_path = (release_root / artifact_manifest_path).resolve()
+try:
+    artifact_manifest_path.relative_to(release_root)
+except ValueError:
+    print("remote artifact_manifest_path escapes release root: %s" % artifact_manifest_path, file=sys.stderr)
+    sys.exit(1)
+if not artifact_manifest_path.is_file():
+    print("remote artifact_manifest.json missing: %s" % artifact_manifest_path, file=sys.stderr)
+    sys.exit(1)
+expected_artifact_sha256 = manifest.get("artifact_manifest_sha256")
+if not isinstance(expected_artifact_sha256, str) or not expected_artifact_sha256:
+    print("remote manifest missing artifact_manifest_sha256", file=sys.stderr)
+    sys.exit(1)
+actual_artifact_sha256 = hashlib.sha256(artifact_manifest_path.read_bytes()).hexdigest()
+if actual_artifact_sha256 != expected_artifact_sha256:
+    print("remote artifact_manifest_sha256 mismatch", file=sys.stderr)
+    sys.exit(1)
+
+if manifest.get("format") == "krw-ontology-release/v2":
+    outputs = manifest.get("indexes")
+    if not isinstance(outputs, dict):
+        print("remote manifest v2 missing indexes", file=sys.stderr)
+        sys.exit(1)
+    file_outputs = []
+    for role in ("monolith", "global_catalog", "global_topics", "shard_manifest"):
+        output = outputs.get(role)
+        if isinstance(output, dict):
+            file_outputs.append((role, output))
+    company_shards = outputs.get("company_shards")
+    if isinstance(company_shards, dict):
+        tickers = company_shards.get("tickers")
+        if not isinstance(tickers, dict):
+            print("remote manifest v2 company_shards missing tickers", file=sys.stderr)
+            sys.exit(1)
+        expected_count = company_shards.get("count")
+        if not isinstance(expected_count, int) or expected_count != len(tickers):
+            print("remote manifest v2 company_shards count mismatch", file=sys.stderr)
+            sys.exit(1)
+        for ticker, output in sorted(tickers.items()):
+            if not isinstance(output, dict):
+                print("remote manifest v2 invalid company shard: %s" % ticker, file=sys.stderr)
+                sys.exit(1)
+            file_outputs.append(("company_shard:%s" % ticker, output))
+    for role, output in file_outputs:
+        raw_path = output.get("path")
+        expected_sha256 = output.get("sha256")
+        if not isinstance(raw_path, str) or not raw_path:
+            print("remote manifest v2 output path missing: %s" % role, file=sys.stderr)
+            sys.exit(1)
+        output_path = Path(raw_path)
+        if output_path.is_absolute():
+            print("remote manifest v2 output path must be relative: %s" % role, file=sys.stderr)
+            sys.exit(1)
+        output_path = (release_root / output_path).resolve()
+        try:
+            output_path.relative_to(release_root)
+        except ValueError:
+            print("remote manifest v2 output escapes release root: %s" % role, file=sys.stderr)
+            sys.exit(1)
+        if not output_path.is_file():
+            print("remote manifest v2 output missing: %s" % role, file=sys.stderr)
+            sys.exit(1)
+        if not isinstance(expected_sha256, str) or not expected_sha256:
+            print("remote manifest v2 output sha256 missing: %s" % role, file=sys.stderr)
+            sys.exit(1)
+        if hashlib.sha256(output_path.read_bytes()).hexdigest() != expected_sha256:
+            print("remote manifest v2 output sha256 mismatch: %s" % role, file=sys.stderr)
+            sys.exit(1)
+
+required_monolith_tables = set((
+    "metadata",
+    "documents",
+    "objects",
+    "edges",
+    "quality_events",
+    "object_fts",
+    "object_text",
+    "object_search_text",
+    "object_traceability",
+    "metric_lookup",
+    "metric_dimension_lookup",
+    "company_dimension_catalog",
+    "exposure_lookup",
+    "agreement_lookup",
+    "event_lookup",
+    "factor_lookup",
+    "company_topic_index",
+    "company_topic_fts",
+    "company_topic_source_objects",
+))
+
+sqlite_paths = [index_path]
+for optional in ("global_catalog.sqlite", "global_topics.sqlite"):
+    path = release_root / "indexes" / optional
+    if path.exists():
+        sqlite_paths.append(path)
+companies_dir = release_root / "indexes" / "companies"
+if companies_dir.is_dir():
+    sqlite_paths.extend(sorted(companies_dir.glob("*.sqlite")))
+
+seen = set()
+unique_sqlite_paths = []
+for path in sqlite_paths:
+    resolved = path.resolve()
+    if resolved in seen:
+        continue
+    seen.add(resolved)
+    unique_sqlite_paths.append(path)
+
+for path in unique_sqlite_paths:
+    if not path.is_file():
+        print("serving SQLite file missing: %s" % path, file=sys.stderr)
+        sys.exit(1)
+    try:
+        with sqlite3.connect(path) as conn:
+            for pragma in ("integrity_check", "quick_check"):
+                rows = [row[0] for row in conn.execute("PRAGMA %s" % pragma).fetchall()]
+                if rows != ["ok"]:
+                    print(
+                        "remote SQLite %s failed for %s: %s" % (pragma, path, rows),
+                        file=sys.stderr,
+                    )
+                    sys.exit(1)
+            if path.name == "agent_index.sqlite":
+                existing = set(
+                    row[0]
+                    for row in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type IN ('table', 'view')"
+                    )
+                )
+                missing = sorted(required_monolith_tables - existing)
+                if missing:
+                    print(
+                        "required monolith table missing in %s: %s" % (path, ", ".join(missing)),
+                        file=sys.stderr,
+                    )
+                    sys.exit(1)
+    except sqlite3.Error as exc:
+        print("remote SQLite verification failed for %s: %s" % (path, exc), file=sys.stderr)
+        sys.exit(1)
+PY
+VERIFY_REPORT="$ROOT/releases/$RELEASE_ID/verify/release_verify.json"
+SMOKE_REPORT="$ROOT/releases/$RELEASE_ID/verify/smoke_queries.json"
+RANKING_QUALITY_REPORT="$ROOT/releases/$RELEASE_ID/verify/ranking_quality.json"
+if [ ! -f "$VERIFY_REPORT" ]; then echo "release_verify.json missing" >&2; exit 1; fi
+if ! grep -q '"ok": true' "$VERIFY_REPORT"; then echo "Release verify report is not ok" >&2; exit 1; fi
+if [ ! -f "$SMOKE_REPORT" ]; then echo "smoke_queries.json missing" >&2; exit 1; fi
+if [ ! -f "$RANKING_QUALITY_REPORT" ]; then echo "ranking_quality.json missing" >&2; exit 1; fi
+if ! grep -q '"format": "krw-ontology-ranking-quality/v1"' "$RANKING_QUALITY_REPORT"; then echo "ranking_quality.json format mismatch" >&2; exit 1; fi
+if ! grep -q '"ok": true' "$RANKING_QUALITY_REPORT"; then echo "ranking_quality.json is not ok" >&2; exit 1; fi
+if ! grep -q '"ranking_quality_path": "verify/ranking_quality.json"' "$VERIFY_REPORT"; then echo "Release verify report missing ranking_quality_path" >&2; exit 1; fi
+VERIFY_RANKING_HASH="$(sed -n 's/.*"ranking_quality_hash": "\\([0-9a-f][0-9a-f]*\\)".*/\\1/p' "$VERIFY_REPORT")"
+RANKING_HASH="$(sed -n 's/.*"ranking_quality_hash": "\\([0-9a-f][0-9a-f]*\\)".*/\\1/p' "$RANKING_QUALITY_REPORT")"
+if [ -z "$VERIFY_RANKING_HASH" ]; then echo "Release verify report missing ranking_quality_hash" >&2; exit 1; fi
+if [ -z "$RANKING_HASH" ]; then echo "ranking_quality.json missing ranking_quality_hash" >&2; exit 1; fi
+if [ "$VERIFY_RANKING_HASH" != "$RANKING_HASH" ]; then echo "ranking_quality_hash mismatch" >&2; exit 1; fi
+mkdir -p "$ROOT/activation_logs" "$ROOT/activation_events"
+ACTIVATION_LOG="$ROOT/activation_logs/$RELEASE_ID.log"
+ACTIVATION_EVENTS="$ROOT/activation_events/$RELEASE_ID.jsonl"
 PREV=""
+json_escape() {{
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}}
+activation_event() {{
+  EVENT="${{1:-unknown}}"
+  STATUS="${{2:-info}}"
+  REASON="${{3:-}}"
+  TS="$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || true)"
+  printf '{{"ts":"%s","event":"%s","status":"%s","release_id":"%s","previous_current":"%s","reason":"%s"}}\\n' "$(json_escape "$TS")" "$(json_escape "$EVENT")" "$(json_escape "$STATUS")" "$(json_escape "$RELEASE_ID")" "$(json_escape "$PREV")" "$(json_escape "$REASON")" >> "$ACTIVATION_EVENTS"
+}}
+printf 'release_id=%s\\n' "$RELEASE_ID" >> "$ACTIVATION_LOG"
+printf 'remote_sqlite_verification=ok\\n' >> "$ACTIVATION_LOG"
+activation_event "bundle_extracted" "ok"
 if [ -L "$ROOT/current" ]; then
   PREV="$(readlink "$ROOT/current" 2>/dev/null || true)"
 elif [ -e "$ROOT/current" ]; then
@@ -4926,22 +7343,40 @@ elif [ -e "$ROOT/current" ]; then
   rm -rf "$ROOT/$PREV"
   mv "$ROOT/current" "$ROOT/$PREV"
 fi
+activation_event "previous_current_detected" "ok"
 rollback() {{
+  REASON="${{1:-activation_failed}}"
+  printf 'failed_activation=%s\\n' "$REASON" >> "$ACTIVATION_LOG"
+  activation_event "rollback" "failed" "$REASON"
   if [ -n "$PREV" ]; then
     ln -sfn "$PREV" "$ROOT/current.rollback"
     mv -Tf "$ROOT/current.rollback" "$ROOT/current"
     if [ -n "$RELOAD_COMMAND" ]; then sh -c "$RELOAD_COMMAND" >/dev/null 2>&1 || true; fi
+  else
+    rm -f "$ROOT/current"
   fi
 }}
+printf 'previous_current=%s\\n' "$PREV" >> "$ACTIVATION_LOG"
 ln -sfn "releases/$RELEASE_ID" "$ROOT/current.next"
 mv -Tf "$ROOT/current.next" "$ROOT/current"
+printf 'current_switched=yes\\n' >> "$ACTIVATION_LOG"
+activation_event "current_switched" "ok"
 if [ -n "$RELOAD_COMMAND" ]; then
-  sh -c "$RELOAD_COMMAND" || {{ rollback; exit 1; }}
+  activation_event "reload" "started"
+  sh -c "$RELOAD_COMMAND" || {{ rollback reload_failed; exit 1; }}
+  activation_event "reload" "ok"
 fi
 if [ -n "$HEALTH_URL" ]; then
-  curl -fsS "$HEALTH_URL" >/dev/null || {{ rollback; exit 1; }}
+  activation_event "health_check" "started"
+  HEALTH_RESPONSE="$(curl -fsS "$HEALTH_URL")" || {{ rollback health_failed; exit 1; }}
+  printf '%s' "$HEALTH_RESPONSE" | grep -q '"ok"[[:space:]]*:[[:space:]]*true' || {{ rollback health_not_ok; exit 1; }}
+  printf '%s' "$HEALTH_RESPONSE" | grep -q '"release_id"[[:space:]]*:[[:space:]]*"'"$RELEASE_ID"'"' || {{ rollback health_release_mismatch; exit 1; }}
+  activation_event "health_check" "ok"
 fi
-rm -f "$BUNDLE"
+printf 'activation_ok=yes\\n' >> "$ACTIVATION_LOG"
+activation_event "activation" "ok"
+ACTIVATION_SUCCEEDED=1
+rm -f "$BUNDLE" "$DELTA_BUNDLE"
 if [ "$KEEP_RELEASES" -gt 0 ]; then
   cd "$ROOT/releases"
   OLD="$(ls -1dt */ 2>/dev/null | tail -n +"$((KEEP_RELEASES + 1))" || true)"
@@ -4980,10 +7415,237 @@ if [ -z "$TARGET" ] || [ ! -d "$ROOT/$TARGET" ]; then
   echo "No rollback target found" >&2
   exit 1
 fi
+	TARGET_RELEASE_ID="$(basename "$TARGET")"
+	MANIFEST="$ROOT/$TARGET/manifest.json"
+	if [ ! -f "$MANIFEST" ]; then echo "Rollback release manifest missing" >&2; exit 1; fi
+if ! grep -q '"env": "prod"' "$MANIFEST"; then echo "Rollback release manifest env is not prod" >&2; exit 1; fi
+if ! grep -q '"release_id": "'"$TARGET_RELEASE_ID"'"' "$MANIFEST"; then echo "Rollback release manifest release_id mismatch" >&2; exit 1; fi
+if [ ! -f "$ROOT/$TARGET/indexes/agent_index.sqlite" ]; then echo "Rollback agent_index.sqlite missing" >&2; exit 1; fi
+PYTHON_BIN="$(command -v python3 || command -v python || true)"
+if [ -z "$PYTHON_BIN" ]; then echo "python3 missing for rollback SQLite verification" >&2; exit 1; fi
+"$PYTHON_BIN" - "$ROOT/$TARGET" <<'PY'
+import hashlib
+import json
+import sqlite3
+import sys
+from pathlib import Path
+
+	release_root = Path(sys.argv[1])
+	manifest_path = release_root / "manifest.json"
+	try:
+	    manifest = json.loads(manifest_path.read_text())
+except Exception as exc:
+    print("rollback manifest JSON invalid: %s" % exc, file=sys.stderr)
+    sys.exit(1)
+
+index_rel = manifest.get("index_path")
+if not isinstance(index_rel, str) or not index_rel:
+    print("rollback manifest missing index_path", file=sys.stderr)
+    sys.exit(1)
+index_path = Path(index_rel)
+if index_path.is_absolute():
+    print("rollback index_path must be relative: %s" % index_rel, file=sys.stderr)
+    sys.exit(1)
+index_path = (release_root / index_path).resolve()
+try:
+    index_path.relative_to(release_root)
+except ValueError:
+    print("rollback index_path escapes release root: %s" % index_path, file=sys.stderr)
+    sys.exit(1)
+if not index_path.is_file():
+    print("rollback manifest index_path missing: %s" % index_path, file=sys.stderr)
+    sys.exit(1)
+expected_index_sha256 = manifest.get("index_sha256")
+if not isinstance(expected_index_sha256, str) or not expected_index_sha256:
+    print("rollback manifest missing index_sha256", file=sys.stderr)
+    sys.exit(1)
+actual_index_sha256 = hashlib.sha256(index_path.read_bytes()).hexdigest()
+if actual_index_sha256 != expected_index_sha256:
+    print("rollback index_sha256 mismatch", file=sys.stderr)
+    sys.exit(1)
+
+artifact_manifest_rel = manifest.get("artifact_manifest_path")
+if not isinstance(artifact_manifest_rel, str) or not artifact_manifest_rel:
+    print("rollback manifest missing artifact_manifest_path", file=sys.stderr)
+    sys.exit(1)
+artifact_manifest_path = Path(artifact_manifest_rel)
+if artifact_manifest_path.is_absolute():
+    print("rollback artifact_manifest_path must be relative: %s" % artifact_manifest_rel, file=sys.stderr)
+    sys.exit(1)
+artifact_manifest_path = (release_root / artifact_manifest_path).resolve()
+try:
+    artifact_manifest_path.relative_to(release_root)
+except ValueError:
+    print("rollback artifact_manifest_path escapes release root: %s" % artifact_manifest_path, file=sys.stderr)
+    sys.exit(1)
+if not artifact_manifest_path.is_file():
+    print("rollback artifact_manifest.json missing: %s" % artifact_manifest_path, file=sys.stderr)
+    sys.exit(1)
+expected_artifact_sha256 = manifest.get("artifact_manifest_sha256")
+if not isinstance(expected_artifact_sha256, str) or not expected_artifact_sha256:
+    print("rollback manifest missing artifact_manifest_sha256", file=sys.stderr)
+    sys.exit(1)
+actual_artifact_sha256 = hashlib.sha256(artifact_manifest_path.read_bytes()).hexdigest()
+if actual_artifact_sha256 != expected_artifact_sha256:
+    print("rollback artifact_manifest_sha256 mismatch", file=sys.stderr)
+    sys.exit(1)
+
+if manifest.get("format") == "krw-ontology-release/v2":
+    outputs = manifest.get("indexes")
+    if not isinstance(outputs, dict):
+        print("rollback manifest v2 missing indexes", file=sys.stderr)
+        sys.exit(1)
+    file_outputs = []
+    for role in ("monolith", "global_catalog", "global_topics", "shard_manifest"):
+        output = outputs.get(role)
+        if isinstance(output, dict):
+            file_outputs.append((role, output))
+    company_shards = outputs.get("company_shards")
+    if isinstance(company_shards, dict):
+        tickers = company_shards.get("tickers")
+        if not isinstance(tickers, dict):
+            print("rollback manifest v2 company_shards missing tickers", file=sys.stderr)
+            sys.exit(1)
+        expected_count = company_shards.get("count")
+        if not isinstance(expected_count, int) or expected_count != len(tickers):
+            print("rollback manifest v2 company_shards count mismatch", file=sys.stderr)
+            sys.exit(1)
+        for ticker, output in sorted(tickers.items()):
+            if not isinstance(output, dict):
+                print("rollback manifest v2 invalid company shard: %s" % ticker, file=sys.stderr)
+                sys.exit(1)
+            file_outputs.append(("company_shard:%s" % ticker, output))
+    for role, output in file_outputs:
+        raw_path = output.get("path")
+        expected_sha256 = output.get("sha256")
+        if not isinstance(raw_path, str) or not raw_path:
+            print("rollback manifest v2 output path missing: %s" % role, file=sys.stderr)
+            sys.exit(1)
+        output_path = Path(raw_path)
+        if output_path.is_absolute():
+            print("rollback manifest v2 output path must be relative: %s" % role, file=sys.stderr)
+            sys.exit(1)
+        output_path = (release_root / output_path).resolve()
+        try:
+            output_path.relative_to(release_root)
+        except ValueError:
+            print("rollback manifest v2 output escapes release root: %s" % role, file=sys.stderr)
+            sys.exit(1)
+        if not output_path.is_file():
+            print("rollback manifest v2 output missing: %s" % role, file=sys.stderr)
+            sys.exit(1)
+        if not isinstance(expected_sha256, str) or not expected_sha256:
+            print("rollback manifest v2 output sha256 missing: %s" % role, file=sys.stderr)
+            sys.exit(1)
+        if hashlib.sha256(output_path.read_bytes()).hexdigest() != expected_sha256:
+            print("rollback manifest v2 output sha256 mismatch: %s" % role, file=sys.stderr)
+            sys.exit(1)
+
+required_monolith_tables = set((
+    "metadata",
+    "documents",
+    "objects",
+    "edges",
+    "quality_events",
+    "object_fts",
+    "object_text",
+    "object_search_text",
+    "object_traceability",
+    "metric_lookup",
+    "metric_dimension_lookup",
+    "company_dimension_catalog",
+    "exposure_lookup",
+    "agreement_lookup",
+    "event_lookup",
+    "factor_lookup",
+    "company_topic_index",
+    "company_topic_fts",
+    "company_topic_source_objects",
+))
+
+sqlite_paths = [index_path]
+for optional in ("global_catalog.sqlite", "global_topics.sqlite"):
+    path = release_root / "indexes" / optional
+    if path.exists():
+        sqlite_paths.append(path)
+companies_dir = release_root / "indexes" / "companies"
+if companies_dir.is_dir():
+    sqlite_paths.extend(sorted(companies_dir.glob("*.sqlite")))
+
+seen = set()
+unique_sqlite_paths = []
+for path in sqlite_paths:
+    resolved = path.resolve()
+    if resolved in seen:
+        continue
+    seen.add(resolved)
+    unique_sqlite_paths.append(path)
+
+for path in unique_sqlite_paths:
+    if not path.is_file():
+        print("rollback serving SQLite file missing: %s" % path, file=sys.stderr)
+        sys.exit(1)
+    try:
+        with sqlite3.connect(path) as conn:
+            for pragma in ("integrity_check", "quick_check"):
+                rows = [row[0] for row in conn.execute("PRAGMA %s" % pragma).fetchall()]
+                if rows != ["ok"]:
+                    print(
+                        "rollback SQLite %s failed for %s: %s" % (pragma, path, rows),
+                        file=sys.stderr,
+                    )
+                    sys.exit(1)
+            if path.name == "agent_index.sqlite":
+                existing = set(
+                    row[0]
+                    for row in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type IN ('table', 'view')"
+                    )
+                )
+                missing = sorted(required_monolith_tables - existing)
+                if missing:
+                    print(
+                        "rollback required monolith table missing in %s: %s" % (path, ", ".join(missing)),
+                        file=sys.stderr,
+                    )
+                    sys.exit(1)
+    except sqlite3.Error as exc:
+        print("rollback SQLite verification failed for %s: %s" % (path, exc), file=sys.stderr)
+        sys.exit(1)
+PY
+VERIFY_REPORT="$ROOT/$TARGET/verify/release_verify.json"
+SMOKE_REPORT="$ROOT/$TARGET/verify/smoke_queries.json"
+RANKING_QUALITY_REPORT="$ROOT/$TARGET/verify/ranking_quality.json"
+if [ ! -f "$VERIFY_REPORT" ]; then echo "rollback release_verify.json missing" >&2; exit 1; fi
+if ! grep -q '"ok": true' "$VERIFY_REPORT"; then echo "Rollback release verify report is not ok" >&2; exit 1; fi
+if [ ! -f "$SMOKE_REPORT" ]; then echo "rollback smoke_queries.json missing" >&2; exit 1; fi
+if [ ! -f "$RANKING_QUALITY_REPORT" ]; then echo "rollback ranking_quality.json missing" >&2; exit 1; fi
+if ! grep -q '"format": "krw-ontology-ranking-quality/v1"' "$RANKING_QUALITY_REPORT"; then echo "rollback ranking_quality.json format mismatch" >&2; exit 1; fi
+if ! grep -q '"ok": true' "$RANKING_QUALITY_REPORT"; then echo "rollback ranking_quality.json is not ok" >&2; exit 1; fi
+if ! grep -q '"ranking_quality_path": "verify/ranking_quality.json"' "$VERIFY_REPORT"; then echo "Rollback release verify report missing ranking_quality_path" >&2; exit 1; fi
+VERIFY_RANKING_HASH="$(sed -n 's/.*"ranking_quality_hash": "\\([0-9a-f][0-9a-f]*\\)".*/\\1/p' "$VERIFY_REPORT")"
+RANKING_HASH="$(sed -n 's/.*"ranking_quality_hash": "\\([0-9a-f][0-9a-f]*\\)".*/\\1/p' "$RANKING_QUALITY_REPORT")"
+if [ -z "$VERIFY_RANKING_HASH" ]; then echo "Rollback release verify report missing ranking_quality_hash" >&2; exit 1; fi
+if [ -z "$RANKING_HASH" ]; then echo "rollback ranking_quality.json missing ranking_quality_hash" >&2; exit 1; fi
+if [ "$VERIFY_RANKING_HASH" != "$RANKING_HASH" ]; then echo "rollback ranking_quality_hash mismatch" >&2; exit 1; fi
+restore_current() {{
+  REASON="${{1:-rollback_failed}}"
+  if [ -n "$CURRENT" ]; then
+    ln -sfn "$CURRENT" "$ROOT/current.rollback"
+    mv -Tf "$ROOT/current.rollback" "$ROOT/current"
+    if [ -n "$RELOAD_COMMAND" ]; then sh -c "$RELOAD_COMMAND" >/dev/null 2>&1 || true; fi
+  fi
+  echo "Rollback post-switch check failed: $REASON" >&2
+  exit 1
+}}
 ln -sfn "$TARGET" "$ROOT/current.next"
 mv -Tf "$ROOT/current.next" "$ROOT/current"
-if [ -n "$RELOAD_COMMAND" ]; then sh -c "$RELOAD_COMMAND"; fi
-if [ -n "$HEALTH_URL" ]; then curl -fsS "$HEALTH_URL" >/dev/null; fi
+if [ -n "$RELOAD_COMMAND" ]; then sh -c "$RELOAD_COMMAND" || restore_current reload_failed; fi
+if [ -n "$HEALTH_URL" ]; then
+  HEALTH_RESPONSE="$(curl -fsS "$HEALTH_URL")" || restore_current health_failed
+  printf '%s' "$HEALTH_RESPONSE" | grep -q '"ok"[[:space:]]*:[[:space:]]*true' || restore_current health_not_ok
+  printf '%s' "$HEALTH_RESPONSE" | grep -q '"release_id"[[:space:]]*:[[:space:]]*"'"$TARGET_RELEASE_ID"'"' || restore_current health_release_mismatch
+fi
 printf '%s\\n' "$TARGET"
 """
 
@@ -4997,6 +7659,7 @@ def _publish_prod_root(
     health_url: str | None = None,
     keep_releases: int | None = None,
     dry_run: bool = False,
+    delta: bool = False,
 ) -> dict[str, str | int | None]:
     settings = _resolve_prod_settings(
         host=host,
@@ -5015,13 +7678,13 @@ def _publish_prod_root(
         "host": settings["host"],
         "remote_root": settings["remote_root"],
         "keep_releases": settings["keep_releases"],
+        "upload_mode": "delta" if delta else "bundle",
+        "changed_file_count": None,
+        "removed_file_count": None,
     }
     if dry_run:
         return result
     with tempfile.TemporaryDirectory(prefix="krw-ontology-prod-") as tmp_dir:
-        bundle_path = Path(tmp_dir) / f"{release_id}.tar.gz"
-        _build_prod_release_bundle(resolved_root, bundle_path, release_id)
-        remote_bundle = f"{settings['remote_root']}/incoming/{release_id}.tar.gz"
         _run_checked(
             [
                 "ssh",
@@ -5032,6 +7695,26 @@ def _publish_prod_root(
                 f"{settings['remote_root']}/releases",
             ]
         )
+        if delta:
+            candidate_root = Path(tmp_dir) / release_id
+            _materialize_verified_prod_release(resolved_root, candidate_root, release_id)
+            remote_files = _fetch_remote_current_file_map(
+                host=str(settings["host"]),
+                remote_root=str(settings["remote_root"]),
+            )
+            bundle_path = Path(tmp_dir) / f"{release_id}.delta.tar.gz"
+            delta_summary = _build_prod_release_delta_bundle(
+                candidate_root,
+                bundle_path,
+                remote_files=remote_files,
+            )
+            result["changed_file_count"] = int(delta_summary["changed_file_count"])
+            result["removed_file_count"] = int(delta_summary["removed_file_count"])
+            remote_bundle = f"{settings['remote_root']}/incoming/{release_id}.delta.tar.gz"
+        else:
+            bundle_path = Path(tmp_dir) / f"{release_id}.tar.gz"
+            _build_prod_release_bundle(resolved_root, bundle_path, release_id)
+            remote_bundle = f"{settings['remote_root']}/incoming/{release_id}.tar.gz"
         _run_checked(["scp", str(bundle_path), f"{settings['host']}:{remote_bundle}"])
         _run_checked(
             ["ssh", str(settings["host"]), "sh", "-s"],
@@ -5142,8 +7825,147 @@ def _replace_tree(source_dir: Path, target_dir: Path) -> None:
         shutil.rmtree(backup_dir)
 
 
-@app.command("build-agent-index")
-def build_agent_index_cmd(
+def _print_agent_index_plan(
+    *,
+    root: Optional[Path],
+    index_path: Optional[Path],
+    cache_root: Optional[Path],
+    workers: Optional[int],
+    layout: str,
+    source_manifest_path: Optional[Path] = None,
+) -> None:
+    from krw_ontology.agent_index import plan_agent_index
+
+    output_root = resolve_ontology_root(root)
+    plan = plan_agent_index(
+        output_root,
+        index_path=index_path,
+        cache_root=cache_root,
+        workers=workers,
+        layout=layout,
+        source_manifest_path=source_manifest_path,
+    )
+    typer.echo(f"Artifacts: {len(plan.items)}")
+    typer.echo(f"Dirty artifacts: {len(plan.dirty_items)}")
+    typer.echo(f"Cached fragments: {len(plan.cached_items)}")
+    typer.echo(f"Companies: {len(plan.company_items)}")
+    typer.echo(f"Cached companies: {len(plan.cached_company_items)}")
+    typer.echo(f"Dirty companies: {len(plan.dirty_company_items)}")
+    typer.echo(f"Dirty tickers: {', '.join(plan.dirty_tickers) if plan.dirty_tickers else '<none>'}")
+    typer.echo(f"Workers: {plan.workers}")
+    typer.echo(f"Layout: {plan.layout}")
+    typer.echo(f"Discovery: {plan.discovery_mode}")
+    typer.echo(f"Cache root: {plan.cache_root}")
+    typer.echo(f"Index path: {plan.index_path}")
+
+
+def _build_agent_index_and_print(
+    *,
+    root: Optional[Path],
+    index_path: Optional[Path],
+    force: bool,
+    cache_root: Optional[Path],
+    workers: Optional[int],
+    layout: str,
+    source_manifest_path: Optional[Path] = None,
+) -> None:
+    from krw_ontology.agent_index import build_agent_index
+
+    output_root = resolve_ontology_root(root)
+    _exit_if_path_mutates_current(output_root, "--root")
+    _exit_if_path_mutates_current(index_path, "--index-path")
+    _exit_if_path_mutates_current(source_manifest_path, "--source-manifest")
+    effective_cache_root = cache_root or (
+        Path(os.environ["KRW_INDEX_FRAGMENT_CACHE_ROOT"])
+        if os.environ.get("KRW_INDEX_FRAGMENT_CACHE_ROOT")
+        else None
+    )
+    _exit_if_path_mutates_current(effective_cache_root, "--cache-root")
+    progress_log = os.environ.get("KRW_BUILD_PROGRESS_LOG")
+    _exit_if_path_mutates_current(Path(progress_log) if progress_log else None, "KRW_BUILD_PROGRESS_LOG")
+    result = build_agent_index(
+        output_root,
+        index_path=index_path,
+        force=force,
+        cache_root=cache_root,
+        workers=workers,
+        layout=layout,
+        source_manifest_path=source_manifest_path,
+    )
+    totals = result["totals"]
+    typer.echo(f"Agent index built: {result['index_path']}")
+    if result.get("build_plan_path"):
+        typer.echo(f"Build plan: {result['build_plan_path']}")
+    if result.get("shards"):
+        shards = result["shards"]
+        typer.echo(f"Global catalog: {shards['global_catalog_path']}")
+        typer.echo(f"Global topics: {shards['global_topics_path']}")
+        typer.echo(f"Company shards: {shards['companies_dir']}")
+    typer.echo(
+        "Indexed "
+        f"{totals['documents']} documents, "
+        f"{totals['objects']} objects, "
+        f"{totals['edges']} edges, "
+        f"{totals['quality_events']} quality events"
+    )
+
+
+def _verify_agent_index_and_print(
+    *,
+    root: Optional[Path],
+    index_path: Optional[Path],
+    verify_shards: bool,
+) -> None:
+    from krw_ontology.agent_index.builder import DEFAULT_INDEX_RELATIVE_PATH, verify_agent_index, verify_index_shards
+
+    output_root = resolve_ontology_root(root)
+    resolved_index_path = (
+        index_path.expanduser().resolve()
+        if index_path is not None
+        else (output_root / DEFAULT_INDEX_RELATIVE_PATH).resolve()
+    )
+    verification = verify_agent_index(resolved_index_path)
+    typer.echo(f"Agent index verify: {'ok' if verification['ok'] else 'failed'}")
+    typer.echo(f"index: {resolved_index_path}")
+    counts = verification.get("counts") or {}
+    if counts:
+        typer.echo(
+            "Counts: "
+            f"documents={counts.get('documents', 0)} "
+            f"objects={counts.get('objects', 0)} "
+            f"edges={counts.get('edges', 0)} "
+            f"quality_events={counts.get('quality_events', 0)}"
+        )
+    shard_verification = None
+    shard_layout_present = (
+        (resolved_index_path.parent / "shard_manifest.json").exists()
+        or (resolved_index_path.parent / "global_catalog.sqlite").exists()
+        or (resolved_index_path.parent / "companies").exists()
+    )
+    if verify_shards and shard_layout_present:
+        shard_verification = verify_index_shards(
+            resolved_index_path.parent,
+            monolith_index_path=resolved_index_path,
+        )
+        typer.echo(f"Shard verify: {'ok' if shard_verification['ok'] else 'failed'}")
+        shard_counts = shard_verification.get("counts") or {}
+        typer.echo(
+            "Shards: "
+            f"tickers={shard_counts.get('ticker_count', 0)} "
+            f"documents={shard_counts.get('documents', 0)} "
+            f"global_topics={shard_counts.get('global_topics', 0)}"
+        )
+    errors = list(verification.get("errors") or [])
+    if shard_verification is not None:
+        errors.extend(f"shards:{error}" for error in shard_verification.get("errors") or [])
+    if errors:
+        for error in errors:
+            typer.echo(f"FAIL {error}")
+        raise typer.Exit(1)
+
+
+@index_app.command("plan")
+def index_plan_cmd(
     root: Optional[Path] = typer.Option(
         None,
         "--root",
@@ -5154,23 +7976,354 @@ def build_agent_index_cmd(
         "--index-path",
         help="SQLite index path. Defaults to <root>/indexes/agent_index.sqlite.",
     ),
-    force: bool = typer.Option(
-        True,
-        "--force/--no-force",
-        help="Rebuild the SQLite index from scratch if it already exists.",
+    cache_root: Optional[Path] = typer.Option(
+        None,
+        "--cache-root",
+        help="Index fragment cache root used for build planning.",
+    ),
+    workers: Optional[int] = typer.Option(None, "--workers", min=1, help="Artifact compile worker count."),
+    layout: str = typer.Option(
+        "monolith-and-shards",
+        "--layout",
+        help="Index layout: monolith, monolith-and-shards, or shards.",
+    ),
+    source_manifest_path: Optional[Path] = typer.Option(
+        None,
+        "--source-manifest",
+        help="Canonical source manifest path for manifest-only discovery.",
     ),
 ) -> None:
-    """Build the SQLite agent retrieval index from existing ontology artifacts."""
-    from krw_ontology.agent_index import build_agent_index
+    """Print the deterministic production index build plan without writing outputs."""
+    _print_agent_index_plan(
+        root=root,
+        index_path=index_path,
+        cache_root=cache_root,
+        workers=workers,
+        layout=layout,
+        source_manifest_path=source_manifest_path,
+    )
+
+
+@index_app.command("build")
+def index_build_cmd(
+    root: Optional[Path] = typer.Option(
+        None,
+        "--root",
+        help="Ontology output root. Defaults to the current working directory.",
+    ),
+    index_path: Optional[Path] = typer.Option(
+        None,
+        "--index-path",
+        help="SQLite index path. Defaults to <root>/indexes/agent_index.sqlite.",
+    ),
+    force: bool = typer.Option(True, "--force/--no-force", help="Rebuild from scratch if output exists."),
+    cache_root: Optional[Path] = typer.Option(
+        None,
+        "--cache-root",
+        help="Index fragment cache root used for build planning.",
+    ),
+    workers: Optional[int] = typer.Option(None, "--workers", min=1, help="Artifact compile worker count."),
+    layout: str = typer.Option(
+        "monolith-and-shards",
+        "--layout",
+        help="Index layout: monolith, monolith-and-shards, or shards.",
+    ),
+    source_manifest_path: Optional[Path] = typer.Option(
+        None,
+        "--source-manifest",
+        help="Canonical source manifest path for manifest-only discovery.",
+    ),
+) -> None:
+    """Build verified production index outputs using fragment cache and shard verification."""
+    _build_agent_index_and_print(
+        root=root,
+        index_path=index_path,
+        force=force,
+        cache_root=cache_root,
+        workers=workers,
+        layout=layout,
+        source_manifest_path=source_manifest_path,
+    )
+
+
+@index_app.command("verify")
+def index_verify_cmd(
+    root: Optional[Path] = typer.Option(
+        None,
+        "--root",
+        help="Ontology output root. Defaults to the current working directory.",
+    ),
+    index_path: Optional[Path] = typer.Option(
+        None,
+        "--index-path",
+        help="SQLite index path. Defaults to <root>/indexes/agent_index.sqlite.",
+    ),
+    verify_shards: bool = typer.Option(
+        True,
+        "--shards/--no-shards",
+        help="Verify shard/global topic outputs when shard layout files are present.",
+    ),
+) -> None:
+    """Verify agent_index.sqlite and shard outputs without rebuilding."""
+    _verify_agent_index_and_print(
+        root=root,
+        index_path=index_path,
+        verify_shards=verify_shards,
+    )
+
+
+@index_app.command("inspect")
+def index_inspect_cmd(
+    root: Optional[Path] = typer.Option(None, "--root", help="Ontology or release root."),
+    index_path: Optional[Path] = typer.Option(None, "--index-path", help="Explicit agent index path."),
+    json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
+) -> None:
+    """Inspect index verification, shard layout, build plan, and build summary."""
+    from krw_ontology.agent_index.builder import DEFAULT_INDEX_RELATIVE_PATH, verify_agent_index, verify_index_shards
 
     output_root = resolve_ontology_root(root)
-    result = build_agent_index(output_root, index_path=index_path, force=force)
-    totals = result["totals"]
-    typer.echo(f"Agent index built: {result['index_path']}")
-    typer.echo(
-        "Indexed "
-        f"{totals['documents']} documents, "
-        f"{totals['objects']} objects, "
-        f"{totals['edges']} edges, "
-        f"{totals['quality_events']} quality events"
+    resolved_index_path = (
+        index_path.expanduser().resolve()
+        if index_path is not None
+        else (output_root / DEFAULT_INDEX_RELATIVE_PATH).resolve()
     )
+    verification = verify_agent_index(resolved_index_path)
+    shard_verification = (
+        verify_index_shards(resolved_index_path.parent, monolith_index_path=resolved_index_path)
+        if (resolved_index_path.parent / "shard_manifest.json").exists()
+        else None
+    )
+    payload = {
+        "root": str(output_root),
+        "index_path": str(resolved_index_path),
+        "verification": verification,
+        "shard_verification": shard_verification,
+        "build_plan": _read_json_object(resolved_index_path.parent / "build_plan.json"),
+        "build_summary": _read_json_object(resolved_index_path.parent / "build_summary.json"),
+        "artifact_manifest": _read_json_object(resolved_index_path.parent / "artifact_manifest.json"),
+        "shard_manifest": _read_json_object(resolved_index_path.parent / "shard_manifest.json"),
+    }
+    if json_output:
+        typer.echo(json.dumps(payload, sort_keys=True))
+        return
+    typer.echo(f"Index inspect: {'ok' if verification['ok'] else 'failed'}")
+    typer.echo(f"index_path: {resolved_index_path}")
+    counts = verification.get("counts") or {}
+    typer.echo(
+        f"counts: documents={counts.get('documents', 0)} objects={counts.get('objects', 0)} "
+        f"edges={counts.get('edges', 0)} quality_events={counts.get('quality_events', 0)}"
+    )
+    if shard_verification is not None:
+        typer.echo(f"shards: {'ok' if shard_verification['ok'] else 'failed'}")
+    summary = payload["build_summary"]
+    if isinstance(summary, dict):
+        fragment_cache = summary.get("fragment_cache") or {}
+        typer.echo(
+            f"fragment_cache: hits={fragment_cache.get('hits', 0)} "
+            f"misses={fragment_cache.get('misses', 0)}"
+        )
+    for error in verification.get("errors") or []:
+        typer.echo(f"FAIL {error}")
+    if not verification["ok"] or (shard_verification is not None and not shard_verification["ok"]):
+        raise typer.Exit(1)
+
+
+@index_app.command("explain-last-build")
+def index_explain_last_build_cmd(
+    root: Optional[Path] = typer.Option(None, "--root", help="Ontology or release root."),
+    index_path: Optional[Path] = typer.Option(None, "--index-path", help="Explicit agent index path."),
+    json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
+) -> None:
+    """Explain the latest build plan, cache use, timings, and slow phases."""
+    from krw_ontology.agent_index.builder import DEFAULT_INDEX_RELATIVE_PATH
+
+    output_root = resolve_ontology_root(root)
+    resolved_index_path = (
+        index_path.expanduser().resolve()
+        if index_path is not None
+        else (output_root / DEFAULT_INDEX_RELATIVE_PATH).resolve()
+    )
+    summary_path = resolved_index_path.parent / "build_summary.json"
+    summary = _read_json_object(summary_path)
+    if summary is None:
+        typer.echo(f"Build summary not found: {summary_path}")
+        raise typer.Exit(1)
+    if json_output:
+        typer.echo(json.dumps(summary, sort_keys=True))
+        return
+    plan = summary.get("build_plan") or {}
+    cache = summary.get("fragment_cache") or {}
+    typer.echo("Last index build")
+    typer.echo(f"summary: {summary_path}")
+    typer.echo(f"artifacts: {plan.get('artifact_count', 0)}")
+    typer.echo(f"dirty_artifacts: {plan.get('dirty_artifact_count', 0)}")
+    typer.echo(f"cached_artifacts: {plan.get('cached_artifact_count', 0)}")
+    typer.echo(f"workers: {plan.get('workers', 0)}")
+    typer.echo(f"layout: {plan.get('layout') or '<unknown>'}")
+    typer.echo(f"fragment_cache: hits={cache.get('hits', 0)} misses={cache.get('misses', 0)}")
+    typer.echo(f"total_elapsed_sec: {summary.get('total_elapsed_sec')}")
+    for item in summary.get("slow_phases") or []:
+        typer.echo(f"slow_phase: {item.get('phase')} {item.get('elapsed_seconds')}s")
+    for item in summary.get("slow_artifacts") or []:
+        typer.echo(f"slow_artifact: {item.get('artifact_index')} {item.get('elapsed_seconds')}s")
+
+
+@index_cache_app.command("status")
+def index_cache_status_cmd(
+    root: Optional[Path] = typer.Option(
+        None,
+        "--root",
+        help="Ontology output root. Defaults to the current working directory.",
+    ),
+    index_path: Optional[Path] = typer.Option(
+        None,
+        "--index-path",
+        help="SQLite index path used for build-plan cache resolution.",
+    ),
+    cache_root: Optional[Path] = typer.Option(
+        None,
+        "--cache-root",
+        help="Index fragment cache root. Defaults to the build-plan cache root.",
+    ),
+    workers: Optional[int] = typer.Option(None, "--workers", min=1, help="Planned artifact compile worker count."),
+    layout: str = typer.Option(
+        "monolith-and-shards",
+        "--layout",
+        help="Index layout: monolith, monolith-and-shards, or shards.",
+    ),
+    limit: int = typer.Option(20, "--limit", min=0, help="Maximum problem entries to print."),
+) -> None:
+    """Inspect fragment cache health and current build-plan reachability."""
+    from krw_ontology.agent_index import inspect_index_fragment_cache, plan_agent_index
+
+    output_root = resolve_ontology_root(root)
+    plan = plan_agent_index(
+        output_root,
+        index_path=index_path,
+        cache_root=cache_root,
+        workers=workers,
+        layout=layout,
+    )
+    status = inspect_index_fragment_cache(
+        plan.cache_root,
+        referenced_fragments=[item.fragment_path for item in plan.items],
+    )
+    counts = status["counts"]
+    needs_attention = status["invalid_fragment_count"] > 0 or status["unreferenced_fragment_count"] > 0
+    typer.echo(f"Fragment cache: {'attention' if needs_attention else 'ok'}")
+    typer.echo(f"Cache root: {status['cache_root']}")
+    typer.echo(
+        "Fragments: "
+        f"total={status['fragment_count']} "
+        f"valid={status['valid_fragment_count']} "
+        f"invalid={status['invalid_fragment_count']} "
+        f"referenced={status['referenced_fragment_count']} "
+        f"unreferenced={status['unreferenced_fragment_count']}"
+    )
+    typer.echo(
+        "Rows: "
+        f"documents={counts.get('documents', 0)} "
+        f"objects={counts.get('objects', 0)} "
+        f"edges={counts.get('edges', 0)} "
+        f"quality_events={counts.get('quality_events', 0)}"
+    )
+    typer.echo(f"Bytes: {status['total_size_bytes']}")
+    tickers = status.get("tickers") or []
+    typer.echo(f"Tickers: {', '.join(tickers) if tickers else '<none>'}")
+    problem_entries = [
+        entry
+        for entry in status["entries"]
+        if not entry["ok"] or entry.get("referenced") is False
+    ]
+    if not problem_entries:
+        return
+    typer.echo(f"Problem fragments: {len(problem_entries)}")
+    for entry in problem_entries[:limit]:
+        reason = "invalid" if not entry["ok"] else "unreferenced"
+        typer.echo(f"{reason}: {entry['fragment_path']} ({entry['size_bytes']} bytes)")
+        for error in entry.get("errors") or []:
+            typer.echo(f"  {error}")
+    if len(problem_entries) > limit:
+        typer.echo(f"... {len(problem_entries) - limit} more")
+
+
+@index_cache_app.command("gc")
+def index_cache_gc_cmd(
+    root: Optional[Path] = typer.Option(
+        None,
+        "--root",
+        help="Ontology output root. Defaults to the current working directory.",
+    ),
+    index_path: Optional[Path] = typer.Option(
+        None,
+        "--index-path",
+        help="SQLite index path used for build-plan cache resolution.",
+    ),
+    cache_root: Optional[Path] = typer.Option(
+        None,
+        "--cache-root",
+        help="Index fragment cache root. Defaults to the build-plan cache root.",
+    ),
+    workers: Optional[int] = typer.Option(None, "--workers", min=1, help="Planned artifact compile worker count."),
+    layout: str = typer.Option(
+        "monolith-and-shards",
+        "--layout",
+        help="Index layout: monolith, monolith-and-shards, or shards.",
+    ),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        help="Delete candidates. Without this flag the command only prints a dry run.",
+    ),
+    include_invalid: bool = typer.Option(
+        True,
+        "--invalid/--no-invalid",
+        help="Include fragments that fail fragment verification.",
+    ),
+    include_unreferenced: bool = typer.Option(
+        True,
+        "--unreferenced/--no-unreferenced",
+        help="Include valid fragments that are not referenced by the current build plan.",
+    ),
+    limit: int = typer.Option(50, "--limit", min=0, help="Maximum candidate entries to print."),
+) -> None:
+    """Garbage-collect invalid or stale fragment cache files."""
+    from krw_ontology.agent_index import gc_index_fragment_cache
+
+    output_root = resolve_ontology_root(root)
+    if yes:
+        effective_cache_root = cache_root or (
+            Path(os.environ["KRW_INDEX_FRAGMENT_CACHE_ROOT"])
+            if os.environ.get("KRW_INDEX_FRAGMENT_CACHE_ROOT")
+            else None
+        )
+        _exit_if_path_mutates_current(effective_cache_root, "--cache-root")
+    result = gc_index_fragment_cache(
+        cache_root,
+        root=output_root,
+        index_path=index_path,
+        layout=layout,
+        workers=workers,
+        dry_run=not yes,
+        include_invalid=include_invalid,
+        include_unreferenced=include_unreferenced,
+    )
+    typer.echo(f"Fragment cache GC: {'dry-run' if result['dry_run'] else 'deleted'}")
+    typer.echo(f"Cache root: {result['cache_root']}")
+    typer.echo(
+        "Fragments: "
+        f"total={result['fragment_count']} "
+        f"valid={result['valid_fragment_count']} "
+        f"invalid={result['invalid_fragment_count']} "
+        f"referenced={result['referenced_fragment_count']} "
+        f"unreferenced={result['unreferenced_fragment_count']}"
+    )
+    typer.echo(f"Candidates: {result['candidate_count']} ({result['candidate_bytes']} bytes)")
+    typer.echo(f"Deleted: {result['deleted_count']} ({result['deleted_bytes']} bytes)")
+    for candidate in result["candidates"][:limit]:
+        typer.echo(
+            f"{candidate['reason']}: {candidate['fragment_path']} "
+            f"({candidate['size_bytes']} bytes)"
+        )
+    if len(result["candidates"]) > limit:
+        typer.echo(f"... {len(result['candidates']) - limit} more")

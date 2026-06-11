@@ -14,7 +14,7 @@ from krw_ontology.agent_index import store as agent_index_store
 from krw_ontology.agent_index import OntologyStore, build_agent_index
 from krw_ontology.mcp_server.http_server import prepare_mcp_runtime
 from krw_ontology.mcp_server import tools as mcp_tools
-from krw_ontology.mcp_server.server import diagnostics_payload, health_payload, mcp
+from krw_ontology.mcp_server.server import diagnostics_payload, health_payload, metrics_payload, mcp
 from krw_ontology.mcp_server.tools import (
     _normalize_object_types,
     catalog_tool,
@@ -121,11 +121,14 @@ def test_mcp_tools_query_trace_quality_and_compare(tmp_path: Path, monkeypatch):
 
 
 def test_mcp_health_reports_release_manifest(tmp_path: Path, monkeypatch):
-    _write_fixture(tmp_path)
-    build_agent_index(tmp_path)
-    write_release_manifest(tmp_path, release_id="20260528_010000", env="prod")
+    release = tmp_path / "releases" / "prod" / "20260528_010000"
+    _write_fixture(release)
+    build_agent_index(release)
+    write_release_manifest(release, release_id="20260528_010000", env="prod")
+    current = release.parent / "current"
+    current.symlink_to(release.name)
     monkeypatch.setenv("KRW_ONTOLOGY_ENV", "prod")
-    monkeypatch.setenv("KRW_ONTOLOGY_RELEASE_ROOT", str(tmp_path))
+    monkeypatch.setenv("KRW_ONTOLOGY_RELEASE_ROOT", str(current))
     monkeypatch.delenv("KRW_ONTOLOGY_INDEX_PATH", raising=False)
 
     payload, status_code = health_payload()
@@ -134,9 +137,42 @@ def test_mcp_health_reports_release_manifest(tmp_path: Path, monkeypatch):
     assert payload["ok"] is True
     assert payload["env"] == "prod"
     assert payload["release_id"] == "20260528_010000"
+    assert payload["root"] == str(release.resolve())
+    assert payload["supplied_root"] == str(current.absolute())
+    assert payload["root_is_current_symlink"] is True
+    assert payload["current_symlink"] is True
+    assert payload["current_symlink_target"] == release.name
+    assert payload["current_release_id"] == release.name
     assert payload["manifest_valid"] is True
-    assert payload["manifest_path"] == str(tmp_path / "manifest.json")
+    assert payload["manifest_path"] == str(release / "manifest.json")
     assert payload["documents"] == 2
+    assert payload["index_shards_present"] is True
+    assert payload["company_shard_count"] == 1
+    assert payload["global_catalog_path"] == "indexes/global_catalog.sqlite"
+    assert payload["global_topics_path"] == "indexes/global_topics.sqlite"
+    assert payload["global_topics_present"] is True
+    assert payload["global_topic_count"] > 0
+    assert payload["company_shards_dir"] == "indexes/companies"
+    assert payload["mcp_store_hot_swap"]["rotations"] == 0
+    assert payload["mcp_store_hot_swap"]["retired_leased"] == 0
+
+
+def test_mcp_health_rejects_configured_prod_non_current_root(tmp_path: Path, monkeypatch):
+    release = tmp_path / "releases" / "prod" / "20260528_010000"
+    _write_fixture(release)
+    build_agent_index(release)
+    write_release_manifest(release, release_id="20260528_010000", env="prod")
+    monkeypatch.setenv("KRW_ONTOLOGY_ENV", "prod")
+    monkeypatch.setenv("KRW_ONTOLOGY_RELEASE_ROOT", str(release))
+    monkeypatch.delenv("KRW_ONTOLOGY_INDEX_PATH", raising=False)
+
+    payload, status_code = health_payload()
+
+    assert status_code == 503
+    assert payload["ok"] is False
+    assert payload["error"] == "prod_current_symlink_required"
+    assert payload["root_is_current_symlink"] is False
+    assert payload["current_symlink"] is False
 
 
 def test_mcp_prepare_runtime_requires_prod_current_symlink(tmp_path: Path):
@@ -179,6 +215,58 @@ def test_mcp_prepare_runtime_requires_prod_current_symlink(tmp_path: Path):
     assert status["store"]["idle"] == 1
 
 
+def test_mcp_prepare_runtime_preserves_current_symlink_for_hot_swap(tmp_path: Path):
+    releases_root = tmp_path / "releases" / "prod"
+    first_release = releases_root / "20260529_010000"
+    second_release = releases_root / "20260529_020000"
+    _write_fixture(first_release, period="FY2025")
+    _write_fixture(second_release, period="FY2026")
+    build_agent_index(first_release)
+    build_agent_index(second_release)
+    write_release_manifest(first_release, release_id=first_release.name, env="prod")
+    write_release_manifest(second_release, release_id=second_release.name, env="prod")
+    current = releases_root / "current"
+    current.symlink_to(first_release.name)
+    env_names = (
+        "KRW_ONTOLOGY_ENV",
+        "KRW_ONTOLOGY_RELEASE_ROOT",
+        "KRW_ONTOLOGY_ROOT",
+        "KRW_ONTOLOGY_MANIFEST_PATH",
+        "KRW_ONTOLOGY_INDEX_PATH",
+        "KRW_MCP_STORE_MODE",
+    )
+    old_env = {name: os.environ.get(name) for name in env_names}
+    for name in env_names:
+        os.environ.pop(name, None)
+
+    mcp_tools.reset_mcp_runtime_caches()
+    try:
+        verification = prepare_mcp_runtime(root=current, env="prod")
+        runtime_index_path = Path(os.environ["KRW_ONTOLOGY_INDEX_PATH"])
+        assert verification["runtime_root"] == str(current.absolute())
+        assert verification["runtime_index_path"] == str(current.absolute() / "indexes" / "agent_index.sqlite")
+        assert runtime_index_path.parent.parent.name == "current"
+
+        with mcp_tools._store(mcp_tools._index(None, None)) as first_store:
+            assert first_store.list_documents()[0]["period"] == "FY2025"
+
+        current.unlink()
+        current.symlink_to(second_release.name)
+
+        with mcp_tools._store(mcp_tools._index(None, None)) as second_store:
+            assert second_store.list_documents()[0]["period"] == "FY2026"
+
+        status = mcp_tools.mcp_runtime_cache_status()
+        assert status["store"]["rotations"] == 1
+    finally:
+        mcp_tools.reset_mcp_runtime_caches()
+        for name, value in old_env.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
 def test_mcp_prepare_runtime_rejects_non_symlink_prod_root(tmp_path: Path):
     release = tmp_path / "releases" / "prod" / "20260529_010000"
     release.mkdir(parents=True)
@@ -208,6 +296,98 @@ def test_mcp_persistent_store_reuses_sqlite_connection(tmp_path: Path, monkeypat
     assert status["store"]["stores"] == 1
     assert status["store"]["hits"] == 1
     assert status["store"]["misses"] == 1
+
+
+def test_mcp_persistent_store_pins_inflight_release_and_rotates_after_current_switch(
+    tmp_path: Path,
+    monkeypatch,
+):
+    releases_root = tmp_path / "releases" / "prod"
+    first_release = releases_root / "20260529_010000"
+    second_release = releases_root / "20260529_020000"
+    _write_fixture(first_release, period="FY2025")
+    _write_fixture(second_release, period="FY2026")
+    build_agent_index(first_release)
+    build_agent_index(second_release)
+    write_release_manifest(first_release, release_id=first_release.name, env="prod")
+    write_release_manifest(second_release, release_id=second_release.name, env="prod")
+    current = releases_root / "current"
+    current.symlink_to(first_release.name)
+    index_path = current / "indexes" / "agent_index.sqlite"
+
+    monkeypatch.setenv("KRW_MCP_STORE_MODE", "persistent")
+    mcp_tools.reset_mcp_runtime_caches()
+
+    try:
+        with mcp_tools._store(index_path) as old_store:
+            assert old_store.list_documents()[0]["period"] == "FY2025"
+            current.unlink()
+            current.symlink_to(second_release.name)
+
+            with mcp_tools._store(index_path) as new_store:
+                assert new_store.list_documents()[0]["period"] == "FY2026"
+                assert new_store.routing_status()["mode"] == "shards"
+
+            inflight_status = mcp_tools.mcp_runtime_cache_status()
+            assert inflight_status["store"]["rotations"] == 1
+            assert inflight_status["store"]["active_stores"] == 1
+            assert inflight_status["store"]["retired_stores"] == 1
+            assert inflight_status["store"]["retired_leased"] == 1
+            assert inflight_status["store"]["rotation_pending"] is True
+            assert inflight_status["store"]["retired_oldest_age_sec"] >= 0
+            assert len(inflight_status["store"]["retired_indexes"]) == 1
+            assert inflight_status["store"]["retired_indexes"][0]["retired"] is True
+            assert inflight_status["store"]["last_rotation"]["previous_resolved_index_path"].endswith(
+                "20260529_010000/indexes/agent_index.sqlite"
+            )
+            assert inflight_status["store"]["last_rotation"]["new_resolved_index_path"].endswith(
+                "20260529_020000/indexes/agent_index.sqlite"
+            )
+            health, health_status = health_payload(root=str(current))
+            assert health_status == 200
+            assert health["release_id"] == "20260529_020000"
+            assert health["mcp_store_hot_swap"]["rotations"] == 1
+            assert health["mcp_store_hot_swap"]["retired_leased"] == 1
+            assert health["mcp_store_hot_swap"]["rotation_pending"] is True
+            assert health["mcp_store_hot_swap"]["retired_oldest_age_sec"] >= 0
+            assert health["mcp_store_hot_swap"]["last_rotation"]["previous_resolved_index_path"].endswith(
+                "20260529_010000/indexes/agent_index.sqlite"
+            )
+            metrics, metrics_status = metrics_payload(root=str(current))
+            assert metrics_status == 200
+            assert 'krw_ontology_mcp_store_rotation_pending{env="prod",release_id="20260529_020000"} 1' in metrics
+            assert 'krw_ontology_mcp_store_retired_leased{env="prod",release_id="20260529_020000"} 1' in metrics
+
+            current.unlink()
+            current.symlink_to(first_release.name)
+            with mcp_tools._store(index_path) as restored_store:
+                assert restored_store.list_documents()[0]["period"] == "FY2025"
+
+            aba_status = mcp_tools.mcp_runtime_cache_status()
+            assert aba_status["store"]["rotations"] == 2
+            assert aba_status["store"]["retired_leased"] == 1
+            assert len(aba_status["store"]["retired_indexes"]) == 1
+            assert len(aba_status["store"]["indexes"]) == 1
+            assert aba_status["store"]["retired_indexes"][0]["resolved_index_path"].endswith(
+                "20260529_010000/indexes/agent_index.sqlite"
+            )
+            assert aba_status["store"]["indexes"][0]["resolved_index_path"].endswith(
+                "20260529_010000/indexes/agent_index.sqlite"
+            )
+            assert (
+                aba_status["store"]["retired_indexes"][0]["generation"]
+                != aba_status["store"]["indexes"][0]["generation"]
+            )
+            assert old_store.list_documents()[0]["period"] == "FY2025"
+        status = mcp_tools.mcp_runtime_cache_status()
+    finally:
+        mcp_tools.reset_mcp_runtime_caches()
+
+    assert status["store"]["rotations"] == 2
+    assert status["store"]["opened"] == 3
+    assert status["store"]["retired_leased"] == 0
+    assert status["store"]["rotation_pending"] is False
+    assert status["store"]["retired_indexes"] == []
 
 
 def test_mcp_query_normalizes_object_type_aliases(tmp_path: Path, monkeypatch):
@@ -1215,6 +1395,24 @@ def test_mcp_health_payload_reports_manifest_counts_without_sqlite_count(
     assert payload["objects"] >= 1
     assert payload["sqlite_checked"] is False
     assert "krw_ontology_topic_map" in payload["tools"]
+    assert payload["mcp_store_hot_swap"]["rotation_pending"] is False
+    assert payload["mcp_store_hot_swap"]["retired_oldest_age_sec"] == 0
+    assert payload["mcp_store_hot_swap"]["retired_indexes"] == []
+
+
+def test_mcp_metrics_payload_exposes_release_and_hot_swap_metrics(tmp_path: Path):
+    _write_fixture(tmp_path)
+    build_agent_index(tmp_path)
+    write_release_manifest(tmp_path, release_id="20260528_020000", env="prod")
+
+    payload, status_code = metrics_payload(root=str(tmp_path))
+
+    assert status_code == 200
+    assert 'krw_ontology_mcp_health_ok{env="prod",release_id="20260528_020000"} 1' in payload
+    assert 'krw_ontology_mcp_release_documents{env="prod",release_id="20260528_020000"} 2' in payload
+    assert "krw_ontology_mcp_store_rotation_pending" in payload
+    assert "krw_ontology_mcp_store_rotations_total" in payload
+    assert "# TYPE krw_ontology_mcp_store_retired_leased gauge" in payload
 
 
 def test_mcp_diagnostics_payload_reports_live_index_counts(tmp_path: Path):

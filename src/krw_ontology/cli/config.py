@@ -15,21 +15,19 @@ DEFAULT_CLI_CONFIG_PATH = Path.home() / ".config" / "krw-ontology" / "config.jso
 CONFIG_KEYS = {
     "running-root",
     "publish-root",
-    "publish-index-path",
     "prod-host",
     "prod-root",
     "prod-reload-command",
     "prod-health-url",
     "prod-keep-releases",
 }
-PATH_CONFIG_KEYS = {"running-root", "publish-root", "publish-index-path"}
+PATH_CONFIG_KEYS = {"running-root", "publish-root"}
 
 
 @dataclass
 class CliConfig:
     running_root: str | None = None
     publish_root: str | None = None
-    publish_index_path: str | None = None
     prod_host: str | None = None
     prod_root: str | None = None
     prod_reload_command: str | None = None
@@ -41,7 +39,6 @@ class CliConfig:
         return cls(
             running_root=payload.get("running_root"),
             publish_root=payload.get("publish_root"),
-            publish_index_path=payload.get("publish_index_path"),
             prod_host=payload.get("prod_host"),
             prod_root=payload.get("prod_root"),
             prod_reload_command=payload.get("prod_reload_command"),
@@ -121,13 +118,4 @@ def resolve_publish_root(root: Path | str | None = None) -> Path | None:
     config = load_cli_config()
     if config.publish_root:
         return Path(config.publish_root).expanduser().resolve()
-    return None
-
-
-def resolve_publish_index_path(path: Path | str | None = None) -> Path | None:
-    if path is not None:
-        return Path(path).expanduser().resolve()
-    config = load_cli_config()
-    if config.publish_index_path:
-        return Path(config.publish_index_path).expanduser().resolve()
     return None

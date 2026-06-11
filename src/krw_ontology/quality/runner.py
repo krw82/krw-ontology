@@ -124,7 +124,6 @@ def _enqueue_docs_missing(job: RepairJob, *, root: Path) -> None:
         years=int(job.payload.get("years") or 3),
         force=False,
         publish_root=None,
-        publish_index_path=None,
     )
     job.payload["pipeline_queue_action"] = "queued_full_refresh"
     job.payload["pipeline_queue_job_id"] = pipeline_job.job_id

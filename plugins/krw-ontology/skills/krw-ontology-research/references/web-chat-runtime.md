@@ -13,7 +13,7 @@ Recommended structure:
 핵심 내용
 해석
 주의할 점
-다음으로 파고들 질문
+이어서 볼 질문
 ```
 
 The exact headings may vary, but the answer must be directly useful and filing-aware.
@@ -38,10 +38,28 @@ generic limitation sections
 Normal answers should end with:
 
 ```text
-다음으로 파고들 질문
+### 이어서 볼 질문
 ```
 
-Include exactly 3 concise Korean questions. Do not run tools to create them. Do not call them chains. Do not mention internal concepts.
+Include exactly 3 concise Korean follow-up prompts. Write them as direct prompts the user can send immediately, not as abstract analyst research topics. Do not run tools to create them. Do not call them chains. Do not mention internal concepts.
+
+Default pattern:
+
+```text
+1. condition that keeps, strengthens, weakens, or breaks the current interpretation
+2. scenario split such as upside/downside/sideways or positive/negative/neutral
+3. opposite view such as weak assumptions, thesis-break signals, or conflicting company comments
+```
+
+For normal research answers, prefer prompts like:
+
+```text
+- 이 이슈가 실적에 연결되는 경로만 더 단순하게 정리해줘.
+- 좋게 볼 근거와 나쁘게 볼 근거를 나눠줘.
+- 가장 먼저 확인해야 할 회사 코멘트 3개만 뽑아줘.
+```
+
+Avoid prompts that require the user to know specific filings, quarters, accounting terms, valuation models, or personal investment inputs.
 
 ## Evidence handling
 

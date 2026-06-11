@@ -141,5 +141,5 @@ Before finalizing, check:
 2. Did every important number connect to an investment meaning?
 3. Did I translate acronyms and jargon into Korean after first mention?
 4. Does the answer explain "so what?" instead of only listing evidence?
-5. Are follow-up questions also plain Korean and action-oriented?
+5. Are follow-up prompts short, plain Korean, and immediately reusable by the user?
 ```

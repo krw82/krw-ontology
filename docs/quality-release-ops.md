@@ -2,6 +2,10 @@
 
 이 문서는 `krw-ontology`의 품질 repair, 일반 queue, dev index publish 흐름을 운영자 기준으로 정리한다.
 
+Release/index 구현 계약과 개발 절차는
+[`production-release-index-development-guide.md`](production-release-index-development-guide.md)를
+source of truth로 사용한다.
+
 핵심 원칙:
 
 - ontology artifact의 근거와 신뢰를 우선한다.
@@ -29,7 +33,7 @@ krw-ontology release publish-dev-watch
 ```text
 quality repair = running artifact 또는 quality queue 상태를 보완
 general queue = docs_missing 같은 티커 재수집/full_refresh 처리
-release publish-dev = running-root를 읽어서 dev agent_index.sqlite를 새로 생성하고 dev/current로 promote
+release publish-dev = running-root를 새 dev release로 materialize하고 전체 index를 검증한 뒤 dev/current로 promote
 ```
 
 ## 2. Quality repair
@@ -367,27 +371,29 @@ krw-ontology release publish-dev
 ```text
 background worker 시작
 configured running-root를 읽음
-dev release index path에 agent_index.sqlite 생성
-manifest 작성
-dev/current promote
+running-root artifact를 새 dev candidate release로 materialize
+candidate 안에서 monolith와 shard index 생성
+manifest v2와 verification report 작성
+검증 성공 후 dev/current atomic promote
+실패 candidate는 dev/failed/로 격리
 ```
 
 중요:
 
 ```text
-running-root 전체를 dev release로 복사하지 않는다.
-index builder의 입력 root만 running-root다.
-산출물은 dev release의 indexes/agent_index.sqlite다.
+running-root는 mutable source이고 dev/current는 immutable serving pointer다.
+publish-dev는 current를 직접 rebuild하지 않는다.
+--no-build-index는 허용되지 않는다.
 ```
 
 내부 의미:
 
-```python
-build_agent_index(
-    root="/Users/.../krw-ontology-data-running",
-    index_path="/Users/.../krw-ontology-data/releases/dev/<release-id>/indexes/agent_index.sqlite",
-    force=True,
-)
+```text
+materialize running-root -> releases/dev/<release-id>
+build_agent_index(releases/dev/<release-id>)
+write manifest v2
+verify release + smoke + ranking
+promote releases/dev/current -> <release-id>
 ```
 
 출력 예:
@@ -470,6 +476,8 @@ worker log:
 ```text
 이미 준비된 dev release directory를 finalize한다.
 prepared release workflow용이다.
+release id를 반드시 명시하거나 publish config에서 non-current prepared release를 찾아야 한다.
+dev/current와 같은 active release를 직접 finalize하지 않는다.
 ```
 
 `release publish-dev`:
@@ -485,9 +493,8 @@ running-root를 읽어서 dev release index를 만들고 dev/current로 promote�
 krw-ontology release publish-dev
 ```
 
-`finalize-dev <release-id>`를 임의 release id로 실행하면 빈 release를 대상으로 만들 수 있으므로 주의한다.
-
-현재는 산출물이 없는 release root에 대해서는 empty index finalize를 거부한다.
+`finalize-dev`는 빈 release, active current, `--no-build-index`를 모두 거부한다.
+prepared candidate가 없다면 `release publish-dev` 또는 `release publish`를 사용한다.
 
 ## 8. Prod 반영
 

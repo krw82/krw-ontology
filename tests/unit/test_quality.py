@@ -309,7 +309,6 @@ def test_docs_missing_repair_skips_existing_active_pipeline_job(tmp_path: Path):
         years=3,
         force=False,
         publish_root=None,
-        publish_index_path=None,
     )
     store = QualityRepairStore(root)
     plan = store.add_plan(

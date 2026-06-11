@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sqlite3
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -16,11 +18,17 @@ from krw_ontology.agent_index import (
     ClaudeAgentQueryPlanner,
     ClaudeAgentReranker,
     OntologyStore,
+    OntologyStoreRouter,
     QueryPlan,
     build_agent_index,
+    open_ontology_store,
+    plan_agent_index,
+    verify_source_artifact_manifest,
+    write_source_artifact_manifest,
 )
 from krw_ontology.cli.main import app
 from krw_ontology.pipeline.stages.build_indexes import build_indexes
+from krw_ontology.release import verify_release_root, write_release_manifest
 from krw_ontology.utils.io import atomic_write_json, write_jsonl
 
 runner = CliRunner()
@@ -137,12 +145,659 @@ def test_build_agent_index_cli(tmp_path: Path):
         metric_value=125.0,
     )
 
-    result = runner.invoke(app, ["build-agent-index", "--root", str(tmp_path)])
+    result = runner.invoke(app, ["index", "build", "--root", str(tmp_path)])
 
     assert result.exit_code == 0
     assert "Agent index built:" in result.output
+    assert "Build plan:" in result.output
+    assert "Global catalog:" in result.output
+    assert "Global topics:" in result.output
+    assert "Company shards:" in result.output
     assert "1 documents" in result.output
     assert (tmp_path / "indexes" / "agent_index.sqlite").exists()
+    assert (tmp_path / "indexes" / "global_catalog.sqlite").exists()
+    assert (tmp_path / "indexes" / "global_topics.sqlite").exists()
+    assert (tmp_path / "indexes" / "companies" / "VG.sqlite").exists()
+    assert (tmp_path / "indexes" / "shard_manifest.json").exists()
+    assert (tmp_path / "indexes" / "build_summary.json").exists()
+    assert (tmp_path / "indexes" / "build_plan.json").exists()
+    assert (tmp_path / "indexes" / "artifact_manifest.json").exists()
+
+
+def test_build_agent_index_monolith_and_shards_outputs_verified_shards(tmp_path: Path):
+    _write_document_fixture(
+        tmp_path,
+        ticker="VG",
+        document_type="10-Q",
+        doc_type_key="10Q",
+        period="FY2025Q3",
+        section_quality={"status": "pass", "missing_core_sections": [], "fail_reasons": []},
+        topic_text="Margin pressure increased because customers demanded lower prices.",
+        metric_name="capex",
+        metric_value=125.0,
+    )
+    _write_document_fixture(
+        tmp_path,
+        ticker="XOM",
+        document_type="10-K",
+        doc_type_key="10K",
+        period="FY2025",
+        section_quality={"status": "pass", "missing_core_sections": [], "fail_reasons": []},
+        topic_text="Capital expenditures increased for upstream projects.",
+        metric_name="capex",
+        metric_value=900.0,
+    )
+
+    result = build_agent_index(tmp_path, layout="monolith-and-shards")
+
+    shards = result["shards"]
+    catalog_path = Path(shards["global_catalog_path"])
+    global_topics_path = Path(shards["global_topics_path"])
+    companies_dir = Path(shards["companies_dir"])
+    manifest_path = Path(shards["manifest_path"])
+    assert catalog_path.exists()
+    assert global_topics_path.exists()
+    assert companies_dir.exists()
+    assert manifest_path.exists()
+    assert shards["ticker_count"] == 2
+    assert shards["verification"]["ok"] is True
+    verification = agent_index_builder.verify_index_shards(
+        tmp_path / "indexes",
+        monolith_index_path=Path(result["index_path"]),
+    )
+    assert verification["ok"] is True, verification["errors"]
+    assert verification["counts"]["ticker_count"] == 2
+    assert verification["counts"]["documents"] == 2
+    assert verification["counts"]["objects"] == result["totals"]["objects"]
+    assert verification["counts"]["global_topics"] > 0
+    assert verification["global_topics_verification"]["ok"] is True
+
+    with sqlite3.connect(catalog_path) as conn:
+        catalog_rows = conn.execute(
+            """
+            SELECT ticker, shard_path, document_count
+            FROM shards
+            ORDER BY ticker
+            """
+        ).fetchall()
+    assert catalog_rows == [
+        ("VG", "companies/VG.sqlite", 1),
+        ("XOM", "companies/XOM.sqlite", 1),
+    ]
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["index_layout_version"] == agent_index_builder.INDEX_LAYOUT_VERSION
+    assert manifest["global_topics"] == "global_topics.sqlite"
+    assert manifest["global_topics_counts"]["company_topic_index"] == verification["counts"]["global_topics"]
+    assert sorted(manifest["shards"]) == ["VG", "XOM"]
+
+    with sqlite3.connect(global_topics_path) as conn:
+        topic_count = conn.execute("SELECT COUNT(*) FROM company_topic_index").fetchone()[0]
+        topic_fts_count = conn.execute("SELECT COUNT(*) FROM company_topic_fts").fetchone()[0]
+    assert topic_count == verification["counts"]["global_topics"]
+    assert topic_fts_count == topic_count
+
+    with OntologyStore(companies_dir / "VG.sqlite") as store:
+        assert store.list_companies() == ["VG"]
+        assert store.query(topic="margin pressure", tickers=["VG"])
+        assert store.query(topic="capital expenditures", tickers=["XOM"]) == []
+
+    build_summary = json.loads(Path(result["build_summary_path"]).read_text(encoding="utf-8"))
+    assert build_summary["shards"]["verification"]["ok"] is True
+    assert build_summary["build_plan"]["layout"] == "monolith-and-shards"
+
+    release_manifest = write_release_manifest(tmp_path, release_id="rel-shards", env="dev")
+    assert release_manifest["format"] == "krw-ontology-release/v2"
+    assert release_manifest["index_shards_present"] is True
+    assert release_manifest["company_shard_count"] == 2
+    assert release_manifest["global_catalog_path"] == "indexes/global_catalog.sqlite"
+    assert release_manifest["global_topics_path"] == "indexes/global_topics.sqlite"
+    assert release_manifest["global_topics_present"] is True
+    assert release_manifest["global_topic_count"] == verification["counts"]["global_topics"]
+    assert release_manifest["indexes"]["monolith"]["path"] == "indexes/agent_index.sqlite"
+    assert release_manifest["indexes"]["global_catalog"]["path"] == "indexes/global_catalog.sqlite"
+    assert release_manifest["indexes"]["global_topics"]["path"] == "indexes/global_topics.sqlite"
+    assert release_manifest["indexes"]["shard_manifest"]["path"] == "indexes/shard_manifest.json"
+    assert release_manifest["indexes"]["company_shards"]["count"] == 2
+    assert sorted(release_manifest["indexes"]["company_shards"]["tickers"]) == ["VG", "XOM"]
+    assert all(
+        entry["sha256"]
+        for entry in release_manifest["indexes"]["company_shards"]["tickers"].values()
+    )
+    release_verification = verify_release_root(tmp_path, env="dev")
+    assert release_verification["ok"] is True, release_verification["errors"]
+    assert release_verification["index_shard_verification"]["ok"] is True
+
+
+def test_ontology_store_router_routes_ticker_scoped_reads_to_company_shards(tmp_path: Path):
+    _write_document_fixture(
+        tmp_path,
+        ticker="VG",
+        document_type="10-Q",
+        doc_type_key="10Q",
+        period="FY2025Q3",
+        section_quality={"status": "pass", "missing_core_sections": [], "fail_reasons": []},
+        topic_text="Margin pressure increased because customers demanded lower prices.",
+        metric_name="capex",
+        metric_value=125.0,
+    )
+    _write_document_fixture(
+        tmp_path,
+        ticker="XOM",
+        document_type="10-K",
+        doc_type_key="10K",
+        period="FY2025",
+        section_quality={"status": "pass", "missing_core_sections": [], "fail_reasons": []},
+        topic_text="Capital expenditures increased for upstream projects.",
+        metric_name="capex",
+        metric_value=900.0,
+    )
+    result = build_agent_index(tmp_path)
+
+    with open_ontology_store(result["index_path"]) as store:
+        assert isinstance(store, OntologyStoreRouter)
+        assert store.list_companies() == ["VG", "XOM"]
+        bundles, diagnostics = store.query_with_diagnostics(
+            topic="margin pressure",
+            tickers=["VG"],
+            limit=5,
+        )
+        assert diagnostics["routing"]["mode"] == "company_shard"
+        assert {bundle["ticker"] for bundle in bundles} == {"VG"}
+        assert store.routing_status()["open_shards"] == ["VG"]
+
+        trace = store.trace("claim:VG:FY2025Q3:10Q:margin-pressure")
+        assert trace is not None
+        assert trace["object"]["ticker"] == "VG"
+
+        discovery = store.discover_company_topics(question="capital expenditures margin pressure")
+        assert discovery["search_diagnostics"]["routing"]["mode"] == "global_topics"
+        assert store.routing_status()["global_topics_open"] is True
+        assert store.routing_status()["monolith_open"] is False
+
+        comparison = store.compare(tickers=["VG", "XOM"], metric="capex")
+        assert comparison["routing"]["mode"] == "company_shards"
+        assert comparison["results"]["VG"][0]["object"]["value"] == 125.0
+        assert comparison["results"]["XOM"][0]["object"]["value"] == 900.0
+        assert store.routing_status()["monolith_open"] is True
+
+
+def test_build_agent_index_cli_monolith_and_shards_outputs_paths(tmp_path: Path):
+    _write_document_fixture(
+        tmp_path,
+        ticker="VG",
+        document_type="10-Q",
+        doc_type_key="10Q",
+        period="FY2025Q3",
+        section_quality={"status": "pass", "missing_core_sections": [], "fail_reasons": []},
+        topic_text="Margin pressure increased because customers demanded lower prices.",
+        metric_name="capex",
+        metric_value=125.0,
+    )
+
+    result = runner.invoke(
+        app,
+        ["index", "build", "--root", str(tmp_path), "--layout", "monolith-and-shards"],
+    )
+
+    assert result.exit_code == 0
+    assert "Global catalog:" in result.output
+    assert "Global topics:" in result.output
+    assert "Company shards:" in result.output
+    assert (tmp_path / "indexes" / "global_catalog.sqlite").exists()
+    assert (tmp_path / "indexes" / "global_topics.sqlite").exists()
+    assert (tmp_path / "indexes" / "companies" / "VG.sqlite").exists()
+    assert (tmp_path / "indexes" / "shard_manifest.json").exists()
+
+
+def test_index_build_and_verify_cli_wrap_production_builder(tmp_path: Path):
+    _write_document_fixture(
+        tmp_path,
+        ticker="VG",
+        document_type="10-Q",
+        doc_type_key="10Q",
+        period="FY2025Q3",
+        section_quality={"status": "pass", "missing_core_sections": [], "fail_reasons": []},
+        topic_text="Margin pressure increased because customers demanded lower prices.",
+        metric_name="capex",
+        metric_value=125.0,
+    )
+
+    build_result = runner.invoke(
+        app,
+        ["index", "build", "--root", str(tmp_path), "--layout", "monolith-and-shards"],
+    )
+    verify_result = runner.invoke(app, ["index", "verify", "--root", str(tmp_path)])
+
+    assert build_result.exit_code == 0, build_result.output
+    assert "Agent index built:" in build_result.output
+    assert "Global catalog:" in build_result.output
+    assert "Global topics:" in build_result.output
+    assert "Company shards:" in build_result.output
+    assert verify_result.exit_code == 0, verify_result.output
+    assert "Agent index verify: ok" in verify_result.output
+    assert "Shard verify: ok" in verify_result.output
+    assert "Shards: tickers=1" in verify_result.output
+
+
+def test_index_verify_cli_fails_for_missing_index(tmp_path: Path):
+    result = runner.invoke(app, ["index", "verify", "--root", str(tmp_path)])
+
+    assert result.exit_code == 1
+    assert "Agent index verify: failed" in result.output
+    assert "FAIL index_missing" in result.output
+
+
+def test_index_plan_cli_does_not_build_sqlite(tmp_path: Path):
+    _write_document_fixture(
+        tmp_path,
+        ticker="VG",
+        document_type="10-Q",
+        doc_type_key="10Q",
+        period="FY2025Q3",
+        section_quality={"status": "pass", "missing_core_sections": [], "fail_reasons": []},
+        topic_text="Margin pressure increased because customers demanded lower prices.",
+        metric_name="capex",
+        metric_value=125.0,
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "index",
+            "plan",
+            "--root",
+            str(tmp_path),
+            "--workers",
+            "2",
+            "--layout",
+            "monolith-and-shards",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "Artifacts: 1" in result.output
+    assert "Dirty artifacts: 1" in result.output
+    assert "Workers: 2" in result.output
+    assert "Layout: monolith-and-shards" in result.output
+    assert not (tmp_path / "indexes" / "agent_index.sqlite").exists()
+    assert not (tmp_path / "indexes" / "build_plan.json").exists()
+
+
+def test_index_inspect_and_explain_last_build_cli(tmp_path: Path):
+    _write_document_fixture(
+        tmp_path,
+        ticker="VG",
+        document_type="10-Q",
+        doc_type_key="10Q",
+        period="FY2025Q3",
+        section_quality={"status": "pass", "missing_core_sections": [], "fail_reasons": []},
+        topic_text="Margin pressure increased because customers demanded lower prices.",
+        metric_name="capex",
+        metric_value=125.0,
+    )
+    build_agent_index(tmp_path)
+
+    inspect_result = runner.invoke(app, ["index", "inspect", "--root", str(tmp_path), "--json"])
+    explain_result = runner.invoke(app, ["index", "explain-last-build", "--root", str(tmp_path), "--json"])
+
+    assert inspect_result.exit_code == 0, inspect_result.output
+    inspect_payload = json.loads(inspect_result.output)
+    assert inspect_payload["verification"]["ok"] is True
+    assert inspect_payload["shard_verification"]["ok"] is True
+    assert inspect_payload["build_summary"]["build_plan"]["artifact_count"] == 1
+    assert explain_result.exit_code == 0, explain_result.output
+    explain_payload = json.loads(explain_result.output)
+    assert explain_payload["build_plan"]["artifact_count"] == 1
+    assert explain_payload["fragment_cache"]["misses"] == 1
+    assert explain_payload["slow_phases"]
+
+
+def test_plan_agent_index_uses_content_addressed_fragment_keys(tmp_path: Path):
+    cache_root = tmp_path / "cache"
+    _write_document_fixture(
+        tmp_path,
+        ticker="VG",
+        document_type="10-Q",
+        doc_type_key="10Q",
+        period="FY2025Q3",
+        section_quality={"status": "pass", "missing_core_sections": [], "fail_reasons": []},
+        topic_text="Margin pressure increased because customers demanded lower prices.",
+        metric_name="capex",
+        metric_value=125.0,
+    )
+
+    first = plan_agent_index(
+        tmp_path,
+        cache_root=cache_root,
+        workers=3,
+        layout="monolith-and-shards",
+    )
+    first_item = first.items[0]
+    assert first.workers == 3
+    assert first.layout == "monolith-and-shards"
+    assert first.dirty_tickers == ("VG",)
+    assert first_item.cache_key.startswith("sha256:")
+    assert first_item.fragment_path.parent == cache_root / "fragments" / first_item.cache_key.split(":", 1)[1][:2]
+    assert first_item.cache_hit is False
+    assert first_item.cache_errors == ("fragment_missing",)
+    assert first_item.estimated_bytes > 0
+    assert first_item.estimated_rows is not None
+
+    first_item.fragment_path.parent.mkdir(parents=True)
+    first_item.fragment_path.write_text("fragment-placeholder", encoding="utf-8")
+    corrupt = plan_agent_index(tmp_path, cache_root=cache_root)
+    assert corrupt.items[0].cache_hit is False
+    assert any(error.startswith("sqlite_error:") for error in corrupt.items[0].cache_errors)
+
+    agent_index_builder.write_index_fragment_metadata(first_item.fragment_path, first_item)
+    verification = agent_index_builder.verify_index_fragment(first_item.fragment_path, expected=first_item)
+    assert verification["ok"] is True
+    mismatch = agent_index_builder.verify_index_fragment(
+        first_item.fragment_path,
+        expected={"cache_key": "sha256:wrong"},
+    )
+    assert mismatch["ok"] is False
+    assert "metadata_mismatch:cache_key" in mismatch["errors"]
+
+    cached = plan_agent_index(tmp_path, cache_root=cache_root)
+    assert cached.items[0].cache_key == first_item.cache_key
+    assert cached.items[0].cache_hit is True
+    assert cached.items[0].cache_errors == ()
+    assert cached.cached_items == cached.items
+    assert cached.dirty_items == ()
+
+    spans_path = tmp_path / "companies" / "VG" / "ontology" / "10Q" / "FY2025Q3" / "spans.jsonl"
+    spans_path.write_text(spans_path.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    changed = plan_agent_index(tmp_path, cache_root=cache_root)
+    assert changed.items[0].content_hash != first_item.content_hash
+    assert changed.items[0].cache_key != first_item.cache_key
+    assert changed.items[0].cache_hit is False
+    assert changed.dirty_tickers == ("VG",)
+
+
+def test_source_manifest_only_discovery_and_build_graph(tmp_path: Path):
+    _write_document_fixture(
+        tmp_path,
+        ticker="VG",
+        document_type="10-Q",
+        doc_type_key="10Q",
+        period="FY2025Q3",
+        section_quality={"status": "pass", "missing_core_sections": [], "fail_reasons": []},
+        topic_text="Margin pressure increased because customers demanded lower prices.",
+        metric_name="capex",
+        metric_value=125.0,
+    )
+    manifest = write_source_artifact_manifest(tmp_path)
+    manifest_path = Path(manifest["path"])
+
+    verification = verify_source_artifact_manifest(tmp_path, manifest_path=manifest_path)
+    plan = plan_agent_index(tmp_path, source_manifest_path=manifest_path)
+    result = build_agent_index(tmp_path, source_manifest_path=manifest_path)
+
+    assert verification["ok"] is True, verification["errors"]
+    assert manifest["format"] == agent_index_builder.SOURCE_ARTIFACT_MANIFEST_FORMAT_VERSION
+    assert plan.discovery_mode == "source-manifest"
+    assert plan.source_manifest_hash == manifest["manifest_hash"]
+    assert len(plan.items) == 1
+    build_graph = json.loads(Path(result["build_graph_path"]).read_text(encoding="utf-8"))
+    assert build_graph["format"] == agent_index_builder.INDEX_BUILD_GRAPH_FORMAT_VERSION
+    assert build_graph["discovery_mode"] == "source-manifest"
+    assert any(node["type"] == "source_manifest" for node in build_graph["nodes"])
+    assert any(node["type"] == "company_projection" for node in build_graph["nodes"])
+
+    spans_path = tmp_path / "companies" / "VG" / "ontology" / "10Q" / "FY2025Q3" / "spans.jsonl"
+    spans_path.write_text(spans_path.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    changed_verification = verify_source_artifact_manifest(tmp_path, manifest_path=manifest_path)
+    assert changed_verification["ok"] is False
+    assert any(error.startswith("source_manifest_content_hash_mismatch:") for error in changed_verification["errors"])
+
+
+def test_build_agent_index_reuses_company_shard_cache(tmp_path: Path):
+    cache_root = tmp_path / "cache"
+    _write_document_fixture(
+        tmp_path,
+        ticker="VG",
+        document_type="10-Q",
+        doc_type_key="10Q",
+        period="FY2025Q3",
+        section_quality={"status": "pass", "missing_core_sections": [], "fail_reasons": []},
+        topic_text="Margin pressure increased because customers demanded lower prices.",
+        metric_name="capex",
+        metric_value=125.0,
+    )
+    _write_document_fixture(
+        tmp_path,
+        ticker="XOM",
+        document_type="10-K",
+        doc_type_key="10K",
+        period="FY2025",
+        section_quality={"status": "pass", "missing_core_sections": [], "fail_reasons": []},
+        topic_text="Capital expenditures increased for upstream projects.",
+        metric_name="capex",
+        metric_value=900.0,
+    )
+
+    first = build_agent_index(tmp_path, cache_root=cache_root)
+    second = build_agent_index(tmp_path, cache_root=cache_root)
+
+    assert first["shards"]["company_cache"]["hits"] == 0
+    assert first["shards"]["company_cache"]["misses"] == 2
+    assert second["shards"]["company_cache"]["hits"] == 2
+    assert second["shards"]["company_cache"]["misses"] == 0
+    assert sorted(second["shards"]["shards"]) == ["VG", "XOM"]
+    assert all(entry["cache_hit"] is True for entry in second["shards"]["shards"].values())
+    build_graph = json.loads(Path(second["build_graph_path"]).read_text(encoding="utf-8"))
+    shard_nodes = [node for node in build_graph["nodes"] if node["type"] == "company_shard"]
+    assert {node["status"] for node in shard_nodes} == {"cached"}
+
+
+def test_fragment_cache_key_changes_with_builder_code_version(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    cache_root = tmp_path / "cache"
+    _write_document_fixture(
+        tmp_path,
+        ticker="VG",
+        document_type="10-Q",
+        doc_type_key="10Q",
+        period="FY2025Q3",
+        section_quality={"status": "pass", "missing_core_sections": [], "fail_reasons": []},
+        topic_text="Margin pressure increased because customers demanded lower prices.",
+        metric_name="capex",
+        metric_value=125.0,
+    )
+    first = plan_agent_index(tmp_path, cache_root=cache_root)
+    first_item = first.items[0]
+    agent_index_builder.write_index_fragment_metadata(first_item.fragment_path, first_item)
+
+    monkeypatch.setattr(agent_index_builder, "AGENT_INDEX_BUILDER_VERSION", "agent-index-builder/test-next")
+    changed = plan_agent_index(tmp_path, cache_root=cache_root)
+    old_fragment = agent_index_builder.verify_index_fragment(first_item.fragment_path)
+
+    assert changed.builder_code_version == "agent-index-builder/test-next"
+    assert changed.items[0].content_hash == first_item.content_hash
+    assert changed.items[0].cache_key != first_item.cache_key
+    assert changed.items[0].cache_hit is False
+    assert "metadata_mismatch:builder_code_version" in old_fragment["errors"]
+
+
+def test_build_agent_index_reuses_verified_fragment_cache(tmp_path: Path):
+    cache_root = tmp_path / "cache"
+    _write_document_fixture(
+        tmp_path,
+        ticker="VG",
+        document_type="10-Q",
+        doc_type_key="10Q",
+        period="FY2025Q3",
+        section_quality={"status": "pass", "missing_core_sections": [], "fail_reasons": []},
+        topic_text="Margin pressure increased because customers demanded lower prices.",
+        metric_name="capex",
+        metric_value=125.0,
+    )
+
+    first = build_agent_index(tmp_path, cache_root=cache_root)
+    second = build_agent_index(tmp_path, cache_root=cache_root)
+
+    assert first["fragment_cache"] == {
+        "hits": 0,
+        "misses": 1,
+        "cache_root": str(cache_root.resolve()),
+        "workers": first["build_plan_summary"]["workers"],
+    }
+    assert second["fragment_cache"] == {
+        "hits": 1,
+        "misses": 0,
+        "cache_root": str(cache_root.resolve()),
+        "workers": second["build_plan_summary"]["workers"],
+    }
+    with sqlite3.connect(second["index_path"]) as conn:
+        raw_build_metadata = conn.execute("SELECT value FROM metadata WHERE key = 'build'").fetchone()[0]
+    build_metadata = json.loads(raw_build_metadata)
+    assert build_metadata["fragment_cache_hits"] == 1
+    assert build_metadata["fragment_cache_misses"] == 0
+    assert build_metadata["fragment_compile_workers"] == second["build_plan_summary"]["workers"]
+
+    with OntologyStore(second["index_path"]) as store:
+        assert store.list_companies() == ["VG"]
+        assert store.query(topic="margin pressure", tickers=["VG"])
+
+
+def test_build_agent_index_rebuilds_corrupt_fragment_cache(tmp_path: Path):
+    cache_root = tmp_path / "cache"
+    _write_document_fixture(
+        tmp_path,
+        ticker="VG",
+        document_type="10-Q",
+        doc_type_key="10Q",
+        period="FY2025Q3",
+        section_quality={"status": "pass", "missing_core_sections": [], "fail_reasons": []},
+        topic_text="Margin pressure increased because customers demanded lower prices.",
+        metric_name="capex",
+        metric_value=125.0,
+    )
+    plan = plan_agent_index(tmp_path, cache_root=cache_root)
+    item = plan.items[0]
+    item.fragment_path.parent.mkdir(parents=True)
+    item.fragment_path.write_text("not sqlite", encoding="utf-8")
+
+    result = build_agent_index(tmp_path, cache_root=cache_root)
+
+    assert result["fragment_cache"]["hits"] == 0
+    assert result["fragment_cache"]["misses"] == 1
+    verification = agent_index_builder.verify_index_fragment(item.fragment_path, expected=item)
+    assert verification["ok"] is True
+    assert verification["counts"]["documents"] == 1
+    assert verification["counts"]["objects"] > 0
+
+
+def test_index_cache_status_reports_referenced_fragments(tmp_path: Path):
+    cache_root = tmp_path / "cache"
+    _write_document_fixture(
+        tmp_path,
+        ticker="VG",
+        document_type="10-Q",
+        doc_type_key="10Q",
+        period="FY2025Q3",
+        section_quality={"status": "pass", "missing_core_sections": [], "fail_reasons": []},
+        topic_text="Margin pressure increased because customers demanded lower prices.",
+        metric_name="capex",
+        metric_value=125.0,
+    )
+    build_agent_index(tmp_path, cache_root=cache_root)
+
+    result = runner.invoke(
+        app,
+        [
+            "index",
+            "cache",
+            "status",
+            "--root",
+            str(tmp_path),
+            "--cache-root",
+            str(cache_root),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Fragment cache: ok" in result.output
+    assert "Fragments: total=1 valid=1 invalid=0 referenced=1 unreferenced=0" in result.output
+    assert "Rows: documents=1" in result.output
+    assert "Tickers: VG" in result.output
+
+
+def test_index_cache_gc_removes_invalid_and_unreferenced_fragments_only_with_yes(tmp_path: Path):
+    cache_root = tmp_path / "cache"
+    _write_document_fixture(
+        tmp_path,
+        ticker="VG",
+        document_type="10-Q",
+        doc_type_key="10Q",
+        period="FY2025Q3",
+        section_quality={"status": "pass", "missing_core_sections": [], "fail_reasons": []},
+        topic_text="Margin pressure increased because customers demanded lower prices.",
+        metric_name="capex",
+        metric_value=125.0,
+    )
+    build_agent_index(tmp_path, cache_root=cache_root)
+    referenced_fragment = next((cache_root / "fragments").rglob("*.sqlite"))
+    stale_fragment = cache_root / "fragments" / "ff" / "stale-copy.sqlite"
+    stale_fragment.parent.mkdir(parents=True)
+    shutil.copy2(referenced_fragment, stale_fragment)
+    invalid_fragment = cache_root / "fragments" / "ee" / "invalid.sqlite"
+    invalid_fragment.parent.mkdir(parents=True)
+    invalid_fragment.write_text("not sqlite", encoding="utf-8")
+
+    dry_run = runner.invoke(
+        app,
+        [
+            "index",
+            "cache",
+            "gc",
+            "--root",
+            str(tmp_path),
+            "--cache-root",
+            str(cache_root),
+        ],
+    )
+
+    assert dry_run.exit_code == 0, dry_run.output
+    assert "Fragment cache GC: dry-run" in dry_run.output
+    assert "Candidates: 2" in dry_run.output
+    assert stale_fragment.exists()
+    assert invalid_fragment.exists()
+    assert referenced_fragment.exists()
+
+    deleted = runner.invoke(
+        app,
+        [
+            "index",
+            "cache",
+            "gc",
+            "--root",
+            str(tmp_path),
+            "--cache-root",
+            str(cache_root),
+            "--yes",
+        ],
+    )
+
+    assert deleted.exit_code == 0, deleted.output
+    assert "Fragment cache GC: deleted" in deleted.output
+    assert "Deleted: 2" in deleted.output
+    assert not stale_fragment.exists()
+    assert not invalid_fragment.exists()
+    assert referenced_fragment.exists()
+
+    status = agent_index_builder.inspect_index_fragment_cache(
+        cache_root,
+        referenced_fragments=[referenced_fragment],
+    )
+    assert status["fragment_count"] == 1
+    assert status["valid_fragment_count"] == 1
+    assert status["invalid_fragment_count"] == 0
+    assert status["referenced_fragment_count"] == 1
 
 
 def test_build_agent_index_resource_env_and_progress_log(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -189,6 +844,18 @@ def test_build_agent_index_resource_env_and_progress_log(tmp_path: Path, monkeyp
     assert build_metadata["build_settings"]["sqlite_synchronous"] == "OFF"
     assert build_metadata["build_settings"]["sqlite_cache_mib"] == 64
     assert build_metadata["build_settings"]["bulk_insert_chunk_size"] == 1234
+    assert result["verification"]["ok"] is True
+    assert Path(result["build_summary_path"]).exists()
+    assert Path(result["build_plan_path"]).exists()
+    assert Path(result["artifact_manifest_path"]).exists()
+    build_summary = json.loads(Path(result["build_summary_path"]).read_text(encoding="utf-8"))
+    assert build_summary["verification"]["ok"] is True
+    assert build_summary["totals"]["documents"] == 1
+    assert build_summary["build_plan"]["artifact_count"] == 1
+    assert build_summary["artifact_manifest"]["artifact_count"] == 1
+    assert build_summary["build_plan"]["dirty_artifact_count"] == 1
+    assert build_summary["fragment_cache"]["misses"] == 1
+    assert build_summary["slow_phases"]
 
     log_rows = [json.loads(line) for line in progress_log.read_text().splitlines()]
     assert log_rows
@@ -199,6 +866,240 @@ def test_build_agent_index_resource_env_and_progress_log(tmp_path: Path, monkeyp
     assert log_rows[0]["sqlite_cache_mib"] == 64
     assert "db_size_mb" in log_rows[0]
     assert "wal_size_mb" in log_rows[0]
+
+
+def test_build_agent_index_failure_preserves_existing_index(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    _write_document_fixture(
+        tmp_path,
+        ticker="VG",
+        document_type="10-Q",
+        doc_type_key="10Q",
+        period="FY2025Q3",
+        section_quality={"status": "pass", "missing_core_sections": [], "fail_reasons": []},
+        topic_text="Margin pressure increased because customers demanded lower prices.",
+        metric_name="capex",
+        metric_value=125.0,
+    )
+    first = build_agent_index(tmp_path)
+    index_path = first["index_path"]
+
+    _write_document_fixture(
+        tmp_path,
+        ticker="XOM",
+        document_type="10-K",
+        doc_type_key="10K",
+        period="FY2025",
+        section_quality={"status": "pass", "missing_core_sections": [], "fail_reasons": []},
+        topic_text="Capital expenditures increased for upstream projects.",
+        metric_name="capex",
+        metric_value=900.0,
+    )
+
+    def fail_index_artifact(*args, **kwargs):
+        raise RuntimeError("forced artifact index failure")
+
+    monkeypatch.setattr(agent_index_builder, "_index_artifact", fail_index_artifact)
+
+    with pytest.raises(RuntimeError, match="forced artifact index failure"):
+        build_agent_index(tmp_path, force=True, workers=1)
+
+    with OntologyStore(index_path) as store:
+        assert store.list_companies() == ["VG"]
+
+    assert not list(index_path.parent.glob(f".{index_path.name}.*.tmp"))
+
+
+def test_build_agent_index_compiles_fragments_with_process_workers(tmp_path: Path):
+    cache_root = tmp_path / "cache"
+    _write_document_fixture(
+        tmp_path,
+        ticker="VG",
+        document_type="10-Q",
+        doc_type_key="10Q",
+        period="FY2025Q3",
+        section_quality={"status": "pass", "missing_core_sections": [], "fail_reasons": []},
+        topic_text="Margin pressure increased because customers demanded lower prices.",
+        metric_name="capex",
+        metric_value=125.0,
+    )
+    _write_document_fixture(
+        tmp_path,
+        ticker="XOM",
+        document_type="10-K",
+        doc_type_key="10K",
+        period="FY2025",
+        section_quality={"status": "pass", "missing_core_sections": [], "fail_reasons": []},
+        topic_text="Capital expenditures increased for upstream projects.",
+        metric_name="capex",
+        metric_value=900.0,
+    )
+
+    result = build_agent_index(tmp_path, cache_root=cache_root, workers=2)
+
+    assert result["fragment_cache"]["hits"] == 0
+    assert result["fragment_cache"]["misses"] == 2
+    with OntologyStore(result["index_path"]) as store:
+        assert store.list_companies() == ["VG", "XOM"]
+
+
+def test_build_agent_index_api_rejects_active_release_and_active_release_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    release_root = tmp_path / "releases" / "dev" / "active"
+    _write_document_fixture(
+        release_root,
+        ticker="VG",
+        document_type="10-Q",
+        doc_type_key="10Q",
+        period="FY2025Q3",
+        section_quality={"status": "pass", "missing_core_sections": [], "fail_reasons": []},
+        topic_text="Margin pressure increased because customers demanded lower prices.",
+        metric_name="capex",
+        metric_value=125.0,
+    )
+    current = release_root.parent / "current"
+    current.symlink_to(release_root.name)
+
+    with pytest.raises(ValueError, match="current is an immutable release pointer"):
+        build_agent_index(current)
+
+    running = tmp_path / "running"
+    _write_document_fixture(
+        running,
+        ticker="XOM",
+        document_type="10-K",
+        doc_type_key="10K",
+        period="FY2025",
+        section_quality={"status": "pass", "missing_core_sections": [], "fail_reasons": []},
+        topic_text="Capital expenditures increased for upstream projects.",
+        metric_name="capex",
+        metric_value=900.0,
+    )
+    with pytest.raises(ValueError, match="current is an immutable release pointer"):
+        build_agent_index(running, cache_root=current / "cache")
+
+    monkeypatch.setenv("KRW_BUILD_PROGRESS_LOG", str(current / "build_progress.jsonl"))
+    with pytest.raises(ValueError, match="current is an immutable release pointer"):
+        build_agent_index(running, cache_root=tmp_path / "cache")
+
+
+def test_parallel_fragment_compile_dispatches_large_artifacts_first(tmp_path: Path):
+    _write_document_fixture(
+        tmp_path,
+        ticker="VG",
+        document_type="10-Q",
+        doc_type_key="10Q",
+        period="FY2025Q3",
+        section_quality={"status": "pass", "missing_core_sections": [], "fail_reasons": []},
+        topic_text="Margin pressure increased because customers demanded lower prices.",
+        metric_name="capex",
+        metric_value=125.0,
+    )
+    _write_document_fixture(
+        tmp_path,
+        ticker="XOM",
+        document_type="10-K",
+        doc_type_key="10K",
+        period="FY2025",
+        section_quality={"status": "pass", "missing_core_sections": [], "fail_reasons": []},
+        topic_text="Capital expenditures increased for upstream projects.",
+        metric_name="capex",
+        metric_value=900.0,
+    )
+    items = plan_agent_index(tmp_path).items
+    small = replace(items[0], estimated_bytes=10, relative_path="z-small")
+    large_b = replace(items[1], estimated_bytes=100, relative_path="b-large")
+    large_a = replace(items[0], estimated_bytes=100, relative_path="a-large")
+
+    ordered = agent_index_builder._fragment_compile_submission_order([small, large_b, large_a])
+
+    assert [item.relative_path for item in ordered] == ["a-large", "b-large", "z-small"]
+
+
+def test_parallel_fragment_pool_failure_retries_sequential_compile(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    cache_root = tmp_path / "cache"
+    _write_document_fixture(
+        tmp_path,
+        ticker="VG",
+        document_type="10-Q",
+        doc_type_key="10Q",
+        period="FY2025Q3",
+        section_quality={"status": "pass", "missing_core_sections": [], "fail_reasons": []},
+        topic_text="Margin pressure increased because customers demanded lower prices.",
+        metric_name="capex",
+        metric_value=125.0,
+    )
+    _write_document_fixture(
+        tmp_path,
+        ticker="XOM",
+        document_type="10-K",
+        doc_type_key="10K",
+        period="FY2025",
+        section_quality={"status": "pass", "missing_core_sections": [], "fail_reasons": []},
+        topic_text="Capital expenditures increased for upstream projects.",
+        metric_name="capex",
+        metric_value=900.0,
+    )
+
+    class BrokenExecutor:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            raise agent_index_builder.BrokenProcessPool("forced pool failure")
+
+        def __exit__(self, *_exc: object) -> None:
+            return None
+
+    monkeypatch.setattr(agent_index_builder, "ProcessPoolExecutor", BrokenExecutor)
+
+    result = build_agent_index(tmp_path, cache_root=cache_root, workers=2)
+
+    assert result["fragment_cache"]["hits"] == 0
+    assert result["fragment_cache"]["misses"] == 2
+    with OntologyStore(result["index_path"]) as store:
+        assert store.list_companies() == ["VG", "XOM"]
+
+
+def test_parallel_fragment_failure_preserves_existing_index(tmp_path: Path):
+    cache_root = tmp_path / "cache"
+    _write_document_fixture(
+        tmp_path,
+        ticker="VG",
+        document_type="10-Q",
+        doc_type_key="10Q",
+        period="FY2025Q3",
+        section_quality={"status": "pass", "missing_core_sections": [], "fail_reasons": []},
+        topic_text="Margin pressure increased because customers demanded lower prices.",
+        metric_name="capex",
+        metric_value=125.0,
+    )
+    first = build_agent_index(tmp_path, cache_root=cache_root, workers=1)
+    index_path = first["index_path"]
+
+    _write_document_fixture(
+        tmp_path,
+        ticker="XOM",
+        document_type="10-K",
+        doc_type_key="10K",
+        period="FY2025",
+        section_quality={"status": "pass", "missing_core_sections": [], "fail_reasons": []},
+        topic_text="Capital expenditures increased for upstream projects.",
+        metric_name="capex",
+        metric_value=900.0,
+    )
+    spans_path = tmp_path / "companies" / "XOM" / "ontology" / "10K" / "FY2025" / "spans.jsonl"
+    spans_path.write_text("{not-json}\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="fragment compile failed"):
+        build_agent_index(tmp_path, cache_root=cache_root, workers=2)
+
+    with OntologyStore(index_path) as store:
+        assert store.list_companies() == ["VG"]
 
 
 def test_build_resource_settings_default_to_off_and_max_local_profile(monkeypatch: pytest.MonkeyPatch):

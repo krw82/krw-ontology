@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Any
 
 from bs4 import BeautifulSoup
-import yaml
 
 from krw_ontology.errors import PipelineStageError
 from krw_ontology.schema.id_utils import generate_scoped_id, generate_xbrl_local_id

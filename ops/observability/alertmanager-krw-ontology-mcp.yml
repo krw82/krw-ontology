@@ -1,0 +1,51 @@
+global:
+  resolve_timeout: 5m
+
+route:
+  receiver: krw-ontology-mcp-default
+  group_by:
+    - alertname
+    - env
+    - release_id
+    - service
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  routes:
+    - receiver: krw-ontology-mcp-critical
+      matchers:
+        - service="krw-ontology-mcp"
+        - severity="critical"
+      repeat_interval: 30m
+    - receiver: krw-ontology-mcp-warning
+      matchers:
+        - service="krw-ontology-mcp"
+        - severity="warning"
+      repeat_interval: 2h
+
+receivers:
+  - name: krw-ontology-mcp-default
+    webhook_configs:
+      - url: http://127.0.0.1:9099/alertmanager/krw-ontology-mcp/default
+        send_resolved: true
+
+  - name: krw-ontology-mcp-critical
+    webhook_configs:
+      - url: http://127.0.0.1:9099/alertmanager/krw-ontology-mcp/critical
+        send_resolved: true
+
+  - name: krw-ontology-mcp-warning
+    webhook_configs:
+      - url: http://127.0.0.1:9099/alertmanager/krw-ontology-mcp/warning
+        send_resolved: true
+
+inhibit_rules:
+  - source_matchers:
+      - service="krw-ontology-mcp"
+      - severity="critical"
+    target_matchers:
+      - service="krw-ontology-mcp"
+      - severity="warning"
+    equal:
+      - env
+      - release_id

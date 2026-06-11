@@ -3,13 +3,10 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
 import re
 from pathlib import Path
 from typing import Any
-
-import yaml
 
 from krw_ontology.config.constants import normalize_doc_type
 from krw_ontology.schema.objects import SCHEMA_VERSION

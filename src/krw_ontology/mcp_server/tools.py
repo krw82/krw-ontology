@@ -14,11 +14,16 @@ import time
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from krw_ontology.agent_index import AgentRetriever, OntologyStore, QueryPlan
+from krw_ontology.agent_index import AgentRetriever, OntologyStore, QueryPlan, open_ontology_store
 from krw_ontology.agent_index.retrieval_text import format_metric_compact
 from krw_ontology.agent_index.research_kernel import ResearchKernel, request_from_query_context_args
 from krw_ontology.agent_index.store import DEFAULT_QUERY_TYPES, agent_index_cache_status
-from krw_ontology.config.paths import ONTOLOGY_ROOT_ENV, resolve_agent_index_path, resolve_ontology_root
+from krw_ontology.config.paths import (
+    ONTOLOGY_INDEX_PATH_ENV,
+    ONTOLOGY_ROOT_ENV,
+    resolve_agent_index_path,
+    resolve_ontology_root,
+)
 
 
 class ResponseFormat(str, Enum):
@@ -89,10 +94,24 @@ def _trace_cache_key(index_path: Path, object_id: str) -> tuple[str, int | None,
 
 
 class _StoreBucket:
-    def __init__(self, signature: tuple[str, int | None, int | None]):
+    def __init__(
+        self,
+        *,
+        logical_path: str,
+        signature: tuple[str, int | None, int | None],
+        generation: int,
+        retired_at_unix: float | None = None,
+    ):
+        self.logical_path = logical_path
         self.signature = signature
-        self.idle: list[OntologyStore] = []
+        self.generation = generation
+        self.retired_at_unix = retired_at_unix
+        self.idle: list[Any] = []
         self.leased = 0
+
+    @property
+    def retired(self) -> bool:
+        return self.retired_at_unix is not None
 
 
 class _PersistentStoreLease:
@@ -101,29 +120,34 @@ class _PersistentStoreLease:
         pool: "_PersistentStorePool",
         logical_path: str,
         signature: tuple[str, int | None, int | None],
-        store: OntologyStore,
+        generation: int,
+        store: Any,
     ):
         self._pool = pool
         self._logical_path = logical_path
         self._signature = signature
+        self._generation = generation
         self._store = store
 
-    def __enter__(self) -> OntologyStore:
+    def __enter__(self) -> Any:
         return self._store
 
     def __exit__(self, *_exc: object) -> None:
-        self._pool.release(self._logical_path, self._signature, self._store)
+        self._pool.release(self._logical_path, self._signature, self._generation, self._store)
 
 
 class _PersistentStorePool:
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._buckets: dict[str, _StoreBucket] = {}
+        self._retired_buckets: list[_StoreBucket] = []
         self._hits = 0
         self._misses = 0
         self._opened = 0
         self._closed = 0
         self._rotations = 0
+        self._generation = 0
+        self._last_rotation: dict[str, Any] | None = None
 
     def acquire(self, index_path: Path) -> _PersistentStoreLease:
         logical_path = str(index_path.expanduser().absolute())
@@ -136,19 +160,27 @@ class _PersistentStorePool:
         with self._lock:
             bucket = self._buckets.get(logical_path)
             if bucket is not None and bucket.signature != signature:
-                self._close_bucket(bucket)
+                self._retire_bucket(
+                    bucket,
+                    replacement_signature=signature,
+                )
                 self._buckets.pop(logical_path, None)
                 bucket = None
                 self._rotations += 1
             if bucket is None:
-                bucket = _StoreBucket(signature)
+                self._generation += 1
+                bucket = _StoreBucket(
+                    logical_path=logical_path,
+                    signature=signature,
+                    generation=self._generation,
+                )
                 self._buckets[logical_path] = bucket
             if bucket.idle:
                 store = bucket.idle.pop()
                 self._hits += 1
                 reused = True
             else:
-                store = OntologyStore(index_path, check_same_thread=False)
+                store = open_ontology_store(index_path, check_same_thread=False)
                 self._misses += 1
                 self._opened += 1
                 reused = False
@@ -167,13 +199,14 @@ class _PersistentStorePool:
                 sort_keys=True,
             ),
         )
-        return _PersistentStoreLease(self, logical_path, signature, store)
+        return _PersistentStoreLease(self, logical_path, signature, bucket.generation, store)
 
     def release(
         self,
         logical_path: str,
         signature: tuple[str, int | None, int | None],
-        store: OntologyStore,
+        generation: int,
+        store: Any,
     ) -> None:
         max_idle = _read_int_env(
             _MCP_STORE_POOL_MAX_ENV,
@@ -182,7 +215,14 @@ class _PersistentStorePool:
         )
         with self._lock:
             bucket = self._buckets.get(logical_path)
-            if bucket is None or bucket.signature != signature:
+            if bucket is None or bucket.signature != signature or bucket.generation != generation:
+                retired_bucket = self._retired_bucket(logical_path, signature, generation)
+                if retired_bucket is not None:
+                    retired_bucket.leased = max(0, retired_bucket.leased - 1)
+                    self._close_store(store)
+                    if retired_bucket.leased == 0:
+                        self._retired_buckets.remove(retired_bucket)
+                    return
                 self._close_store(store)
                 return
             bucket.leased = max(0, bucket.leased - 1)
@@ -197,19 +237,26 @@ class _PersistentStorePool:
 
     def status(self) -> dict[str, Any]:
         with self._lock:
+            now = time.time()
             stores = sum(bucket.leased + len(bucket.idle) for bucket in self._buckets.values())
+            retired_leased = sum(bucket.leased for bucket in self._retired_buckets)
+            retired_ages = [
+                now - bucket.retired_at_unix
+                for bucket in self._retired_buckets
+                if bucket.retired_at_unix is not None
+            ]
             idle = sum(len(bucket.idle) for bucket in self._buckets.values())
             leased = sum(bucket.leased for bucket in self._buckets.values())
             indexes = [
-                {
-                    "logical_path": logical_path,
-                    "resolved_index_path": bucket.signature[0],
-                    "mtime_ns": bucket.signature[1],
-                    "size": bucket.signature[2],
-                    "idle": len(bucket.idle),
-                    "leased": bucket.leased,
-                }
-                for logical_path, bucket in sorted(self._buckets.items())
+                self._bucket_status(bucket)
+                for _logical_path, bucket in sorted(self._buckets.items())
+            ]
+            retired_indexes = [
+                self._bucket_status(bucket)
+                for bucket in sorted(
+                    self._retired_buckets,
+                    key=lambda item: (item.logical_path, item.generation),
+                )
             ]
             return {
                 "mode": _store_mode(),
@@ -218,15 +265,22 @@ class _PersistentStorePool:
                     _DEFAULT_MCP_STORE_POOL_MAX,
                     min_value=1,
                 ),
-                "stores": stores,
+                "stores": stores + retired_leased,
+                "active_stores": stores,
+                "retired_stores": retired_leased,
                 "idle": idle,
                 "leased": leased,
+                "retired_leased": retired_leased,
+                "rotation_pending": retired_leased > 0,
+                "retired_oldest_age_sec": int(max(retired_ages)) if retired_ages else 0,
                 "hits": self._hits,
                 "misses": self._misses,
                 "opened": self._opened,
                 "closed": self._closed,
                 "rotations": self._rotations,
+                "last_rotation": self._last_rotation,
                 "indexes": indexes,
+                "retired_indexes": retired_indexes,
             }
 
     def reset(self) -> None:
@@ -234,18 +288,77 @@ class _PersistentStorePool:
             for bucket in self._buckets.values():
                 self._close_bucket(bucket)
             self._buckets.clear()
+            self._retired_buckets.clear()
             self._hits = 0
             self._misses = 0
             self._opened = 0
             self._closed = 0
             self._rotations = 0
+            self._generation = 0
+            self._last_rotation = None
+
+    def _retire_bucket(
+        self,
+        bucket: _StoreBucket,
+        *,
+        replacement_signature: tuple[str, int | None, int | None],
+    ) -> None:
+        retired_at_unix = time.time()
+        while bucket.idle:
+            self._close_store(bucket.idle.pop())
+        self._last_rotation = {
+            "logical_path": bucket.logical_path,
+            "previous_resolved_index_path": bucket.signature[0],
+            "previous_mtime_ns": bucket.signature[1],
+            "previous_size": bucket.signature[2],
+            "new_resolved_index_path": replacement_signature[0],
+            "new_mtime_ns": replacement_signature[1],
+            "new_size": replacement_signature[2],
+            "retired_leased": bucket.leased,
+            "rotated_at_unix": retired_at_unix,
+        }
+        if bucket.leased > 0:
+            bucket.retired_at_unix = retired_at_unix
+            self._retired_buckets.append(bucket)
+        else:
+            bucket.retired_at_unix = retired_at_unix
 
     def _close_bucket(self, bucket: _StoreBucket) -> None:
         while bucket.idle:
             self._close_store(bucket.idle.pop())
         bucket.leased = 0
 
-    def _close_store(self, store: OntologyStore) -> None:
+    def _retired_bucket(
+        self,
+        logical_path: str,
+        signature: tuple[str, int | None, int | None],
+        generation: int,
+    ) -> _StoreBucket | None:
+        for bucket in self._retired_buckets:
+            if (
+                bucket.logical_path == logical_path
+                and bucket.signature == signature
+                and bucket.generation == generation
+            ):
+                return bucket
+        return None
+
+    def _bucket_status(self, bucket: _StoreBucket) -> dict[str, Any]:
+        payload = {
+            "logical_path": bucket.logical_path,
+            "resolved_index_path": bucket.signature[0],
+            "mtime_ns": bucket.signature[1],
+            "size": bucket.signature[2],
+            "idle": len(bucket.idle),
+            "leased": bucket.leased,
+            "generation": bucket.generation,
+            "retired": bucket.retired,
+        }
+        if bucket.retired_at_unix is not None:
+            payload["retired_at_unix"] = bucket.retired_at_unix
+        return payload
+
+    def _close_store(self, store: Any) -> None:
         try:
             store.close()
         finally:
@@ -1638,6 +1751,12 @@ def _root(root: str | None) -> Path:
 
 
 def _index(root: str | None, index_path: str | None) -> Path:
+    if index_path is not None:
+        return Path(index_path).expanduser().absolute()
+    if root is None:
+        raw_index_path = os.environ.get(ONTOLOGY_INDEX_PATH_ENV)
+        if raw_index_path:
+            return Path(raw_index_path).expanduser().absolute()
     return resolve_agent_index_path(root, index_path, fallback_to_cwd=False)
 
 
@@ -1645,12 +1764,12 @@ def _store(index_path: Path) -> Any:
     if not index_path.exists():
         raise FileNotFoundError(
             "Ontology agent index not found at "
-            f"{index_path}. Build it with: uv run krw-ontology build-agent-index "
+            f"{index_path}. Build it with: uv run krw-ontology index build "
             f"--root ${ONTOLOGY_ROOT_ENV}"
         )
     if _persistent_store_enabled():
         return _STORE_POOL.acquire(index_path)
-    return OntologyStore(index_path)
+    return open_ontology_store(index_path)
 
 
 def ensure_persistent_store_open(index_path: Path) -> None:

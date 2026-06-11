@@ -13,7 +13,7 @@ no generic limitation heading
 no FY as primary user-facing label
 answers start from the most recent available filing unless the user asks for a historical period or specific filing
 a newer 10-Q beats an older 10-K for current drivers; a latest 10-K is primary only when no newer 10-Q exists
-three follow-up questions present
+three short follow-up prompts present under 이어서 볼 질문
 strong claims traceable or metric-lineage grounded
 direct vs related context separated
 normal answers are interpretation-first, not raw-number dumps

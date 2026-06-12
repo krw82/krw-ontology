@@ -16,6 +16,10 @@ from krw_ontology.agent_index.spine_builder import (
 )
 from krw_ontology.agent_index.spine_schema import (
     GLOBAL_SPINE_LAYOUT,
+    GLOBAL_SPINE_REQUIRED_METADATA_KEYS,
+    GLOBAL_SPINE_SCHEMA_VERSION,
+    GLOBAL_SPINE_TABLES,
+    read_global_spine_metadata,
     verify_global_spine_schema,
 )
 
@@ -26,8 +30,9 @@ def verify_spine_shard_release(
     manifest_path: Path | None = None,
     require_manifest: bool = True,
     sample_limit: int = 20,
+    deep: bool = True,
 ) -> dict[str, Any]:
-    """Deep-verify a v3 release without any monolith dependency."""
+    """Verify a v3 release without any monolith dependency."""
     root = release_root.expanduser().resolve()
     manifest_file = manifest_path.expanduser().resolve() if manifest_path is not None else root / "manifest.json"
     errors: list[str] = []
@@ -55,10 +60,14 @@ def verify_spine_shard_release(
     shard_manifest_path = _manifest_file_path(root, manifest, "shard_manifest", default="indexes/shard_manifest.json")
     company_shards_dir = _manifest_dir_path(root, manifest, "company_shards", default="indexes/companies")
 
-    if manifest:
+    if manifest and deep:
         errors.extend(_manifest_file_digest_errors(manifest, "global_spine", global_spine_path))
         errors.extend(_manifest_file_digest_errors(manifest, "shard_manifest", shard_manifest_path))
-    spine_verification = verify_global_spine_schema(global_spine_path)
+    spine_verification = (
+        verify_global_spine_schema(global_spine_path)
+        if deep
+        else _verify_global_spine_schema_light(global_spine_path)
+    )
     if not spine_verification["ok"]:
         errors.extend(f"global_spine:{error}" for error in spine_verification["errors"])
 
@@ -80,19 +89,27 @@ def verify_spine_shard_release(
     if global_spine_path.is_file() and spine_verification["ok"]:
         with sqlite3.connect(global_spine_path) as spine_conn:
             spine_conn.row_factory = sqlite3.Row
-            counts.update(_global_counts(spine_conn))
-            errors.extend(_global_endpoint_errors(spine_conn, sample_limit=sample_limit))
+            if deep:
+                counts.update(_global_counts(spine_conn))
+                errors.extend(_global_endpoint_errors(spine_conn, sample_limit=sample_limit))
             for index, (ticker, entry) in enumerate(sorted(shard_entries.items()), start=1):
                 shard_path = _resolve_shard_path(root, company_shards_dir, entry)
-                result = _verify_one_shard(
-                    spine_conn,
-                    shard_path,
-                    ticker=str(ticker),
-                    schema_name=f"shard_{index}",
-                    sample_limit=sample_limit,
-                    expected_sha256=_expected_shard_sha256(manifest, str(ticker), entry),
-                    shard_entry=entry if isinstance(entry, Mapping) else {},
-                )
+                if deep:
+                    result = _verify_one_shard(
+                        spine_conn,
+                        shard_path,
+                        ticker=str(ticker),
+                        schema_name=f"shard_{index}",
+                        sample_limit=sample_limit,
+                        expected_sha256=_expected_shard_sha256(manifest, str(ticker), entry),
+                        shard_entry=entry if isinstance(entry, Mapping) else {},
+                    )
+                else:
+                    result = _verify_one_shard_light(
+                        root,
+                        shard_path,
+                        shard_entry=entry if isinstance(entry, Mapping) else {},
+                    )
                 shard_results[str(ticker)] = result
                 if not result["ok"]:
                     errors.extend(f"shard:{ticker}:{error}" for error in result["errors"])
@@ -111,8 +128,94 @@ def verify_spine_shard_release(
         "counts": counts,
         "global_spine_verification": spine_verification,
         "shards": shard_results,
-        "verification_mode": "spine-shard-release",
+        "verification_mode": "spine-shard-release-deep" if deep else "spine-shard-release-light",
         "manifest_required": require_manifest,
+        "deep": deep,
+    }
+
+
+def _verify_one_shard_light(
+    root: Path,
+    shard_path: Path,
+    *,
+    shard_entry: Mapping[str, Any],
+) -> dict[str, Any]:
+    errors: list[str] = []
+    try:
+        shard_path.resolve().relative_to(root)
+    except ValueError:
+        errors.append("shard_path_outside_root")
+    if not shard_path.is_file():
+        errors.append("shard_missing")
+    errors.extend(_quality_summary_manifest_errors(shard_entry))
+    return {
+        "ok": not errors,
+        "errors": errors,
+        "path": str(shard_path),
+        "counts": {},
+        "source_artifact_sqlite_verification": None,
+    }
+
+
+def _verify_global_spine_schema_light(path: Path) -> dict[str, Any]:
+    resolved = path.expanduser().resolve()
+    errors: list[str] = []
+    warnings: list[str] = []
+    tables: list[str] = []
+    metadata: dict[str, Any] = {}
+    if not resolved.exists():
+        return {
+            "ok": False,
+            "path": str(resolved),
+            "errors": ["global_spine_missing"],
+            "warnings": warnings,
+            "tables": tables,
+            "metadata": metadata,
+            "verification_mode": "global-spine-schema-light",
+        }
+    try:
+        with sqlite3.connect(resolved) as conn:
+            tables = sorted(
+                str(row[0])
+                for row in conn.execute(
+                    """
+                    SELECT name
+                    FROM sqlite_master
+                    WHERE type IN ('table', 'view')
+                    """
+                ).fetchall()
+            )
+            metadata = read_global_spine_metadata(conn)
+    except sqlite3.Error as exc:
+        return {
+            "ok": False,
+            "path": str(resolved),
+            "errors": [f"sqlite_error:{exc}"],
+            "warnings": warnings,
+            "tables": tables,
+            "metadata": metadata,
+            "verification_mode": "global-spine-schema-light",
+        }
+
+    table_set = set(tables)
+    for table in GLOBAL_SPINE_TABLES:
+        if table not in table_set:
+            errors.append(f"global_spine_table_missing:{table}")
+    for key in GLOBAL_SPINE_REQUIRED_METADATA_KEYS:
+        if key not in metadata:
+            errors.append(f"global_spine_metadata_missing:{key}")
+    if metadata.get("schema_version") != GLOBAL_SPINE_SCHEMA_VERSION:
+        errors.append("global_spine_schema_version_mismatch")
+    if metadata.get("index_layout") != GLOBAL_SPINE_LAYOUT:
+        errors.append("global_spine_index_layout_mismatch")
+    return {
+        "ok": not errors,
+        "path": str(resolved),
+        "errors": errors,
+        "warnings": warnings,
+        "tables": tables,
+        "metadata": metadata,
+        "verification_mode": "global-spine-schema-light",
     }
 
 
@@ -240,15 +343,23 @@ def _verify_one_shard(
 
 def _quality_summary_errors(shard_path: Path, shard_entry: Mapping[str, Any]) -> list[str]:
     expected = shard_entry.get("quality_summary")
-    if not isinstance(expected, Mapping):
-        return ["quality_summary_missing"]
-    if expected.get("format") != SHARD_QUALITY_SUMMARY_FORMAT_VERSION:
-        return ["quality_summary_format_mismatch"]
+    manifest_errors = _quality_summary_manifest_errors(shard_entry)
+    if manifest_errors:
+        return manifest_errors
     actual = _company_shard_quality_summary(shard_path)
     expected_json = json.dumps(expected, ensure_ascii=False, sort_keys=True, default=str)
     actual_json = json.dumps(actual, ensure_ascii=False, sort_keys=True, default=str)
     if expected_json != actual_json:
         return ["quality_summary_mismatch"]
+    return []
+
+
+def _quality_summary_manifest_errors(shard_entry: Mapping[str, Any]) -> list[str]:
+    expected = shard_entry.get("quality_summary")
+    if not isinstance(expected, Mapping):
+        return ["quality_summary_missing"]
+    if expected.get("format") != SHARD_QUALITY_SUMMARY_FORMAT_VERSION:
+        return ["quality_summary_format_mismatch"]
     return []
 
 

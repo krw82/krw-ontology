@@ -10,8 +10,9 @@ import shutil
 import sqlite3
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures.process import BrokenProcessPool
 from collections import defaultdict
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -167,6 +168,13 @@ def build_spine_shard_release_outputs(
             },
             started_at=source_started_at,
         )
+        plan_started_at = time.perf_counter()
+        progress.record(
+            "build_plan",
+            "build_plan",
+            "started",
+            output=build_plan_path,
+        )
         plan = _plan_v3_artifact_inputs(
             resolved_root,
             sqlite_path=global_spine_path,
@@ -177,6 +185,16 @@ def build_spine_shard_release_outputs(
         if not plan.company_items:
             raise ValueError("No company artifacts found for v3 release build")
 
+        cache_probe_started_at = time.perf_counter()
+        progress.record(
+            "cache_probe",
+            "cache_probe",
+            "started",
+            details={
+                "company_count": len(plan.company_items),
+                "worker_count": min(plan.workers, len(plan.company_items)),
+            },
+        )
         company_specs = _company_build_specs(
             plan,
             companies_dir=companies_dir,
@@ -205,8 +223,30 @@ def build_spine_shard_release_outputs(
                 for spec in company_specs
             ],
         }
-        plan_started_at = time.perf_counter()
         _write_json(build_plan_path, build_plan)
+        progress.record(
+            "cache_probe",
+            "cache_probe",
+            "complete",
+            details={
+                "company_count": len(company_specs),
+                "company_cache_hits": sum(
+                    1 for spec in company_specs if spec["company_plan"].company_items[0].cache_hit
+                ),
+                "spine_fragment_cache_hits": sum(
+                    1
+                    for spec in company_specs
+                    if _plan_spine_fragment_cache_hit(
+                        spec,
+                        release_id=release_id,
+                        source_manifest_hash=plan.source_manifest_hash,
+                        cache_root=plan.cache_root,
+                        no_cache=no_cache,
+                    )
+                ),
+            },
+            started_at=cache_probe_started_at,
+        )
         progress.record(
             "build_plan",
             "build_plan",
@@ -291,6 +331,13 @@ def build_spine_shard_release_outputs(
             release_id=release_id,
             source_manifest_hash=plan.source_manifest_hash,
             generate_links=generate_links,
+            progress_callback=lambda event: progress.record(
+                str(event.get("node_id") or "global_spine_merge"),
+                str(event.get("stage") or "global_spine_merge"),
+                str(event.get("status") or "progress"),
+                output=event.get("output"),
+                details=event.get("details") if isinstance(event.get("details"), Mapping) else None,
+            ),
         )
         progress.record(
             "global_spine_merge",
@@ -657,20 +704,24 @@ def _build_company_shard_from_plan(
     company_item = company_plan.company_items[0]
     resolved_shard_path.parent.mkdir(parents=True, exist_ok=True)
     if not no_cache and company_item.cache_hit:
-        _copy_sqlite_database(company_item.shard_cache_path, resolved_shard_path)
-        verification = verify_source_artifact_sqlite(resolved_shard_path)
-        if not verification["ok"]:
-            errors = ", ".join(verification["errors"])
-            raise RuntimeError(f"cached company shard failed verification: {normalized_ticker}: {errors}")
-        return CompanyShardBuildResult(
-            ticker=normalized_ticker,
-            shard_path=resolved_shard_path,
-            cache_hit=True,
-            artifact_count=len(company_plan.items),
-            totals=_company_shard_counts(resolved_shard_path),
-            verification=verification,
-            cache_key=company_item.cache_key,
-        )
+        try:
+            _copy_sqlite_database(company_item.shard_cache_path, resolved_shard_path)
+            verification = verify_source_artifact_sqlite(resolved_shard_path)
+            if not verification["ok"]:
+                errors = ", ".join(verification["errors"])
+                raise RuntimeError(f"cached company shard failed verification: {normalized_ticker}: {errors}")
+            return CompanyShardBuildResult(
+                ticker=normalized_ticker,
+                shard_path=resolved_shard_path,
+                cache_hit=True,
+                artifact_count=len(company_plan.items),
+                totals=_company_shard_counts(resolved_shard_path),
+                verification=verification,
+                cache_key=company_item.cache_key,
+            )
+        except Exception:
+            _quarantine_sqlite_cache(company_item.shard_cache_path)
+            cleanup_sqlite_database_files(resolved_shard_path)
 
     if no_cache:
         for item in company_plan.items:
@@ -734,6 +785,33 @@ def _company_build_specs(
             }
         )
     return sorted(specs, key=lambda spec: (-int(spec["estimated_cost"]), str(spec["ticker"])))
+
+
+def _plan_spine_fragment_cache_hit(
+    spec: Mapping[str, Any],
+    *,
+    release_id: str,
+    source_manifest_hash: str | None,
+    cache_root: Path,
+    no_cache: bool,
+) -> bool:
+    if no_cache:
+        return False
+    ticker = str(spec["ticker"])
+    company_plan = spec["company_plan"]
+    if not company_plan.company_items:
+        return False
+    company_item = company_plan.company_items[0]
+    cache_key = _spine_fragment_cache_key(
+        ticker=ticker,
+        company_cache_key=company_item.cache_key,
+        source_manifest_hash=source_manifest_hash,
+    )
+    return not _verify_spine_fragment_cache(
+        _spine_fragment_cache_path(cache_root, cache_key),
+        ticker=ticker,
+        cache_key=cache_key,
+    )
 
 
 def _build_company_shards_for_release(
@@ -805,66 +883,83 @@ def _build_company_shards_for_release(
                 )
         return results
     results: list[CompanyShardBuildResult] = []
-    with ProcessPoolExecutor(max_workers=worker_count) as executor:
-        futures = {}
-        for spec in company_specs:
-            ticker = str(spec["ticker"])
-            shard_path = Path(spec["shard_path"])
-            company_plan = spec["company_plan"]
-            started_at = time.perf_counter()
-            if progress:
-                progress.record(
-                    f"company_shard:{ticker}",
-                    "company_shard",
-                    "started",
-                    ticker=ticker,
-                    output=shard_path,
-                    cache_hit=False if no_cache else bool(company_plan.company_items[0].cache_hit),
-                    details={"completed": len(results), "total": total},
-                )
-            future = executor.submit(
-                _build_company_shard_from_plan,
-                root,
-                ticker=ticker,
-                shard_path=shard_path,
-                company_plan=company_plan,
-                no_cache=no_cache,
-            )
-            futures[future] = (ticker, shard_path, started_at)
-        for future in as_completed(futures):
-            ticker, shard_path, started_at = futures[future]
-            try:
-                result = future.result()
-            except Exception as exc:
+    try:
+        with ProcessPoolExecutor(max_workers=worker_count) as executor:
+            futures = {}
+            for spec in company_specs:
+                ticker = str(spec["ticker"])
+                shard_path = Path(spec["shard_path"])
+                company_plan = spec["company_plan"]
+                started_at = time.perf_counter()
                 if progress:
                     progress.record(
                         f"company_shard:{ticker}",
                         "company_shard",
-                        "failed",
+                        "started",
                         ticker=ticker,
                         output=shard_path,
-                        error=str(exc),
+                        cache_hit=False if no_cache else bool(company_plan.company_items[0].cache_hit),
                         details={"completed": len(results), "total": total},
+                    )
+                future = executor.submit(
+                    _build_company_shard_from_plan,
+                    root,
+                    ticker=ticker,
+                    shard_path=shard_path,
+                    company_plan=company_plan,
+                    no_cache=no_cache,
+                )
+                futures[future] = (ticker, shard_path, started_at)
+            for future in as_completed(futures):
+                ticker, shard_path, started_at = futures[future]
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    if progress:
+                        progress.record(
+                            f"company_shard:{ticker}",
+                            "company_shard",
+                            "failed",
+                            ticker=ticker,
+                            output=shard_path,
+                            error=str(exc),
+                            details={"completed": len(results), "total": total},
+                            started_at=started_at,
+                        )
+                    raise
+                results.append(result)
+                if progress:
+                    progress.record(
+                        f"company_shard:{ticker}",
+                        "company_shard",
+                        "cached" if result.cache_hit else "rebuilt",
+                        ticker=ticker,
+                        output=result.shard_path,
+                        cache_hit=result.cache_hit,
+                        details={
+                            "completed": len(results),
+                            "total": total,
+                            "artifact_count": result.artifact_count,
+                            "cache_key": result.cache_key,
+                        },
                         started_at=started_at,
                     )
-                raise
-            results.append(result)
-            if progress:
-                progress.record(
-                    f"company_shard:{ticker}",
-                    "company_shard",
-                    "cached" if result.cache_hit else "rebuilt",
-                    ticker=ticker,
-                    output=result.shard_path,
-                    cache_hit=result.cache_hit,
-                    details={
-                        "completed": len(results),
-                        "total": total,
-                        "artifact_count": result.artifact_count,
-                        "cache_key": result.cache_key,
-                    },
-                    started_at=started_at,
-                )
+    except BrokenProcessPool as exc:
+        if progress:
+            progress.record(
+                "company_shards",
+                "company_shard",
+                "fallback_sequential",
+                error=str(exc),
+                details={"workers": worker_count, "total": total},
+            )
+        return _build_company_shards_for_release(
+            root,
+            company_specs=company_specs,
+            workers=1,
+            no_cache=no_cache,
+            progress=progress,
+        )
     return sorted(results, key=lambda result: result.ticker)
 
 
@@ -946,58 +1041,78 @@ def _emit_spine_fragments_for_release(
                 )
         return results
     results: list[SpineFragmentResult] = []
-    with ProcessPoolExecutor(max_workers=worker_count) as executor:
-        futures = {}
-        for task in tasks:
-            shard_result = task["shard_result"]
-            ticker = shard_result.ticker
-            fragment_path = Path(task["fragment_path"])
-            started_at = time.perf_counter()
-            if progress:
-                progress.record(
-                    f"spine_fragment:{ticker}",
-                    "spine_fragment",
-                    "started",
-                    ticker=ticker,
-                    output=fragment_path,
-                    cache_hit=False if no_cache else None,
-                    details={"completed": len(results), "total": total},
-                )
-            futures[executor.submit(_emit_spine_fragment_cached, **task)] = (ticker, fragment_path, started_at)
-        for future in as_completed(futures):
-            ticker, fragment_path, started_at = futures[future]
-            try:
-                result = future.result()
-            except Exception as exc:
+    try:
+        with ProcessPoolExecutor(max_workers=worker_count) as executor:
+            futures = {}
+            for task in tasks:
+                shard_result = task["shard_result"]
+                ticker = shard_result.ticker
+                fragment_path = Path(task["fragment_path"])
+                started_at = time.perf_counter()
                 if progress:
                     progress.record(
                         f"spine_fragment:{ticker}",
                         "spine_fragment",
-                        "failed",
+                        "started",
                         ticker=ticker,
                         output=fragment_path,
-                        error=str(exc),
+                        cache_hit=False if no_cache else None,
                         details={"completed": len(results), "total": total},
+                    )
+                futures[executor.submit(_emit_spine_fragment_cached, **task)] = (ticker, fragment_path, started_at)
+            for future in as_completed(futures):
+                ticker, fragment_path, started_at = futures[future]
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    if progress:
+                        progress.record(
+                            f"spine_fragment:{ticker}",
+                            "spine_fragment",
+                            "failed",
+                            ticker=ticker,
+                            output=fragment_path,
+                            error=str(exc),
+                            details={"completed": len(results), "total": total},
+                            started_at=started_at,
+                        )
+                    raise
+                results.append(result)
+                if progress:
+                    progress.record(
+                        f"spine_fragment:{ticker}",
+                        "spine_fragment",
+                        "cached" if result.cache_hit else "rebuilt",
+                        ticker=ticker,
+                        output=result.fragment_path,
+                        cache_hit=result.cache_hit,
+                        details={
+                            "completed": len(results),
+                            "total": total,
+                            "cache_key": result.cache_key,
+                            "counts": dict(result.counts),
+                        },
                         started_at=started_at,
                     )
-                raise
-            results.append(result)
-            if progress:
-                progress.record(
-                    f"spine_fragment:{ticker}",
-                    "spine_fragment",
-                    "cached" if result.cache_hit else "rebuilt",
-                    ticker=ticker,
-                    output=result.fragment_path,
-                    cache_hit=result.cache_hit,
-                    details={
-                        "completed": len(results),
-                        "total": total,
-                        "cache_key": result.cache_key,
-                        "counts": dict(result.counts),
-                    },
-                    started_at=started_at,
-                )
+    except BrokenProcessPool as exc:
+        if progress:
+            progress.record(
+                "spine_fragments",
+                "spine_fragment",
+                "fallback_sequential",
+                error=str(exc),
+                details={"workers": worker_count, "total": total},
+            )
+        return _emit_spine_fragments_for_release(
+            shard_results,
+            fragments_dir=fragments_dir,
+            release_id=release_id,
+            source_manifest_hash=source_manifest_hash,
+            cache_root=cache_root,
+            workers=1,
+            no_cache=no_cache,
+            progress=progress,
+        )
     return sorted(results, key=lambda result: result.ticker)
 
 
@@ -1049,6 +1164,7 @@ def merge_spine_fragments(
     replace: bool = True,
     generate_links: bool = True,
     created_at: str | None = None,
+    progress_callback: Callable[[Mapping[str, Any]], None] | None = None,
 ) -> GlobalSpineMergeResult:
     """Merge per-company spine fragments into one deterministic global spine."""
     resolved_fragments = tuple(sorted((path.expanduser().resolve() for path in fragments), key=lambda path: path.name))
@@ -1078,6 +1194,20 @@ def merge_spine_fragments(
                 },
             )
             for index, fragment in enumerate(resolved_fragments, start=1):
+                if progress_callback:
+                    progress_callback(
+                        {
+                            "node_id": f"global_spine_merge:{fragment.stem}",
+                            "stage": "global_spine_merge",
+                            "status": "started",
+                            "output": resolved_output,
+                            "details": {
+                                "completed": index - 1,
+                                "total": len(resolved_fragments),
+                                "fragment": fragment.name,
+                            },
+                        }
+                    )
                 verification = verify_global_spine_schema(fragment)
                 if not verification["ok"]:
                     errors = ", ".join(verification["errors"])
@@ -1090,6 +1220,30 @@ def merge_spine_fragments(
                     conn.commit()
                 finally:
                     conn.execute(f"DETACH DATABASE {schema_name}")
+                if progress_callback:
+                    progress_callback(
+                        {
+                            "node_id": f"global_spine_merge:{fragment.stem}",
+                            "stage": "global_spine_merge",
+                            "status": "merged",
+                            "output": resolved_output,
+                            "details": {
+                                "completed": index,
+                                "total": len(resolved_fragments),
+                                "fragment": fragment.name,
+                            },
+                        }
+                    )
+            if progress_callback:
+                progress_callback(
+                    {
+                        "node_id": "global_chain_links",
+                        "stage": "global_spine_merge",
+                        "status": "started",
+                        "output": resolved_output,
+                        "details": {"generate_links": generate_links},
+                    }
+                )
             chain_result = (
                 generate_cross_company_links(conn, replace=True)
                 if generate_links
@@ -1101,6 +1255,20 @@ def merge_spine_fragments(
                     skipped_generic_keys=0,
                 )
             )
+            if progress_callback:
+                progress_callback(
+                    {
+                        "node_id": "global_chain_links",
+                        "stage": "global_spine_merge",
+                        "status": "complete",
+                        "output": resolved_output,
+                        "details": {
+                            "inserted": chain_result.inserted,
+                            "exact_links": chain_result.exact_links,
+                            "similarity_links": chain_result.similarity_links,
+                        },
+                    }
+                )
             counts = {
                 table_name: _count_table(conn, table_name)
                 for table_name in GLOBAL_SPINE_TABLES
@@ -1267,16 +1435,24 @@ def _emit_spine_fragment_cached(
         ticker=shard_result.ticker,
         cache_key=cache_key,
     ):
-        _copy_sqlite_database(cache_path, fragment_path)
-        counts = _spine_counts(fragment_path)
-        return SpineFragmentResult(
-            ticker=shard_result.ticker,
-            fragment_path=fragment_path.expanduser().resolve(),
-            shard_path=shard_result.shard_path,
-            counts=counts,
-            cache_hit=True,
-            cache_key=cache_key,
-        )
+        try:
+            _copy_sqlite_database(cache_path, fragment_path)
+            verification = verify_global_spine_schema(fragment_path)
+            if not verification["ok"]:
+                errors = ", ".join(verification["errors"])
+                raise RuntimeError(f"cached spine fragment failed verification: {shard_result.ticker}: {errors}")
+            counts = _spine_counts(fragment_path)
+            return SpineFragmentResult(
+                ticker=shard_result.ticker,
+                fragment_path=fragment_path.expanduser().resolve(),
+                shard_path=shard_result.shard_path,
+                counts=counts,
+                cache_hit=True,
+                cache_key=cache_key,
+            )
+        except Exception:
+            _quarantine_sqlite_cache(cache_path)
+            cleanup_sqlite_database_files(fragment_path)
 
     result = emit_spine_fragment_from_company_shard(
         shard_result.shard_path,
@@ -1579,6 +1755,19 @@ def _store_sqlite_database_cache(source_path: Path, cache_path: Path) -> None:
         os.replace(tmp_path, cache_path)
     finally:
         cleanup_sqlite_database_files(tmp_path)
+
+
+def _quarantine_sqlite_cache(cache_path: Path) -> Path | None:
+    if not cache_path.exists():
+        return None
+    target = cache_path.with_name(f".corrupt-{cache_path.name}.{os.getpid()}.{time.time_ns()}")
+    cleanup_sqlite_database_files(target)
+    try:
+        os.replace(cache_path, target)
+    except OSError:
+        cleanup_sqlite_database_files(cache_path)
+        return None
+    return target
 
 
 def _company_shard_counts(path: Path) -> dict[str, int]:

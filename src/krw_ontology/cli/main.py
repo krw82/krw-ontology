@@ -1618,6 +1618,7 @@ def quality_repair_run_cmd(
             log_handle.flush()
             process = subprocess.Popen(
                 command,
+                stdin=subprocess.DEVNULL,
                 stdout=log_handle,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
@@ -2552,6 +2553,16 @@ def _publish_root_as_local_release(
     global_spine_path = release_root / "indexes" / "global_spine.sqlite"
     lock_path = env_root / "locks" / "release_transaction.lock"
     with FileProcessLock(lock_path):
+        _quarantine_stale_release_candidates(
+            resolved_releases_root,
+            resolved_env,
+            reason="preflight stale release cleanup before publish_root",
+            exclude_release_ids={release_id},
+        )
+        _release_disk_preflight(
+            source_root=resolved_source_root,
+            release_root=release_root,
+        )
         if release_root.exists():
             if not allow_prepared_release_root:
                 raise FileExistsError(f"Release directory already exists: {release_root}")
@@ -2841,6 +2852,61 @@ def _materialize_release_root_from_source(source_root: Path, release_root: Path)
             shutil.copy2(source_path, target_path)
 
 
+def _release_disk_preflight(*, source_root: Path, release_root: Path) -> None:
+    release_root.parent.mkdir(parents=True, exist_ok=True)
+    free_bytes = shutil.disk_usage(str(release_root.parent)).free
+    source_bytes = _estimate_materialized_source_size(source_root)
+    reserve_bytes = _release_min_free_bytes()
+    required_bytes = max(source_bytes * 3, reserve_bytes)
+    if free_bytes < required_bytes:
+        raise RuntimeError(
+            "release_disk_preflight_failed: "
+            f"free={free_bytes} required={required_bytes} "
+            f"estimated_source={source_bytes} release_root={release_root}"
+        )
+
+
+def _release_min_free_bytes() -> int:
+    raw_bytes = os.environ.get("KRW_ONTOLOGY_RELEASE_MIN_FREE_BYTES")
+    if raw_bytes:
+        try:
+            return max(1, int(raw_bytes))
+        except ValueError:
+            pass
+    raw_gb = os.environ.get("KRW_ONTOLOGY_RELEASE_MIN_FREE_GB")
+    if raw_gb:
+        try:
+            return max(1, int(float(raw_gb) * 1024**3))
+        except ValueError:
+            pass
+    return 5 * 1024**3
+
+
+def _estimate_materialized_source_size(source_root: Path) -> int:
+    total = 0
+    resolved_root = source_root.expanduser().resolve()
+    for dirpath, dirnames, filenames in os.walk(resolved_root):
+        current = Path(dirpath)
+        if current == resolved_root:
+            dirnames[:] = [
+                name
+                for name in dirnames
+                if name not in _MATERIALIZED_SOURCE_IGNORED_TOP_LEVEL
+            ]
+        if current == resolved_root / "indexes":
+            filenames[:] = [name for name in filenames if name == "source_manifest.json"]
+            dirnames[:] = []
+        for filename in filenames:
+            path = current / filename
+            if _is_legacy_agent_index_file_name(path.name):
+                continue
+            try:
+                total += path.stat().st_size
+            except OSError:
+                continue
+    return total
+
+
 def _dev_publish_paths(releases_root: Path, release_id: str) -> dict[str, Path]:
     release_root = release_env_root(releases_root, "dev").expanduser().resolve() / release_id
     return {
@@ -2999,6 +3065,60 @@ def _release_worker_pid(releases_root: Path, env: str, release_id: str) -> int |
         return int(path.read_text(encoding="utf-8").strip())
     except (FileNotFoundError, ValueError):
         return None
+
+
+def _release_worker_runtime_status(release_root: Path, pid: int | None, state: Mapping[str, object]) -> dict[str, object]:
+    running = pid is not None and is_pid_running(pid)
+    state_status = str(state.get("status") or "<unknown>")
+    stale_pid = _stale_release_worker_pid(release_root)
+    stale = (
+        stale_pid is not None
+        and state_status in {"running", "cancel_requested", "<unknown>"}
+        and _release_looks_interrupted(release_root)
+    )
+    return {
+        "running": running,
+        "stale": stale,
+        "stale_pid": stale_pid,
+        "status": "stale" if stale else state_status,
+    }
+
+
+def _quarantine_stale_release_candidates(
+    releases_root: Path,
+    env: str,
+    *,
+    reason: str,
+    exclude_release_ids: set[str] | None = None,
+) -> list[dict[str, object]]:
+    resolved_env = normalize_ontology_env(env)
+    env_root = release_env_root(releases_root, resolved_env).expanduser().resolve()
+    if not env_root.exists():
+        return []
+    current_id = current_release_id(env_root)
+    excluded = set(exclude_release_ids or set())
+    if current_id:
+        excluded.add(current_id)
+    quarantined: list[dict[str, object]] = []
+    candidates = [
+        path
+        for path in sorted(env_root.iterdir(), key=lambda item: item.stat().st_mtime, reverse=True)
+        if _is_release_candidate(path) and path.name not in excluded
+    ]
+    for candidate in candidates:
+        stale_pid = _stale_release_worker_pid(candidate)
+        if stale_pid is None or not _release_looks_interrupted(candidate):
+            continue
+        result = quarantine_local_release(
+            releases_root,
+            env=resolved_env,
+            release_path=candidate,
+            action="cleanup_interrupted",
+            error=f"{reason}: interrupted release worker pid={stale_pid} is not running",
+        )
+        if result is not None:
+            quarantined.append(result)
+    return quarantined
 
 
 def _latest_release_candidate_id(releases_root: Path, env: str) -> str | None:
@@ -3474,6 +3594,7 @@ def release_publish_dev_cmd(
                 log_handle.flush()
                 process = subprocess.Popen(
                     command,
+                    stdin=subprocess.DEVNULL,
                     stdout=log_handle,
                     stderr=subprocess.STDOUT,
                     start_new_session=True,
@@ -3944,7 +4065,12 @@ def release_verify_cmd(
     startup_check: bool = typer.Option(
         False,
         "--startup-check",
-        help="Run the lightweight MCP startup contract check instead of deep release verification.",
+        help="Run the MCP startup contract check instead of release activation verification.",
+    ),
+    deep: bool = typer.Option(
+        False,
+        "--deep",
+        help="Run full topology/hash/endpoint verification. Default release verification is lightweight.",
     ),
     write_report: bool = typer.Option(
         False,
@@ -3955,6 +4081,9 @@ def release_verify_cmd(
     """Verify the v3 release manifest and global spine + company shard topology."""
     if startup_check and write_report:
         typer.echo("FAIL --startup-check is read-only and cannot write verification artifacts")
+        raise typer.Exit(1)
+    if startup_check and deep:
+        typer.echo("FAIL --startup-check and --deep cannot be used together")
         raise typer.Exit(1)
     if write_report:
         _exit_if_path_mutates_current(root, "--root")
@@ -3970,6 +4099,7 @@ def release_verify_cmd(
                 root,
                 env=env,
                 require_current_symlink=require_current_symlink,
+                deep=deep,
             )
     except ValueError as exc:
         typer.echo(f"FAIL {exc}")
@@ -3985,6 +4115,10 @@ def release_verify_cmd(
     typer.echo(f"Release verify: {'ok' if verification['ok'] else 'failed'}")
     if startup_check:
         typer.echo("mode: startup")
+    elif deep:
+        typer.echo("mode: deep")
+    else:
+        typer.echo("mode: light")
     typer.echo(f"root: {verification['root']}")
     typer.echo(f"env: {verification.get('env') or '<missing>'}")
     typer.echo(f"release_id: {verification.get('release_id') or '<missing>'}")
@@ -4608,12 +4742,19 @@ def _start_release_build_worker(
     label: str,
 ) -> None:
     paths = _release_command_paths(releases_root, env, release_id)
+    _quarantine_stale_release_candidates(
+        releases_root,
+        env,
+        reason=f"preflight stale release cleanup before {label}",
+        exclude_release_ids={release_id},
+    )
     if paths["release_root"].exists():
         raise FileExistsError(f"Release directory already exists: {paths['release_root']}")
     if not source_root.is_dir():
         raise FileNotFoundError(f"Source root not found: {source_root}")
     if not _release_root_has_ontology_artifacts(source_root):
         raise RuntimeError(f"Source root has no ontology artifacts under companies/: {source_root}")
+    _release_disk_preflight(source_root=source_root, release_root=paths["release_root"])
     paths["log_path"].parent.mkdir(parents=True, exist_ok=True)
     command = [
         sys.executable,
@@ -4640,6 +4781,7 @@ def _start_release_build_worker(
         log_handle.flush()
         process = subprocess.Popen(
             command,
+            stdin=subprocess.DEVNULL,
             stdout=log_handle,
             stderr=subprocess.STDOUT,
             start_new_session=True,
@@ -4757,11 +4899,15 @@ def release_status_cmd(
     if selected_release_id is not None:
         paths = _release_command_paths(resolved_releases_root, resolved_env, selected_release_id)
         pid = _release_worker_pid(resolved_releases_root, resolved_env, selected_release_id)
-        running = pid is not None and is_pid_running(pid)
         state = _release_worker_state(resolved_releases_root, resolved_env, selected_release_id) or {}
+        runtime = _release_worker_runtime_status(paths["release_root"], pid, state)
+        running = bool(runtime["running"])
         typer.echo(f"selected: {selected_release_id}")
         typer.echo(f"worker: {'running' if running else 'stopped'}" + (f" pid={pid}" if pid else ""))
-        typer.echo(f"worker_status: {state.get('status') or '<unknown>'}")
+        typer.echo(f"worker_status: {runtime['status']}")
+        if runtime["stale"]:
+            typer.echo(f"stale_worker: true pid={runtime['stale_pid']}")
+            typer.echo(f"cleanup: krw-ontology release cleanup-interrupted {selected_release_id}")
         typer.echo(f"release_root: {paths['release_root']}")
         typer.echo(f"global_spine: {'present' if paths['global_spine_path'].exists() else 'missing'} {paths['global_spine_path']}")
         typer.echo(f"manifest: {'present' if (paths['release_root'] / RELEASE_MANIFEST_FILENAME).exists() else 'missing'}")
@@ -6588,6 +6734,7 @@ def queue_start_cmd(
         log_handle.flush()
         process = subprocess.Popen(
             command,
+            stdin=subprocess.DEVNULL,
             stdout=log_handle,
             stderr=subprocess.STDOUT,
             start_new_session=True,

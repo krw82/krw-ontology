@@ -5,6 +5,7 @@ import sqlite3
 from pathlib import Path
 
 import krw_ontology.agent_index.builder as agent_index_builder
+import krw_ontology.agent_index.spine_builder as spine_builder
 from krw_ontology.agent_index.source_artifact_sqlite import (
     SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION,
     SOURCE_ARTIFACT_SQLITE_SCHEMA_VERSION,
@@ -150,6 +151,25 @@ def _write_synthetic_company_shard(path: Path) -> None:
                    '["Microsoft"]', '["demand"]', '[]', 'high', 0.9)
             """
         )
+
+
+def _write_minimal_context_artifact(root: Path, ticker: str) -> None:
+    artifact_index_path = root / "companies" / ticker / "context" / "artifact_index.json"
+    artifact_index_path.parent.mkdir(parents=True, exist_ok=True)
+    artifact_index_path.write_text(
+        json.dumps(
+            {
+                "ticker": ticker,
+                "document_type": "COMPANY",
+                "doc_type_key": "COMPANY",
+                "period": "ALL",
+                "files": {},
+                "counts": {},
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
 
 
 def test_emit_spine_fragment_from_company_shard_projects_global_rows(tmp_path: Path) -> None:
@@ -311,9 +331,12 @@ def test_build_spine_shard_release_outputs_builds_v3_without_monolith(tmp_path: 
     ]
     event_keys = {(event["stage"], event["node_id"], event["status"]) for event in progress_events}
     assert ("source_discovery", "source_manifest", "complete") in event_keys
+    assert ("build_plan", "build_plan", "started") in event_keys
+    assert ("cache_probe", "cache_probe", "complete") in event_keys
     assert ("build_plan", "build_plan", "complete") in event_keys
     assert ("company_shard", "company_shard:AAPL", "rebuilt") in event_keys
     assert ("spine_fragment", "spine_fragment:AAPL", "rebuilt") in event_keys
+    assert ("global_spine_merge", "global_spine_merge:AAPL", "merged") in event_keys
     assert ("global_spine_merge", "global_spine_merge", "complete") in event_keys
     assert ("manifest", "shard_manifest", "complete") in event_keys
     assert ("build_summary", "build_summary", "complete") in event_keys
@@ -327,7 +350,93 @@ def test_build_spine_shard_release_outputs_builds_v3_without_monolith(tmp_path: 
     verification = verify_release_root(release_root, env="dev")
 
     assert verification["ok"] is True, verification["errors"]
-    assert verification["verification_mode"] == "release-root-v3"
+    assert verification["verification_mode"] == "release-root-v3-light"
+
+
+def test_build_spine_shard_release_outputs_retries_process_pool_sequentially(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release_root = tmp_path / "release"
+    _write_minimal_context_artifact(release_root, "AAPL")
+    _write_minimal_context_artifact(release_root, "MSFT")
+
+    class BrokenExecutor:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            raise spine_builder.BrokenProcessPool("forced pool failure")
+
+        def __exit__(self, *_exc: object) -> None:
+            return None
+
+    monkeypatch.setattr(spine_builder, "ProcessPoolExecutor", BrokenExecutor)
+
+    result = build_spine_shard_release_outputs(
+        release_root,
+        release_id="fallback-release",
+        workers=2,
+        no_cache=True,
+        generate_links=False,
+    )
+
+    assert sorted(item.ticker for item in result.shard_results) == ["AAPL", "MSFT"]
+    progress_events = [
+        json.loads(line)
+        for line in result.progress_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    event_keys = {(event["stage"], event["node_id"], event["status"]) for event in progress_events}
+    assert ("company_shard", "company_shards", "fallback_sequential") in event_keys
+    assert ("spine_fragment", "spine_fragments", "fallback_sequential") in event_keys
+
+
+def test_company_shard_runtime_cache_corruption_rebuilds_and_quarantines(tmp_path: Path) -> None:
+    release_root = tmp_path / "release"
+    cache_root = tmp_path / "cache"
+    _write_minimal_context_artifact(release_root, "AAPL")
+    first = build_spine_shard_release_outputs(
+        release_root,
+        release_id="first-release",
+        cache_root=cache_root,
+        workers=1,
+        generate_links=False,
+    )
+    first_shard = first.shard_results[0]
+    assert first_shard.cache_key is not None
+    digest = first_shard.cache_key.split(":", 1)[-1]
+    cache_path = cache_root / "v3" / "company_shards" / digest[:2] / f"{digest}.sqlite"
+    assert cache_path.exists()
+
+    plan = spine_builder._plan_v3_artifact_inputs(
+        release_root,
+        sqlite_path=release_root / "indexes" / "global_spine.sqlite",
+        cache_root=cache_root,
+        workers=1,
+        source_manifest_path=release_root / "source_manifest.json",
+    )
+    company_plan = spine_builder._filter_plan_for_company(
+        plan,
+        ticker="AAPL",
+        shard_path=release_root / "indexes" / "companies" / "AAPL.sqlite",
+        no_cache=False,
+    )
+    assert company_plan.company_items[0].cache_hit is True
+    cache_path.write_text("not sqlite", encoding="utf-8")
+
+    result = spine_builder._build_company_shard_from_plan(
+        release_root,
+        ticker="AAPL",
+        shard_path=release_root / "indexes" / "companies" / "AAPL.sqlite",
+        company_plan=company_plan,
+        no_cache=False,
+    )
+
+    assert result.cache_hit is False
+    assert result.shard_path.exists()
+    assert not cache_path.read_bytes().startswith(b"not sqlite")
+    assert list(cache_path.parent.glob(".corrupt-*.sqlite.*"))
 
 
 def _write_spine_fragment(path: Path, *, ticker: str, topic_key: str, topic_label: str) -> None:
@@ -503,9 +612,73 @@ def test_verify_spine_shard_release_checks_global_and_shard_consistency(tmp_path
 
     assert result["ok"] is True, result["errors"]
     assert release_result["ok"] is True, release_result["errors"]
-    assert release_result["verification_mode"] == "release-root-v3"
+    assert release_result["verification_mode"] == "release-root-v3-light"
     assert result["counts"]["global_object_locator"] == 2
     assert set(result["shards"]) == {"AAPL"}
+
+
+def test_verify_release_root_light_skips_endpoint_deep_scan(tmp_path: Path) -> None:
+    release_root = tmp_path / "release"
+    (release_root / "companies" / "AAPL").mkdir(parents=True)
+    shard_path = release_root / "indexes" / "companies" / "AAPL.sqlite"
+    _write_synthetic_company_shard(shard_path)
+    fragment_path = release_root / "indexes" / "fragments" / "spine" / "AAPL.sqlite"
+    emit_spine_fragment_from_company_shard(
+        shard_path,
+        fragment_path,
+        ticker="AAPL",
+        shard_path_in_release="indexes/companies/AAPL.sqlite",
+    )
+    global_spine_path = release_root / "indexes" / "global_spine.sqlite"
+    merge_spine_fragments(
+        [fragment_path],
+        global_spine_path,
+        release_id="test-release",
+        created_at="2026-06-12T00:00:00+00:00",
+    )
+    with sqlite3.connect(global_spine_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO global_edge_spine(
+                edge_id, from_object_id, to_object_id, from_ticker, to_ticker,
+                relation_type, edge_scope, source_object_type, target_object_type,
+                confidence, evidence_grade, materiality, recency_score,
+                shard_hint, compact_reason
+            )
+            VALUES(
+                'edge:broken:endpoint', 'obj:AAPL:missing', 'obj:AAPL:metric',
+                'AAPL', 'AAPL', 'supports', 'intra_company', NULL, NULL,
+                NULL, NULL, NULL, NULL, 'indexes/companies/AAPL.sqlite', 'test'
+            )
+            """
+        )
+    (release_root / "indexes" / "shard_manifest.json").write_text(
+        json.dumps(
+            {
+                "format": "krw-ontology-shard-manifest/v3",
+                "shards": {
+                    "AAPL": {
+                        "path": "companies/AAPL.sqlite",
+                        "quality_summary": _company_shard_quality_summary(shard_path),
+                    }
+                },
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    from krw_ontology.release import verify_release_root, write_release_manifest_v3
+
+    write_release_manifest_v3(release_root, release_id="test-release", env="dev")
+
+    light_result = verify_release_root(release_root, env="dev")
+    deep_result = verify_release_root(release_root, env="dev", deep=True)
+
+    assert light_result["ok"] is True, light_result["errors"]
+    assert light_result["verification_mode"] == "release-root-v3-light"
+    assert light_result["spine_shard_verification"]["deep"] is False
+    assert deep_result["ok"] is False
+    assert any(error.startswith("spine_shard:edge_from_endpoint_missing:") for error in deep_result["errors"])
 
 
 def test_verify_spine_shard_release_rejects_stale_quality_summary(tmp_path: Path) -> None:

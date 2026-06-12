@@ -444,8 +444,8 @@ def test_quality_repair_run_defaults_to_latest_all_background(tmp_path: Path, mo
     class FakeProcess:
         pid = 12345
 
-    def fake_popen(command, *, stdout, stderr, start_new_session):
-        calls.append((command, stderr, start_new_session))
+    def fake_popen(command, *, stdin, stdout, stderr, start_new_session):
+        calls.append((command, stdin, stderr, start_new_session))
         stdout.write("fake quality worker\n")
         stdout.flush()
         return FakeProcess()
@@ -477,8 +477,9 @@ def test_quality_repair_run_defaults_to_latest_all_background(tmp_path: Path, mo
     assert "--plan" in command
     assert "qr_test" in command
     assert "--all" in command
-    assert calls[0][1] is cli_main.subprocess.STDOUT
-    assert calls[0][2] is True
+    assert calls[0][1] is cli_main.subprocess.DEVNULL
+    assert calls[0][2] is cli_main.subprocess.STDOUT
+    assert calls[0][3] is True
     assert "Started quality repair worker pid=12345" in result.output
     assert "selected_jobs: 4" in result.output
     assert (root / ".krw_pipeline" / "quality" / "logs" / "worker.log").exists()

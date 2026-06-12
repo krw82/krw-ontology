@@ -289,13 +289,14 @@ def verify_release_root(
     env: str | None = None,
     manifest_path: Path | str | None = None,
     require_current_symlink: bool = False,
+    deep: bool = False,
 ) -> dict[str, Any]:
-    """Deep-verify a v3 global spine + company shard release."""
+    """Verify a v3 global spine + company shard release for activation."""
     supplied_root = Path(root).expanduser()
     root_path = supplied_root.resolve()
     manifest, found_manifest_path = load_release_manifest(root_path, manifest_path=manifest_path)
     if manifest.get("format") != RELEASE_FORMAT_V3:
-        errors = _release_filesystem_errors(root_path)
+        errors = _release_filesystem_errors(root_path) if deep else _release_filesystem_light_errors(root_path)
         if require_current_symlink and not _is_current_symlink_path(supplied_root):
             errors.insert(0, "current_symlink_required")
         errors.append("manifest_missing" if not manifest else "manifest_format_unsupported")
@@ -324,6 +325,7 @@ def verify_release_root(
         found_manifest_path=found_manifest_path,
         env=env,
         require_current_symlink=require_current_symlink,
+        deep=deep,
     )
 
 
@@ -335,11 +337,12 @@ def _verify_release_root_v3(
     found_manifest_path: Path | None,
     env: str | None,
     require_current_symlink: bool,
+    deep: bool,
 ) -> dict[str, Any]:
     errors: list[str] = []
     if require_current_symlink and not _is_current_symlink_path(supplied_root):
         errors.append("current_symlink_required")
-    errors.extend(_release_filesystem_errors(root_path))
+    errors.extend(_release_filesystem_errors(root_path) if deep else _release_filesystem_light_errors(root_path))
     errors.extend(_release_manifest_startup_errors_v3(root_path, manifest))
     expected_env = normalize_ontology_env(env) if env is not None else None
     manifest_env = manifest.get("env")
@@ -348,6 +351,7 @@ def _verify_release_root_v3(
     spine_shard_verification = verify_spine_shard_release(
         root_path,
         manifest_path=found_manifest_path,
+        deep=deep,
     )
     errors.extend(f"spine_shard:{error}" for error in spine_shard_verification["errors"])
     global_spine_path = _resolve_v3_global_spine_path(root_path, manifest)
@@ -367,7 +371,8 @@ def _verify_release_root_v3(
         "spine_shard_verification": spine_shard_verification,
         "smoke_verification": None,
         "current_symlink": _is_current_symlink_path(supplied_root),
-        "verification_mode": "release-root-v3",
+        "verification_mode": "release-root-v3-deep" if deep else "release-root-v3-light",
+        "deep": deep,
     }
 
 
@@ -581,6 +586,19 @@ def _release_filesystem_errors(root_path: Path) -> list[str]:
     return errors
 
 
+def _release_filesystem_light_errors(root_path: Path) -> list[str]:
+    errors: list[str] = []
+    if not root_path.exists():
+        return ["release_root_missing"]
+    if not root_path.is_dir():
+        return ["release_root_not_directory"]
+    if not (root_path / "companies").is_dir():
+        errors.append("companies_dir_missing")
+    if not (root_path / "indexes").is_dir():
+        errors.append("indexes_dir_missing")
+    return errors
+
+
 def _is_release_temp_path(path: Path) -> bool:
     name = path.name
     if name == ".build" or name.endswith(".tmp") or name.endswith(".building"):
@@ -615,6 +633,7 @@ def write_release_verification_report(
     env: str | None = None,
     manifest_path: Path | str | None = None,
     require_current_symlink: bool = False,
+    deep: bool = False,
     verification: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Write a deterministic verification report for an immutable release root."""
@@ -629,6 +648,7 @@ def write_release_verification_report(
             env=env,
             manifest_path=manifest_path,
             require_current_symlink=require_current_symlink,
+            deep=deep,
         )
     else:
         verification_payload = verification
@@ -636,7 +656,13 @@ def write_release_verification_report(
         **verification_payload,
         "errors": list(verification_payload.get("errors") or []),
     }
-    file_trace = _release_file_trace(root_path)
+    report_deep = bool(verification_payload.get("deep"))
+    report_manifest = verification_payload.get("manifest")
+    file_trace = _release_file_trace(
+        root_path,
+        deep=report_deep,
+        manifest=report_manifest if isinstance(report_manifest, Mapping) else None,
+    )
     reproducibility_hash = _release_reproducibility_hash(
         release_id=verification_payload.get("release_id"),
         env=verification_payload.get("env"),
@@ -683,7 +709,22 @@ def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
     os.replace(tmp_path, path)
 
 
-def _release_file_trace(root: Path) -> list[dict[str, Any]]:
+def _read_json_object(path: Path) -> dict[str, Any] | None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _release_file_trace(
+    root: Path,
+    *,
+    deep: bool = False,
+    manifest: Mapping[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    if not deep:
+        return _release_file_trace_light(root, manifest=manifest)
     entries: list[dict[str, Any]] = []
     if not root.exists():
         return entries
@@ -715,6 +756,97 @@ def _release_file_trace(root: Path) -> list[dict[str, Any]]:
             }
         )
     return entries
+
+
+def _release_file_trace_light(root: Path, *, manifest: Mapping[str, Any] | None = None) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def add(path: Path) -> None:
+        try:
+            relative_path = path.resolve().relative_to(root)
+        except ValueError:
+            return
+        relative = relative_path.as_posix()
+        if relative in seen or relative.startswith(f"{RELEASE_VERIFY_DIRNAME}/"):
+            return
+        seen.add(relative)
+        if path.is_symlink():
+            entries.append(
+                {
+                    "path": relative,
+                    "role": _release_file_role(relative_path),
+                    "kind": "symlink",
+                    "target": os.readlink(path),
+                }
+            )
+            return
+        if not path.is_file():
+            return
+        stat = path.stat()
+        entries.append(
+            {
+                "path": relative,
+                "role": _release_file_role(relative_path),
+                "kind": "file",
+                "size_bytes": stat.st_size,
+                "mtime": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
+            }
+        )
+
+    add(root / RELEASE_MANIFEST_FILENAME)
+    global_spine_path = _resolve_v3_global_spine_path(root, manifest or {})
+    add(global_spine_path)
+    shard_manifest_path = _manifest_index_file_path(root, manifest, "shard_manifest", default="indexes/shard_manifest.json")
+    add(shard_manifest_path)
+    add(root / "indexes" / "build_summary.json")
+    shard_manifest = _read_json_object(shard_manifest_path)
+    shards = shard_manifest.get("shards") if isinstance(shard_manifest, Mapping) else None
+    if isinstance(shards, Mapping):
+        company_shards_dir = _manifest_index_dir_path(root, manifest, "company_shards", default="indexes/companies")
+        for entry in shards.values():
+            if not isinstance(entry, Mapping):
+                continue
+            raw_path = entry.get("path") or entry.get("shard_path")
+            if not isinstance(raw_path, str) or not raw_path:
+                continue
+            candidate = Path(raw_path)
+            if candidate.is_absolute():
+                shard_path = candidate.expanduser().resolve()
+            elif candidate.parts and candidate.parts[0] == "indexes":
+                shard_path = (root / candidate).resolve()
+            else:
+                shard_path = (root / "indexes" / candidate).resolve()
+                if not shard_path.exists():
+                    shard_path = (company_shards_dir / candidate.name).resolve()
+            add(shard_path)
+    return sorted(entries, key=lambda item: item["path"])
+
+
+def _manifest_index_file_path(
+    root: Path,
+    manifest: Mapping[str, Any] | None,
+    role: str,
+    *,
+    default: str,
+) -> Path:
+    output = ((manifest or {}).get("indexes") or {}).get(role)
+    raw_path = output.get("path") if isinstance(output, Mapping) else None
+    candidate = Path(raw_path) if isinstance(raw_path, str) and raw_path else Path(default)
+    return candidate.expanduser().resolve() if candidate.is_absolute() else (root / candidate).resolve()
+
+
+def _manifest_index_dir_path(
+    root: Path,
+    manifest: Mapping[str, Any] | None,
+    role: str,
+    *,
+    default: str,
+) -> Path:
+    output = ((manifest or {}).get("indexes") or {}).get(role)
+    raw_path = output.get("dir") if isinstance(output, Mapping) else None
+    candidate = Path(raw_path) if isinstance(raw_path, str) and raw_path else Path(default)
+    return candidate.expanduser().resolve() if candidate.is_absolute() else (root / candidate).resolve()
 
 
 def _release_file_role(relative_path: Path) -> str:

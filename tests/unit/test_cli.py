@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import json
+import shutil
 import sqlite3
 import tarfile
 from pathlib import Path
@@ -2552,7 +2553,7 @@ class TestReleaseCommand:
 
         result = runner.invoke(
             app,
-            ["release", "verify", "--root", str(release_root), "--env", "prod"],
+            ["release", "verify", "--root", str(release_root), "--env", "prod", "--deep"],
         )
 
         assert result.exit_code == 1
@@ -2567,7 +2568,7 @@ class TestReleaseCommand:
 
         result = runner.invoke(
             app,
-            ["release", "verify", "--root", str(release_root), "--env", "prod"],
+            ["release", "verify", "--root", str(release_root), "--env", "prod", "--deep"],
         )
 
         assert result.exit_code == 1
@@ -2663,7 +2664,7 @@ class TestReleaseCommand:
 
         result = runner.invoke(
             app,
-            ["release", "verify", "--root", str(release_root), "--env", "prod"],
+            ["release", "verify", "--root", str(release_root), "--env", "prod", "--deep"],
         )
 
         assert result.exit_code == 1
@@ -2757,7 +2758,7 @@ class TestReleaseCommand:
         assert report["format"] == "krw-ontology-release-verify/v1"
         assert report["ok"] is True
         assert report["global_spine_path"] == "indexes/global_spine.sqlite"
-        assert report["verification"]["verification_mode"] == "release-root-v3"
+        assert report["verification"]["verification_mode"] == "release-root-v3-light"
         assert report["verification"]["smoke_verification"] is None
         assert "smoke_queries_path" not in report
         assert "ranking_quality_path" not in report
@@ -2775,7 +2776,7 @@ class TestReleaseCommand:
         second_report = json.loads(report_path.read_text())
         assert second.exit_code == 0, second.output
         assert second_report["reproducibility_hash"] == report["reproducibility_hash"]
-        assert second_report["verification"]["verification_mode"] == "release-root-v3"
+        assert second_report["verification"]["verification_mode"] == "release-root-v3-light"
 
     def test_release_verify_rejects_removed_smoke_baseline_options(self, tmp_path: Path):
         release_root = tmp_path / "releases" / "prod" / "rel-baseline"
@@ -2812,7 +2813,7 @@ class TestReleaseCommand:
         assert "index_layout: global-spine-and-company-shards" in result.output
         assert not (release_root / "verify" / "smoke_queries.json").exists()
         assert not (release_root / "verify" / "ranking_quality.json").exists()
-        assert report["verification"]["verification_mode"] == "release-root-v3"
+        assert report["verification"]["verification_mode"] == "release-root-v3-light"
         assert report["verification"]["spine_shard_verification"]["ok"] is True
 
     def test_release_verify_help_hides_legacy_ranking_threshold_options(self):
@@ -3656,8 +3657,8 @@ class TestQueueCommands:
         class FakeProcess:
             pid = 12345
 
-        def fake_popen(command, *, stdout, stderr, start_new_session):
-            calls.append((command, stderr, start_new_session))
+        def fake_popen(command, *, stdin, stdout, stderr, start_new_session):
+            calls.append((command, stdin, stderr, start_new_session))
             stdout.write("fake worker\n")
             stdout.flush()
             return FakeProcess()
@@ -3675,7 +3676,9 @@ class TestQueueCommands:
         assert "queue-run" in command
         assert "--watch" in command
         assert str(tmp_path.resolve()) in command
-        assert calls[0][2] is True
+        assert calls[0][1] is cli_main.subprocess.DEVNULL
+        assert calls[0][2] is cli_main.subprocess.STDOUT
+        assert calls[0][3] is True
         assert "Started queue worker pid=12345" in result.output
         assert (tmp_path / ".krw_pipeline" / "logs" / "worker.log").exists()
 
@@ -3685,8 +3688,8 @@ class TestQueueCommands:
         class FakeProcess:
             pid = 12345
 
-        def fake_popen(command, *, stdout, stderr, start_new_session):
-            calls.append(command)
+        def fake_popen(command, *, stdin, stdout, stderr, start_new_session):
+            calls.append((command, stdin))
             return FakeProcess()
 
         monkeypatch.setattr(cli_main.subprocess, "Popen", fake_popen)
@@ -3697,7 +3700,8 @@ class TestQueueCommands:
         )
 
         assert result.exit_code == 0
-        assert "--publish-prod" in calls[0]
+        assert "--publish-prod" in calls[0][0]
+        assert calls[0][1] is cli_main.subprocess.DEVNULL
 
     def test_queue_start_can_enable_index_refresh(self, tmp_path: Path, monkeypatch):
         calls = []
@@ -3705,8 +3709,8 @@ class TestQueueCommands:
         class FakeProcess:
             pid = 12345
 
-        def fake_popen(command, *, stdout, stderr, start_new_session):
-            calls.append(command)
+        def fake_popen(command, *, stdin, stdout, stderr, start_new_session):
+            calls.append((command, stdin))
             return FakeProcess()
 
         monkeypatch.setattr(cli_main.subprocess, "Popen", fake_popen)
@@ -3717,7 +3721,8 @@ class TestQueueCommands:
         )
 
         assert result.exit_code == 0
-        assert "--refresh-index" in calls[0]
+        assert "--refresh-index" in calls[0][0]
+        assert calls[0][1] is cli_main.subprocess.DEVNULL
 
     def test_queue_stop_requests_graceful_worker_stop(self, tmp_path: Path, monkeypatch):
         store = pipeline_queue.PipelineQueue(tmp_path)
@@ -4757,6 +4762,82 @@ def test_release_cleanup_interrupted_quarantines_stale_worker_candidate(tmp_path
     assert "99999999" in failure["error"]
 
 
+def test_release_status_marks_stale_worker_candidate(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("KRW_ONTOLOGY_CLI_CONFIG", str(tmp_path / "config.json"))
+    releases_root = tmp_path / "releases"
+    release_root = releases_root / "dev" / "stale-rel"
+    release_root.mkdir(parents=True)
+    (release_root / "worker.pid").write_text("99999999", encoding="utf-8")
+    (release_root / "worker_state.json").write_text(
+        json.dumps({"pid": 99999999, "status": "running"}, sort_keys=True),
+        encoding="utf-8",
+    )
+    runner.invoke(app, ["config", "set", "publish-root", str(releases_root)])
+
+    result = runner.invoke(app, ["release", "status", "stale-rel"])
+
+    assert result.exit_code == 0, result.output
+    assert "worker_status: stale" in result.output
+    assert "stale_worker: true pid=99999999" in result.output
+    assert "cleanup: krw-ontology release cleanup-interrupted stale-rel" in result.output
+
+
+def test_release_force_preflight_quarantines_stale_candidate(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("KRW_ONTOLOGY_CLI_CONFIG", str(tmp_path / "config.json"))
+    monkeypatch.setattr(cli_main, "_default_release_id", lambda: "new-rel")
+    running_root = tmp_path / "running"
+    releases_root = tmp_path / "releases"
+    stale_root = releases_root / "dev" / "stale-rel"
+    _write_minimal_source_artifact(running_root, "CVX")
+    stale_root.mkdir(parents=True)
+    (stale_root / "worker.pid").write_text("99999999", encoding="utf-8")
+    (stale_root / "worker_state.json").write_text(
+        json.dumps({"pid": 99999999, "status": "running"}, sort_keys=True),
+        encoding="utf-8",
+    )
+    runner.invoke(app, ["config", "set", "running-root", str(running_root)])
+    runner.invoke(app, ["config", "set", "publish-root", str(releases_root)])
+
+    class FakeProcess:
+        pid = 12345
+
+    def fake_popen(command, *, stdin, stdout, stderr, start_new_session):
+        return FakeProcess()
+
+    monkeypatch.setattr(cli_main.subprocess, "Popen", fake_popen)
+
+    result = runner.invoke(app, ["release", "force"])
+
+    failed_root = releases_root / "dev" / "failed" / "stale-rel"
+    assert result.exit_code == 0, result.output
+    assert not stale_root.exists()
+    assert failed_root.is_dir()
+    failure = json.loads((failed_root / "failure.json").read_text(encoding="utf-8"))
+    assert failure["action"] == "cleanup_interrupted"
+    assert "preflight stale release cleanup before force" in failure["error"]
+    assert (releases_root / "dev" / "new-rel" / "worker.pid").exists()
+
+
+def test_release_force_disk_preflight_blocks_low_space(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("KRW_ONTOLOGY_CLI_CONFIG", str(tmp_path / "config.json"))
+    monkeypatch.setenv("KRW_ONTOLOGY_RELEASE_MIN_FREE_BYTES", "100")
+    monkeypatch.setattr(cli_main, "_default_release_id", lambda: "low-space")
+    running_root = tmp_path / "running"
+    releases_root = tmp_path / "releases"
+    _write_minimal_source_artifact(running_root, "CVX")
+    runner.invoke(app, ["config", "set", "running-root", str(running_root)])
+    runner.invoke(app, ["config", "set", "publish-root", str(releases_root)])
+
+    disk_usage = shutil._ntuple_diskusage(total=1000, used=999, free=1)
+    monkeypatch.setattr(cli_main.shutil, "disk_usage", lambda _path: disk_usage)
+
+    result = runner.invoke(app, ["release", "force"])
+
+    assert result.exit_code == 1
+    assert "release_disk_preflight_failed" in result.output
+    assert not (releases_root / "dev" / "low-space" / "worker.pid").exists()
+
+
 def test_release_publish_dev_defaults_to_background_worker(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("KRW_ONTOLOGY_CLI_CONFIG", str(tmp_path / "config.json"))
     monkeypatch.setattr(cli_main, "_default_release_id", lambda: "20260603_120000")
@@ -4770,8 +4851,8 @@ def test_release_publish_dev_defaults_to_background_worker(tmp_path: Path, monke
     class FakeProcess:
         pid = 23456
 
-    def fake_popen(command, *, stdout, stderr, start_new_session):
-        calls.append((command, stderr, start_new_session))
+    def fake_popen(command, *, stdin, stdout, stderr, start_new_session):
+        calls.append((command, stdin, stderr, start_new_session))
         stdout.write("fake publish worker\n")
         stdout.flush()
         return FakeProcess()
@@ -4789,11 +4870,52 @@ def test_release_publish_dev_defaults_to_background_worker(tmp_path: Path, monke
     assert "20260603_120000" in command
     assert "--from-root" in command
     assert str(running_root.resolve()) in command
-    assert calls[0][1] is cli_main.subprocess.STDOUT
-    assert calls[0][2] is True
+    assert calls[0][1] is cli_main.subprocess.DEVNULL
+    assert calls[0][2] is cli_main.subprocess.STDOUT
+    assert calls[0][3] is True
     assert (release_root / "logs" / "publish-dev.log").exists()
     assert "Started dev publish worker pid=23456" in result.output
     assert "index_layout: global-spine-and-company-shards" in result.output
     assert f"global_spine: {release_root / 'indexes' / 'global_spine.sqlite'}" in result.output
     assert f"shard_manifest: {release_root / 'indexes' / 'shard_manifest.json'}" in result.output
     assert "watch: krw-ontology release publish-dev-watch 20260603_120000" in result.output
+
+
+def test_release_force_defaults_to_background_worker_with_devnull_stdin(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("KRW_ONTOLOGY_CLI_CONFIG", str(tmp_path / "config.json"))
+    monkeypatch.setattr(cli_main, "_default_release_id", lambda: "20260603_130000")
+    running_root = tmp_path / "running"
+    releases_root = tmp_path / "releases"
+    _write_minimal_source_artifact(running_root, "CVX")
+    runner.invoke(app, ["config", "set", "running-root", str(running_root)])
+    runner.invoke(app, ["config", "set", "publish-root", str(releases_root)])
+    calls = []
+
+    class FakeProcess:
+        pid = 34567
+
+    def fake_popen(command, *, stdin, stdout, stderr, start_new_session):
+        calls.append((command, stdin, stderr, start_new_session))
+        stdout.write("fake release worker\n")
+        stdout.flush()
+        return FakeProcess()
+
+    monkeypatch.setattr(cli_main.subprocess, "Popen", fake_popen)
+
+    result = runner.invoke(app, ["release", "force"])
+
+    release_root = releases_root / "dev" / "20260603_130000"
+    assert result.exit_code == 0, result.output
+    assert calls
+    command = calls[0][0]
+    assert "release-build-worker" in command
+    assert "--release-id" in command
+    assert "20260603_130000" in command
+    assert "--from-root" in command
+    assert str(running_root.resolve()) in command
+    assert calls[0][1] is cli_main.subprocess.DEVNULL
+    assert calls[0][2] is cli_main.subprocess.STDOUT
+    assert calls[0][3] is True
+    assert (release_root / "logs" / "release-build.log").exists()
+    assert "Started release worker pid=34567" in result.output
+    assert "watch: krw-ontology release watch 20260603_130000" in result.output

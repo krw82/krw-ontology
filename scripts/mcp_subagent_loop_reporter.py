@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import statistics
 import time
 from concurrent.futures import ProcessPoolExecutor
@@ -13,6 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from krw_ontology.config.paths import ONTOLOGY_GLOBAL_SPINE_PATH_ENV, ONTOLOGY_RELEASE_ROOT_ENV
 from krw_ontology.mcp_server.tools import (
     catalog_tool,
     index_context_tool,
@@ -27,9 +29,6 @@ from krw_ontology.mcp_server.tools import (
     chain_tool,
 )
 
-ROOT_DEFAULT = "~/krw-ontology-data"
-
-
 def _utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S%z")
 
@@ -41,18 +40,17 @@ class QueryCase:
     kwargs: dict[str, Any]
 
 
-def _build_cases(root: str) -> list[QueryCase]:
+def _build_cases() -> list[QueryCase]:
     return [
         QueryCase(
             name="catalog_tool",
             fn_name="catalog_tool",
-            kwargs={"root": root, "response_format": "json"},
+            kwargs={"response_format": "json"},
         ),
         QueryCase(
             name="index_context_tool",
             fn_name="index_context_tool",
             kwargs={
-                "root": root,
                 "include_counts": True,
                 "include_capabilities": True,
                 "include_quality_summary": True,
@@ -62,7 +60,7 @@ def _build_cases(root: str) -> list[QueryCase]:
         QueryCase(
             name="company_context_tool",
             fn_name="company_context_tool",
-            kwargs={"ticker": "AAPL", "root": root, "response_format": "json", "limit_topics": 40},
+            kwargs={"ticker": "AAPL", "response_format": "json", "limit_topics": 40},
         ),
         QueryCase(
             name="query_context_tool",
@@ -70,7 +68,6 @@ def _build_cases(root: str) -> list[QueryCase]:
             kwargs={
                 "question": "AAPL AI demand growth and margin risk",
                 "ticker": "AAPL",
-                "root": root,
                 "response_format": "json",
                 "limit_results": 20,
                 "limit_tickers": 20,
@@ -85,7 +82,6 @@ def _build_cases(root: str) -> list[QueryCase]:
                 "document_types": ["10-K"],
                 "object_types": ["ResearchClaim", "BusinessFactor"],
                 "limit": 20,
-                "root": root,
                 "response_format": "json",
                 "response_detail": "compact",
             },
@@ -105,7 +101,6 @@ def _build_cases(root: str) -> list[QueryCase]:
                 ],
                 "limit": 80,
                 "include_rejected": True,
-                "root": root,
                 "response_format": "json",
                 "response_detail": "full",
             },
@@ -118,7 +113,6 @@ def _build_cases(root: str) -> list[QueryCase]:
                 "tickers": ["AAPL"],
                 "document_types": ["10-K"],
                 "limit": 20,
-                "root": root,
                 "response_format": "json",
                 "response_detail": "full",
             },
@@ -127,7 +121,6 @@ def _build_cases(root: str) -> list[QueryCase]:
             name="quality_tool",
             fn_name="quality_tool",
             kwargs={
-                "root": root,
                 "ticker": "AAPL",
                 "document_type": "10-K",
                 "response_format": "json",
@@ -139,7 +132,6 @@ def _build_cases(root: str) -> list[QueryCase]:
             fn_name="compare_tool",
             kwargs={
                 "tickers": ["AAPL", "AMZN", "AMD"],
-                "root": root,
                 "topic": "revenue growth",
                 "document_types": ["10-K"],
                 "periods": ["CY2025"],
@@ -152,7 +144,6 @@ def _build_cases(root: str) -> list[QueryCase]:
             fn_name="plan_query_tool",
             kwargs={
                 "question": "AAPL exposure to cloud and AI infrastructure demand changes",
-                "root": root,
                 "response_format": "json",
             },
         ),
@@ -205,14 +196,13 @@ def _median(values: list[float] | None) -> float | None:
     return round(statistics.median(values), 3)
 
 
-def _resolve_seed_id(root: str) -> str | None:
+def _resolve_seed_id() -> str | None:
     resp = json.loads(query_tool(
         topic="risk",
         tickers=["AAPL"],
         document_types=["10-K"],
         object_types=["ResearchClaim", "BusinessFactor", "EvidenceQuote"],
         limit=1,
-        root=root,
         response_format="json",
         response_detail="compact",
     ))
@@ -252,23 +242,22 @@ def _append_markdown_line(path: Path, round_no: int, result_rows: list[dict[str,
     path.write_text(path.read_text() + "\n" + "\n".join(lines) + "\n", encoding="utf-8")
 
 
-def run_round(root: str, repeat_each: int, parallel_workers: int, out_path: Path) -> int:
-    cases = _build_cases(root)
-    seed_id = _resolve_seed_id(root)
+def run_round(repeat_each: int, parallel_workers: int, out_path: Path) -> int:
+    cases = _build_cases()
+    seed_id = _resolve_seed_id()
     trace_case = []
     if seed_id:
         trace_case = [
             QueryCase(
                 name="trace_tool",
                 fn_name="trace_tool",
-                kwargs={"object_id": seed_id, "root": root, "response_format": "json"},
+                kwargs={"object_id": seed_id, "response_format": "json"},
             ),
             QueryCase(
                 name="chain_tool",
                 fn_name="chain_tool",
                 kwargs={
                     "object_id": seed_id,
-                    "root": root,
                     "response_format": "json",
                     "max_depth": 2,
                     "direction": "both",
@@ -309,26 +298,35 @@ def run_round(root: str, repeat_each: int, parallel_workers: int, out_path: Path
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--root", default=ROOT_DEFAULT)
+    parser.add_argument("--release-root", default=None, help="v3 release root to read.")
+    parser.add_argument("--global-spine-path", default=None, help="Explicit v3 global_spine.sqlite path.")
     parser.add_argument("--report", default="~/krw-ontology/mcp_subagent_loop_report.md")
     parser.add_argument("--repeat-each", type=int, default=1)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--max-rounds", type=int, default=0, help="0이면 무한반복")
     parser.add_argument("--sleep", type=float, default=30.0)
     args = parser.parse_args()
+    configure_runtime_env(release_root=args.release_root, global_spine_path=args.global_spine_path)
 
     report_path = Path(args.report)
     rounds = 0
     try:
         while True:
             rounds += 1
-            run_no = run_round(args.root, args.repeat_each, args.workers, report_path)
+            run_no = run_round(args.repeat_each, args.workers, report_path)
             print(f"[{_utc_now()}] round={run_no} done")
             if args.max_rounds and rounds >= args.max_rounds:
                 break
             time.sleep(args.sleep)
     except KeyboardInterrupt:
         print(f"[{_utc_now()}] stopped by user at round={rounds}")
+
+
+def configure_runtime_env(*, release_root: str | None, global_spine_path: str | None) -> None:
+    if release_root:
+        os.environ[ONTOLOGY_RELEASE_ROOT_ENV] = str(Path(release_root).expanduser().resolve())
+    if global_spine_path:
+        os.environ[ONTOLOGY_GLOBAL_SPINE_PATH_ENV] = str(Path(global_spine_path).expanduser().resolve())
 
 
 if __name__ == "__main__":

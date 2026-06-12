@@ -14,12 +14,14 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
 import re
 import statistics
 import time
 from typing import Any
 
+from krw_ontology.config.paths import ONTOLOGY_GLOBAL_SPINE_PATH_ENV, ONTOLOGY_RELEASE_ROOT_ENV
 from krw_ontology.mcp_server.tools import query_context_tool
 
 
@@ -43,14 +45,15 @@ def main() -> None:
         default="/tmp/krw_company_suggested_prompts_by_ticker.md",
         help="Markdown prompt source.",
     )
-    parser.add_argument("--root", default=None, help="Ontology data root.")
-    parser.add_argument("--index-path", default=None, help="Explicit agent_index.sqlite path.")
+    parser.add_argument("--release-root", default=None, help="v3 release root to read.")
+    parser.add_argument("--global-spine-path", default=None, help="Explicit v3 global_spine.sqlite path.")
     parser.add_argument("--output-prefix", default=None, help="Output path prefix without extension.")
     parser.add_argument("--limit", type=int, default=None, help="Run only the first N parsed cases.")
     parser.add_argument("--offset", type=int, default=0, help="Skip the first N parsed cases.")
     parser.add_argument("--limit-results", type=int, default=10, help="query_context limit_results.")
     parser.add_argument("--stop-on-error", action="store_true", help="Abort after first failed case.")
     args = parser.parse_args()
+    configure_runtime_env(release_root=args.release_root, global_spine_path=args.global_spine_path)
 
     prompt_path = Path(args.prompts)
     all_cases = parse_prompt_cases(prompt_path)
@@ -72,8 +75,6 @@ def main() -> None:
                 case,
                 ordinal=ordinal,
                 total=len(selected),
-                root=args.root,
-                index_path=args.index_path,
                 limit_results=args.limit_results,
             )
             records.append(record)
@@ -134,13 +135,18 @@ def parse_prompt_cases(path: Path) -> list[PromptCase]:
     return cases
 
 
+def configure_runtime_env(*, release_root: str | None, global_spine_path: str | None) -> None:
+    if release_root:
+        os.environ[ONTOLOGY_RELEASE_ROOT_ENV] = str(Path(release_root).expanduser().resolve())
+    if global_spine_path:
+        os.environ[ONTOLOGY_GLOBAL_SPINE_PATH_ENV] = str(Path(global_spine_path).expanduser().resolve())
+
+
 def run_case(
     case: PromptCase,
     *,
     ordinal: int,
     total: int,
-    root: str | None,
-    index_path: str | None,
     limit_results: int,
 ) -> dict[str, Any]:
     kwargs: dict[str, Any] = {
@@ -148,10 +154,6 @@ def run_case(
         "ticker": case.ticker,
         "limit_results": limit_results,
     }
-    if root:
-        kwargs["root"] = root
-    if index_path:
-        kwargs["index_path"] = index_path
 
     started = time.perf_counter()
     status = "ok"

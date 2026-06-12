@@ -24,11 +24,11 @@ The endpoint exports release labels:
 Core metrics:
 
 - `krw_ontology_mcp_health_ok`
-- `krw_ontology_mcp_index_present`
+- `krw_ontology_mcp_global_spine_present`
 - `krw_ontology_mcp_release_documents`
 - `krw_ontology_mcp_release_objects`
 - `krw_ontology_mcp_company_shards`
-- `krw_ontology_mcp_global_topics`
+- `krw_ontology_mcp_global_topic_spine_rows`
 - `krw_ontology_mcp_store_rotation_pending`
 - `krw_ontology_mcp_store_retired_leased`
 - `krw_ontology_mcp_store_retired_oldest_age_seconds`
@@ -41,7 +41,7 @@ thresholds, then load the rendered file into Prometheus or your rule manager.
 The rules cover:
 
 - MCP health failure
-- missing index
+- missing global spine
 - stuck hot-swap retired leases
 - excessive store rotations
 - empty production release
@@ -64,7 +64,7 @@ krw-ontology observability render-prometheus-alerts \
 Supported threshold variables:
 
 - `KRW_PROMETHEUS_MCP_DOWN_FOR`
-- `KRW_PROMETHEUS_INDEX_MISSING_FOR`
+- `KRW_PROMETHEUS_GLOBAL_SPINE_MISSING_FOR`
 - `KRW_PROMETHEUS_HOT_SWAP_STUCK_FOR`
 - `KRW_PROMETHEUS_HOT_SWAP_RETIRED_AGE_SECONDS`
 - `KRW_PROMETHEUS_RETIRED_LEASES_FOR`

@@ -1,4 +1,4 @@
-"""Read-only MCP tool implementations over the ontology agent index."""
+"""Read-only MCP tool implementations over the v3 ontology release."""
 
 from __future__ import annotations
 
@@ -14,14 +14,17 @@ import time
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from krw_ontology.agent_index import AgentRetriever, OntologyStore, QueryPlan, open_ontology_store
+from krw_ontology.agent_index import (
+    AgentRetriever,
+    GLOBAL_SPINE_RELATIVE_PATH,
+    QueryPlan,
+    open_ontology_store,
+)
 from krw_ontology.agent_index.retrieval_text import format_metric_compact
 from krw_ontology.agent_index.research_kernel import ResearchKernel, request_from_query_context_args
-from krw_ontology.agent_index.store import DEFAULT_QUERY_TYPES, agent_index_cache_status
+from krw_ontology.agent_index.store import DEFAULT_QUERY_TYPES, OntologyStore, agent_index_cache_status
 from krw_ontology.config.paths import (
-    ONTOLOGY_INDEX_PATH_ENV,
-    ONTOLOGY_ROOT_ENV,
-    resolve_agent_index_path,
+    ONTOLOGY_GLOBAL_SPINE_PATH_ENV,
     resolve_ontology_root,
 )
 
@@ -46,7 +49,7 @@ LOGGER = logging.getLogger(__name__)
 SLOW_MCP_TOOL_LOG_THRESHOLD_MS = 5_000
 _SLOW_MCP_TOOL_LOG_MARKER = "[krw-ontology:mcp-slow-path]"
 _TRACE_TOOL_CACHE_MAX = 512
-_TRACE_TOOL_CACHE: OrderedDict[tuple[str, int | None, str], dict[str, Any]] = OrderedDict()
+_TRACE_TOOL_CACHE: OrderedDict[tuple[str, int | None, int | None, str], dict[str, Any]] = OrderedDict()
 _TRACE_TOOL_CACHE_LOCK = threading.Lock()
 _MCP_STORE_MODE_ENV = "KRW_MCP_STORE_MODE"
 _MCP_STORE_POOL_MAX_ENV = "KRW_MCP_STORE_POOL_MAX"
@@ -88,9 +91,9 @@ def _index_signature(index_path: Path) -> tuple[str, int | None, int | None]:
     return (str(resolved_path), stat.st_mtime_ns, stat.st_size)
 
 
-def _trace_cache_key(index_path: Path, object_id: str) -> tuple[str, int | None, str]:
+def _trace_cache_key(index_path: Path, object_id: str) -> tuple[str, int | None, int | None, str]:
     signature = _index_signature(index_path)
-    return (signature[0], signature[1], object_id)
+    return (*signature, object_id)
 
 
 class _StoreBucket:
@@ -180,7 +183,7 @@ class _PersistentStorePool:
                 self._hits += 1
                 reused = True
             else:
-                store = open_ontology_store(index_path, check_same_thread=False)
+                store = open_ontology_store(index_path, check_same_thread=False, routing="spine")
                 self._misses += 1
                 self._opened += 1
                 reused = False
@@ -192,8 +195,8 @@ class _PersistentStorePool:
             "mcp_store_acquire %s",
             json.dumps(
                 {
-                    "index_path": str(index_path),
-                    "resolved_index_path": signature[0],
+                    "global_spine_path": str(index_path),
+                    "resolved_global_spine_path": signature[0],
                     "reused": reused,
                 },
                 sort_keys=True,
@@ -247,11 +250,11 @@ class _PersistentStorePool:
             ]
             idle = sum(len(bucket.idle) for bucket in self._buckets.values())
             leased = sum(bucket.leased for bucket in self._buckets.values())
-            indexes = [
+            global_spine_stores = [
                 self._bucket_status(bucket)
                 for _logical_path, bucket in sorted(self._buckets.items())
             ]
-            retired_indexes = [
+            retired_global_spine_stores = [
                 self._bucket_status(bucket)
                 for bucket in sorted(
                     self._retired_buckets,
@@ -279,8 +282,8 @@ class _PersistentStorePool:
                 "closed": self._closed,
                 "rotations": self._rotations,
                 "last_rotation": self._last_rotation,
-                "indexes": indexes,
-                "retired_indexes": retired_indexes,
+                "global_spine_stores": global_spine_stores,
+                "retired_global_spine_stores": retired_global_spine_stores,
             }
 
     def reset(self) -> None:
@@ -308,10 +311,10 @@ class _PersistentStorePool:
             self._close_store(bucket.idle.pop())
         self._last_rotation = {
             "logical_path": bucket.logical_path,
-            "previous_resolved_index_path": bucket.signature[0],
+            "previous_resolved_global_spine_path": bucket.signature[0],
             "previous_mtime_ns": bucket.signature[1],
             "previous_size": bucket.signature[2],
-            "new_resolved_index_path": replacement_signature[0],
+            "new_resolved_global_spine_path": replacement_signature[0],
             "new_mtime_ns": replacement_signature[1],
             "new_size": replacement_signature[2],
             "retired_leased": bucket.leased,
@@ -346,7 +349,7 @@ class _PersistentStorePool:
     def _bucket_status(self, bucket: _StoreBucket) -> dict[str, Any]:
         payload = {
             "logical_path": bucket.logical_path,
-            "resolved_index_path": bucket.signature[0],
+            "resolved_global_spine_path": bucket.signature[0],
             "mtime_ns": bucket.signature[1],
             "size": bucket.signature[2],
             "idle": len(bucket.idle),
@@ -601,8 +604,6 @@ _OBJECT_TYPE_ALIASES = {
 
 def catalog_tool(
     *,
-    root: str | None = None,
-    index_path: str | None = None,
     ticker: str | None = None,
     document_types: list[str] | None = None,
     limit: int = 50,
@@ -610,8 +611,8 @@ def catalog_tool(
     response_format: ResponseFormat = ResponseFormat.JSON,
 ) -> str:
     """Return available companies, documents, periods, and index metadata."""
-    root_path = _root(root)
-    index = _index(root, index_path)
+    root_path = _runtime_root()
+    index = _runtime_global_spine_path()
     limit = _bounded_limit(limit)
     offset = _bounded_offset(offset)
 
@@ -623,7 +624,7 @@ def catalog_tool(
     page = documents[offset : offset + limit]
     payload = {
         "root": str(root_path),
-        "index_path": str(index),
+        "global_spine_path": str(index),
         "companies": companies,
         "document_types": sorted({doc["document_type"] for doc in documents}),
         "periods": sorted({doc["period"] for doc in documents}),
@@ -635,8 +636,6 @@ def catalog_tool(
 
 def query_tool(
     *,
-    root: str | None = None,
-    index_path: str | None = None,
     topic: str | None = None,
     ticker: str | None = None,
     tickers: list[str] | None = None,
@@ -659,7 +658,10 @@ def query_tool(
 ) -> str:
     """Search accepted ontology objects and return evidence bundles."""
     started_at = time.perf_counter()
-    index = _index(root, index_path)
+    runtime_override_error = _runtime_override_error(extra_args, response_format)
+    if runtime_override_error is not None:
+        return runtime_override_error
+    index = _runtime_global_spine_path()
     limit = _bounded_limit(limit)
     offset = _bounded_offset(offset)
     detail = _coerce_response_detail(response_detail)
@@ -886,8 +888,6 @@ def query_tool(
 
 def topic_map_tool(
     *,
-    root: str | None = None,
-    index_path: str | None = None,
     ticker: str,
     document_types: list[str] | None = None,
     periods: list[str] | None = None,
@@ -895,7 +895,7 @@ def topic_map_tool(
     response_format: ResponseFormat = ResponseFormat.JSON,
 ) -> str:
     """Return company-specific search vocabulary for broad research questions."""
-    index = _index(root, index_path)
+    index = _runtime_global_spine_path()
     limit = _bounded_limit(limit)
     with _store(index) as store:
         payload = store.topic_map(
@@ -910,8 +910,6 @@ def topic_map_tool(
 def retrieve_tool(
     *,
     question: str,
-    root: str | None = None,
-    index_path: str | None = None,
     ticker: str | None = None,
     tickers: list[str] | None = None,
     document_types: list[str] | None = None,
@@ -928,7 +926,10 @@ def retrieve_tool(
     **extra_args: Any,
 ) -> str:
     """Use the deterministic local planner, then retrieve evidence bundles."""
-    index = _index(root, index_path)
+    runtime_override_error = _runtime_override_error(extra_args, response_format)
+    if runtime_override_error is not None:
+        return runtime_override_error
+    index = _runtime_global_spine_path()
     limit = _bounded_limit(limit)
     detail = _coerce_response_detail(response_detail)
     detail_policy = _response_detail_policy(response_detail, detail)
@@ -1024,6 +1025,64 @@ def retrieve_tool(
             limit_tickers=max(1, min(limit_groups, 20)),
             include_internal_ids=detail == ResponseDetail.FULL,
         )
+        release_missing_parts = _release_missing_parts_from_context(research_context)
+        if release_missing_parts:
+            payload = {
+                "question": question,
+                "query": {
+                    "question": question,
+                    "tickers": _upper_list(normalized_tickers),
+                    "ticker_alias": ticker,
+                    "document_types": document_types or [],
+                    "periods": _upper_list(periods),
+                    "group_by": normalized_group_by,
+                    "limit_groups": limit_groups,
+                    "limit_per_group": limit_per_group,
+                    "answer_candidate_only": answer_candidate_only,
+                },
+                "answerability": research_context.get("answerability")
+                or {
+                    "direct_answerable": False,
+                    "related_context_available": False,
+                    "negative_answer_supported": False,
+                    "needs_user_clarification": False,
+                    "recommended_answer_mode": "not_answerable_from_current_release",
+                },
+                "recommended_answer_mode": "not_answerable_from_current_release",
+                "directness_guard": _directness_guard_from_research_context(research_context),
+                "research_context_version": research_context.get("research_context_version"),
+                "research_status": "not_answerable_from_current_release",
+                "research_context": {
+                    "research_context_version": research_context.get("research_context_version"),
+                    "research_status": "not_answerable_from_current_release",
+                    "kernel": research_context.get("kernel"),
+                    "agent_autonomy": research_context.get("agent_autonomy"),
+                    "missing_parts": release_missing_parts,
+                    "missing_shards": research_context.get("missing_shards") or {},
+                    "unknown_tickers": research_context.get("unknown_tickers") or [],
+                    "do_not_call": research_context.get("do_not_call") or [],
+                    "directness_guard": _directness_guard_from_research_context(research_context),
+                    "research_pack": research_context.get("research_pack"),
+                    "routing": research_context.get("routing"),
+                },
+                "research_pack": research_context.get("research_pack"),
+                "kernel": research_context.get("kernel"),
+                "agent_autonomy": research_context.get("agent_autonomy"),
+                "missing_parts": release_missing_parts,
+                "missing_shards": research_context.get("missing_shards") or {},
+                "unknown_tickers": research_context.get("unknown_tickers") or [],
+                "do_not_call": research_context.get("do_not_call") or [],
+                "routing": research_context.get("routing"),
+                "direct_evidence": [],
+                "related_context": [],
+                "rejected_context": [],
+                "response_detail": detail.value,
+                "response_detail_policy": detail_policy,
+            }
+            if input_warnings:
+                payload["input_warnings"] = input_warnings
+            _attach_agent_guidance(payload, agent_guidance)
+            return _format_response(payload, response_format, _markdown_retrieve)
         if research_context.get("research_status") == "out_of_scope_for_filing_ontology":
             payload = {
                 "question": question,
@@ -1059,7 +1118,7 @@ def retrieve_tool(
                 payload["input_warnings"] = input_warnings
             _attach_agent_guidance(payload, agent_guidance)
             return _format_response(payload, response_format, _markdown_retrieve)
-        if _should_skip_legacy_retrieve(research_context, detail=detail):
+        if _should_skip_secondary_retrieve(research_context, detail=detail):
             payload = {
                 "question": question,
                 "query": {
@@ -1093,7 +1152,7 @@ def retrieve_tool(
                 "agent_autonomy": research_context.get("agent_autonomy"),
                 "missing_parts": research_context.get("missing_parts") or [],
                 "do_not_call": research_context.get("do_not_call") or [],
-                "legacy_retrieve_skipped": True,
+                "secondary_retrieve_skipped": True,
                 "direct_evidence": [],
                 "related_context": [],
                 "rejected_context": [],
@@ -1120,10 +1179,15 @@ def retrieve_tool(
         "kernel": research_context.get("kernel"),
         "agent_autonomy": research_context.get("agent_autonomy"),
         "missing_parts": research_context.get("missing_parts") or [],
+        "missing_shards": research_context.get("missing_shards") or {},
+        "unknown_tickers": research_context.get("unknown_tickers") or [],
         "do_not_call": research_context.get("do_not_call") or [],
         "directness_guard": _directness_guard_from_research_context(research_context),
         "research_pack": research_context.get("research_pack"),
+        "routing": research_context.get("routing"),
     }
+    if research_context.get("routing"):
+        result.setdefault("routing", research_context.get("routing"))
     result["directness_guard"] = _directness_guard_from_research_context(research_context)
     result["kernel"] = research_context.get("kernel")
     result.setdefault("answerability", research_context.get("answerability") or {})
@@ -1179,12 +1243,10 @@ def retrieve_tool(
 def trace_tool(
     *,
     object_id: str,
-    root: str | None = None,
-    index_path: str | None = None,
     response_format: ResponseFormat = ResponseFormat.JSON,
 ) -> str:
     """Trace one ontology object to its source document, quotes, spans, and quality."""
-    index = _index(root, index_path)
+    index = _runtime_global_spine_path()
     cache_key = _trace_cache_key(index, object_id)
     with _TRACE_TOOL_CACHE_LOCK:
         cached = _TRACE_TOOL_CACHE.get(cache_key)
@@ -1231,15 +1293,13 @@ def trace_tool(
 def chain_tool(
     *,
     object_id: str,
-    root: str | None = None,
-    index_path: str | None = None,
     max_depth: int = 2,
     direction: str = "both",
     include_quote_text: bool = False,
     response_format: ResponseFormat = ResponseFormat.JSON,
 ) -> str:
     """Return compact evidence, semantic, and temporal chains around one object."""
-    index = _index(root, index_path)
+    index = _runtime_global_spine_path()
     max_depth = max(0, min(int(max_depth), 4))
     with _store(index) as store:
         chain = store.chain(
@@ -1284,8 +1344,6 @@ def chain_tool(
 
 def quality_tool(
     *,
-    root: str | None = None,
-    index_path: str | None = None,
     ticker: str | None = None,
     document_type: str | None = None,
     period: str | None = None,
@@ -1294,7 +1352,7 @@ def quality_tool(
     response_format: ResponseFormat = ResponseFormat.JSON,
 ) -> str:
     """Return section-quality, rejected-object, and batch-failure signals."""
-    index = _index(root, index_path)
+    index = _runtime_global_spine_path()
     limit = _bounded_limit(limit)
     offset = _bounded_offset(offset)
     with _store(index) as store:
@@ -1308,14 +1366,16 @@ def quality_tool(
         "summary": quality["summary"],
         "pagination": _pagination(len(events), offset, len(page), limit),
     }
+    if isinstance(quality.get("routing"), Mapping):
+        payload["routing"] = dict(quality["routing"])
+    if isinstance(quality.get("topology"), Mapping):
+        payload["topology"] = dict(quality["topology"])
     return _format_response(payload, response_format, _markdown_quality)
 
 
 def compare_tool(
     *,
     tickers: list[str] | None = None,
-    root: str | None = None,
-    index_path: str | None = None,
     ticker: str | None = None,
     ticker_a: str | None = None,
     ticker_b: str | None = None,
@@ -1329,6 +1389,9 @@ def compare_tool(
     **extra_args: Any,
 ) -> str:
     """Compare companies by a topic search or canonical metric."""
+    runtime_override_error = _runtime_override_error(extra_args, response_format)
+    if runtime_override_error is not None:
+        return runtime_override_error
     normalized_tickers = _merge_compare_ticker_aliases(
         tickers=tickers,
         ticker=ticker,
@@ -1369,7 +1432,7 @@ def compare_tool(
             payload["input_warnings"] = input_warnings
         return _format_response(payload, response_format, _markdown_error)
 
-    index = _index(root, index_path)
+    index = _runtime_global_spine_path()
     limit_per_ticker = max(1, min(int(limit_per_ticker), 10))
     with _store(index) as store:
         if period_compare:
@@ -1446,12 +1509,10 @@ def compare_tool(
 def plan_query_tool(
     *,
     question: str,
-    root: str | None = None,
-    index_path: str | None = None,
     response_format: ResponseFormat = ResponseFormat.JSON,
 ) -> str:
     """Return the deterministic QueryPlan for a natural-language question."""
-    index = _index(root, index_path)
+    index = _runtime_global_spine_path()
     with _store(index) as store:
         plan = AgentRetriever(store).plan(question)
     payload = {"plan": plan.to_dict()}
@@ -1460,17 +1521,15 @@ def plan_query_tool(
 
 def index_context_tool(
     *,
-    root: str | None = None,
-    index_path: str | None = None,
     include_counts: bool = False,
     include_capabilities: bool = True,
     include_quality_summary: bool = False,
     allow_expensive: bool = False,
     response_format: ResponseFormat = ResponseFormat.JSON,
 ) -> str:
-    """Return a compact AI capability card for the current agent index."""
+    """Return a compact AI capability card for the current v3 ontology release."""
     started_at = time.perf_counter()
-    index = _index(root, index_path)
+    index = _runtime_global_spine_path()
     counts_requested = bool(include_counts)
     quality_requested = bool(include_quality_summary)
     effective_include_counts = counts_requested and allow_expensive
@@ -1490,7 +1549,7 @@ def index_context_tool(
         "counts_returned": effective_include_counts,
         "quality_summary_returned": effective_include_quality_summary,
         "reason": (
-            "index_context is an operational/debug capability card. "
+            "index_context is an operational/debug capability card for the current v3 ontology release. "
             "Expensive table counts and quality summary scans are disabled by default; "
             "use query_context for normal research questions."
         ),
@@ -1519,8 +1578,6 @@ def index_context_tool(
 def company_context_tool(
     *,
     ticker: str,
-    root: str | None = None,
-    index_path: str | None = None,
     document_types: list[str] | None = None,
     periods: list[str] | None = None,
     limit_topics: int = 12,
@@ -1528,7 +1585,7 @@ def company_context_tool(
     response_format: ResponseFormat = ResponseFormat.JSON,
 ) -> str:
     """Return compressed evidence-derived topic context for one company."""
-    index = _index(root, index_path)
+    index = _runtime_global_spine_path()
     with _store(index) as store:
         payload = store.company_context(
             ticker=ticker,
@@ -1543,8 +1600,6 @@ def company_context_tool(
 def query_context_tool(
     *,
     question: str,
-    root: str | None = None,
-    index_path: str | None = None,
     ticker: str | None = None,
     tickers: list[str] | None = None,
     document_types: list[str] | None = None,
@@ -1557,7 +1612,7 @@ def query_context_tool(
 ) -> str:
     """Return a compact answer-planning pack with answerability guidance."""
     started_at = time.perf_counter()
-    index = _index(root, index_path)
+    index = _runtime_global_spine_path()
     with _store(index) as store:
         payload = store.query_context(
             question=question,
@@ -1605,7 +1660,7 @@ def _markdown_index_context(payload: Mapping[str, Any]) -> str:
         [
             "# KRW Ontology Index Context",
             f"- status: {payload.get('index_status')}",
-            f"- schema: {payload.get('agent_index_schema_version')}",
+            f"- schema: {payload.get('schema_version')}",
             f"- tickers: {', '.join(payload.get('available_tickers') or [])}",
             f"- guard_mode: {guard.get('mode')}",
             f"- counts_returned: {guard.get('counts_returned')}",
@@ -1746,36 +1801,53 @@ def _compare_periods(
     }
 
 
-def _root(root: str | None) -> Path:
-    return resolve_ontology_root(root, fallback_to_cwd=False)
+_RUNTIME_PATH_OVERRIDE_ARGS = {
+    "root",
+    "index_path",
+    "global_spine_path",
+    "release_root",
+}
 
 
-def _index(root: str | None, index_path: str | None) -> Path:
-    if index_path is not None:
-        return Path(index_path).expanduser().absolute()
-    if root is None:
-        raw_index_path = os.environ.get(ONTOLOGY_INDEX_PATH_ENV)
-        if raw_index_path:
-            return Path(raw_index_path).expanduser().absolute()
-    return resolve_agent_index_path(root, index_path, fallback_to_cwd=False)
+def _runtime_root() -> Path:
+    return resolve_ontology_root(None, fallback_to_cwd=False)
+
+
+def _runtime_global_spine_path() -> Path:
+    raw_index_path = os.environ.get(ONTOLOGY_GLOBAL_SPINE_PATH_ENV)
+    if raw_index_path:
+        return Path(raw_index_path).expanduser().absolute()
+    return (_runtime_root() / GLOBAL_SPINE_RELATIVE_PATH).absolute()
+
+
+def _runtime_override_error(
+    extra_args: Mapping[str, Any] | None,
+    response_format: ResponseFormat,
+) -> str | None:
+    if not extra_args:
+        return None
+    forbidden = sorted(str(key) for key in extra_args if str(key) in _RUNTIME_PATH_OVERRIDE_ARGS)
+    if not forbidden:
+        return None
+    payload = _error_payload(
+        "runtime_path_override_not_allowed",
+        "MCP tools read only the configured v3 release runtime.",
+        "Set KRW_ONTOLOGY_RELEASE_ROOT before starting the MCP server; do not pass root or index paths to tools.",
+    )
+    payload["forbidden_args"] = forbidden
+    return _format_response(payload, response_format, _markdown_error)
 
 
 def _store(index_path: Path) -> Any:
     if not index_path.exists():
         raise FileNotFoundError(
-            "Ontology agent index not found at "
-            f"{index_path}. Build it with: uv run krw-ontology index build "
-            f"--root ${ONTOLOGY_ROOT_ENV}"
+            "KRW Ontology v3 global spine not found at "
+            f"{index_path}. Build and promote a release with: "
+            "uv run krw-ontology release force"
         )
     if _persistent_store_enabled():
         return _STORE_POOL.acquire(index_path)
-    return open_ontology_store(index_path)
-
-
-def ensure_persistent_store_open(index_path: Path) -> None:
-    """Open and retain a pooled SQLite store when MCP persistent mode is enabled."""
-    if _persistent_store_enabled():
-        _STORE_POOL.ensure_open(index_path)
+    return open_ontology_store(index_path, routing="spine")
 
 
 def reset_mcp_runtime_caches() -> None:
@@ -1797,7 +1869,7 @@ def mcp_runtime_cache_status() -> dict[str, Any]:
     return {
         "store": _STORE_POOL.status(),
         "trace": trace_cache,
-        "agent_index": agent_index_cache_status(),
+        "query_cache": agent_index_cache_status(),
         "retriever": retriever_cache_status(),
     }
 
@@ -2103,6 +2175,9 @@ def _compact_research_context(context: Mapping[str, Any]) -> dict[str, Any]:
         "kernel": context.get("kernel") or {},
         "agent_autonomy": context.get("agent_autonomy") or {},
         "missing_parts": context.get("missing_parts") or [],
+        "missing_shards": context.get("missing_shards") or {},
+        "unknown_tickers": context.get("unknown_tickers") or [],
+        "routing": context.get("routing") or {},
         "do_not_call": context.get("do_not_call") or [],
         "directness_guard": context.get("directness_guard") or {},
         "research_pack_summary": context.get("research_pack_summary") or {},
@@ -2170,7 +2245,7 @@ def _stop_guard_from_research_context(context: Mapping[str, Any]) -> dict[str, A
     return {}
 
 
-def _should_skip_legacy_retrieve(context: Mapping[str, Any], *, detail: ResponseDetail) -> bool:
+def _should_skip_secondary_retrieve(context: Mapping[str, Any], *, detail: ResponseDetail) -> bool:
     if detail == ResponseDetail.FULL:
         return False
     status = str(context.get("research_status") or "")
@@ -2178,6 +2253,20 @@ def _should_skip_legacy_retrieve(context: Mapping[str, Any], *, detail: Response
         return False
     do_not_call = {str(value) for value in context.get("do_not_call") or []}
     return "krw_ontology_retrieve" in do_not_call
+
+
+def _release_missing_parts_from_context(context: Mapping[str, Any]) -> list[str]:
+    release_missing_markers = {"ticker_shard_missing", "ticker_shard_not_found"}
+    missing_parts = [
+        str(value)
+        for value in context.get("missing_parts") or []
+        if str(value) in release_missing_markers
+    ]
+    if context.get("missing_shards") and "ticker_shard_missing" not in missing_parts:
+        missing_parts.append("ticker_shard_missing")
+    if context.get("unknown_tickers") and "ticker_shard_not_found" not in missing_parts:
+        missing_parts.append("ticker_shard_not_found")
+    return missing_parts
 
 
 def _directness_guard_from_summary_payload(payload: Mapping[str, Any], *, topic: str | None) -> dict[str, Any]:
@@ -2281,6 +2370,11 @@ def _comparison_row(
 ) -> dict[str, Any]:
     evaluation = evaluation or {}
     if not items:
+        missing_reason = (
+            "ticker_shard_missing"
+            if evaluation.get("reason") == "ticker_shard_missing"
+            else "no_matching_ontology_objects"
+        )
         return {
             "comparison_key": comparison_key,
             "ticker": ticker,
@@ -2308,10 +2402,19 @@ def _comparison_row(
             "support_claim_count": evaluation.get("support_claim_count") or 0,
             "matched_required_facets": evaluation.get("matched_required_facets") or [],
             "missing_required_facets": evaluation.get("missing_required_facets") or [],
-            "why_tier": evaluation.get("why_tier") or "No matching ontology objects were returned for this comparison key.",
-            "caveats": ["No matching ontology objects were returned for this comparison key."],
+            "why_tier": evaluation.get("why_tier")
+            or (
+                "The company shard declared for this comparison key is missing from the active release."
+                if missing_reason == "ticker_shard_missing"
+                else "No matching ontology objects were returned for this comparison key."
+            ),
+            "caveats": [
+                "The company shard declared for this comparison key is missing from the active release."
+                if missing_reason == "ticker_shard_missing"
+                else "No matching ontology objects were returned for this comparison key."
+            ],
             "missing": True,
-            "missing_reason": "no_matching_ontology_objects",
+            "missing_reason": missing_reason,
         }
 
     item = _best_comparison_item(items, topic=topic)
@@ -2838,7 +2941,7 @@ def _markdown_catalog(payload: dict[str, Any]) -> str:
     lines = [
         "# Ontology Catalog",
         f"- Root: `{payload['root']}`",
-        f"- Index: `{payload['index_path']}`",
+        f"- Global spine: `{payload['global_spine_path']}`",
         f"- Companies: {', '.join(payload['companies']) or '(none)'}",
         f"- Documents returned: {payload['pagination']['count']}",
     ]

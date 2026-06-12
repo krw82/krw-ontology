@@ -1,17 +1,16 @@
-"""Filesystem path helpers for ontology data roots and agent indexes."""
+"""Filesystem path helpers for ontology data roots and v3 release runtimes."""
 
 from __future__ import annotations
 
 import os
 from pathlib import Path
 
-from krw_ontology.agent_index.builder import DEFAULT_INDEX_RELATIVE_PATH
-
 ONTOLOGY_ENV_ENV = "KRW_ONTOLOGY_ENV"
 ONTOLOGY_ROOT_ENV = "KRW_ONTOLOGY_ROOT"
 ONTOLOGY_RELEASE_ROOT_ENV = "KRW_ONTOLOGY_RELEASE_ROOT"
 ONTOLOGY_MANIFEST_PATH_ENV = "KRW_ONTOLOGY_MANIFEST_PATH"
-ONTOLOGY_INDEX_PATH_ENV = "KRW_ONTOLOGY_INDEX_PATH"
+ONTOLOGY_GLOBAL_SPINE_PATH_ENV = "KRW_ONTOLOGY_GLOBAL_SPINE_PATH"
+ONTOLOGY_SHARD_MANIFEST_PATH_ENV = "KRW_ONTOLOGY_SHARD_MANIFEST_PATH"
 DEFAULT_ONTOLOGY_ROOT = Path.home() / "krw-ontology-data"
 
 
@@ -38,19 +37,3 @@ def resolve_ontology_root(root: Path | str | None = None, *, fallback_to_cwd: bo
     if root is not None:
         return Path(root).expanduser().resolve()
     return configured_ontology_root(fallback_to_cwd=fallback_to_cwd)
-
-
-def resolve_agent_index_path(
-    root: Path | str | None = None,
-    index_path: Path | str | None = None,
-    *,
-    fallback_to_cwd: bool = True,
-) -> Path:
-    """Resolve the SQLite agent index path for an ontology root."""
-    if index_path is not None:
-        return Path(index_path).expanduser().resolve()
-    if root is None:
-        raw_index_path = os.environ.get(ONTOLOGY_INDEX_PATH_ENV)
-        if raw_index_path:
-            return Path(raw_index_path).expanduser().resolve()
-    return resolve_ontology_root(root, fallback_to_cwd=fallback_to_cwd) / DEFAULT_INDEX_RELATIVE_PATH

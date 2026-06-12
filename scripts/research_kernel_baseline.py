@@ -12,10 +12,12 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
 import time
 from typing import Any, Callable
 
+from krw_ontology.config.paths import ONTOLOGY_GLOBAL_SPINE_PATH_ENV, ONTOLOGY_RELEASE_ROOT_ENV
 from krw_ontology.mcp_server.tools import compare_tool, query_context_tool, retrieve_tool
 
 
@@ -71,11 +73,12 @@ SMOKE_CASES: list[dict[str, Any]] = [
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--root", default=None, help="Ontology data root.")
-    parser.add_argument("--index-path", default=None, help="Explicit agent_index.sqlite path.")
+    parser.add_argument("--release-root", default=None, help="v3 release root to read.")
+    parser.add_argument("--global-spine-path", default=None, help="Explicit v3 global_spine.sqlite path.")
     parser.add_argument("--output-prefix", default=None, help="Output path prefix without extension.")
     parser.add_argument("--limit-cases", type=int, default=None, help="Run only the first N cases.")
     args = parser.parse_args()
+    _configure_runtime_env(release_root=args.release_root, global_spine_path=args.global_spine_path)
 
     cases = SMOKE_CASES[: args.limit_cases] if args.limit_cases else SMOKE_CASES
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -85,10 +88,6 @@ def main() -> None:
     for case in cases:
         tool_name = str(case["tool"])
         kwargs = dict(case["kwargs"])
-        if args.root:
-            kwargs["root"] = args.root
-        if args.index_path:
-            kwargs["index_path"] = args.index_path
         started = time.perf_counter()
         status = "ok"
         error: str | None = None
@@ -146,6 +145,13 @@ def _tool(name: str) -> Callable[..., str]:
     if name == "compare":
         return compare_tool
     raise ValueError(f"Unsupported tool: {name}")
+
+
+def _configure_runtime_env(*, release_root: str | None, global_spine_path: str | None) -> None:
+    if release_root:
+        os.environ[ONTOLOGY_RELEASE_ROOT_ENV] = str(Path(release_root).expanduser().resolve())
+    if global_spine_path:
+        os.environ[ONTOLOGY_GLOBAL_SPINE_PATH_ENV] = str(Path(global_spine_path).expanduser().resolve())
 
 
 def _summary(records: list[dict[str, Any]]) -> dict[str, Any]:

@@ -3,8 +3,8 @@
 이 문서는 `krw-ontology`의 품질 repair, 일반 queue, dev index publish 흐름을 운영자 기준으로 정리한다.
 
 Release/index 구현 계약과 개발 절차는
-[`production-release-index-development-guide.md`](production-release-index-development-guide.md)를
-source of truth로 사용한다.
+[`v3-final-production-master-development-guide.md`](v3-final-production-master-development-guide.md)를
+source of truth로 사용한다. 일반 운영자의 최종 권장 명령은 `release force`다.
 
 핵심 원칙:
 
@@ -24,8 +24,8 @@ krw-ontology quality repair run
 krw-ontology quality repair watch
 krw-ontology quality repair log --follow
 krw-ontology queue status --compact
-krw-ontology release publish-dev
-krw-ontology release publish-dev-watch
+krw-ontology release force
+krw-ontology release watch
 ```
 
 중요한 구분:
@@ -33,7 +33,7 @@ krw-ontology release publish-dev-watch
 ```text
 quality repair = running artifact 또는 quality queue 상태를 보완
 general queue = docs_missing 같은 티커 재수집/full_refresh 처리
-release publish-dev = running-root를 새 dev release로 materialize하고 전체 index를 검증한 뒤 dev/current로 promote
+release force = running-root를 새 immutable v3 release로 만들고 검증한 뒤 dev/current로 promote
 ```
 
 ## 2. Quality repair
@@ -358,12 +358,12 @@ Stop requested: yes
 
 이면 worker가 새 job을 잡지 않는다. 필요하면 stale 정리 후 다시 시작한다.
 
-## 6. Dev index publish
+## 6. Dev v3 release 생성
 
 ### 6.1 기본 실행
 
 ```bash
-krw-ontology release publish-dev
+krw-ontology release force
 ```
 
 기본 동작:
@@ -372,8 +372,9 @@ krw-ontology release publish-dev
 background worker 시작
 configured running-root를 읽음
 running-root artifact를 새 dev candidate release로 materialize
-candidate 안에서 monolith와 shard index 생성
-manifest v2와 verification report 작성
+candidate 안에서 company shard와 spine fragment 생성 또는 cache 재사용
+global_spine.sqlite와 shard_manifest.json 생성
+manifest v3와 verification report 작성
 검증 성공 후 dev/current atomic promote
 실패 candidate는 dev/failed/로 격리
 ```
@@ -382,59 +383,66 @@ manifest v2와 verification report 작성
 
 ```text
 running-root는 mutable source이고 dev/current는 immutable serving pointer다.
-publish-dev는 current를 직접 rebuild하지 않는다.
---no-build-index는 허용되지 않는다.
+release force는 current를 직접 rebuild하지 않는다.
+force는 새 release 생성을 강제하지만 valid cache는 사용할 수 있다.
+cache를 전부 우회하려면 명시적으로 --no-cache를 사용한다.
 ```
 
 내부 의미:
 
 ```text
 materialize running-root -> releases/dev/<release-id>
-build_agent_index(releases/dev/<release-id>)
-write manifest v2
-verify release + smoke + ranking
+build/reuse indexes/companies/<TICKER>.sqlite
+build/reuse indexes/fragments/spine/<TICKER>.sqlite
+merge indexes/global_spine.sqlite
+write manifest v3
+verify release + topology + smoke
 promote releases/dev/current -> <release-id>
 ```
 
 출력 예:
 
 ```text
-Started dev publish worker pid=12345
+Started release worker pid=12345
 release_id: 20260603_231500
+env: dev
 source_root: /Users/.../krw-ontology-data-running
 release_root: /Users/.../krw-ontology-data/releases/dev/20260603_231500
-index_path: /Users/.../releases/dev/20260603_231500/indexes/agent_index.sqlite
-log: /Users/.../releases/dev/20260603_231500/logs/publish-dev.log
+global_spine: /Users/.../releases/dev/20260603_231500/indexes/global_spine.sqlite
+log: /Users/.../releases/dev/20260603_231500/logs/release-build.log
 progress: /Users/.../releases/dev/20260603_231500/indexes/build_progress.jsonl
-watch: krw-ontology release publish-dev-watch 20260603_231500
+watch: krw-ontology release watch 20260603_231500
 ```
 
 ### 6.2 Foreground 실행
 
 ```bash
-krw-ontology release publish-dev --foreground
+krw-ontology release force --foreground
 ```
 
 디버깅용이다. 일반 운영에서는 기본 background를 사용한다.
 
-### 6.3 Dry run
+### 6.3 실행 전 plan
 
 ```bash
-krw-ontology release publish-dev --dry-run
+krw-ontology release plan
 ```
+
+이 명령은 source와 cache를 읽어 dirty/cached ticker와 build DAG를 보여주지만
+release output은 쓰지 않는다.
 
 ### 6.4 상태 확인
 
-latest dev publish release:
+현재 dev current와 latest worker:
 
 ```bash
-krw-ontology release publish-dev-status
+krw-ontology release status
 ```
 
 특정 release:
 
 ```bash
-krw-ontology release publish-dev-status 20260603_231500
+krw-ontology release inspect 20260603_231500
 ```
 
 ### 6.5 로그 확인
@@ -442,19 +450,13 @@ krw-ontology release publish-dev-status 20260603_231500
 latest:
 
 ```bash
-krw-ontology release publish-dev-watch
+krw-ontology release watch
 ```
 
 특정 release:
 
 ```bash
-krw-ontology release publish-dev-watch 20260603_231500
-```
-
-follow 없이 tail만:
-
-```bash
-krw-ontology release publish-dev-watch 20260603_231500 --no-follow
+krw-ontology release watch 20260603_231500
 ```
 
 progress file:
@@ -466,51 +468,51 @@ progress file:
 worker log:
 
 ```text
-<dev-release-root>/logs/publish-dev.log
+<dev-release-root>/logs/release-build.log
 ```
 
-## 7. finalize-dev와 publish-dev의 차이
+## 7. force와 no-cache의 차이
 
-`release finalize-dev`:
+`release force`:
 
 ```text
-이미 준비된 dev release directory를 finalize한다.
-prepared release workflow용이다.
-release id를 반드시 명시하거나 publish config에서 non-current prepared release를 찾아야 한다.
-dev/current와 같은 active release를 직접 finalize하지 않는다.
+항상 새 immutable release를 만든다.
+변경되지 않은 company shard와 spine fragment cache는 재사용할 수 있다.
 ```
 
-`release publish-dev`:
+`release force --no-cache`:
 
 ```text
-running-root를 읽어서 dev release index를 만들고 dev/current로 promote한다.
-일반 운영자가 쓰는 기본 명령이다.
+항상 새 immutable release를 만든다.
+company shard와 spine fragment cache read를 우회하고 source에서 다시 계산한다.
 ```
 
 일반 운영에서는 보통 이 명령을 쓴다.
 
 ```bash
-krw-ontology release publish-dev
+krw-ontology release force
 ```
 
-`finalize-dev`는 빈 release, active current, `--no-build-index`를 모두 거부한다.
-prepared candidate가 없다면 `release publish-dev` 또는 `release publish`를 사용한다.
+`--no-cache`는 cache 손상 조사, schema invalidation 검증, cold build baseline에서만
+사용한다.
 
 ## 8. Prod 반영
 
-dev 확인 후 prod materialize:
+dev 확인:
 
 ```bash
-krw-ontology release materialize-prod <release-id>
+krw-ontology release startup-check --env dev
+krw-ontology quality check --env dev
 ```
 
-prod 서버 publish:
+prod 서버 publish는 configured dev/current를 기본으로 사용하고 delta upload를 기본으로
+한다.
 
 ```bash
-krw-ontology prod publish
+krw-ontology prod publish-dev
 ```
 
-`prod publish`는 운영 current를 바꾸는 명령이므로 foreground 유지가 안전하다.
+quality check는 자동 prod gate가 아니다. 사용자가 원할 때 실행한다.
 
 ## 9. 자주 보는 문제
 
@@ -526,10 +528,11 @@ input root에 companies artifact가 없음
 권장:
 
 ```bash
-krw-ontology release publish-dev
+krw-ontology release plan
+krw-ontology release force
 ```
 
-이 명령은 running-root를 input으로 사용한다.
+이 명령들은 configured running-root를 input으로 사용한다.
 
 ### 9.2 `Worker: stopped`인데 pending이 남음
 
@@ -603,7 +606,8 @@ krw-ontology queue watch
 dev index publish:
 
 ```bash
-krw-ontology release publish-dev
-krw-ontology release publish-dev-watch
-krw-ontology release publish-dev-status
+krw-ontology release plan
+krw-ontology release force
+krw-ontology release watch
+krw-ontology release status
 ```

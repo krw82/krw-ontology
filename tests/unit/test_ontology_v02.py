@@ -6,7 +6,8 @@ import asyncio
 from collections import Counter
 from pathlib import Path
 
-from krw_ontology.agent_index import OntologyStore, build_agent_index
+from krw_ontology.agent_index.store import OntologyStore
+from krw_ontology.agent_index.builder import build_agent_index as _build_legacy_agent_index
 from krw_ontology.factor_taxonomy import canonical_factor_key, factor_spec, normalize_sector_hint
 from krw_ontology.pipeline.stages.build_company_context import build_company_context
 from krw_ontology.pipeline.stages.build_indexes import build_indexes
@@ -19,6 +20,11 @@ from krw_ontology.pipeline.stages.validate_ontology import run_validate_ontology
 from krw_ontology.schema.objects import SCHEMA_VERSION
 from krw_ontology.utils.io import atomic_write_json, read_jsonl, write_jsonl
 from krw_ontology.validators.schema_validator import validate_schema
+
+
+def build_agent_index(*args, **kwargs):
+    kwargs.setdefault("allow_internal_legacy_builder", True)
+    return _build_legacy_agent_index(*args, **kwargs)
 
 
 def test_global_factor_taxonomy_canonicalizes_factor_hints_independent_of_sector():

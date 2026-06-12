@@ -23,7 +23,7 @@ DEFAULT_ALERTMANAGER_TEMPLATE_PATH = (
 OBSERVABILITY_DOCTOR_REPORT_FORMAT = "krw-ontology-observability-doctor/v1"
 PROMETHEUS_ALERT_ENV_VARS = {
     "mcp_down_for": "KRW_PROMETHEUS_MCP_DOWN_FOR",
-    "index_missing_for": "KRW_PROMETHEUS_INDEX_MISSING_FOR",
+    "global_spine_missing_for": "KRW_PROMETHEUS_GLOBAL_SPINE_MISSING_FOR",
     "hot_swap_stuck_for": "KRW_PROMETHEUS_HOT_SWAP_STUCK_FOR",
     "hot_swap_retired_age_seconds": "KRW_PROMETHEUS_HOT_SWAP_RETIRED_AGE_SECONDS",
     "retired_leases_for": "KRW_PROMETHEUS_RETIRED_LEASES_FOR",
@@ -34,7 +34,7 @@ PROMETHEUS_ALERT_ENV_VARS = {
 }
 PROMETHEUS_REQUIRED_METRICS = {
     "krw_ontology_mcp_health_ok",
-    "krw_ontology_mcp_index_present",
+    "krw_ontology_mcp_global_spine_present",
     "krw_ontology_mcp_release_documents",
     "krw_ontology_mcp_release_objects",
     "krw_ontology_mcp_store_rotation_pending",
@@ -150,7 +150,7 @@ def render_prometheus_alerts_config(
     )
 
     rules["KRWOntologyMCPDown"]["for"] = values["mcp_down_for"]
-    rules["KRWOntologyMCPIndexMissing"]["for"] = values["index_missing_for"]
+    rules["KRWOntologyMCPGlobalSpineMissing"]["for"] = values["global_spine_missing_for"]
     rules["KRWOntologyMCPHotSwapStuck"]["for"] = values["hot_swap_stuck_for"]
     rules["KRWOntologyMCPHotSwapStuck"]["expr"] = (
         "krw_ontology_mcp_store_rotation_pending == 1 "
@@ -331,7 +331,7 @@ def _prometheus_alert_thresholds(
 ) -> tuple[dict[str, str | int], dict[str, str]]:
     defaults: dict[str, str | int] = {
         "mcp_down_for": "2m",
-        "index_missing_for": "1m",
+        "global_spine_missing_for": "1m",
         "hot_swap_stuck_for": "5m",
         "hot_swap_retired_age_seconds": 300,
         "retired_leases_for": "15m",
@@ -379,7 +379,7 @@ def _prometheus_alert_rule_map(payload: dict[str, Any]) -> dict[str, dict[str, A
                 rules[alert_name] = rule
     required = {
         "KRWOntologyMCPDown",
-        "KRWOntologyMCPIndexMissing",
+        "KRWOntologyMCPGlobalSpineMissing",
         "KRWOntologyMCPHotSwapStuck",
         "KRWOntologyMCPRetiredLeasesPresent",
         "KRWOntologyMCPExcessiveRotations",

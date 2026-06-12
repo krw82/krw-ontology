@@ -1,11 +1,18 @@
 # Production release and index development guide
 
+> 2026-06-12 historical-only notice: 이 문서는 v2 `monolith-and-shards` 구현
+> 계약과 이력만 기록한다. 현재 production 구현의 source of truth가 아니며,
+> 새 코드나 운영 절차의 근거로 사용하지 않는다. 최종 기준은
+> [`v3-final-production-master-development-guide.md`](v3-final-production-master-development-guide.md)
+> 이다. v3는 v1/v2 호환 없이 `global_spine.sqlite`와 company shards를
+> production 기본 artifact로 사용하고, monolith는 production에서 제외한다.
+
 이 문서는 `krw-ontology`의 release transaction, agent index build, shard serving,
 CLI, 검증, 운영 관측성을 구현하고 변경할 때 사용하는 개발 기준 문서다.
 
 상세 설계 배경과 대안 검토는
 [`production-release-index-architecture.md`](production-release-index-architecture.md)에
-남긴다. 이 문서는 현재 구현된 계약과 개발 절차를 source of truth로 사용한다.
+남긴다. 이 문서는 v2 당시 구현 계약과 개발 절차를 역사 기록으로만 사용한다.
 
 기준일: 2026-06-11
 

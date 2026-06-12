@@ -156,22 +156,38 @@ class RepairJob:
 @dataclass
 class RepairPlan:
     plan_id: str
-    source_index_path: str
+    global_spine_path: str
     release_label: str
     min_docs: int
     job_ids: list[str]
     summary: dict[str, int]
+    release_root: str | None = None
+    release_id: str | None = None
+    release_format: str | None = None
+    release_manifest_sha256: str | None = None
+    source_manifest_sha256: str | None = None
+    global_spine_sha256: str | None = None
+    shard_manifest_sha256: str | None = None
+    quality_plan_format: str = "krw-ontology-quality-plan/v3"
     created_at: str = field(default_factory=utc_now)
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "RepairPlan":
         return cls(
             plan_id=payload["plan_id"],
-            source_index_path=payload["source_index_path"],
+            global_spine_path=payload["global_spine_path"],
             release_label=payload.get("release_label", ""),
             min_docs=int(payload.get("min_docs", 5)),
             job_ids=list(payload.get("job_ids") or []),
             summary={str(k): int(v) for k, v in dict(payload.get("summary") or {}).items()},
+            release_root=payload.get("release_root"),
+            release_id=payload.get("release_id"),
+            release_format=payload.get("release_format"),
+            release_manifest_sha256=payload.get("release_manifest_sha256"),
+            source_manifest_sha256=payload.get("source_manifest_sha256"),
+            global_spine_sha256=payload.get("global_spine_sha256"),
+            shard_manifest_sha256=payload.get("shard_manifest_sha256"),
+            quality_plan_format=payload.get("quality_plan_format") or "krw-ontology-quality-plan/v3",
             created_at=payload.get("created_at") or utc_now(),
         )
 

@@ -21,12 +21,14 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
 import re
 import statistics
 import time
 from typing import Any, Mapping
 
+from krw_ontology.config.paths import ONTOLOGY_GLOBAL_SPINE_PATH_ENV, ONTOLOGY_RELEASE_ROOT_ENV
 from krw_ontology.mcp_server.tools import query_context_tool, query_tool, trace_tool
 
 
@@ -55,8 +57,8 @@ class PromptCase:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--prompts", default="/tmp/krw_company_suggested_prompts_by_ticker.md")
-    parser.add_argument("--index-path", default="~/krw-ontology-data/indexes/agent_index.sqlite")
-    parser.add_argument("--root", default=None)
+    parser.add_argument("--release-root", default=None, help="v3 release root to read.")
+    parser.add_argument("--global-spine-path", default=None, help="Explicit v3 global_spine.sqlite path.")
     parser.add_argument("--limit", type=int, default=30)
     parser.add_argument("--offset", type=int, default=0)
     parser.add_argument("--limit-results", type=int, default=10)
@@ -64,6 +66,7 @@ def main() -> None:
     parser.add_argument("--research-mode", choices=["fast", "standard", "deep"], default="standard")
     parser.add_argument("--output-prefix", default=None)
     args = parser.parse_args()
+    configure_runtime_env(release_root=args.release_root, global_spine_path=args.global_spine_path)
 
     cases = parse_prompt_cases(Path(args.prompts))[args.offset :]
     if args.limit is not None:
@@ -83,8 +86,6 @@ def main() -> None:
                 case,
                 ordinal=ordinal,
                 total=len(cases),
-                root=args.root,
-                index_path=args.index_path,
                 limit_results=args.limit_results,
                 max_traces=args.max_traces,
                 research_mode=args.research_mode,
@@ -144,13 +145,18 @@ def parse_prompt_cases(path: Path) -> list[PromptCase]:
     return cases
 
 
+def configure_runtime_env(*, release_root: str | None, global_spine_path: str | None) -> None:
+    if release_root:
+        os.environ[ONTOLOGY_RELEASE_ROOT_ENV] = str(Path(release_root).expanduser().resolve())
+    if global_spine_path:
+        os.environ[ONTOLOGY_GLOBAL_SPINE_PATH_ENV] = str(Path(global_spine_path).expanduser().resolve())
+
+
 def run_case(
     case: PromptCase,
     *,
     ordinal: int,
     total: int,
-    root: str | None,
-    index_path: str,
     limit_results: int,
     max_traces: int,
     research_mode: str,
@@ -159,10 +165,7 @@ def run_case(
         "question": case.question,
         "ticker": case.ticker,
         "limit_results": limit_results,
-        "index_path": index_path,
     }
-    if root:
-        kwargs["root"] = root
 
     started = time.perf_counter()
     tool_calls: list[dict[str, Any]] = []
@@ -193,7 +196,6 @@ def run_case(
                 topic=targeted_query_topic(case.question, latest_requested=latest_requested),
                 ticker=case.ticker,
                 document_type="10-Q" if latest_requested else None,
-                index_path=index_path,
                 limit=min(limit_results, 5),
                 response_detail="compact",
             )
@@ -214,7 +216,7 @@ def run_case(
                     trace_object_ids = follow_up_trace_ids[:trace_budget_for_mode("standard", max_traces, context)]
         for trace_object_id in trace_object_ids:
             call_start = time.perf_counter()
-            trace_raw = trace_tool(object_id=trace_object_id, index_path=index_path)
+            trace_raw = trace_tool(object_id=trace_object_id)
             tool_calls.append(
                 {
                     "tool": "krw_ontology_trace",

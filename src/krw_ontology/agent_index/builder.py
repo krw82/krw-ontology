@@ -43,7 +43,9 @@ from krw_ontology.utils.io import read_jsonl
 logger = logging.getLogger("krw_ontology")
 
 AGENT_INDEX_SCHEMA_VERSION = "1.0.0-alpha.3"
-AGENT_INDEX_BUILDER_VERSION = "agent-index-builder/v2"
+SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION = "source-artifact-sqlite-builder/v1"
+AGENT_INDEX_BUILDER_VERSION = SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION
+SOURCE_ARTIFACT_SQLITE_BUILD_STAGE = "source_artifact_sqlite"
 DEFAULT_INDEX_RELATIVE_PATH = Path("indexes") / "agent_index.sqlite"
 INDEX_BUILD_PLAN_FORMAT_VERSION = "krw-agent-index-build-plan/v1"
 SOURCE_ARTIFACT_MANIFEST_FORMAT_VERSION = "krw-agent-index-source-manifest/v1"
@@ -53,6 +55,14 @@ INDEX_COMPANY_CACHE_FORMAT_VERSION = "krw-agent-index-company-cache/v1"
 INDEX_LAYOUT_VERSION = "krw-agent-index-layout/v1"
 SUPPORTED_INDEX_LAYOUTS = frozenset({"monolith", "monolith-and-shards", "shards"})
 RELEASE_ENV_NAMES = frozenset({"dev", "staging", "prod"})
+LEGACY_BUILDER_DISABLED_MESSAGE = (
+    "legacy agent_index.sqlite builder is disabled by default; "
+    "use v3 global spine + company shard builders"
+)
+LEGACY_SHARD_FACADE_DISABLED_MESSAGE = (
+    "legacy v2 shard/catalog facade is disabled by default; "
+    "use v3 global spine + company shard builders"
+)
 
 
 @dataclass(frozen=True)
@@ -435,10 +445,10 @@ def _env_int(name: str, default: int, *, min_value: int = 0) -> int:
         value = int(str(raw).strip())
     except ValueError:
         logger.warning(
-            "build_agent_index: ignoring invalid integer env %s=%r",
+            "source_artifact_sqlite: ignoring invalid integer env %s=%r",
             name,
             raw,
-            extra={"stage": "build_agent_index"},
+            extra={"stage": SOURCE_ARTIFACT_SQLITE_BUILD_STAGE},
         )
         return default
     return max(min_value, value)
@@ -452,10 +462,10 @@ def _env_float(name: str, default: float, *, min_value: float = 0.0) -> float:
         value = float(str(raw).strip())
     except ValueError:
         logger.warning(
-            "build_agent_index: ignoring invalid float env %s=%r",
+            "source_artifact_sqlite: ignoring invalid float env %s=%r",
             name,
             raw,
-            extra={"stage": "build_agent_index"},
+            extra={"stage": SOURCE_ARTIFACT_SQLITE_BUILD_STAGE},
         )
         return default
     return max(min_value, value)
@@ -478,15 +488,16 @@ def _build_resource_settings(index_path: Path | None = None) -> dict[str, Any]:
     synchronous = str(os.getenv("KRW_SQLITE_SYNCHRONOUS") or "OFF").strip().upper()
     if synchronous not in _SQLITE_SYNCHRONOUS_VALUES:
         logger.warning(
-            "build_agent_index: ignoring invalid KRW_SQLITE_SYNCHRONOUS=%r",
+            "source_artifact_sqlite: ignoring invalid KRW_SQLITE_SYNCHRONOUS=%r",
             synchronous,
-            extra={"stage": "build_agent_index"},
+            extra={"stage": SOURCE_ARTIFACT_SQLITE_BUILD_STAGE},
         )
         synchronous = "OFF"
 
     cache_mib = _env_int("KRW_SQLITE_CACHE_MIB", default_cache_mib, min_value=1)
     mmap_gib = _env_float("KRW_SQLITE_MMAP_GIB", default_mmap_gib, min_value=0.0)
     return {
+        "build_stage": SOURCE_ARTIFACT_SQLITE_BUILD_STAGE,
         "resource_profile": profile,
         "sqlite_synchronous": synchronous,
         "sqlite_cache_mib": cache_mib,
@@ -566,6 +577,7 @@ class _BuildProgressLogger:
         shm_path = Path(str(self.index_path) + "-shm")
         payload = {
             "event": "build_phase",
+            "stage": self.settings.get("build_stage") or SOURCE_ARTIFACT_SQLITE_BUILD_STAGE,
             "phase": phase,
             "ts": datetime.now(timezone.utc).isoformat(),
             "pid": os.getpid(),
@@ -592,10 +604,10 @@ def _elapsed(started_at: float) -> float:
 
 def _log_build_phase(phase: str, **fields: Any) -> None:
     rendered = " ".join(f"{key}={value}" for key, value in fields.items())
-    message = f"build_agent_index: {phase}"
+    message = f"source_artifact_sqlite: {phase}"
     if rendered:
         message = f"{message} {rendered}"
-    logger.info(message, extra={"stage": "build_agent_index"})
+    logger.info(message, extra={"stage": SOURCE_ARTIFACT_SQLITE_BUILD_STAGE})
     if _ACTIVE_BUILD_PROGRESS_LOGGER is not None:
         _ACTIVE_BUILD_PROGRESS_LOGGER.write(phase, fields)
 
@@ -613,13 +625,16 @@ def build_agent_index(
     workers: int | None = None,
     layout: str = "monolith-and-shards",
     source_manifest_path: Path | None = None,
+    allow_internal_legacy_builder: bool = False,
 ) -> dict[str, Any]:
-    """Build a global SQLite agent index from all discovered artifact indexes.
+    """Build a legacy global SQLite agent index from discovered artifact indexes.
 
-    The public builder never removes the serving index before a replacement is
-    fully built and verified. It writes to a temporary SQLite file in the same
-    directory, validates it, then atomically replaces the target database.
+    Production builds must use the v3 global spine + company shard release
+    builders. This legacy materializer remains only as an internal fixture and
+    as the reusable table-writer implementation behind v3 company shard builds.
     """
+    if not allow_internal_legacy_builder:
+        raise ValueError(LEGACY_BUILDER_DISABLED_MESSAGE)
     root = root.resolve()
     published_index_path = (index_path or root / DEFAULT_INDEX_RELATIVE_PATH).resolve()
     _assert_not_active_release_path(root, "root")
@@ -632,6 +647,7 @@ def build_agent_index(
         workers=workers,
         layout=layout,
         source_manifest_path=source_manifest_path,
+        allow_internal_legacy_builder=True,
     )
     _assert_not_active_release_path(plan.cache_root, "cache_root")
     progress_log_path = str(plan.build_settings.get("progress_log_path") or "")
@@ -809,6 +825,9 @@ def verify_agent_index(index_path: Path) -> dict[str, Any]:
                     schema_version = build_metadata.get("agent_index_schema_version") or build_metadata.get("schema_version")
                     if schema_version != AGENT_INDEX_SCHEMA_VERSION:
                         errors.append("agent_index_schema_version_mismatch")
+                    source_artifact_schema_version = build_metadata.get("source_artifact_sqlite_schema_version")
+                    if source_artifact_schema_version not in (None, AGENT_INDEX_SCHEMA_VERSION):
+                        errors.append("source_artifact_sqlite_schema_version_mismatch")
     except sqlite3.Error as exc:
         errors.append(f"sqlite_error:{exc}")
     return {
@@ -824,8 +843,11 @@ def build_index_shards(
     index_path: Path,
     *,
     output_dir: Path | None = None,
+    allow_internal_legacy_builder: bool = False,
 ) -> dict[str, Any]:
     """Build and publish global catalog/company shards from a verified monolith."""
+    if not allow_internal_legacy_builder:
+        raise ValueError(LEGACY_SHARD_FACADE_DISABLED_MESSAGE)
     source_index_path = index_path.expanduser().resolve()
     target_output_dir = (output_dir or source_index_path.parent).expanduser().resolve()
     stage = _stage_index_shards(
@@ -846,8 +868,11 @@ def verify_index_shards(
     global_topics_path: Path | None = None,
     companies_dir: Path | None = None,
     monolith_index_path: Path | None = None,
+    allow_internal_legacy_builder: bool = False,
 ) -> dict[str, Any]:
     """Verify a shard-aware index directory."""
+    if not allow_internal_legacy_builder:
+        raise ValueError(LEGACY_SHARD_FACADE_DISABLED_MESSAGE)
     resolved_index_dir = index_dir.expanduser().resolve()
     resolved_catalog_path = (catalog_path or resolved_index_dir / "global_catalog.sqlite").expanduser().resolve()
     resolved_global_topics_path = (global_topics_path or resolved_index_dir / "global_topics.sqlite").expanduser().resolve()
@@ -1378,7 +1403,11 @@ def _stage_index_shards(
                 source_build_metadata=source_build_metadata,
             )
 
-        verification = verify_index_shards(stage_root, monolith_index_path=source_index_path)
+        verification = verify_index_shards(
+            stage_root,
+            monolith_index_path=source_index_path,
+            allow_internal_legacy_builder=True,
+        )
         if not verification["ok"]:
             errors = ", ".join(verification["errors"])
             raise RuntimeError(f"index shard layout failed verification: {errors}")
@@ -1920,7 +1949,9 @@ def write_source_artifact_manifest(
         "format": SOURCE_ARTIFACT_MANIFEST_FORMAT_VERSION,
         "root": str(resolved_root),
         "builder_code_version": AGENT_INDEX_BUILDER_VERSION,
+        "source_artifact_sqlite_builder_version": AGENT_INDEX_BUILDER_VERSION,
         "agent_index_schema_version": AGENT_INDEX_SCHEMA_VERSION,
+        "source_artifact_sqlite_schema_version": AGENT_INDEX_SCHEMA_VERSION,
         "ontology_schema_version": SCHEMA_VERSION,
         "retrieval_text_builder_version": RETRIEVAL_TEXT_BUILDER_VERSION,
         "company_topic_builder_version": COMPANY_TOPIC_BUILDER_VERSION,
@@ -2136,13 +2167,14 @@ def plan_agent_index(
     layout: str = "monolith-and-shards",
     workers: int | None = None,
     source_manifest_path: Path | None = None,
+    allow_internal_legacy_builder: bool = False,
 ) -> IndexBuildPlan:
-    """Create a deterministic build plan for the agent index.
+    """Create a deterministic build plan for the legacy agent index.
 
-    The plan is intentionally independent of mtimes. Cache keys are derived
-    from indexed input bytes plus builder/schema versions, so later fragment
-    compilation can reuse the same correctness boundary.
+    Normal production planning must use plan_spine_shard_release_outputs().
     """
+    if not allow_internal_legacy_builder:
+        raise ValueError(LEGACY_BUILDER_DISABLED_MESSAGE)
     resolved_root = root.expanduser().resolve()
     resolved_index_path = (index_path or resolved_root / DEFAULT_INDEX_RELATIVE_PATH).expanduser().resolve()
     resolved_layout = _normalize_index_layout(layout)
@@ -2267,7 +2299,9 @@ def _company_cache_input_hash(ticker: str, artifact_cache_keys: Sequence[str]) -
         "ticker": ticker,
         "artifact_cache_keys": list(artifact_cache_keys),
         "builder_code_version": AGENT_INDEX_BUILDER_VERSION,
+        "source_artifact_sqlite_builder_version": AGENT_INDEX_BUILDER_VERSION,
         "agent_index_schema_version": AGENT_INDEX_SCHEMA_VERSION,
+        "source_artifact_sqlite_schema_version": AGENT_INDEX_SCHEMA_VERSION,
         "ontology_schema_version": SCHEMA_VERSION,
         "retrieval_text_builder_version": RETRIEVAL_TEXT_BUILDER_VERSION,
         "company_topic_builder_version": COMPANY_TOPIC_BUILDER_VERSION,
@@ -2466,7 +2500,9 @@ def _artifact_fragment_cache_key(content_hash: str) -> str:
         "fragment_cache_format_version": INDEX_FRAGMENT_CACHE_FORMAT_VERSION,
         "content_hash": content_hash,
         "builder_code_version": AGENT_INDEX_BUILDER_VERSION,
+        "source_artifact_sqlite_builder_version": AGENT_INDEX_BUILDER_VERSION,
         "agent_index_schema_version": AGENT_INDEX_SCHEMA_VERSION,
+        "source_artifact_sqlite_schema_version": AGENT_INDEX_SCHEMA_VERSION,
         "ontology_schema_version": SCHEMA_VERSION,
         "retrieval_text_builder_version": RETRIEVAL_TEXT_BUILDER_VERSION,
         "company_topic_builder_version": COMPANY_TOPIC_BUILDER_VERSION,
@@ -2496,7 +2532,9 @@ def _expected_fragment_metadata(
         "cache_key": cache_key,
         "content_hash": content_hash,
         "builder_code_version": AGENT_INDEX_BUILDER_VERSION,
+        "source_artifact_sqlite_builder_version": AGENT_INDEX_BUILDER_VERSION,
         "agent_index_schema_version": AGENT_INDEX_SCHEMA_VERSION,
+        "source_artifact_sqlite_schema_version": AGENT_INDEX_SCHEMA_VERSION,
         "ontology_schema_version": SCHEMA_VERSION,
         "retrieval_text_builder_version": RETRIEVAL_TEXT_BUILDER_VERSION,
         "company_topic_builder_version": COMPANY_TOPIC_BUILDER_VERSION,
@@ -2626,7 +2664,9 @@ def verify_index_fragment(
         required_versions = {
             "fragment_cache_format_version": INDEX_FRAGMENT_CACHE_FORMAT_VERSION,
             "builder_code_version": AGENT_INDEX_BUILDER_VERSION,
+            "source_artifact_sqlite_builder_version": AGENT_INDEX_BUILDER_VERSION,
             "agent_index_schema_version": AGENT_INDEX_SCHEMA_VERSION,
+            "source_artifact_sqlite_schema_version": AGENT_INDEX_SCHEMA_VERSION,
             "ontology_schema_version": SCHEMA_VERSION,
             "retrieval_text_builder_version": RETRIEVAL_TEXT_BUILDER_VERSION,
             "company_topic_builder_version": COMPANY_TOPIC_BUILDER_VERSION,
@@ -2776,6 +2816,7 @@ def gc_index_fragment_cache(
             cache_root=resolved_cache_root,
             layout=layout,
             workers=workers,
+            allow_internal_legacy_builder=True,
         )
         referenced_fragments = tuple(item.fragment_path for item in plan.items)
 
@@ -3187,7 +3228,11 @@ def _build_agent_index_direct(
     root = root.resolve()
     index_path = index_path.resolve()
     published_index_path = (published_index_path or index_path).resolve()
-    plan = plan or plan_agent_index(root, index_path=published_index_path)
+    plan = plan or plan_agent_index(
+        root,
+        index_path=published_index_path,
+        allow_internal_legacy_builder=True,
+    )
     if force and index_path.exists():
         index_path.unlink()
     index_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3362,7 +3407,9 @@ def _build_agent_index_direct(
                         {
                             "schema_version": AGENT_INDEX_SCHEMA_VERSION,
                             "agent_index_schema_version": AGENT_INDEX_SCHEMA_VERSION,
+                            "source_artifact_sqlite_schema_version": AGENT_INDEX_SCHEMA_VERSION,
                             "builder_code_version": AGENT_INDEX_BUILDER_VERSION,
+                            "source_artifact_sqlite_builder_version": AGENT_INDEX_BUILDER_VERSION,
                             "ontology_schema_version": SCHEMA_VERSION,
                             "ontology_registry_version": _registry_version(conn),
                             "retrieval_text_builder_version": RETRIEVAL_TEXT_BUILDER_VERSION,
@@ -3412,11 +3459,11 @@ def _build_agent_index_direct(
         )
 
         logger.info(
-            "build_agent_index: indexed %d documents, %d objects, %d edges",
+            "source_artifact_sqlite: indexed %d documents, %d objects, %d edges",
             totals["documents"],
             totals["objects"],
             totals["edges"],
-            extra={"stage": "build_agent_index"},
+            extra={"stage": SOURCE_ARTIFACT_SQLITE_BUILD_STAGE},
         )
         return {
             "index_path": index_path,
@@ -3440,6 +3487,43 @@ def _build_agent_index_direct(
     finally:
         conn.close()
         _ACTIVE_BUILD_PROGRESS_LOGGER = previous_progress_logger
+
+
+def _plan_artifact_index_inputs(
+    root: Path,
+    *,
+    index_path: Path,
+    cache_root: Path | None = None,
+    workers: int | None = None,
+    source_manifest_path: Path | None = None,
+) -> IndexBuildPlan:
+    """Plan source artifact inputs for v3 shard materialization."""
+    return plan_agent_index(
+        root,
+        index_path=index_path,
+        cache_root=cache_root,
+        workers=workers,
+        layout="shards",
+        source_manifest_path=source_manifest_path,
+        allow_internal_legacy_builder=True,
+    )
+
+
+def _build_artifact_index_sqlite(
+    root: Path,
+    *,
+    index_path: Path,
+    published_index_path: Path,
+    plan: IndexBuildPlan,
+) -> dict[str, Any]:
+    """Materialize one SQLite database from a prepared artifact input plan."""
+    return _build_agent_index_direct(
+        root,
+        index_path=index_path,
+        published_index_path=published_index_path,
+        force=True,
+        plan=plan,
+    )
 
 
 def discover_artifact_indexes(root: Path) -> list[Path]:
@@ -3494,9 +3578,9 @@ def _checkpoint_wal(
         conn.execute(f"PRAGMA wal_checkpoint({mode})").fetchall()
     except sqlite3.OperationalError as exc:
         logger.debug(
-            "build_agent_index: WAL checkpoint skipped: %s",
+            "source_artifact_sqlite: WAL checkpoint skipped: %s",
             exc,
-            extra={"stage": "build_agent_index"},
+            extra={"stage": SOURCE_ARTIFACT_SQLITE_BUILD_STAGE},
         )
 
 

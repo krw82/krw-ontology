@@ -169,8 +169,8 @@
           "refId": "A"
         },
         {
-          "expr": "krw_ontology_mcp_global_topics{env=\"$env\"}",
-          "legendFormat": "global topics",
+          "expr": "krw_ontology_mcp_global_topic_spine_rows{env=\"$env\"}",
+          "legendFormat": "global topic spine",
           "refId": "B"
         }
       ],

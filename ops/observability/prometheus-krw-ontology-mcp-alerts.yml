@@ -12,15 +12,15 @@ groups:
           summary: KRW Ontology MCP health check is failing
           description: "MCP health for env={{ $labels.env }} release={{ $labels.release_id }} has reported unhealthy for more than 2 minutes."
 
-      - alert: KRWOntologyMCPIndexMissing
-        expr: krw_ontology_mcp_index_present == 0
+      - alert: KRWOntologyMCPGlobalSpineMissing
+        expr: krw_ontology_mcp_global_spine_present == 0
         for: 1m
         labels:
           severity: critical
           service: krw-ontology-mcp
         annotations:
-          summary: KRW Ontology MCP index is missing
-          description: "The configured agent index for env={{ $labels.env }} release={{ $labels.release_id }} is not present."
+          summary: KRW Ontology MCP global spine is missing
+          description: "The configured global spine for env={{ $labels.env }} release={{ $labels.release_id }} is not present."
 
       - alert: KRWOntologyMCPHotSwapStuck
         expr: krw_ontology_mcp_store_rotation_pending == 1 and on(env, release_id) krw_ontology_mcp_store_retired_oldest_age_seconds > 300

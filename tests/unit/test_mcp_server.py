@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -11,7 +12,9 @@ import pytest
 
 from krw_ontology.agent_index import builder as agent_index_builder
 from krw_ontology.agent_index import store as agent_index_store
-from krw_ontology.agent_index import OntologyStore, build_agent_index
+from krw_ontology.agent_index import OntologySpineRouter, build_spine_shard_release_outputs
+from krw_ontology.agent_index.builder import build_agent_index as _build_legacy_agent_index
+from krw_ontology.agent_index.store import OntologyStore
 from krw_ontology.mcp_server.http_server import prepare_mcp_runtime
 from krw_ontology.mcp_server import tools as mcp_tools
 from krw_ontology.mcp_server.server import diagnostics_payload, health_payload, metrics_payload, mcp
@@ -19,6 +22,7 @@ from krw_ontology.mcp_server.tools import (
     _normalize_object_types,
     catalog_tool,
     chain_tool,
+    company_context_tool,
     compare_tool,
     index_context_tool,
     plan_query_tool,
@@ -26,21 +30,52 @@ from krw_ontology.mcp_server.tools import (
     query_context_tool,
     query_tool,
     retrieve_tool,
+    ResponseDetail,
     trace_tool,
     topic_map_tool,
     ResponseFormat,
 )
-from krw_ontology.release import write_release_manifest
+from krw_ontology.release import write_release_manifest_v3
 from krw_ontology.utils.io import atomic_write_json, write_jsonl
+
+
+def build_agent_index(*args, **kwargs):
+    kwargs.setdefault("allow_internal_legacy_builder", True)
+    return _build_legacy_agent_index(*args, **kwargs)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_mcp_runtime_env():
+    env_names = (
+        "KRW_ONTOLOGY_ENV",
+        "KRW_ONTOLOGY_RELEASE_ROOT",
+        "KRW_ONTOLOGY_ROOT",
+        "KRW_ONTOLOGY_MANIFEST_PATH",
+        "KRW_ONTOLOGY_INDEX_LAYOUT",
+        "KRW_ONTOLOGY_GLOBAL_SPINE_PATH",
+        "KRW_ONTOLOGY_SHARD_MANIFEST_PATH",
+        "KRW_MCP_STORE_MODE",
+    )
+    old_env = {name: os.environ.get(name) for name in env_names}
+    mcp_tools.reset_mcp_runtime_caches()
+    try:
+        yield
+    finally:
+        mcp_tools.reset_mcp_runtime_caches()
+        for name, value in old_env.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
 
 
 def test_mcp_tools_query_trace_quality_and_compare(tmp_path: Path, monkeypatch):
     _write_fixture(tmp_path)
-    index = build_agent_index(tmp_path)
+    index = _build_v3_runtime(tmp_path)
     monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
 
     catalog = json.loads(catalog_tool())
-    assert catalog["index_path"] == str(index["index_path"])
+    assert catalog["global_spine_path"] == str(index["index_path"])
     assert catalog["companies"] == ["VG"]
     assert catalog["documents"][0]["period"] == "FY2025"
 
@@ -67,9 +102,18 @@ def test_mcp_tools_query_trace_quality_and_compare(tmp_path: Path, monkeypatch):
     trace = json.loads(trace_tool(object_id="claim:VG:FY2025:10K:revenue-growth"))
     assert trace["object"]["type"] == "ResearchClaim"
     assert trace["evidence"]["quotes"][0]["id"] == "quote:VG:FY2025:10K:0001"
+    assert trace["routing"]["mode"] == "object_locator"
+    assert trace["routing"]["fallback"] is False
+    assert trace["object_locator"]["object_id"] == "claim:VG:FY2025:10K:revenue-growth"
+    assert trace["object_locator"]["ticker"] == "VG"
+    assert trace["object_locator"]["shard_available"] is True
+    assert trace["object_locator"]["shard_missing"] is False
 
     chain = json.loads(chain_tool(object_id="business_factor:VG:FY2025:10K:revenue-growth"))
     assert chain["object"]["type"] == "BusinessFactor"
+    assert chain["object_locator"]["object_id"] == "business_factor:VG:FY2025:10K:revenue-growth"
+    assert chain["object_locator"]["ticker"] == "VG"
+    assert chain["object_locator"]["shard_available"] is True
     assert chain["chain"]["evidence_chain"]["claims"][0]["id"] == "claim:VG:FY2025:10K:revenue-growth"
     assert chain["chain"]["evidence_chain"]["quotes"][0]["id"] == "quote:VG:FY2025:10K:0001"
     assert "text" not in chain["chain"]["evidence_chain"]["quotes"][0]
@@ -121,22 +165,18 @@ def test_mcp_tools_query_trace_quality_and_compare(tmp_path: Path, monkeypatch):
 
 
 def test_mcp_health_reports_release_manifest(tmp_path: Path, monkeypatch):
-    release = tmp_path / "releases" / "prod" / "20260528_010000"
-    _write_fixture(release)
-    build_agent_index(release)
-    write_release_manifest(release, release_id="20260528_010000", env="prod")
-    current = release.parent / "current"
-    current.symlink_to(release.name)
+    current = _write_v3_current_release(tmp_path, release_id="20260612_010000")
+    release = current.resolve()
     monkeypatch.setenv("KRW_ONTOLOGY_ENV", "prod")
     monkeypatch.setenv("KRW_ONTOLOGY_RELEASE_ROOT", str(current))
-    monkeypatch.delenv("KRW_ONTOLOGY_INDEX_PATH", raising=False)
+    monkeypatch.delenv("KRW_ONTOLOGY_GLOBAL_SPINE_PATH", raising=False)
 
     payload, status_code = health_payload()
 
     assert status_code == 200
     assert payload["ok"] is True
     assert payload["env"] == "prod"
-    assert payload["release_id"] == "20260528_010000"
+    assert payload["release_id"] == "20260612_010000"
     assert payload["root"] == str(release.resolve())
     assert payload["supplied_root"] == str(current.absolute())
     assert payload["root_is_current_symlink"] is True
@@ -146,25 +186,28 @@ def test_mcp_health_reports_release_manifest(tmp_path: Path, monkeypatch):
     assert payload["manifest_valid"] is True
     assert payload["manifest_path"] == str(release / "manifest.json")
     assert payload["documents"] == 2
-    assert payload["index_shards_present"] is True
+    assert payload["objects"] >= 1
+    assert payload["index_layout"] == "global-spine-and-company-shards"
+    assert payload["global_spine_path"] == str(release / "indexes" / "global_spine.sqlite")
+    assert payload["global_spine_manifest_path"] == "indexes/global_spine.sqlite"
+    assert payload["global_spine_present"] is True
+    assert payload["company_shards_present"] is True
     assert payload["company_shard_count"] == 1
-    assert payload["global_catalog_path"] == "indexes/global_catalog.sqlite"
-    assert payload["global_topics_path"] == "indexes/global_topics.sqlite"
-    assert payload["global_topics_present"] is True
-    assert payload["global_topic_count"] > 0
+    assert payload["global_topic_spine_present"] is True
+    assert payload["global_topic_spine_count"] > 0
+    assert "global_topics_present" not in payload
+    assert "global_topic_count" not in payload
     assert payload["company_shards_dir"] == "indexes/companies"
     assert payload["mcp_store_hot_swap"]["rotations"] == 0
     assert payload["mcp_store_hot_swap"]["retired_leased"] == 0
 
 
 def test_mcp_health_rejects_configured_prod_non_current_root(tmp_path: Path, monkeypatch):
-    release = tmp_path / "releases" / "prod" / "20260528_010000"
-    _write_fixture(release)
-    build_agent_index(release)
-    write_release_manifest(release, release_id="20260528_010000", env="prod")
+    current = _write_v3_current_release(tmp_path, release_id="20260612_010000")
+    release = current.resolve()
     monkeypatch.setenv("KRW_ONTOLOGY_ENV", "prod")
     monkeypatch.setenv("KRW_ONTOLOGY_RELEASE_ROOT", str(release))
-    monkeypatch.delenv("KRW_ONTOLOGY_INDEX_PATH", raising=False)
+    monkeypatch.delenv("KRW_ONTOLOGY_GLOBAL_SPINE_PATH", raising=False)
 
     payload, status_code = health_payload()
 
@@ -172,23 +215,19 @@ def test_mcp_health_rejects_configured_prod_non_current_root(tmp_path: Path, mon
     assert payload["ok"] is False
     assert payload["error"] == "prod_current_symlink_required"
     assert payload["root_is_current_symlink"] is False
-    assert payload["current_symlink"] is False
+    assert payload["current_symlink"] is True
+    assert payload["current_symlink_target"] == release.name
 
 
 def test_mcp_prepare_runtime_requires_prod_current_symlink(tmp_path: Path):
-    release = tmp_path / "releases" / "prod" / "20260529_010000"
-    release.mkdir(parents=True)
-    _write_fixture(release)
-    build_agent_index(release)
-    write_release_manifest(release, release_id="20260529_010000", env="prod")
-    current = release.parent / "current"
-    current.symlink_to(release.name)
+    current = _write_v3_current_release(tmp_path, release_id="20260612_010000")
     env_names = (
         "KRW_ONTOLOGY_ENV",
         "KRW_ONTOLOGY_RELEASE_ROOT",
         "KRW_ONTOLOGY_ROOT",
         "KRW_ONTOLOGY_MANIFEST_PATH",
-        "KRW_ONTOLOGY_INDEX_PATH",
+        "KRW_ONTOLOGY_GLOBAL_SPINE_PATH",
+        "KRW_ONTOLOGY_SHARD_MANIFEST_PATH",
         "KRW_MCP_STORE_MODE",
     )
     old_env = {name: os.environ.get(name) for name in env_names}
@@ -208,11 +247,178 @@ def test_mcp_prepare_runtime_requires_prod_current_symlink(tmp_path: Path):
                 os.environ[name] = value
 
     assert verification["ok"] is True
-    assert verification["release_id"] == "20260529_010000"
+    assert verification["release_id"] == "20260612_010000"
     assert verification["current_symlink"] is True
+    assert verification["runtime_store_opened"] is False
     assert status["store"]["mode"] == "persistent"
-    assert status["store"]["stores"] == 1
-    assert status["store"]["idle"] == 1
+    assert status["store"]["stores"] == 0
+    assert status["store"]["idle"] == 0
+
+
+def test_mcp_prepare_runtime_and_health_accept_v3_without_opening_monolith_store(
+    tmp_path: Path,
+    monkeypatch,
+):
+    release = tmp_path / "releases" / "prod" / "20260612_010000"
+    release.mkdir(parents=True)
+    _write_fixture(release)
+    build_spine_shard_release_outputs(
+        release,
+        release_id=release.name,
+        workers=1,
+        no_cache=True,
+    )
+    write_release_manifest_v3(release, release_id=release.name, env="prod")
+    current = release.parent / "current"
+    current.symlink_to(release.name)
+
+    monkeypatch.setenv("KRW_ONTOLOGY_ENV", "prod")
+    monkeypatch.setenv("KRW_ONTOLOGY_RELEASE_ROOT", str(current))
+    monkeypatch.delenv("KRW_ONTOLOGY_GLOBAL_SPINE_PATH", raising=False)
+
+    verification = prepare_mcp_runtime(root=current, env="prod")
+    payload, status_code = health_payload()
+
+    assert verification["ok"] is True, verification["errors"]
+    assert verification["verification_mode"] == "startup-v3"
+    assert verification["runtime_store_opened"] is False
+    assert verification["runtime_global_spine_path"] == str(current.absolute() / "indexes" / "global_spine.sqlite")
+    assert os.environ["KRW_ONTOLOGY_GLOBAL_SPINE_PATH"] == str(current.absolute() / "indexes" / "global_spine.sqlite")
+    assert os.environ["KRW_ONTOLOGY_SHARD_MANIFEST_PATH"] == str(current.absolute() / "indexes" / "shard_manifest.json")
+    assert os.environ["KRW_ONTOLOGY_INDEX_LAYOUT"] == "global-spine-and-company-shards"
+    assert status_code == 200
+    assert payload["ok"] is True
+    assert payload["release_id"] == release.name
+    assert payload["index_layout"] == "global-spine-and-company-shards"
+    assert payload["global_spine_present"] is True
+    assert payload["company_shard_count"] == 1
+    assert "error" not in payload
+
+
+def test_mcp_tools_use_spine_router_for_v3_release(tmp_path: Path, monkeypatch):
+    current = _write_v3_current_release(tmp_path)
+    monkeypatch.setenv("KRW_MCP_STORE_MODE", "per_call")
+    prepare_mcp_runtime(root=current, env="prod", store_mode="per_call")
+
+    index_path = Path(os.environ["KRW_ONTOLOGY_GLOBAL_SPINE_PATH"])
+    with mcp_tools._store(index_path) as store:
+        assert isinstance(store, OntologySpineRouter)
+        assert store.routing_status()["mode"] == "global_spine"
+        assert store.routing_status()["fallback_enabled"] is False
+        assert "monolith_open" not in store.routing_status()
+        documents = store.list_documents()
+        rows, diagnostics = store.query_compact_with_diagnostics(
+            topic="revenue demand",
+            tickers=["VG"],
+            limit=5,
+        )
+
+    catalog = json.loads(catalog_tool())
+    query = json.loads(query_tool(topic="revenue demand", ticker="VG", limit=5))
+    no_ticker_query = json.loads(query_tool(topic="revenue demand", limit=5))
+    topic_map = json.loads(topic_map_tool(ticker="VG", limit=5))
+    trace = json.loads(trace_tool(object_id="claim:VG:FY2025:10K:revenue-growth"))
+    quality = json.loads(quality_tool(ticker="VG"))
+
+    assert documents
+    assert rows
+    assert diagnostics["routing"]["fallback"] is False
+    assert catalog["companies"] == ["VG"]
+    assert query["results"]
+    assert query["search_diagnostics"]["routing"]["fallback"] is False
+    assert no_ticker_query["results"]
+    assert no_ticker_query["search_diagnostics"]["routing"]["mode"] == "global_spine_fanout"
+    assert topic_map["ticker"] == "VG"
+    assert topic_map["routing"]["mode"] == "company_shard"
+    assert topic_map["routing"]["fallback"] is False
+    assert topic_map["routing"]["fallback_used"] is False
+    assert trace["object"]["id"] == "claim:VG:FY2025:10K:revenue-growth"
+    assert trace["routing"]["mode"] == "object_locator"
+    assert trace["routing"]["fallback"] is False
+    assert quality["summary"]["documents"] >= 1
+    assert quality["routing"]["mode"] == "company_shard"
+    assert quality["routing"]["fallback"] is False
+
+
+def test_mcp_tools_report_declared_but_missing_company_shard_without_fallback(
+    tmp_path: Path,
+    monkeypatch,
+):
+    current = _write_v3_current_release(tmp_path)
+    release = current.resolve()
+    missing_shard = release / "indexes" / "companies" / "VG.sqlite"
+    missing_shard.unlink()
+    monkeypatch.setenv("KRW_MCP_STORE_MODE", "per_call")
+    prepare_mcp_runtime(root=current, env="prod", store_mode="per_call")
+
+    index_path = Path(os.environ["KRW_ONTOLOGY_GLOBAL_SPINE_PATH"])
+    with mcp_tools._store(index_path) as store:
+        assert isinstance(store, OntologySpineRouter)
+        status = store.routing_status()
+        assert status["ticker_count"] == 1
+        assert status["available_ticker_count"] == 0
+        assert status["missing_shard_count"] == 1
+        assert status["missing_shards"] == {"VG": str(missing_shard)}
+        assert status["fallback_enabled"] is False
+        assert "monolith_open" not in status
+        assert status["fallback"] is False
+
+    catalog = json.loads(catalog_tool())
+    query = json.loads(query_tool(topic="revenue demand", ticker="VG", limit=5))
+    summary_query = json.loads(
+        query_tool(
+            topic="revenue demand",
+            ticker="VG",
+            limit=5,
+            response_detail=ResponseDetail.TICKER_SUMMARY,
+        )
+    )
+    topic_map = json.loads(topic_map_tool(ticker="VG", limit=5))
+    query_context = json.loads(query_context_tool(question="VG revenue demand", ticker="VG", limit_results=5))
+    retrieve = json.loads(retrieve_tool(question="VG revenue demand", ticker="VG", limit=5))
+    trace = json.loads(trace_tool(object_id="claim:VG:FY2025:10K:revenue-growth"))
+    chain = json.loads(chain_tool(object_id="claim:VG:FY2025:10K:revenue-growth"))
+    quality = json.loads(quality_tool(ticker="VG"))
+    compare = json.loads(compare_tool(tickers=["VG", "XOM"], topic="revenue demand", limit_per_ticker=2))
+
+    assert catalog["companies"] == ["VG"]
+    assert query["results"] == []
+    assert query["search_diagnostics"]["routing"]["fallback"] is False
+    assert query["search_diagnostics"]["missing_shards"] == {"VG": str(missing_shard)}
+    assert query["search_diagnostics"]["fallback_used"] is False
+    assert "monolith_fallback_used" not in query["search_diagnostics"]
+    assert summary_query["search_diagnostics"]["routing"]["missing_shards"] == {"VG": str(missing_shard)}
+    assert summary_query["search_diagnostics"]["missing_shards"] == {"VG": str(missing_shard)}
+    assert topic_map["error"]["code"] == "ticker_shard_missing"
+    assert topic_map["routing"]["fallback"] is False
+    assert query_context["research_status"] == "not_answerable_from_current_release"
+    assert query_context["missing_parts"] == ["ticker_shard_missing"]
+    assert query_context["missing_shards"] == {"VG": str(missing_shard)}
+    assert query_context["routing"]["fallback"] is False
+    assert retrieve["research_status"] == "not_answerable_from_current_release"
+    assert retrieve["missing_parts"] == ["ticker_shard_missing"]
+    assert retrieve["missing_shards"] == {"VG": str(missing_shard)}
+    assert retrieve["direct_evidence"] == []
+    assert retrieve["related_context"] == []
+    assert trace["error"]["code"] == "ticker_shard_missing"
+    assert trace["missing_shards"] == {"VG": str(missing_shard)}
+    assert trace["fallback_used"] is False
+    assert trace["object_locator"]["ticker"] == "VG"
+    assert trace["object_locator"]["shard_available"] is False
+    assert trace["object_locator"]["shard_missing"] is True
+    assert trace["object_locator"]["resolved_shard_path"] == str(missing_shard)
+    assert "monolith_fallback_used" not in trace
+    assert chain["error"]["code"] == "ticker_shard_missing"
+    assert chain["object_locator"]["shard_missing"] is True
+    assert quality["summary"]["missing_parts"] == ["ticker_shard_missing"]
+    assert quality["summary"]["missing_shards"] == {"VG": str(missing_shard)}
+    assert quality["routing"]["mode"] == "company_shard_missing"
+    assert quality["routing"]["fallback"] is False
+    vg_row = next(row for row in compare["comparison_rows"] if row["comparison_key"] == "VG")
+    assert vg_row["missing"] is True
+    assert vg_row["missing_reason"] == "ticker_shard_missing"
+    assert compare["routing"]["mode"] == "compare_fanout"
+    assert compare["routing"]["missing_shards"] == {"VG": str(missing_shard)}
 
 
 def test_mcp_prepare_runtime_preserves_current_symlink_for_hot_swap(tmp_path: Path):
@@ -221,10 +427,10 @@ def test_mcp_prepare_runtime_preserves_current_symlink_for_hot_swap(tmp_path: Pa
     second_release = releases_root / "20260529_020000"
     _write_fixture(first_release, period="FY2025")
     _write_fixture(second_release, period="FY2026")
-    build_agent_index(first_release)
-    build_agent_index(second_release)
-    write_release_manifest(first_release, release_id=first_release.name, env="prod")
-    write_release_manifest(second_release, release_id=second_release.name, env="prod")
+    build_spine_shard_release_outputs(first_release, release_id=first_release.name, workers=1, no_cache=True)
+    build_spine_shard_release_outputs(second_release, release_id=second_release.name, workers=1, no_cache=True)
+    write_release_manifest_v3(first_release, release_id=first_release.name, env="prod")
+    write_release_manifest_v3(second_release, release_id=second_release.name, env="prod")
     current = releases_root / "current"
     current.symlink_to(first_release.name)
     env_names = (
@@ -232,7 +438,8 @@ def test_mcp_prepare_runtime_preserves_current_symlink_for_hot_swap(tmp_path: Pa
         "KRW_ONTOLOGY_RELEASE_ROOT",
         "KRW_ONTOLOGY_ROOT",
         "KRW_ONTOLOGY_MANIFEST_PATH",
-        "KRW_ONTOLOGY_INDEX_PATH",
+        "KRW_ONTOLOGY_GLOBAL_SPINE_PATH",
+        "KRW_ONTOLOGY_SHARD_MANIFEST_PATH",
         "KRW_MCP_STORE_MODE",
     )
     old_env = {name: os.environ.get(name) for name in env_names}
@@ -242,19 +449,25 @@ def test_mcp_prepare_runtime_preserves_current_symlink_for_hot_swap(tmp_path: Pa
     mcp_tools.reset_mcp_runtime_caches()
     try:
         verification = prepare_mcp_runtime(root=current, env="prod")
-        runtime_index_path = Path(os.environ["KRW_ONTOLOGY_INDEX_PATH"])
+        runtime_global_spine_path = Path(os.environ["KRW_ONTOLOGY_GLOBAL_SPINE_PATH"])
         assert verification["runtime_root"] == str(current.absolute())
-        assert verification["runtime_index_path"] == str(current.absolute() / "indexes" / "agent_index.sqlite")
-        assert runtime_index_path.parent.parent.name == "current"
+        assert verification["runtime_global_spine_path"] == str(current.absolute() / "indexes" / "global_spine.sqlite")
+        assert runtime_global_spine_path.parent.parent.name == "current"
 
-        with mcp_tools._store(mcp_tools._index(None, None)) as first_store:
+        with mcp_tools._store(mcp_tools._runtime_global_spine_path()) as first_store:
             assert first_store.list_documents()[0]["period"] == "FY2025"
+        first_trace = json.loads(trace_tool(object_id="claim:VG:FY2025:10K:revenue-growth"))
+        assert first_trace["object_locator"]["period"] == "FY2025"
 
         current.unlink()
         current.symlink_to(second_release.name)
 
-        with mcp_tools._store(mcp_tools._index(None, None)) as second_store:
+        with mcp_tools._store(mcp_tools._runtime_global_spine_path()) as second_store:
             assert second_store.list_documents()[0]["period"] == "FY2026"
+        stale_trace = json.loads(trace_tool(object_id="claim:VG:FY2025:10K:revenue-growth"))
+        assert stale_trace["error"]["code"] == "not_found"
+        second_trace = json.loads(trace_tool(object_id="claim:VG:FY2026:10K:revenue-growth"))
+        assert second_trace["object_locator"]["period"] == "FY2026"
 
         status = mcp_tools.mcp_runtime_cache_status()
         assert status["store"]["rotations"] == 1
@@ -271,8 +484,8 @@ def test_mcp_prepare_runtime_rejects_non_symlink_prod_root(tmp_path: Path):
     release = tmp_path / "releases" / "prod" / "20260529_010000"
     release.mkdir(parents=True)
     _write_fixture(release)
-    build_agent_index(release)
-    write_release_manifest(release, release_id="20260529_010000", env="prod")
+    build_spine_shard_release_outputs(release, release_id=release.name, workers=1, no_cache=True)
+    write_release_manifest_v3(release, release_id=release.name, env="prod")
 
     with pytest.raises(RuntimeError, match="current_symlink_required"):
         prepare_mcp_runtime(root=release, env="prod")
@@ -312,7 +525,7 @@ def test_mcp_prepare_runtime_rejects_legacy_v1_current_without_sqlite_open(
 
 def test_mcp_persistent_store_reuses_sqlite_connection(tmp_path: Path, monkeypatch):
     _write_fixture(tmp_path)
-    index = build_agent_index(tmp_path)
+    index = _build_v3_runtime(tmp_path)
     monkeypatch.setenv("KRW_MCP_STORE_MODE", "persistent")
     mcp_tools.reset_mcp_runtime_caches()
 
@@ -339,13 +552,13 @@ def test_mcp_persistent_store_pins_inflight_release_and_rotates_after_current_sw
     second_release = releases_root / "20260529_020000"
     _write_fixture(first_release, period="FY2025")
     _write_fixture(second_release, period="FY2026")
-    build_agent_index(first_release)
-    build_agent_index(second_release)
-    write_release_manifest(first_release, release_id=first_release.name, env="prod")
-    write_release_manifest(second_release, release_id=second_release.name, env="prod")
+    build_spine_shard_release_outputs(first_release, release_id=first_release.name, workers=1, no_cache=True)
+    build_spine_shard_release_outputs(second_release, release_id=second_release.name, workers=1, no_cache=True)
+    write_release_manifest_v3(first_release, release_id=first_release.name, env="prod")
+    write_release_manifest_v3(second_release, release_id=second_release.name, env="prod")
     current = releases_root / "current"
     current.symlink_to(first_release.name)
-    index_path = current / "indexes" / "agent_index.sqlite"
+    index_path = current / "indexes" / "global_spine.sqlite"
 
     monkeypatch.setenv("KRW_MCP_STORE_MODE", "persistent")
     mcp_tools.reset_mcp_runtime_caches()
@@ -358,7 +571,7 @@ def test_mcp_persistent_store_pins_inflight_release_and_rotates_after_current_sw
 
             with mcp_tools._store(index_path) as new_store:
                 assert new_store.list_documents()[0]["period"] == "FY2026"
-                assert new_store.routing_status()["mode"] == "shards"
+                assert new_store.routing_status()["mode"] == "global_spine"
 
             inflight_status = mcp_tools.mcp_runtime_cache_status()
             assert inflight_status["store"]["rotations"] == 1
@@ -367,13 +580,13 @@ def test_mcp_persistent_store_pins_inflight_release_and_rotates_after_current_sw
             assert inflight_status["store"]["retired_leased"] == 1
             assert inflight_status["store"]["rotation_pending"] is True
             assert inflight_status["store"]["retired_oldest_age_sec"] >= 0
-            assert len(inflight_status["store"]["retired_indexes"]) == 1
-            assert inflight_status["store"]["retired_indexes"][0]["retired"] is True
-            assert inflight_status["store"]["last_rotation"]["previous_resolved_index_path"].endswith(
-                "20260529_010000/indexes/agent_index.sqlite"
+            assert len(inflight_status["store"]["retired_global_spine_stores"]) == 1
+            assert inflight_status["store"]["retired_global_spine_stores"][0]["retired"] is True
+            assert inflight_status["store"]["last_rotation"]["previous_resolved_global_spine_path"].endswith(
+                "20260529_010000/indexes/global_spine.sqlite"
             )
-            assert inflight_status["store"]["last_rotation"]["new_resolved_index_path"].endswith(
-                "20260529_020000/indexes/agent_index.sqlite"
+            assert inflight_status["store"]["last_rotation"]["new_resolved_global_spine_path"].endswith(
+                "20260529_020000/indexes/global_spine.sqlite"
             )
             health, health_status = health_payload(root=str(current))
             assert health_status == 200
@@ -382,8 +595,8 @@ def test_mcp_persistent_store_pins_inflight_release_and_rotates_after_current_sw
             assert health["mcp_store_hot_swap"]["retired_leased"] == 1
             assert health["mcp_store_hot_swap"]["rotation_pending"] is True
             assert health["mcp_store_hot_swap"]["retired_oldest_age_sec"] >= 0
-            assert health["mcp_store_hot_swap"]["last_rotation"]["previous_resolved_index_path"].endswith(
-                "20260529_010000/indexes/agent_index.sqlite"
+            assert health["mcp_store_hot_swap"]["last_rotation"]["previous_resolved_global_spine_path"].endswith(
+                "20260529_010000/indexes/global_spine.sqlite"
             )
             metrics, metrics_status = metrics_payload(root=str(current))
             assert metrics_status == 200
@@ -398,17 +611,17 @@ def test_mcp_persistent_store_pins_inflight_release_and_rotates_after_current_sw
             aba_status = mcp_tools.mcp_runtime_cache_status()
             assert aba_status["store"]["rotations"] == 2
             assert aba_status["store"]["retired_leased"] == 1
-            assert len(aba_status["store"]["retired_indexes"]) == 1
-            assert len(aba_status["store"]["indexes"]) == 1
-            assert aba_status["store"]["retired_indexes"][0]["resolved_index_path"].endswith(
-                "20260529_010000/indexes/agent_index.sqlite"
+            assert len(aba_status["store"]["retired_global_spine_stores"]) == 1
+            assert len(aba_status["store"]["global_spine_stores"]) == 1
+            assert aba_status["store"]["retired_global_spine_stores"][0]["resolved_global_spine_path"].endswith(
+                "20260529_010000/indexes/global_spine.sqlite"
             )
-            assert aba_status["store"]["indexes"][0]["resolved_index_path"].endswith(
-                "20260529_010000/indexes/agent_index.sqlite"
+            assert aba_status["store"]["global_spine_stores"][0]["resolved_global_spine_path"].endswith(
+                "20260529_010000/indexes/global_spine.sqlite"
             )
             assert (
-                aba_status["store"]["retired_indexes"][0]["generation"]
-                != aba_status["store"]["indexes"][0]["generation"]
+                aba_status["store"]["retired_global_spine_stores"][0]["generation"]
+                != aba_status["store"]["global_spine_stores"][0]["generation"]
             )
             assert old_store.list_documents()[0]["period"] == "FY2025"
         status = mcp_tools.mcp_runtime_cache_status()
@@ -419,12 +632,12 @@ def test_mcp_persistent_store_pins_inflight_release_and_rotates_after_current_sw
     assert status["store"]["opened"] == 3
     assert status["store"]["retired_leased"] == 0
     assert status["store"]["rotation_pending"] is False
-    assert status["store"]["retired_indexes"] == []
+    assert status["store"]["retired_global_spine_stores"] == []
 
 
 def test_mcp_query_normalizes_object_type_aliases(tmp_path: Path, monkeypatch):
     _write_fixture(tmp_path)
-    build_agent_index(tmp_path)
+    _build_v3_runtime(tmp_path)
     monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
 
     query = json.loads(
@@ -468,7 +681,7 @@ def test_mcp_event_aliases_are_not_overwritten():
 
 def test_mcp_query_falls_back_for_korean_topic(tmp_path: Path, monkeypatch):
     _write_fixture(tmp_path)
-    build_agent_index(tmp_path)
+    _build_v3_runtime(tmp_path)
     monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
 
     query = json.loads(
@@ -492,7 +705,7 @@ def test_mcp_query_falls_back_for_korean_topic(tmp_path: Path, monkeypatch):
 
 def test_mcp_topic_map_repackages_company_vocabulary(tmp_path: Path, monkeypatch):
     _write_fixture(tmp_path)
-    build_agent_index(tmp_path)
+    _build_v3_runtime(tmp_path)
     monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
 
     topic_map = json.loads(topic_map_tool(ticker="VG", limit=10))
@@ -502,6 +715,9 @@ def test_mcp_topic_map_repackages_company_vocabulary(tmp_path: Path, monkeypatch
         "company_business_profile:VG:ALL"
     ]
     assert topic_map["source"]["fallback_used"] is False
+    assert topic_map["routing"]["mode"] == "company_shard"
+    assert topic_map["routing"]["fallback"] is False
+    assert topic_map["routing"]["fallback_used"] is False
     factor_terms = {
         entry["term"] for entry in topic_map["topics"]["external_factors"]
     }
@@ -518,9 +734,59 @@ def test_mcp_topic_map_repackages_company_vocabulary(tmp_path: Path, monkeypatch
     )
 
 
+def test_mcp_compare_quality_topic_and_company_context_report_v3_routing(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _write_fixture(tmp_path)
+    _clone_fixture_company(tmp_path, source_ticker="VG", target_ticker="XOM")
+    _build_v3_runtime(tmp_path)
+    monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
+
+    compare = json.loads(
+        compare_tool(
+            tickers=["VG", "XOM"],
+            topic="revenue growth customer demand",
+            limit_per_ticker=2,
+        )
+    )
+    quality = json.loads(quality_tool())
+    topic_map = json.loads(topic_map_tool(ticker="VG", limit=5))
+    company_context = json.loads(company_context_tool(ticker="XOM", limit_topics=5))
+
+    assert compare["routing"]["mode"] == "compare_fanout"
+    assert compare["routing"]["route_tickers"] == ["VG", "XOM"]
+    assert compare["routing"]["fallback"] is False
+    assert compare["routing"]["fallback_used"] is False
+    assert compare["missing_shards"] == {}
+    assert compare["unknown_tickers"] == []
+    assert set(compare["results"]) == {"VG", "XOM"}
+    assert compare["results"]["VG"]
+    assert compare["results"]["XOM"]
+    assert {
+        row["comparison_key"] for row in compare["comparison_rows"] if not row["missing"]
+    } == {"VG", "XOM"}
+    assert compare["comparison_contexts"]["VG"]["routing"]["mode"] == "company_shard"
+    assert compare["comparison_contexts"]["XOM"]["routing"]["mode"] == "company_shard"
+
+    assert quality["routing"]["mode"] == "quality_release_scan"
+    assert quality["routing"]["route_tickers"] == ["VG", "XOM"]
+    assert quality["routing"]["fallback"] is False
+    assert quality["topology"]["mode"] == "global_spine"
+    assert quality["topology"]["fallback"] is False
+    assert {document["ticker"] for document in quality["documents"]} == {"VG", "XOM"}
+
+    assert topic_map["routing"]["mode"] == "company_shard"
+    assert topic_map["routing"]["route_tickers"] == ["VG"]
+    assert topic_map["routing"]["fallback"] is False
+    assert company_context["routing"]["mode"] == "company_shard"
+    assert company_context["routing"]["route_tickers"] == ["XOM"]
+    assert company_context["routing"]["fallback"] is False
+
+
 def test_mcp_chain_returns_object_specific_chains(tmp_path: Path, monkeypatch):
     _write_fixture(tmp_path)
-    build_agent_index(tmp_path)
+    _build_v3_runtime(tmp_path)
     monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
 
     exposure_chain = json.loads(
@@ -552,9 +818,39 @@ def test_mcp_chain_returns_object_specific_chains(tmp_path: Path, monkeypatch):
     assert quote_chain["chain"]["evidence_chain"]["claims"][0]["id"] == "claim:VG:FY2025:10K:revenue-growth"
 
 
+def test_mcp_chain_includes_global_spine_cross_company_neighbors(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _write_fixture(tmp_path)
+    _clone_fixture_company(tmp_path, source_ticker="VG", target_ticker="XOM")
+    _build_v3_runtime(tmp_path)
+    monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
+
+    chain = json.loads(chain_tool(object_id="business_factor:VG:FY2025:10K:revenue-growth"))
+
+    assert chain["routing"]["mode"] == "object_locator"
+    assert chain["routing"]["fallback"] is False
+    assert chain["object_locator"]["object_id"] == "business_factor:VG:FY2025:10K:revenue-growth"
+    assert chain["object_locator"]["ticker"] == "VG"
+    assert chain["object_locator"]["shard_available"] is True
+    neighbors = chain["global_spine_neighbors"]
+    assert neighbors
+    assert any(
+        {neighbor["from_ticker"], neighbor["to_ticker"]} == {"VG", "XOM"}
+        and neighbor["shared_key_type"] in {"factor", "topic", "metric"}
+        for neighbor in neighbors
+    )
+    assert any(
+        str(neighbor["from_object_id"]).startswith("business_factor:XOM")
+        or str(neighbor["to_object_id"]).startswith("business_factor:XOM")
+        for neighbor in neighbors
+    )
+
+
 def test_mcp_chain_respects_depth_and_quote_text_option(tmp_path: Path, monkeypatch):
     _write_fixture(tmp_path)
-    build_agent_index(tmp_path)
+    _build_v3_runtime(tmp_path)
     monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
 
     shallow = json.loads(
@@ -594,7 +890,7 @@ def test_mcp_chain_reports_missing_ambiguous_and_unsupported_objects(
     monkeypatch,
 ):
     _write_fixture(tmp_path)
-    build_agent_index(tmp_path)
+    _build_v3_runtime(tmp_path)
     monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
 
     missing = json.loads(chain_tool(object_id="business_factor:VG:missing"))
@@ -610,7 +906,7 @@ def test_mcp_chain_reports_missing_ambiguous_and_unsupported_objects(
 def test_mcp_compare_allows_single_ticker_period_comparison(tmp_path: Path, monkeypatch):
     _write_fixture(tmp_path, period="FY2024", text="Revenue growth faced operational risk.")
     _write_fixture(tmp_path, period="FY2025", text="Revenue growth faced regulatory risk.")
-    build_agent_index(tmp_path)
+    _build_v3_runtime(tmp_path)
     monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
 
     compare = json.loads(
@@ -634,7 +930,7 @@ def test_mcp_compare_allows_single_ticker_period_comparison(tmp_path: Path, monk
 
 def test_mcp_compare_markdown_includes_directness_guard(tmp_path: Path, monkeypatch):
     _write_fixture(tmp_path)
-    build_agent_index(tmp_path)
+    _build_v3_runtime(tmp_path)
     monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
 
     markdown = compare_tool(
@@ -652,7 +948,7 @@ def test_mcp_compare_markdown_includes_directness_guard(tmp_path: Path, monkeypa
 
 def test_mcp_trace_accepts_unique_id_prefix(tmp_path: Path, monkeypatch):
     _write_fixture(tmp_path)
-    build_agent_index(tmp_path)
+    _build_v3_runtime(tmp_path)
     monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
 
     trace = json.loads(trace_tool(object_id="claim:VG:FY2025:10K:revenue"))
@@ -663,7 +959,7 @@ def test_mcp_trace_accepts_unique_id_prefix(tmp_path: Path, monkeypatch):
 
 def test_mcp_trace_returns_ambiguous_prefix_candidates(tmp_path: Path, monkeypatch):
     _write_fixture(tmp_path)
-    build_agent_index(tmp_path)
+    _build_v3_runtime(tmp_path)
     monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
 
     trace = json.loads(trace_tool(object_id="claim:VG"))
@@ -696,7 +992,7 @@ def test_mcp_index_context_defaults_to_lightweight_guard(
     monkeypatch,
 ):
     _write_fixture(tmp_path)
-    build_agent_index(tmp_path)
+    _build_v3_runtime(tmp_path)
     monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
 
     payload = json.loads(index_context_tool())
@@ -712,13 +1008,13 @@ def test_mcp_index_context_defaults_to_lightweight_guard(
         "expensive_counts_requested": False,
         "expensive_quality_summary_requested": False,
         "allow_expensive": False,
-        "counts_returned": False,
-        "quality_summary_returned": False,
-        "reason": (
-            "index_context is an operational/debug capability card. "
-            "Expensive table counts and quality summary scans are disabled by default; "
-            "use query_context for normal research questions."
-        ),
+            "counts_returned": False,
+            "quality_summary_returned": False,
+            "reason": (
+                "index_context is an operational/debug capability card for the current v3 ontology release. "
+                "Expensive table counts and quality summary scans are disabled by default; "
+                "use query_context for normal research questions."
+            ),
         "how_to_enable_expensive": (
             "Pass allow_expensive=true with include_counts and/or include_quality_summary "
             "only for explicit audit/debug operations."
@@ -732,7 +1028,7 @@ def test_mcp_index_context_requires_explicit_allow_expensive_for_counts(
     monkeypatch,
 ):
     _write_fixture(tmp_path)
-    build_agent_index(tmp_path)
+    _build_v3_runtime(tmp_path)
     monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
 
     guarded = json.loads(
@@ -767,7 +1063,7 @@ def test_mcp_index_context_logs_guard_timing(
     caplog,
 ):
     _write_fixture(tmp_path)
-    build_agent_index(tmp_path)
+    _build_v3_runtime(tmp_path)
     monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
 
     with caplog.at_level("INFO", logger=mcp_tools.LOGGER.name):
@@ -786,7 +1082,7 @@ def test_mcp_query_logs_slow_timing_without_raw_topic(
     caplog,
 ):
     _write_fixture(tmp_path)
-    build_agent_index(tmp_path)
+    _build_v3_runtime(tmp_path)
     monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
     monkeypatch.setattr(mcp_tools, "SLOW_MCP_TOOL_LOG_THRESHOLD_MS", 0)
 
@@ -808,7 +1104,7 @@ def test_mcp_query_context_logs_slow_timing_without_raw_question(
     caplog,
 ):
     _write_fixture(tmp_path)
-    build_agent_index(tmp_path)
+    _build_v3_runtime(tmp_path)
     monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
     monkeypatch.setattr(mcp_tools, "SLOW_MCP_TOOL_LOG_THRESHOLD_MS", 0)
 
@@ -829,7 +1125,7 @@ def test_mcp_query_context_returns_research_pack_and_bounded_chain(
     monkeypatch,
 ):
     _write_fixture(tmp_path)
-    build_agent_index(tmp_path)
+    _build_v3_runtime(tmp_path)
     monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
 
     payload = json.loads(
@@ -859,7 +1155,7 @@ def test_mcp_query_context_includes_cross_company_signal_pack(
     monkeypatch,
 ):
     _write_fixture(tmp_path)
-    build_agent_index(tmp_path)
+    _build_v3_runtime(tmp_path)
     monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
 
     payload = json.loads(
@@ -908,7 +1204,7 @@ def test_mcp_query_context_stops_out_of_scope_valuation(
     monkeypatch,
 ):
     _write_fixture(tmp_path)
-    build_agent_index(tmp_path)
+    _build_v3_runtime(tmp_path)
     monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
 
     payload = json.loads(
@@ -942,7 +1238,7 @@ def test_mcp_query_context_includes_metric_series_research_pack(
     monkeypatch,
 ):
     _write_metric_dimension_fixture(tmp_path)
-    build_agent_index(tmp_path)
+    _build_v3_runtime(tmp_path)
     monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
 
     payload = json.loads(
@@ -989,7 +1285,7 @@ def test_mcp_query_context_risk_thesis_router_skips_metric_deep_path(
     monkeypatch,
 ):
     _write_metric_dimension_fixture(tmp_path)
-    build_agent_index(tmp_path)
+    _build_v3_runtime(tmp_path)
     monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
 
     payload = json.loads(
@@ -1017,7 +1313,7 @@ def test_mcp_query_context_company_overview_router_avoids_metric_first(
     monkeypatch,
 ):
     _write_metric_dimension_fixture(tmp_path)
-    build_agent_index(tmp_path)
+    _build_v3_runtime(tmp_path)
     monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
 
     payload = json.loads(
@@ -1043,7 +1339,7 @@ def test_mcp_query_context_projection_pack_marks_candidates_search_only_for_dire
     monkeypatch,
 ):
     _write_fixture(tmp_path)
-    build_agent_index(tmp_path)
+    _build_v3_runtime(tmp_path)
     monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
 
     payload = json.loads(
@@ -1199,7 +1495,7 @@ def test_mcp_retrieve_uses_research_context_stop_guard(
     monkeypatch,
 ):
     _write_fixture(tmp_path)
-    build_agent_index(tmp_path)
+    _build_v3_runtime(tmp_path)
     monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
 
     payload = json.loads(
@@ -1233,7 +1529,7 @@ def test_mcp_retrieve_attaches_research_context_for_normal_question(
     monkeypatch,
 ):
     _write_fixture(tmp_path)
-    build_agent_index(tmp_path)
+    _build_v3_runtime(tmp_path)
     monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
 
     payload = json.loads(
@@ -1256,12 +1552,40 @@ def test_mcp_retrieve_attaches_research_context_for_normal_question(
     assert payload["research_context"]["directness_guard"] == payload["directness_guard"]
 
 
+def test_mcp_retrieve_without_ticker_reports_global_spine_fanout_route(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _write_fixture(tmp_path)
+    _clone_fixture_company(tmp_path, source_ticker="VG", target_ticker="XOM")
+    _build_v3_runtime(tmp_path)
+    monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
+
+    payload = json.loads(
+        retrieve_tool(
+            question="revenue growth customer demand natural gas operating margin",
+            limit=5,
+            limit_groups=5,
+        )
+    )
+
+    assert payload["routing"]["mode"] == "global_spine_fanout"
+    assert payload["routing"]["fallback"] is False
+    assert payload["research_context"]["routing"] == payload["routing"]
+    assert payload["research_context"]["missing_shards"] == {}
+    assert payload["research_context"]["unknown_tickers"] == []
+    signal_pack = payload["research_context"]["research_pack"]["cross_company_signal_pack"]
+    assert signal_pack["mode"] == "cross_company_signal_synthesis"
+    assert {"VG", "XOM"} <= set(signal_pack["ticker_basket"])
+    assert {row["ticker"] for row in signal_pack["company_evidence_rows"]} >= {"VG", "XOM"}
+
+
 def test_mcp_retrieve_adds_soft_guidance_for_repeated_retrieve_context(
     tmp_path: Path,
     monkeypatch,
 ):
     _write_fixture(tmp_path)
-    build_agent_index(tmp_path)
+    _build_v3_runtime(tmp_path)
     monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
 
     payload = json.loads(
@@ -1311,7 +1635,7 @@ def test_mcp_retrieve_omits_soft_guidance_before_retrieve_repeats(
     monkeypatch,
 ):
     _write_fixture(tmp_path)
-    build_agent_index(tmp_path)
+    _build_v3_runtime(tmp_path)
     monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
 
     payload = json.loads(
@@ -1331,12 +1655,12 @@ def test_mcp_retrieve_omits_soft_guidance_before_retrieve_repeats(
     assert "agent_guidance" not in payload
 
 
-def test_mcp_retrieve_skips_legacy_when_research_context_is_sufficient(
+def test_mcp_retrieve_skips_secondary_retrieve_when_research_context_is_sufficient(
     tmp_path: Path,
     monkeypatch,
 ):
     _write_metric_dimension_fixture(tmp_path)
-    build_agent_index(tmp_path)
+    _build_v3_runtime(tmp_path)
     monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
 
     payload = json.loads(
@@ -1350,7 +1674,8 @@ def test_mcp_retrieve_skips_legacy_when_research_context_is_sufficient(
 
     assert payload["research_status"] == "sufficient_for_default_answer"
     assert payload["kernel"]["intent"] == "metric_series"
-    assert payload["legacy_retrieve_skipped"] is True
+    assert payload["secondary_retrieve_skipped"] is True
+    assert "legacy_retrieve_skipped" not in payload
     assert payload["research_pack"]["metric_series_pack"]["mode"] == "metric_dimension_lookup"
     assert payload["direct_evidence"] == []
     assert payload["related_context"] == []
@@ -1362,7 +1687,7 @@ def test_mcp_retrieve_exposes_directness_guard_for_direct_question(
     monkeypatch,
 ):
     _write_fixture(tmp_path)
-    build_agent_index(tmp_path)
+    _build_v3_runtime(tmp_path)
     monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
 
     payload = json.loads(
@@ -1383,7 +1708,7 @@ def test_mcp_markdown_outputs_include_directness_guard(
     monkeypatch,
 ):
     _write_fixture(tmp_path)
-    build_agent_index(tmp_path)
+    _build_v3_runtime(tmp_path)
     monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
 
     context_markdown = query_context_tool(
@@ -1409,50 +1734,46 @@ def test_mcp_health_payload_reports_manifest_counts_without_sqlite_count(
     tmp_path: Path,
     monkeypatch,
 ):
-    _write_fixture(tmp_path)
-    build_agent_index(tmp_path)
-    write_release_manifest(tmp_path, release_id="20260528_020000", env="prod")
+    current = _write_v3_current_release(tmp_path, release_id="20260612_020000")
 
     def fail_connect(*_args, **_kwargs):
         raise AssertionError("health_payload must not open SQLite")
 
     monkeypatch.setattr("krw_ontology.mcp_server.server.sqlite3.connect", fail_connect)
 
-    payload, status_code = health_payload(root=str(tmp_path))
+    payload, status_code = health_payload(root=str(current))
 
     assert status_code == 200
     assert payload["ok"] is True
-    assert payload["root"] == str(tmp_path.resolve())
+    assert payload["root"] == str(current.resolve())
     assert payload["documents"] == 2
     assert payload["objects"] >= 1
     assert payload["sqlite_checked"] is False
     assert "krw_ontology_topic_map" in payload["tools"]
     assert payload["mcp_store_hot_swap"]["rotation_pending"] is False
     assert payload["mcp_store_hot_swap"]["retired_oldest_age_sec"] == 0
-    assert payload["mcp_store_hot_swap"]["retired_indexes"] == []
+    assert payload["mcp_store_hot_swap"]["retired_global_spine_stores"] == []
 
 
 def test_mcp_metrics_payload_exposes_release_and_hot_swap_metrics(tmp_path: Path):
-    _write_fixture(tmp_path)
-    build_agent_index(tmp_path)
-    write_release_manifest(tmp_path, release_id="20260528_020000", env="prod")
+    current = _write_v3_current_release(tmp_path, release_id="20260612_020000")
 
-    payload, status_code = metrics_payload(root=str(tmp_path))
+    payload, status_code = metrics_payload(root=str(current))
 
     assert status_code == 200
-    assert 'krw_ontology_mcp_health_ok{env="prod",release_id="20260528_020000"} 1' in payload
-    assert 'krw_ontology_mcp_release_documents{env="prod",release_id="20260528_020000"} 2' in payload
+    assert 'krw_ontology_mcp_health_ok{env="prod",release_id="20260612_020000"} 1' in payload
+    assert 'krw_ontology_mcp_release_documents{env="prod",release_id="20260612_020000"} 2' in payload
+    assert "krw_ontology_mcp_global_topic_spine_rows" in payload
+    assert "krw_ontology_mcp_global_topics" not in payload
     assert "krw_ontology_mcp_store_rotation_pending" in payload
     assert "krw_ontology_mcp_store_rotations_total" in payload
     assert "# TYPE krw_ontology_mcp_store_retired_leased gauge" in payload
 
 
 def test_mcp_diagnostics_payload_reports_live_index_counts(tmp_path: Path):
-    _write_fixture(tmp_path)
-    build_agent_index(tmp_path)
-    write_release_manifest(tmp_path, release_id="20260528_020000", env="prod")
+    current = _write_v3_current_release(tmp_path, release_id="20260612_020000")
 
-    payload, status_code = diagnostics_payload(root=str(tmp_path))
+    payload, status_code = diagnostics_payload(root=str(current))
 
     assert status_code == 200
     assert payload["ok"] is True
@@ -1466,7 +1787,17 @@ def test_mcp_health_payload_reports_missing_index(tmp_path: Path):
 
     assert status_code == 503
     assert payload["ok"] is False
-    assert payload["error"] == "agent_index_not_found"
+    assert payload["error"] == "global_spine_not_found"
+
+
+def test_mcp_external_tool_schema_does_not_expose_runtime_path_overrides():
+    for tool in mcp._tool_manager.list_tools():
+        properties = (tool.parameters or {}).get("properties") or {}
+        assert "root" not in properties, tool.name
+        assert "index_path" not in properties, tool.name
+        assert "global_spine_path" not in properties, tool.name
+        assert "release_root" not in properties, tool.name
+        assert "manifest_path" not in properties, tool.name
 
 
 def _write_fixture(
@@ -1724,6 +2055,57 @@ def _write_fixture(
         claim_id=claim_id,
         quote_id=quote_id,
     )
+
+
+def _write_v3_current_release(tmp_path: Path, *, release_id: str = "20260612_010000") -> Path:
+    release = tmp_path / "releases" / "prod" / release_id
+    release.mkdir(parents=True)
+    _write_fixture(release)
+    build_spine_shard_release_outputs(
+        release,
+        release_id=release.name,
+        workers=1,
+        no_cache=True,
+    )
+    write_release_manifest_v3(release, release_id=release.name, env="prod")
+    current = release.parent / "current"
+    current.symlink_to(release.name)
+    return current
+
+
+def _clone_fixture_company(
+    root: Path,
+    *,
+    source_ticker: str,
+    target_ticker: str,
+) -> None:
+    source_dir = root / "companies" / source_ticker
+    target_dir = root / "companies" / target_ticker
+    shutil.copytree(source_dir, target_dir)
+    for path in target_dir.rglob("*"):
+        if not path.is_file():
+            continue
+        text = path.read_text(encoding="utf-8")
+        path.write_text(text.replace(source_ticker, target_ticker), encoding="utf-8")
+
+
+def _build_v3_runtime(root: Path, *, release_id: str = "test-v3-runtime") -> dict[str, Any]:
+    result = build_spine_shard_release_outputs(
+        root,
+        release_id=release_id,
+        workers=1,
+        no_cache=True,
+    )
+    write_release_manifest_v3(root, release_id=release_id, env="dev")
+    os.environ["KRW_ONTOLOGY_ENV"] = "dev"
+    os.environ["KRW_ONTOLOGY_RELEASE_ROOT"] = str(root.resolve())
+    os.environ["KRW_ONTOLOGY_GLOBAL_SPINE_PATH"] = str(result.global_spine_path.resolve())
+    os.environ["KRW_ONTOLOGY_SHARD_MANIFEST_PATH"] = str(result.shard_manifest_path.resolve())
+    return {
+        "index_path": result.global_spine_path.resolve(),
+        "release_root": root.resolve(),
+        "build_result": result,
+    }
 
 
 def _write_context_fixture(
@@ -2405,11 +2787,10 @@ def test_metric_dimension_normalization_uses_generic_rules_not_value_special_cas
 
 def test_query_ticker_summary_discovery_contract(tmp_path: Path) -> None:
     _write_fixture(tmp_path)
-    build_agent_index(tmp_path)
+    _build_v3_runtime(tmp_path)
 
     payload = json.loads(
         query_tool(
-            root=str(tmp_path),
             topic="commodity volatility natural gas price revenue exposure",
             object_types=["ExternalFactorExposure", "ResearchClaim", "EvidenceQuote", "SupportLink"],
             response_detail="ticker_summary",
@@ -2447,7 +2828,7 @@ def test_query_ticker_summary_discovery_contract(tmp_path: Path) -> None:
 
 def test_query_compact_exposes_directness_guard_for_direct_question(tmp_path: Path, monkeypatch) -> None:
     _write_fixture(tmp_path)
-    build_agent_index(tmp_path)
+    _build_v3_runtime(tmp_path)
     monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
 
     payload = json.loads(
@@ -2476,11 +2857,10 @@ def test_query_compact_exposes_directness_guard_for_direct_question(tmp_path: Pa
 
 def test_query_ids_only_response_detail_contract(tmp_path: Path) -> None:
     _write_fixture(tmp_path)
-    build_agent_index(tmp_path)
+    _build_v3_runtime(tmp_path)
 
     payload = json.loads(
         query_tool(
-            root=str(tmp_path),
             topic="revenue growth",
             response_detail="ids_only",
             limit=3,
@@ -2496,11 +2876,10 @@ def test_retrieve_ticker_summary_discovery_contract(tmp_path: Path) -> None:
     from krw_ontology.mcp_server.tools import retrieve_tool
 
     _write_fixture(tmp_path)
-    build_agent_index(tmp_path)
+    _build_v3_runtime(tmp_path)
 
     payload = json.loads(
         retrieve_tool(
-            root=str(tmp_path),
             question="commodity volatility and natural gas price exposure",
             response_detail="ticker_summary",
             group_by="ticker",
@@ -2531,11 +2910,10 @@ def test_retrieve_ticker_summary_exposes_directness_guard_for_direct_question(tm
     from krw_ontology.mcp_server.tools import retrieve_tool
 
     _write_fixture(tmp_path)
-    build_agent_index(tmp_path)
+    _build_v3_runtime(tmp_path)
 
     payload = json.loads(
         retrieve_tool(
-            root=str(tmp_path),
             question="VG는 GPU HBM 가격 변동에 직접 노출되어 있나?",
             response_detail="ticker_summary",
             group_by="ticker",
@@ -2565,11 +2943,10 @@ def test_ticker_summary_demotes_untraced_direct_candidate(tmp_path: Path) -> Non
     exposures[0]["supported_by_claims"] = []
     exposures[0]["supported_by_quotes"] = []
     write_jsonl(exposure_path, exposures)
-    build_agent_index(tmp_path)
+    _build_v3_runtime(tmp_path)
 
     payload = json.loads(
         query_tool(
-            root=str(tmp_path),
             topic="feed gas costs Henry Hub operating margin",
             response_detail="ticker_summary",
             group_by="ticker",

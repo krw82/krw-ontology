@@ -12,15 +12,14 @@ import typer
 from krw_ontology.config.paths import (
     DEFAULT_ONTOLOGY_ROOT,
     ONTOLOGY_ENV_ENV,
-    ONTOLOGY_INDEX_PATH_ENV,
+    ONTOLOGY_GLOBAL_SPINE_PATH_ENV,
     ONTOLOGY_MANIFEST_PATH_ENV,
     ONTOLOGY_RELEASE_ROOT_ENV,
     ONTOLOGY_ROOT_ENV,
+    ONTOLOGY_SHARD_MANIFEST_PATH_ENV,
 )
-from krw_ontology.agent_index.builder import DEFAULT_INDEX_RELATIVE_PATH
 from krw_ontology.mcp_server.server import mcp
-from krw_ontology.mcp_server.tools import ensure_persistent_store_open
-from krw_ontology.release import normalize_ontology_env, verify_release_startup
+from krw_ontology.release import normalize_ontology_env, verify_release_startup_v3
 
 LOGGER = logging.getLogger(__name__)
 
@@ -45,7 +44,6 @@ def prepare_mcp_runtime(
     root: Path,
     env: str | None,
     expected_release_id: str | None = None,
-    index_path: Path | None = None,
     require_current_symlink: bool = False,
     store_mode: str = "persistent",
 ) -> dict[str, Any]:
@@ -56,10 +54,10 @@ def prepare_mcp_runtime(
         raise RuntimeError(f"store_mode must be persistent or per_call, got {store_mode!r}")
     root = root.expanduser()
     require_symlink = require_current_symlink or resolved_env == "prod"
-    verification = verify_release_startup(
+    verification = verify_release_startup_v3(
         root,
         env=resolved_env,
-        index_path=index_path,
+        manifest_path=root / "manifest.json",
         require_current_symlink=require_symlink,
     )
     if not verification["ok"]:
@@ -72,22 +70,25 @@ def prepare_mcp_runtime(
         )
     manifest_path = verification.get("manifest_path")
     runtime_root = _absolute_without_resolving(root)
-    runtime_index_path = _runtime_index_path(
+    runtime_global_spine_path = _runtime_global_spine_path(
         runtime_root=runtime_root,
         verification=verification,
-        explicit_index_path=index_path,
     )
+    shard_manifest_path = runtime_root / "indexes" / "shard_manifest.json"
 
     os.environ[ONTOLOGY_ENV_ENV] = resolved_env
     os.environ[ONTOLOGY_RELEASE_ROOT_ENV] = str(runtime_root)
     os.environ[ONTOLOGY_ROOT_ENV] = str(runtime_root)
     if manifest_path:
         os.environ[ONTOLOGY_MANIFEST_PATH_ENV] = str(manifest_path)
-    os.environ[ONTOLOGY_INDEX_PATH_ENV] = str(runtime_index_path)
+    os.environ[ONTOLOGY_GLOBAL_SPINE_PATH_ENV] = str(runtime_global_spine_path)
+    os.environ[ONTOLOGY_SHARD_MANIFEST_PATH_ENV] = str(shard_manifest_path)
+    os.environ["KRW_ONTOLOGY_INDEX_LAYOUT"] = str(verification["index_layout"])
     os.environ["KRW_MCP_STORE_MODE"] = normalized_store_mode
-    ensure_persistent_store_open(runtime_index_path)
     verification["runtime_root"] = str(runtime_root)
-    verification["runtime_index_path"] = str(runtime_index_path)
+    verification["runtime_global_spine_path"] = str(runtime_global_spine_path)
+    verification["runtime_shard_manifest_path"] = str(shard_manifest_path)
+    verification["runtime_store_opened"] = False
     return verification
 
 
@@ -95,20 +96,19 @@ def _absolute_without_resolving(path: Path) -> Path:
     return path.expanduser().absolute()
 
 
-def _runtime_index_path(
+def _runtime_global_spine_path(
     *,
     runtime_root: Path,
     verification: dict[str, Any],
-    explicit_index_path: Path | None,
 ) -> Path:
-    if explicit_index_path is not None:
-        return _absolute_without_resolving(explicit_index_path)
     manifest = verification.get("manifest") if isinstance(verification.get("manifest"), dict) else {}
-    manifest_index_path = manifest.get("index_path") if isinstance(manifest, dict) else None
-    if isinstance(manifest_index_path, str) and manifest_index_path:
-        candidate = Path(manifest_index_path).expanduser()
+    raw_spine_path = manifest.get("global_spine_path")
+    if not isinstance(raw_spine_path, str) or not raw_spine_path:
+        raw_spine_path = (((manifest.get("indexes") or {}).get("global_spine") or {}).get("path"))
+    if isinstance(raw_spine_path, str) and raw_spine_path:
+        candidate = Path(raw_spine_path).expanduser()
         return candidate.absolute() if candidate.is_absolute() else runtime_root / candidate
-    return runtime_root / DEFAULT_INDEX_RELATIVE_PATH
+    raise RuntimeError("verified v3 release manifest is missing global spine path")
 
 
 def serve(
@@ -131,11 +131,6 @@ def serve(
         DEFAULT_ONTOLOGY_ROOT,
         "--root",
         help="Stable ontology data root. The server reads only this root by default.",
-    ),
-    index_path: Path | None = typer.Option(
-        None,
-        "--index-path",
-        help="Optional explicit SQLite index path. Defaults to manifest index_path.",
     ),
     expected_release_id: str | None = typer.Option(
         None,
@@ -185,7 +180,6 @@ def serve(
             root=root,
             env=env,
             expected_release_id=expected_release_id,
-            index_path=index_path,
             require_current_symlink=require_current_symlink,
             store_mode=store_mode,
         )
@@ -199,11 +193,11 @@ def serve(
     mcp.settings.json_response = json_response
     mcp.settings.log_level = log_level
     LOGGER.info(
-        "mcp_server_start env=%s release_id=%s root=%s index_path=%s host=%s port=%s path=%s store_mode=%s",
+        "mcp_server_start env=%s release_id=%s root=%s global_spine_path=%s host=%s port=%s path=%s store_mode=%s",
         verification.get("env"),
         verification.get("release_id"),
         verification.get("root"),
-        verification.get("index_path"),
+        verification.get("runtime_global_spine_path"),
         host,
         port,
         mcp_path,

@@ -17,7 +17,6 @@ from krw_ontology.config.paths import (
     ONTOLOGY_ENV_ENV,
     ONTOLOGY_RELEASE_ROOT_ENV,
     ONTOLOGY_ROOT_ENV,
-    resolve_agent_index_path,
     resolve_ontology_root,
 )
 from krw_ontology.mcp_server.tools import (
@@ -40,8 +39,7 @@ from krw_ontology.mcp_server.tools import (
 from krw_ontology.release import (
     load_release_manifest,
     normalize_ontology_env,
-    resolve_manifest_index_path,
-    verify_release_startup,
+    verify_release_startup_v3,
 )
 
 mcp = FastMCP("krw_ontology_mcp")
@@ -57,23 +55,39 @@ READ_ONLY = ToolAnnotations(
 def health_payload(
     *,
     root: str | None = None,
-    index_path: str | None = None,
 ) -> tuple[dict, int]:
     """Return lightweight health metadata for the configured ontology release."""
     supplied_root_path = _supplied_root_path(root)
     root_path = supplied_root_path.resolve()
-    release_manifest, release_manifest_path = load_release_manifest(root_path)
+    release_manifest, release_manifest_path = load_release_manifest(
+        root_path,
+        manifest_path=root_path / "manifest.json",
+    )
     configured_env = _configured_env_name()
     current_symlink = _current_symlink_metadata(supplied_root_path, root_path)
-    resolved_index_path = (
-        resolve_agent_index_path(root_path, index_path, fallback_to_cwd=False)
-        if index_path is not None
-        else resolve_manifest_index_path(root_path, release_manifest)
+    resolved_global_spine_path = _health_global_spine_path(root_path, release_manifest)
+    index_outputs = release_manifest.get("indexes") if isinstance(release_manifest.get("indexes"), dict) else {}
+    global_spine_output = (
+        index_outputs.get("global_spine") if isinstance(index_outputs.get("global_spine"), dict) else {}
     )
-    startup_verification = verify_release_startup(
+    global_spine_counts = (
+        global_spine_output.get("counts") if isinstance(global_spine_output.get("counts"), dict) else {}
+    )
+    company_shards_output = (
+        index_outputs.get("company_shards") if isinstance(index_outputs.get("company_shards"), dict) else {}
+    )
+    document_count = _manifest_non_negative_int(global_spine_counts.get("global_document_catalog"))
+    object_count = _manifest_non_negative_int(
+        release_manifest.get("global_object_count")
+        if release_manifest.get("global_object_count") is not None
+        else global_spine_counts.get("global_object_locator")
+    )
+    global_topic_spine_count = _manifest_non_negative_int(global_spine_counts.get("global_topic_spine"))
+    company_shard_count = _manifest_non_negative_int(company_shards_output.get("count"))
+    startup_verification = verify_release_startup_v3(
         supplied_root_path,
         env=configured_env,
-        index_path=Path(index_path) if index_path is not None else None,
+        manifest_path=root_path / "manifest.json",
         require_current_symlink=configured_env == "prod",
         check_sqlite=False,
     )
@@ -83,7 +97,6 @@ def health_payload(
         "ok": False,
         "root": str(root_path),
         "supplied_root": str(supplied_root_path.expanduser().absolute()),
-        "index_path": str(resolved_index_path),
         "release_id": release_manifest.get("release_id"),
         "env": release_manifest.get("env") or configured_env,
         "configured_env": configured_env,
@@ -96,17 +109,16 @@ def health_payload(
         "current_symlink_target": current_symlink["current_symlink_target"],
         "current_release_id": current_symlink["current_release_id"],
         "root_is_current_symlink": current_symlink["root_is_current_symlink"],
-        "agent_index_schema_version": release_manifest.get("agent_index_schema_version"),
-        "index_generated_at": release_manifest.get("index_generated_at"),
         "index_layout": release_manifest.get("index_layout"),
-        "index_layout_version": release_manifest.get("index_layout_version"),
-        "index_shards_present": bool(release_manifest.get("index_shards_present")),
-        "global_catalog_path": release_manifest.get("global_catalog_path"),
-        "global_topics_path": release_manifest.get("global_topics_path"),
-        "global_topics_present": bool(release_manifest.get("global_topics_present")),
-        "global_topic_count": _manifest_non_negative_int(release_manifest.get("global_topic_count")),
-        "company_shards_dir": release_manifest.get("company_shards_dir"),
-        "company_shard_count": _manifest_non_negative_int(release_manifest.get("company_shard_count")),
+        "global_spine_schema_version": global_spine_output.get("schema_version"),
+        "global_spine_path": str(resolved_global_spine_path),
+        "global_spine_manifest_path": global_spine_output.get("path"),
+        "global_spine_present": resolved_global_spine_path.exists(),
+        "company_shards_present": bool(company_shards_output.get("required")),
+        "global_topic_spine_present": global_topic_spine_count is not None and global_topic_spine_count > 0,
+        "global_topic_spine_count": global_topic_spine_count,
+        "company_shards_dir": release_manifest.get("company_shards_dir") or company_shards_output.get("dir"),
+        "company_shard_count": company_shard_count,
         "cache": cache_status,
         "mcp_store_hot_swap": {
             "mode": store_status.get("mode"),
@@ -118,18 +130,18 @@ def health_payload(
             "rotation_pending": bool(store_status.get("rotation_pending")),
             "retired_oldest_age_sec": store_status.get("retired_oldest_age_sec"),
             "last_rotation": store_status.get("last_rotation"),
-            "retired_indexes": store_status.get("retired_indexes") or [],
+            "retired_global_spine_stores": store_status.get("retired_global_spine_stores") or [],
         },
-        "documents": _manifest_non_negative_int(release_manifest.get("document_count")),
-        "objects": _manifest_non_negative_int(release_manifest.get("object_count")),
+        "documents": document_count,
+        "objects": object_count,
         "sqlite_checked": False,
         "tools": sorted(tool.name for tool in mcp._tool_manager.list_tools()),
     }
     if configured_env == "prod" and not current_symlink["root_is_current_symlink"]:
         payload["error"] = "prod_current_symlink_required"
         return payload, 503
-    if not resolved_index_path.exists():
-        payload["error"] = "agent_index_not_found"
+    if not resolved_global_spine_path.exists():
+        payload["error"] = "global_spine_not_found"
         return payload, 503
     if not startup_verification["ok"]:
         payload["error"] = "release_startup_verification_failed"
@@ -155,6 +167,14 @@ def _configured_env_name() -> str | None:
     return normalize_ontology_env(raw_env)
 
 
+def _health_global_spine_path(root_path: Path, release_manifest: dict[str, Any]) -> Path:
+    raw_path = (((release_manifest.get("indexes") or {}).get("global_spine") or {}).get("path"))
+    if isinstance(raw_path, str) and raw_path:
+        candidate = Path(raw_path).expanduser()
+        return candidate.resolve() if candidate.is_absolute() else (root_path / candidate).resolve()
+    return (root_path / "indexes" / "global_spine.sqlite").resolve()
+
+
 def _current_symlink_metadata(supplied_root_path: Path, root_path: Path) -> dict[str, Any]:
     supplied_absolute = supplied_root_path.expanduser().absolute()
     root_is_current_symlink = supplied_absolute.name == "current" and supplied_absolute.is_symlink()
@@ -172,10 +192,9 @@ def _current_symlink_metadata(supplied_root_path: Path, root_path: Path) -> dict
 def metrics_payload(
     *,
     root: str | None = None,
-    index_path: str | None = None,
 ) -> tuple[str, int]:
     """Return Prometheus-compatible text metrics for external monitors."""
-    payload, status_code = health_payload(root=root, index_path=index_path)
+    payload, status_code = health_payload(root=root)
     cache = payload.get("cache") if isinstance(payload.get("cache"), dict) else {}
     store = cache.get("store") if isinstance(cache.get("store"), dict) else {}
     labels = {
@@ -191,8 +210,8 @@ def metrics_payload(
             labels,
         ),
         (
-            "krw_ontology_mcp_index_present",
-            "MCP configured agent index presence.",
+            "krw_ontology_mcp_global_spine_present",
+            "MCP configured global spine presence.",
             "gauge",
             1 if status_code == 200 else 0,
             labels,
@@ -219,10 +238,10 @@ def metrics_payload(
             labels,
         ),
         (
-            "krw_ontology_mcp_global_topics",
-            "Global topic count from release manifest.",
+            "krw_ontology_mcp_global_topic_spine_rows",
+            "Global topic spine row count from release manifest.",
             "gauge",
-            payload.get("global_topic_count"),
+            payload.get("global_topic_spine_count"),
             labels,
         ),
         (
@@ -288,19 +307,22 @@ def metrics_payload(
 def diagnostics_payload(
     *,
     root: str | None = None,
-    index_path: str | None = None,
 ) -> tuple[dict, int]:
     """Return heavier diagnostics, including live SQLite count queries."""
-    payload, status_code = health_payload(root=root, index_path=index_path)
+    payload, status_code = health_payload(root=root)
     if status_code != 200:
         payload["sqlite_checked"] = False
         return payload, status_code
 
-    resolved_index_path = Path(str(payload["index_path"]))
+    resolved_global_spine_path = Path(str(payload["global_spine_path"]))
     try:
-        with closing(sqlite3.connect(resolved_index_path)) as conn:
-            payload["documents"] = conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
-            payload["objects"] = conn.execute("SELECT COUNT(*) FROM objects").fetchone()[0]
+        with closing(sqlite3.connect(resolved_global_spine_path)) as conn:
+            payload["documents"] = conn.execute(
+                "SELECT COUNT(*) FROM global_document_catalog"
+            ).fetchone()[0]
+            payload["objects"] = conn.execute(
+                "SELECT COUNT(*) FROM global_object_locator"
+            ).fetchone()[0]
     except sqlite3.Error as exc:
         payload["error"] = f"sqlite_error: {exc}"
         payload["sqlite_checked"] = True
@@ -372,8 +394,6 @@ async def krw_ontology_diagnostics(_request: Request) -> JSONResponse:
     annotations=READ_ONLY,
 )
 async def krw_ontology_catalog(
-    root: str | None = None,
-    index_path: str | None = None,
     ticker: str | None = None,
     document_types: list[str] | None = None,
     limit: int = 50,
@@ -382,8 +402,6 @@ async def krw_ontology_catalog(
 ) -> str:
     """List indexed companies, document types, periods, and document metadata."""
     return catalog_tool(
-        root=root,
-        index_path=index_path,
         ticker=ticker,
         document_types=document_types,
         limit=limit,
@@ -398,8 +416,6 @@ async def krw_ontology_catalog(
     annotations=READ_ONLY,
 )
 async def krw_ontology_index_context(
-    root: str | None = None,
-    index_path: str | None = None,
     include_counts: bool = False,
     include_capabilities: bool = True,
     include_quality_summary: bool = False,
@@ -408,8 +424,6 @@ async def krw_ontology_index_context(
 ) -> str:
     """Return index schema, capabilities, coverage, and answerability policy."""
     return index_context_tool(
-        root=root,
-        index_path=index_path,
         include_counts=include_counts,
         include_capabilities=include_capabilities,
         include_quality_summary=include_quality_summary,
@@ -425,8 +439,6 @@ async def krw_ontology_index_context(
 )
 async def krw_ontology_company_context(
     ticker: str,
-    root: str | None = None,
-    index_path: str | None = None,
     document_types: list[str] | None = None,
     periods: list[str] | None = None,
     limit_topics: int = 12,
@@ -436,8 +448,6 @@ async def krw_ontology_company_context(
     """Return evidence-derived company topic profiles for search planning."""
     return company_context_tool(
         ticker=ticker,
-        root=root,
-        index_path=index_path,
         document_types=document_types,
         periods=periods,
         limit_topics=limit_topics,
@@ -453,8 +463,6 @@ async def krw_ontology_company_context(
 )
 async def krw_ontology_query_context(
     question: str,
-    root: str | None = None,
-    index_path: str | None = None,
     ticker: str | None = None,
     tickers: list[str] | None = None,
     document_types: list[str] | None = None,
@@ -468,8 +476,6 @@ async def krw_ontology_query_context(
     """Return a compact query-specific context pack with answerability guidance."""
     return query_context_tool(
         question=question,
-        root=root,
-        index_path=index_path,
         ticker=ticker,
         tickers=tickers,
         document_types=document_types,
@@ -488,8 +494,6 @@ async def krw_ontology_query_context(
     annotations=READ_ONLY,
 )
 async def krw_ontology_query(
-    root: str | None = None,
-    index_path: str | None = None,
     topic: str | None = None,
     ticker: str | None = None,
     tickers: list[str] | None = None,
@@ -511,8 +515,6 @@ async def krw_ontology_query(
 ) -> str:
     """Search accepted ontology objects and return source-grounded evidence bundles."""
     return query_tool(
-        root=root,
-        index_path=index_path,
         topic=topic,
         ticker=ticker,
         tickers=tickers,
@@ -541,8 +543,6 @@ async def krw_ontology_query(
 )
 async def krw_ontology_topic_map(
     ticker: str,
-    root: str | None = None,
-    index_path: str | None = None,
     document_types: list[str] | None = None,
     periods: list[str] | None = None,
     limit: int = 10,
@@ -550,8 +550,6 @@ async def krw_ontology_topic_map(
 ) -> str:
     """Return company-specific vocabulary for planning ontology searches."""
     return topic_map_tool(
-        root=root,
-        index_path=index_path,
         ticker=ticker,
         document_types=document_types,
         periods=periods,
@@ -567,8 +565,6 @@ async def krw_ontology_topic_map(
 )
 async def krw_ontology_retrieve(
     question: str,
-    root: str | None = None,
-    index_path: str | None = None,
     ticker: str | None = None,
     tickers: list[str] | None = None,
     document_types: list[str] | None = None,
@@ -586,8 +582,6 @@ async def krw_ontology_retrieve(
     """Run the deterministic local planner for a natural-language ontology question."""
     return retrieve_tool(
         question=question,
-        root=root,
-        index_path=index_path,
         ticker=ticker,
         tickers=tickers,
         document_types=document_types,
@@ -611,15 +605,11 @@ async def krw_ontology_retrieve(
 )
 async def krw_ontology_trace(
     object_id: str,
-    root: str | None = None,
-    index_path: str | None = None,
     response_format: ResponseFormat = ResponseFormat.JSON,
 ) -> str:
     """Trace an object id to its source document, supporting quotes, spans, and quality."""
     return trace_tool(
         object_id=object_id,
-        root=root,
-        index_path=index_path,
         response_format=response_format,
     )
 
@@ -631,8 +621,6 @@ async def krw_ontology_trace(
 )
 async def krw_ontology_chain(
     object_id: str,
-    root: str | None = None,
-    index_path: str | None = None,
     max_depth: int = 2,
     direction: str = "both",
     include_quote_text: bool = False,
@@ -641,8 +629,6 @@ async def krw_ontology_chain(
     """Return evidence, semantic-neighbor, and temporal-context chains around an object."""
     return chain_tool(
         object_id=object_id,
-        root=root,
-        index_path=index_path,
         max_depth=max_depth,
         direction=direction,
         include_quote_text=include_quote_text,
@@ -656,8 +642,6 @@ async def krw_ontology_chain(
     annotations=READ_ONLY,
 )
 async def krw_ontology_quality(
-    root: str | None = None,
-    index_path: str | None = None,
     ticker: str | None = None,
     document_type: str | None = None,
     period: str | None = None,
@@ -667,8 +651,6 @@ async def krw_ontology_quality(
 ) -> str:
     """Return rejected-object, batch-failure, and section-quality events."""
     return quality_tool(
-        root=root,
-        index_path=index_path,
         ticker=ticker,
         document_type=document_type,
         period=period,
@@ -685,8 +667,6 @@ async def krw_ontology_quality(
 )
 async def krw_ontology_compare(
     tickers: list[str] | None = None,
-    root: str | None = None,
-    index_path: str | None = None,
     ticker: str | None = None,
     ticker_a: str | None = None,
     ticker_b: str | None = None,
@@ -701,8 +681,6 @@ async def krw_ontology_compare(
     """Compare two or more companies by evidence topic or canonical metric."""
     return compare_tool(
         tickers=tickers,
-        root=root,
-        index_path=index_path,
         ticker=ticker,
         ticker_a=ticker_a,
         ticker_b=ticker_b,
@@ -723,15 +701,11 @@ async def krw_ontology_compare(
 )
 async def krw_ontology_plan_query(
     question: str,
-    root: str | None = None,
-    index_path: str | None = None,
     response_format: ResponseFormat = ResponseFormat.JSON,
 ) -> str:
     """Return the deterministic QueryPlan without executing a search."""
     return plan_query_tool(
         question=question,
-        root=root,
-        index_path=index_path,
         response_format=response_format,
     )
 

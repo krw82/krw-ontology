@@ -1,10 +1,17 @@
 # Production release transaction and agent index architecture
 
+> 2026-06-12 historical-only notice: 이 문서는 v2 `monolith-and-shards` 설계
+> 배경과 구현 이력만 보존한다. 현재 production 구현의 source of truth가 아니며,
+> 새 코드나 운영 절차의 근거로 사용하지 않는다. 최종 기준은
+> [`v3-final-production-master-development-guide.md`](v3-final-production-master-development-guide.md)
+> 이다. v3는 production monolith fallback을 제거하고 `global_spine.sqlite`와
+> company shards만으로 serving한다.
+
 이 문서는 `krw-ontology`의 publish, release, agent index build, MCP serving 구조를 장기 최선 기준으로 재설계하기 위한 개발 문서다.
 
 현재 구현 계약과 변경 절차의 source of truth는
-[`production-release-index-development-guide.md`](production-release-index-development-guide.md)다.
-이 문서는 설계 배경, 상세 대안, 장기 판단 근거를 보존한다.
+[`v3-final-production-master-development-guide.md`](v3-final-production-master-development-guide.md)다.
+이 문서는 v2 설계 배경, 상세 대안, 장기 판단 근거만 보존한다.
 
 핵심 결론:
 

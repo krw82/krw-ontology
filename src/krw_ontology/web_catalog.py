@@ -6,6 +6,7 @@ import json
 import re
 import sqlite3
 from collections import Counter
+from collections.abc import Mapping
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,24 +21,39 @@ def export_web_catalog(
     root: Path | str,
     *,
     env: str | None = None,
-    index_path: Path | str | None = None,
 ) -> dict[str, Any]:
     """Export a compact, read-only web catalog from an existing release.
 
     This function intentionally never builds or mutates the ontology index.
-    The release must already contain a valid manifest and agent_index.sqlite.
+    The release must already be a valid v3 global spine + company shard release.
     """
-    verification = verify_release_root(root, env=env, index_path=index_path)
+    verification = verify_release_root(root, env=env)
     if not verification["ok"]:
         raise ValueError(f"Release verification failed: {', '.join(verification['errors'])}")
 
     root_path = Path(verification["root"])
-    resolved_index_path = Path(str(verification["index_path"]))
     manifest = verification["manifest"]
-    with closing(_connect_readonly(resolved_index_path)) as conn:
-        conn.row_factory = sqlite3.Row
-        companies = _export_companies(conn)
-        summary = _export_summary(conn, companies=companies)
+    if manifest.get("format") != "krw-ontology-release/v3":
+        raise ValueError(f"Web catalog export requires v3 release (found {manifest.get('format') or '<missing>'})")
+    global_spine_path = Path(str(verification["global_spine_path"]))
+    shard_manifest_path = _resolve_manifest_path(root_path, manifest, "shard_manifest", "indexes/shard_manifest.json")
+    shard_paths = _v3_company_shard_paths(root_path, shard_manifest_path)
+    companies: list[dict[str, Any]] = []
+    index_document_count = 0
+    object_count = 0
+    for shard_path in shard_paths:
+        with closing(_connect_readonly(shard_path)) as conn:
+            conn.row_factory = sqlite3.Row
+            companies.extend(_export_companies(conn))
+            index_document_count += _safe_count(conn, "SELECT COUNT(*) FROM documents", ())
+            object_count += _safe_count(conn, "SELECT COUNT(*) FROM objects", ())
+    companies.sort(key=lambda item: item["ticker"])
+    summary = {
+        "company_count": len(companies),
+        "document_count": sum(company["coverage"]["document_count"] for company in companies),
+        "index_document_count": index_document_count,
+        "object_count": object_count,
+    }
 
     return {
         "format": WEB_CATALOG_FORMAT,
@@ -47,14 +63,17 @@ def export_web_catalog(
         "source": {
             "root": str(root_path),
             "manifest_path": verification.get("manifest_path"),
-            "index_path": str(resolved_index_path),
+            "global_spine_path": str(global_spine_path),
+            "shard_manifest_path": str(shard_manifest_path),
         },
         "release": {
             "release_id": manifest.get("release_id"),
             "env": manifest.get("env"),
             "created_at": manifest.get("created_at"),
-            "agent_index_schema_version": manifest.get("agent_index_schema_version"),
-            "index_generated_at": manifest.get("index_generated_at"),
+            "format": manifest.get("format"),
+            "index_layout": manifest.get("index_layout"),
+            "spine_schema_version": ((manifest.get("builder") or {}).get("spine_schema_version")),
+            "company_shard_schema_version": ((manifest.get("builder") or {}).get("company_shard_schema_version")),
         },
         "summary": summary,
         "companies": companies,
@@ -66,14 +85,49 @@ def write_web_catalog(
     out: Path | str,
     *,
     env: str | None = None,
-    index_path: Path | str | None = None,
 ) -> dict[str, Any]:
     """Write a compact web catalog JSON file from an existing release."""
-    catalog = export_web_catalog(root, env=env, index_path=index_path)
+    catalog = export_web_catalog(root, env=env)
     out_path = Path(out).expanduser().resolve()
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(catalog, indent=2, sort_keys=True, ensure_ascii=False) + "\n", encoding="utf-8")
     return catalog
+
+
+def _resolve_manifest_path(root: Path, manifest: Mapping[str, Any], role: str, default: str) -> Path:
+    raw_path = (((manifest.get("indexes") or {}).get(role) or {}).get("path"))
+    if not isinstance(raw_path, str) or not raw_path:
+        raw_path = default
+    candidate = Path(raw_path)
+    resolved = candidate.expanduser().resolve() if candidate.is_absolute() else (root / candidate).resolve()
+    resolved.relative_to(root)
+    return resolved
+
+
+def _v3_company_shard_paths(root: Path, shard_manifest_path: Path) -> list[Path]:
+    payload = json.loads(shard_manifest_path.read_text(encoding="utf-8"))
+    shards = payload.get("shards")
+    if not isinstance(shards, Mapping):
+        raise ValueError("shard_manifest_missing_shards")
+    paths: list[Path] = []
+    for ticker, entry in sorted(shards.items()):
+        if not isinstance(entry, Mapping):
+            raise ValueError(f"shard_manifest_entry_invalid:{ticker}")
+        raw_path = entry.get("path")
+        if not isinstance(raw_path, str) or not raw_path:
+            raise ValueError(f"shard_manifest_path_missing:{ticker}")
+        candidate = Path(raw_path)
+        if candidate.is_absolute():
+            resolved = candidate.expanduser().resolve()
+        elif candidate.parts and candidate.parts[0] == "indexes":
+            resolved = (root / candidate).resolve()
+        else:
+            resolved = (root / "indexes" / candidate).resolve()
+        resolved.relative_to(root)
+        if not resolved.is_file():
+            raise ValueError(f"company_shard_missing:{ticker}:{resolved}")
+        paths.append(resolved)
+    return paths
 
 
 def _connect_readonly(index_path: Path) -> sqlite3.Connection:

@@ -17,11 +17,11 @@ README_PATH = OBSERVABILITY_DIR / "README.md"
 
 REQUIRED_METRICS = {
     "krw_ontology_mcp_health_ok",
-    "krw_ontology_mcp_index_present",
+    "krw_ontology_mcp_global_spine_present",
     "krw_ontology_mcp_release_documents",
     "krw_ontology_mcp_release_objects",
     "krw_ontology_mcp_company_shards",
-    "krw_ontology_mcp_global_topics",
+    "krw_ontology_mcp_global_topic_spine_rows",
     "krw_ontology_mcp_store_rotation_pending",
     "krw_ontology_mcp_store_retired_leased",
     "krw_ontology_mcp_store_retired_oldest_age_seconds",
@@ -30,7 +30,7 @@ REQUIRED_METRICS = {
 
 ALERT_METRICS = {
     "krw_ontology_mcp_health_ok",
-    "krw_ontology_mcp_index_present",
+    "krw_ontology_mcp_global_spine_present",
     "krw_ontology_mcp_release_documents",
     "krw_ontology_mcp_release_objects",
     "krw_ontology_mcp_store_rotation_pending",
@@ -48,7 +48,7 @@ def test_prometheus_alert_rules_cover_release_and_hot_swap_metrics() -> None:
     alert_names = {rule["alert"] for rule in rules}
     assert alert_names >= {
         "KRWOntologyMCPDown",
-        "KRWOntologyMCPIndexMissing",
+        "KRWOntologyMCPGlobalSpineMissing",
         "KRWOntologyMCPHotSwapStuck",
         "KRWOntologyMCPRetiredLeasesPresent",
         "KRWOntologyMCPExcessiveRotations",
@@ -76,7 +76,7 @@ def test_grafana_dashboard_uses_mcp_metrics_and_release_template() -> None:
         for target in panel.get("targets", [])
     }
     panel_expr_text = "\n".join(sorted(panel_exprs))
-    for metric in REQUIRED_METRICS - {"krw_ontology_mcp_index_present"}:
+    for metric in REQUIRED_METRICS - {"krw_ontology_mcp_global_spine_present"}:
         assert metric in panel_expr_text
     assert 'env="$env"' in panel_expr_text
 

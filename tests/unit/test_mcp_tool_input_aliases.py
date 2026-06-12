@@ -3,12 +3,40 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
-from krw_ontology.agent_index import build_agent_index
+import pytest
+
 from krw_ontology.mcp_server.server import mcp
+from krw_ontology.mcp_server import tools as mcp_tools
 from krw_ontology.mcp_server.tools import compare_tool, query_tool, retrieve_tool
-from tests.unit.test_mcp_server import _write_fixture
+from tests.unit.test_mcp_server import _build_v3_runtime, _write_fixture
+
+
+@pytest.fixture(autouse=True)
+def _isolate_mcp_runtime_env():
+    env_names = (
+        "KRW_ONTOLOGY_ENV",
+        "KRW_ONTOLOGY_RELEASE_ROOT",
+        "KRW_ONTOLOGY_ROOT",
+        "KRW_ONTOLOGY_MANIFEST_PATH",
+        "KRW_ONTOLOGY_INDEX_LAYOUT",
+        "KRW_ONTOLOGY_GLOBAL_SPINE_PATH",
+        "KRW_ONTOLOGY_SHARD_MANIFEST_PATH",
+        "KRW_MCP_STORE_MODE",
+    )
+    old_env = {name: os.environ.get(name) for name in env_names}
+    mcp_tools.reset_mcp_runtime_caches()
+    try:
+        yield
+    finally:
+        mcp_tools.reset_mcp_runtime_caches()
+        for name, value in old_env.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
 
 
 def test_mcp_public_schema_exposes_aliases_without_required_extra_args() -> None:
@@ -43,11 +71,10 @@ def test_mcp_public_schema_exposes_aliases_without_required_extra_args() -> None
 
 def test_query_tool_accepts_scalar_aliases_and_records_unknown_args(tmp_path: Path) -> None:
     _write_fixture(tmp_path)
-    build_agent_index(tmp_path)
+    _build_v3_runtime(tmp_path)
 
     payload = json.loads(
         query_tool(
-            root=str(tmp_path),
             topic="revenue growth",
             ticker="VG",
             document_type="10-K",
@@ -83,11 +110,10 @@ def test_query_tool_accepts_scalar_aliases_and_records_unknown_args(tmp_path: Pa
 
 def test_query_tool_scalar_aliases_do_not_force_tickers_when_absent(tmp_path: Path) -> None:
     _write_fixture(tmp_path)
-    build_agent_index(tmp_path)
+    _build_v3_runtime(tmp_path)
 
     payload = json.loads(
         query_tool(
-            root=str(tmp_path),
             topic="revenue growth",
             document_type="10-K",
             period="FY2025",
@@ -108,11 +134,10 @@ def test_query_tool_scalar_aliases_do_not_force_tickers_when_absent(tmp_path: Pa
 
 def test_retrieve_tool_accepts_ticker_alias_and_records_unknown_args(tmp_path: Path) -> None:
     _write_fixture(tmp_path)
-    build_agent_index(tmp_path)
+    _build_v3_runtime(tmp_path)
 
     payload = json.loads(
         retrieve_tool(
-            root=str(tmp_path),
             question="VG revenue growth evidence",
             ticker="VG",
             limit=3,
@@ -130,11 +155,10 @@ def test_retrieve_tool_accepts_agent_context_without_unknown_arg_warning(
     tmp_path: Path,
 ) -> None:
     _write_fixture(tmp_path)
-    build_agent_index(tmp_path)
+    _build_v3_runtime(tmp_path)
 
     payload = json.loads(
         retrieve_tool(
-            root=str(tmp_path),
             question="VG revenue growth evidence",
             ticker="VG",
             limit=3,
@@ -158,11 +182,10 @@ def test_retrieve_tool_accepts_agent_context_without_unknown_arg_warning(
 
 def test_compare_tool_accepts_pair_aliases_and_records_unknown_args(tmp_path: Path) -> None:
     _write_fixture(tmp_path)
-    build_agent_index(tmp_path)
+    _build_v3_runtime(tmp_path)
 
     payload = json.loads(
         compare_tool(
-            root=str(tmp_path),
             ticker_a="VG",
             ticker_b="XOM",
             topic="revenue growth",
@@ -183,11 +206,10 @@ def test_compare_tool_accepts_pair_aliases_and_records_unknown_args(tmp_path: Pa
 
 def test_compare_tool_accepts_single_ticker_alias_for_period_compare(tmp_path: Path) -> None:
     _write_fixture(tmp_path)
-    build_agent_index(tmp_path)
+    _build_v3_runtime(tmp_path)
 
     payload = json.loads(
         compare_tool(
-            root=str(tmp_path),
             ticker="VG",
             periods=["FY2024", "FY2025"],
             topic="revenue growth",
@@ -204,11 +226,10 @@ def test_compare_tool_accepts_single_ticker_alias_for_period_compare(tmp_path: P
 
 def test_full_response_detail_is_globally_downgraded(tmp_path: Path) -> None:
     _write_fixture(tmp_path)
-    build_agent_index(tmp_path)
+    _build_v3_runtime(tmp_path)
 
     query_payload = json.loads(
         query_tool(
-            root=str(tmp_path),
             topic="revenue growth",
             ticker="VG",
             response_detail="full",
@@ -217,7 +238,6 @@ def test_full_response_detail_is_globally_downgraded(tmp_path: Path) -> None:
     )
     retrieve_payload = json.loads(
         retrieve_tool(
-            root=str(tmp_path),
             question="VG revenue growth evidence",
             ticker="VG",
             response_detail="full",
@@ -226,7 +246,6 @@ def test_full_response_detail_is_globally_downgraded(tmp_path: Path) -> None:
     )
     compare_payload = json.loads(
         compare_tool(
-            root=str(tmp_path),
             ticker="VG",
             periods=["FY2024", "FY2025"],
             topic="revenue growth",

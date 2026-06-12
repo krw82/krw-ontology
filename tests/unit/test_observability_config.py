@@ -69,7 +69,7 @@ def test_render_prometheus_alerts_config_injects_thresholds_from_env(tmp_path: P
     output_path = tmp_path / "prometheus-alerts.yml"
     env = {
         "KRW_PROMETHEUS_MCP_DOWN_FOR": "3m",
-        "KRW_PROMETHEUS_INDEX_MISSING_FOR": "90s",
+        "KRW_PROMETHEUS_GLOBAL_SPINE_MISSING_FOR": "90s",
         "KRW_PROMETHEUS_HOT_SWAP_STUCK_FOR": "10m",
         "KRW_PROMETHEUS_HOT_SWAP_RETIRED_AGE_SECONDS": "900",
         "KRW_PROMETHEUS_RETIRED_LEASES_FOR": "20m",
@@ -84,7 +84,7 @@ def test_render_prometheus_alerts_config_injects_thresholds_from_env(tmp_path: P
     payload = yaml.safe_load(output_path.read_text(encoding="utf-8"))
     rules = {rule["alert"]: rule for rule in payload["groups"][0]["rules"]}
     assert rules["KRWOntologyMCPDown"]["for"] == "3m"
-    assert rules["KRWOntologyMCPIndexMissing"]["for"] == "90s"
+    assert rules["KRWOntologyMCPGlobalSpineMissing"]["for"] == "90s"
     assert rules["KRWOntologyMCPHotSwapStuck"]["for"] == "10m"
     assert "krw_ontology_mcp_store_retired_oldest_age_seconds > 900" in rules[
         "KRWOntologyMCPHotSwapStuck"

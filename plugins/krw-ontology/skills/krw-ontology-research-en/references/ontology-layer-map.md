@@ -4,11 +4,13 @@ Use this map for internal reasoning only. Do not expose these layer names in nor
 
 ## Mental model
 
-The MCP server reads a generated SQLite serving index. The canonical ontology artifacts remain the source of truth, while serving tables are optimized routes into that evidence.
+The MCP server reads a v3 release serving index. The canonical ontology artifacts remain the source of truth, while serving tables are optimized routes into that evidence.
 
 ```text
 canonical ontology artifacts = source of truth
-agent_index.sqlite = read-optimized serving cache
+global_spine.sqlite = cross-company spine, ranking, and object locator
+companies/<TICKER>.sqlite = ticker-local evidence shard
+shard_manifest.json = shard routing and integrity manifest
 projection/index tables = route candidates
 trace/metric lineage = evidence grounding
 ```

@@ -3945,7 +3945,10 @@ def release_finalize_dev_cmd(
 
 @release_app.command("materialize-prod")
 def release_materialize_prod_cmd(
-    release_id: str = typer.Argument(..., help="Source dev/staging release id to copy."),
+    release_id: str = typer.Argument(
+        ...,
+        help="Source dev/staging release id to copy. Use 'current' for the source env current release.",
+    ),
     releases_root: Path = typer.Option(
         _default_releases_root(),
         "--releases-root",
@@ -3961,16 +3964,32 @@ def release_materialize_prod_cmd(
         "--prod-release-id",
         help="Prod release id to create. Defaults to the source release id.",
     ),
+    promote: bool = typer.Option(
+        True,
+        "--promote/--no-promote",
+        help="Promote prod/current after materializing the prod release.",
+    ),
+    startup_check: bool = typer.Option(
+        True,
+        "--startup-check/--no-startup-check",
+        help="Run the lightweight prod/current MCP startup check after promotion.",
+    ),
     dry_run: bool = typer.Option(False, "--dry-run", help="Show the prod release that would be created."),
 ) -> None:
-    """Copy a verified dev/staging release into prod release space without activating it."""
+    """Copy a verified dev/staging release into prod release space and promote prod/current by default."""
     source_env = normalize_ontology_env(from_env)
     if source_env == "prod":
         typer.echo("--from-env must be dev or staging.")
         raise typer.Exit(1)
-    target_id = prod_release_id or release_id
-    source_root = release_env_root(releases_root, source_env).expanduser().resolve() / release_id
-    prod_root = release_env_root(releases_root, "prod").expanduser().resolve() / target_id
+    source_env_root = release_env_root(releases_root, source_env).expanduser().resolve()
+    source_release_id = current_release_id(source_env_root) if release_id == "current" else release_id
+    if not source_release_id:
+        typer.echo(f"No current release found for env={source_env}")
+        raise typer.Exit(1)
+    target_id = prod_release_id or source_release_id
+    source_root = source_env_root / source_release_id
+    prod_env_root = release_env_root(releases_root, "prod").expanduser().resolve()
+    prod_root = prod_env_root / target_id
     source_startup = verify_release_startup_v3(source_root, env=source_env, check_sqlite=False)
     if not source_startup["ok"]:
         typer.echo(f"Source release must be v3: {', '.join(source_startup['errors'])}")
@@ -3986,6 +4005,8 @@ def release_materialize_prod_cmd(
         typer.echo(f"Dry run: would materialize prod release {target_id}")
         typer.echo(f"source_root: {source_root}")
         typer.echo(f"prod_root: {prod_root}")
+        typer.echo(f"promote: {promote}")
+        typer.echo(f"startup_check: {startup_check and promote}")
         return
 
     _copy_release_tree(source_root, prod_root)
@@ -4013,10 +4034,36 @@ def release_materialize_prod_cmd(
     typer.echo(f"verify_report: {verify_report['path']}")
     typer.echo(f"index_layout: {manifest.get('index_layout') or '<missing>'}")
     typer.echo(f"global_spine: {prod_root / 'indexes' / 'global_spine.sqlite'}")
-    typer.echo(
-        "Next: krw-ontology release promote "
-        f"{target_id} --releases-root {releases_root} --env prod"
+    if not promote:
+        typer.echo(
+            "Next: krw-ontology release promote "
+            f"{target_id} --releases-root {releases_root} --env prod"
+        )
+        return
+
+    try:
+        promotion = promote_local_release(releases_root, env="prod", release_id=target_id)
+    except Exception as exc:
+        typer.echo(f"FAILED prod promote: {exc}")
+        raise typer.Exit(1) from exc
+    typer.echo(f"Prod release promoted: {promotion['release_id']}")
+    typer.echo(f"current: {promotion['current']}")
+    typer.echo(f"promote_verify_report: {promotion['verify_report']}")
+
+    if not startup_check:
+        return
+    startup_verification = verify_release_startup_v3(
+        prod_env_root / "current",
+        env="prod",
+        require_current_symlink=True,
+        check_sqlite=True,
     )
+    if not startup_verification["ok"]:
+        typer.echo(f"FAILED prod startup-check: {', '.join(startup_verification['errors'])}")
+        raise typer.Exit(1)
+    typer.echo("Prod startup-check: ok")
+    typer.echo(f"startup_release_id: {startup_verification.get('release_id')}")
+    typer.echo(f"startup_global_spine: {startup_verification.get('global_spine_path')}")
 
 
 @release_app.command("write-manifest")
@@ -9380,7 +9427,15 @@ def _build_agent_index_and_print(
     typer.echo(f"Build progress: {result.progress_path}")
     typer.echo(f"Shard manifest: {result.shard_manifest_path}")
     typer.echo(f"Company shards: {result.release_root / 'indexes' / 'companies'}")
-    typer.echo(f"Spine fragments: {result.release_root / 'indexes' / 'fragments' / 'spine'}")
+    fragment_cleanup = (summary.get("artifact_cleanup") or {}).get("spine_fragments") or {}
+    if fragment_cleanup.get("removed"):
+        typer.echo(
+            "Spine fragments: cleaned "
+            f"{fragment_cleanup.get('file_count', 0)} temporary files "
+            f"({fragment_cleanup.get('size_bytes', 0)} bytes)"
+        )
+    else:
+        typer.echo(f"Spine fragments: {result.release_root / 'indexes' / 'fragments' / 'spine'}")
     typer.echo(
         "Indexed "
         f"{summary.get('artifact_count', 0)} artifacts, "

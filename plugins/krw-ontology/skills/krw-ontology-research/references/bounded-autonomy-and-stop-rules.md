@@ -66,7 +66,8 @@ the next tool would only make the answer more exhaustive, not more correct
 For sector/global/macro questions:
 
 ```text
-use a bounded covered universe
+use a bounded covered universe for broad questions
+allow one v3 global-spine query_context pass for concrete tickerless factor/channel questions with limit_tickers <= 5
 synthesize cross-company signals
 avoid whole-catalog inventory
 avoid unsupported tickers

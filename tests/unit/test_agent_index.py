@@ -307,12 +307,12 @@ def test_build_agent_index_cli(tmp_path: Path):
     assert "V3 index built:" in result.output
     assert "Build plan:" in result.output
     assert "Company shards:" in result.output
-    assert "Spine fragments:" in result.output
+    assert "Spine fragments: cleaned" in result.output
     assert "1 documents" in result.output
     assert not (tmp_path / "indexes" / "agent_index.sqlite").exists()
     assert (tmp_path / "indexes" / "global_spine.sqlite").exists()
     assert (tmp_path / "indexes" / "companies" / "VG.sqlite").exists()
-    assert (tmp_path / "indexes" / "fragments" / "spine" / "VG.sqlite").exists()
+    assert not (tmp_path / "indexes" / "fragments" / "spine").exists()
     assert (tmp_path / "indexes" / "shard_manifest.json").exists()
     assert (tmp_path / "indexes" / "build_summary.json").exists()
     assert (tmp_path / "indexes" / "build_plan.json").exists()
@@ -454,10 +454,10 @@ def test_build_agent_index_cli_v3_outputs_paths(tmp_path: Path):
 
     assert result.exit_code == 0
     assert "Company shards:" in result.output
-    assert "Spine fragments:" in result.output
+    assert "Spine fragments: cleaned" in result.output
     assert (tmp_path / "indexes" / "global_spine.sqlite").exists()
     assert (tmp_path / "indexes" / "companies" / "VG.sqlite").exists()
-    assert (tmp_path / "indexes" / "fragments" / "spine" / "VG.sqlite").exists()
+    assert not (tmp_path / "indexes" / "fragments" / "spine").exists()
     assert (tmp_path / "indexes" / "shard_manifest.json").exists()
 
 

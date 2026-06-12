@@ -123,4 +123,6 @@ direct exposure / related pressure channel
 business model / product platform / customer demand
 ```
 
-For sector/global/macro questions, pair the internal English investment brief with a bounded covered universe when possible.
+For broad sector/global/macro news questions, pair the internal English investment brief with a bounded covered universe when possible.
+
+For concrete tickerless news events with a specific factor, channel, product, business model, metric, event type, or company type, query_context may receive `tickers=[]` with `limit_tickers <= 5` and `limit_results <= 3` after stock-news event discovery. Treat the v3 global spine result as candidate ticker ranking and evidence routing, not as the final answer.

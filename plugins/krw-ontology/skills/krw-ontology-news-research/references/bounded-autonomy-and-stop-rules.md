@@ -72,7 +72,8 @@ only weak news sources remain after one constrained official/major-source confir
 For sector/global/macro questions:
 
 ```text
-use a bounded covered universe
+use a bounded covered universe for broad questions
+allow one v3 global-spine query_context pass for concrete tickerless post-news event questions with limit_tickers <= 5
 synthesize cross-company signals
 avoid whole-catalog inventory
 avoid unsupported tickers

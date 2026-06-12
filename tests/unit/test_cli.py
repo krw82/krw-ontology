@@ -3030,7 +3030,9 @@ class TestReleaseCommand:
         assert "Dev release finalized: 20260528_070000" in result.output
         assert "V3 indexes built:" in result.output
 
-    def test_release_materialize_prod_copies_dev_release_and_rewrites_manifest(self, tmp_path: Path):
+    def test_release_materialize_prod_copies_dev_release_rewrites_manifest_and_promotes(
+        self, tmp_path: Path
+    ):
         releases_root = tmp_path / "releases"
         source = releases_root / "dev" / "20260528_080000"
         _write_minimal_v3_release(source, release_id="20260528_080000", env="dev", ticker="VG")
@@ -3056,8 +3058,57 @@ class TestReleaseCommand:
         assert (prod / "indexes" / "global_spine.sqlite").exists()
         assert (prod / "indexes" / "companies" / "VG.sqlite").exists()
         assert not (prod / "indexes" / "agent_index.sqlite").exists()
+        assert os.readlink(releases_root / "prod" / "current") == "20260528_080000"
+        assert "Prod release promoted: 20260528_080000" in result.output
+        assert "Prod startup-check: ok" in result.output
+        assert "startup_release_id: 20260528_080000" in result.output
+        assert "krw-ontology release promote 20260528_080000" not in result.output
+
+    def test_release_materialize_prod_no_promote_keeps_copy_only_behavior(self, tmp_path: Path):
+        releases_root = tmp_path / "releases"
+        source = releases_root / "dev" / "20260528_090000"
+        _write_minimal_v3_release(source, release_id="20260528_090000", env="dev", ticker="VG")
+
+        result = runner.invoke(
+            app,
+            [
+                "release",
+                "materialize-prod",
+                "20260528_090000",
+                "--releases-root",
+                str(releases_root),
+                "--no-promote",
+            ],
+        )
+
+        assert result.exit_code == 0
+        prod = releases_root / "prod" / "20260528_090000"
+        assert (prod / "manifest.json").exists()
         assert not (releases_root / "prod" / "current").exists()
-        assert "krw-ontology release promote 20260528_080000" in result.output
+        assert "krw-ontology release promote 20260528_090000" in result.output
+        assert "Prod release promoted:" not in result.output
+
+    def test_release_materialize_prod_current_uses_source_current(self, tmp_path: Path):
+        releases_root = tmp_path / "releases"
+        source = releases_root / "dev" / "20260528_100000"
+        _write_minimal_v3_release(source, release_id="20260528_100000", env="dev", ticker="VG")
+        os.symlink(source.name, releases_root / "dev" / "current")
+
+        result = runner.invoke(
+            app,
+            [
+                "release",
+                "materialize-prod",
+                "current",
+                "--releases-root",
+                str(releases_root),
+            ],
+        )
+
+        assert result.exit_code == 0
+        assert (releases_root / "prod" / "20260528_100000" / "manifest.json").exists()
+        assert os.readlink(releases_root / "prod" / "current") == "20260528_100000"
+        assert "Prod startup-check: ok" in result.output
 
 
 class TestQueueCommands:

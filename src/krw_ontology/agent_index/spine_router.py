@@ -3,13 +3,24 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
-from collections import Counter
+from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from krw_ontology.agent_index.store import OntologyStore
-from krw_ontology.agent_index.spine_schema import GLOBAL_SPINE_LAYOUT, verify_global_spine_schema
+from krw_ontology.agent_index.spine_schema import (
+    GLOBAL_SPINE_LAYOUT,
+    GLOBAL_SPINE_SCHEMA_VERSION,
+    GLOBAL_SPINE_TABLES,
+    read_global_spine_metadata,
+)
+
+_ROUTER_FANOUT_WORKERS_ENV = "KRW_ROUTER_FANOUT_WORKERS"
+_DEFAULT_ROUTER_FANOUT_WORKERS = 8
+_MAX_ROUTER_FANOUT_WORKERS = 16
 
 
 class OntologySpineRouter:
@@ -31,9 +42,28 @@ class OntologySpineRouter:
     @classmethod
     def can_open(cls, path: Path | str) -> bool:
         candidate = Path(path).expanduser()
-        if candidate.name == "global_spine.sqlite" and candidate.is_file():
-            return verify_global_spine_schema(candidate)["ok"]
-        return False
+        if candidate.name != "global_spine.sqlite" or not candidate.is_file():
+            return False
+        try:
+            with sqlite3.connect(candidate) as conn:
+                metadata = read_global_spine_metadata(conn)
+                if metadata.get("schema_version") != GLOBAL_SPINE_SCHEMA_VERSION:
+                    return False
+                if metadata.get("index_layout") != GLOBAL_SPINE_LAYOUT:
+                    return False
+                tables = {
+                    str(row[0])
+                    for row in conn.execute(
+                        """
+                        SELECT name
+                        FROM sqlite_master
+                        WHERE type IN ('table', 'view')
+                        """
+                    ).fetchall()
+                }
+        except (OSError, sqlite3.Error):
+            return False
+        return set(GLOBAL_SPINE_TABLES).issubset(tables)
 
     @property
     def conn(self) -> sqlite3.Connection:
@@ -249,17 +279,25 @@ class OntologySpineRouter:
         )
         route_tickers = scoped_tickers or candidate_tickers
         contexts: list[dict[str, Any]] = []
-        for candidate in candidate_tickers:
-            context = self._store_for_ticker(candidate).query_context(
+
+        def load_context(candidate: str, store: OntologyStore) -> dict[str, Any]:
+            context = store.query_context(
                 question=question,
                 tickers=[candidate],
                 **kwargs,
             )
             context.setdefault("routing", self._route_payload("company_shard", [candidate]))
-            contexts.append(context)
+            return context
+
+        context_by_ticker, shard_errors, worker_count = self._store_fanout(candidate_tickers, load_context)
+        for candidate in candidate_tickers:
+            context = context_by_ticker.get(candidate)
+            if isinstance(context, Mapping):
+                contexts.append(context)
         if len(contexts) == 1:
             payload = contexts[0]
             payload["routing"] = self._route_payload("company_shard", route_tickers)
+            payload["routing"].update(self._fanout_diagnostics(worker_count, shard_errors))
             self._attach_missing_release_parts(payload, route_tickers)
             _attach_spine_cross_company_pack(
                 payload,
@@ -269,10 +307,12 @@ class OntologySpineRouter:
                 documents=self.list_documents(),
             )
             return payload
+        routing = self._route_payload("global_spine_fanout", route_tickers)
+        routing.update(self._fanout_diagnostics(worker_count, shard_errors))
         payload = _merge_query_contexts(
             contexts,
             question=question,
-            routing=self._route_payload("global_spine_fanout", route_tickers),
+            routing=routing,
         )
         self._attach_missing_release_parts(payload, route_tickers)
         _attach_spine_cross_company_pack(
@@ -302,9 +342,9 @@ class OntologySpineRouter:
         )
         route_tickers = requested_tickers or candidate_tickers
         shard_payloads: list[dict[str, Any]] = []
-        for ticker in candidate_tickers:
-            store = self._store_for_ticker(ticker)
-            payload = store.discover_company_topics(
+
+        def load_discovery(ticker: str, store: OntologyStore) -> dict[str, Any]:
+            return store.discover_company_topics(
                 question=question,
                 tickers=[ticker],
                 limit_groups=1,
@@ -312,14 +352,20 @@ class OntologySpineRouter:
                 limit=limit,
                 **kwargs,
             )
+
+        payload_by_ticker, shard_errors, worker_count = self._store_fanout(candidate_tickers, load_discovery)
+        for ticker in candidate_tickers:
+            payload = payload_by_ticker.get(ticker)
             if isinstance(payload, Mapping):
                 shard_payloads.append(dict(payload))
         if shard_payloads:
+            routing = self._route_payload("global_spine", route_tickers)
+            routing.update(self._fanout_diagnostics(worker_count, shard_errors))
             return _merge_discovery_payloads(
                 shard_payloads,
                 question=question,
                 candidate_tickers=candidate_tickers,
-                routing=self._route_payload("global_spine", route_tickers),
+                routing=routing,
                 limit=limit,
             )
 
@@ -339,11 +385,15 @@ class OntologySpineRouter:
             "question": question,
             "ticker_candidates": candidates[:limit],
             "search_diagnostics": {
-                "routing": self._route_payload("global_spine", route_tickers),
+                "routing": {
+                    **self._route_payload("global_spine", route_tickers),
+                    **self._fanout_diagnostics(worker_count, shard_errors),
+                },
                 "candidate_tickers": candidate_tickers,
                 "missing_shards": self._missing_shards_for_tickers(route_tickers),
                 "unknown_tickers": self._unknown_tickers(route_tickers),
                 "fallback_used": False,
+                **self._fanout_diagnostics(worker_count, shard_errors),
             },
         }
 
@@ -436,10 +486,18 @@ class OntologySpineRouter:
             return payload
         documents = self.list_documents()
         events: list[dict[str, Any]] = []
+
+        def load_quality(shard_ticker: str, store: OntologyStore) -> dict[str, Any]:
+            return store.quality(ticker=shard_ticker, **kwargs)
+
+        quality_by_ticker, shard_errors, worker_count = self._store_fanout(sorted(self._shard_paths), load_quality)
         for shard_ticker in sorted(self._shard_paths):
-            shard_quality = self._store_for_ticker(shard_ticker).quality(ticker=shard_ticker, **kwargs)
+            shard_quality = quality_by_ticker.get(shard_ticker)
+            if not isinstance(shard_quality, Mapping):
+                continue
             events.extend(shard_quality.get("events") or [])
         routing = self._route_payload("quality_release_scan", self.list_companies())
+        routing.update(self._fanout_diagnostics(worker_count, shard_errors))
         return {
             "documents": documents,
             "events": events,
@@ -453,6 +511,8 @@ class OntologySpineRouter:
                 "missing_shards": {
                     ticker: str(path) for ticker, path in sorted(self._missing_shard_paths.items())
                 },
+                "shard_errors": dict(sorted(shard_errors.items())),
+                "fanout_workers": worker_count,
             },
             "topology": self.routing_status(),
             "routing": routing,
@@ -469,6 +529,60 @@ class OntologySpineRouter:
     def __getattr__(self, name: str) -> Any:
         raise AttributeError(f"{type(self).__name__} has no fallback for {name!r}")
 
+    def _fanout_worker_count(self, count: int) -> int:
+        if count <= 0:
+            return 0
+        configured = _read_int_env(
+            _ROUTER_FANOUT_WORKERS_ENV,
+            _DEFAULT_ROUTER_FANOUT_WORKERS,
+            min_value=1,
+        )
+        return max(1, min(count, configured, _MAX_ROUTER_FANOUT_WORKERS))
+
+    def _store_fanout(
+        self,
+        tickers: Sequence[str],
+        callback: Callable[[str, OntologyStore], Any],
+    ) -> tuple[dict[str, Any], dict[str, str], int]:
+        available_tickers = [ticker for ticker in tickers if ticker in self._shard_paths]
+        worker_count = self._fanout_worker_count(len(available_tickers))
+        results: dict[str, Any] = {}
+        errors: dict[str, str] = {}
+        if not available_tickers:
+            return results, errors, worker_count
+        if worker_count <= 1:
+            for ticker in available_tickers:
+                try:
+                    results[ticker] = callback(ticker, self._store_for_ticker(ticker))
+                except Exception as exc:  # pragma: no cover - defensive partial-failure path
+                    errors[ticker] = _fanout_error(exc)
+            return results, errors, worker_count
+
+        def run(ticker: str) -> tuple[str, Any]:
+            with OntologyStore(self._shard_paths[ticker], check_same_thread=True) as store:
+                return ticker, callback(ticker, store)
+
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            future_to_ticker = {executor.submit(run, ticker): ticker for ticker in available_tickers}
+            for future in as_completed(future_to_ticker):
+                ticker = future_to_ticker[future]
+                try:
+                    result_ticker, payload = future.result()
+                except Exception as exc:  # pragma: no cover - exercised through integration failures
+                    errors[ticker] = _fanout_error(exc)
+                    continue
+                results[result_ticker] = payload
+        return results, errors, worker_count
+
+    def _fanout_diagnostics(self, worker_count: int, errors: Mapping[str, str]) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "fanout_parallel": worker_count > 1,
+            "fanout_workers": worker_count,
+        }
+        if errors:
+            payload["shard_errors"] = dict(sorted(errors.items()))
+        return payload
+
     def _fanout_query(self, *, compact: bool, **kwargs: Any) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         explicit_tickers = _normalize_tickers(kwargs.get("tickers"))
         topic = str(kwargs.get("topic") or kwargs.get("question") or "")
@@ -478,28 +592,41 @@ class OntologySpineRouter:
         results: list[dict[str, Any]] = []
         shard_diagnostics: dict[str, Any] = {}
         primary_diagnostics: dict[str, Any] = {}
-        for ticker in candidate_tickers:
+
+        def load_query(ticker: str, store: OntologyStore) -> dict[str, Any]:
             ticker_kwargs = {**kwargs, "tickers": [ticker], "limit": limit}
-            store = self._store_for_ticker(ticker)
             if compact:
                 rows, diagnostics = store.query_compact_with_diagnostics(**ticker_kwargs)
             else:
                 rows, diagnostics = store.query_with_diagnostics(**ticker_kwargs)
+            return {"rows": list(rows), "diagnostics": diagnostics}
+
+        query_by_ticker, shard_errors, worker_count = self._store_fanout(candidate_tickers, load_query)
+        for ticker in candidate_tickers:
+            payload = query_by_ticker.get(ticker)
+            if not isinstance(payload, Mapping):
+                continue
+            rows = list(payload.get("rows") or [])
+            diagnostics = payload.get("diagnostics") if isinstance(payload.get("diagnostics"), Mapping) else {}
             shard_diagnostics[ticker] = diagnostics
             if not primary_diagnostics and isinstance(diagnostics, Mapping):
                 primary_diagnostics = dict(diagnostics)
             results.extend(rows)
             if len(results) >= limit:
                 break
+        fanout_diagnostics = self._fanout_diagnostics(worker_count, shard_errors)
+        routing = self._route_payload("global_spine_fanout", route_tickers)
+        routing.update(fanout_diagnostics)
         diagnostics = dict(primary_diagnostics)
         diagnostics.update(
             {
-            "result_count": min(len(results), limit),
-            "routing": self._route_payload("global_spine_fanout", route_tickers),
-            "shard_diagnostics": shard_diagnostics,
-            "missing_shards": self._missing_shards_for_tickers(route_tickers),
-            "unknown_tickers": self._unknown_tickers(route_tickers),
-            "fallback_used": False,
+                "result_count": min(len(results), limit),
+                "routing": routing,
+                "shard_diagnostics": shard_diagnostics,
+                "missing_shards": self._missing_shards_for_tickers(route_tickers),
+                "unknown_tickers": self._unknown_tickers(route_tickers),
+                "fallback_used": False,
+                **fanout_diagnostics,
             }
         )
         return results[:limit], diagnostics
@@ -509,6 +636,7 @@ class OntologySpineRouter:
         results: dict[str, list[dict[str, Any]]] = {}
         evaluations: dict[str, dict[str, Any]] = {}
         contexts: dict[str, dict[str, Any]] = {}
+        available_tickers: list[str] = []
         for ticker in ticker_list:
             if ticker not in self._shard_paths:
                 reason = "ticker_shard_missing" if ticker in self._missing_shard_paths else "ticker_shard_not_found"
@@ -525,13 +653,34 @@ class OntologySpineRouter:
                     "unknown_tickers": self._unknown_tickers([ticker]),
                 }
                 continue
-            store = self._store_for_ticker(ticker)
+            available_tickers.append(ticker)
+
+        def load_compare(ticker: str, store: OntologyStore) -> dict[str, Any]:
             compare_fn = store.compare_compact if compact else store.compare
-            payload = compare_fn(tickers=[ticker], **kwargs)
+            return compare_fn(tickers=[ticker], **kwargs)
+
+        payload_by_ticker, shard_errors, worker_count = self._store_fanout(available_tickers, load_compare)
+        for ticker in available_tickers:
+            payload = payload_by_ticker.get(ticker)
+            if not isinstance(payload, Mapping):
+                results[ticker] = []
+                evaluations[ticker] = {
+                    "status": "error",
+                    "reason": shard_errors.get(ticker, "ticker_shard_query_failed"),
+                }
+                contexts[ticker] = {
+                    "research_status": "not_answerable_from_current_release",
+                    "missing_parts": ["ticker_shard_query_failed"],
+                    "routing": self._route_payload("compare_fanout", [ticker]),
+                }
+                continue
             results[ticker] = list((payload.get("results") or {}).get(ticker) or [])
             evaluations[ticker] = dict((payload.get("comparison_evaluations") or {}).get(ticker) or {})
             contexts[ticker] = dict((payload.get("comparison_contexts") or {}).get(ticker) or {})
             contexts[ticker].setdefault("routing", self._route_payload("company_shard", [ticker]))
+        fanout_diagnostics = self._fanout_diagnostics(worker_count, shard_errors)
+        routing = self._route_payload("compare_fanout", ticker_list)
+        routing.update(fanout_diagnostics)
         return {
             "mode": "metric" if kwargs.get("metric") else "topic",
             "topic": kwargs.get("topic"),
@@ -544,7 +693,8 @@ class OntologySpineRouter:
             "missing_shards": self._missing_shards_for_tickers(ticker_list),
             "unknown_tickers": self._unknown_tickers(ticker_list),
             "fallback_used": False,
-            "routing": self._route_payload("compare_fanout", ticker_list),
+            "routing": routing,
+            **fanout_diagnostics,
         }
 
     def _candidate_tickers(
@@ -554,24 +704,12 @@ class OntologySpineRouter:
         explicit_tickers: Sequence[str] | None,
         limit: int,
     ) -> list[str]:
+        resolved_limit = max(1, int(limit))
         if explicit_tickers:
             return [ticker for ticker in explicit_tickers if ticker in self._shard_paths]
-        terms = _fts_query(question)
-        if terms:
-            rows = self.conn.execute(
-                """
-                SELECT ticker, COUNT(*) AS hits
-                FROM global_search_fts
-                WHERE global_search_fts MATCH ?
-                GROUP BY ticker
-                ORDER BY hits DESC, ticker
-                LIMIT ?
-                """,
-                (terms, max(1, int(limit))),
-            ).fetchall()
-            tickers = [str(row["ticker"]).upper() for row in rows if str(row["ticker"]).upper() in self._shard_paths]
-            if tickers:
-                return tickers
+        ranked_tickers = self._rank_candidate_tickers(question, limit=resolved_limit)
+        if ranked_tickers:
+            return ranked_tickers
         rows = self.conn.execute(
             """
             SELECT ticker, COUNT(*) AS objects
@@ -580,9 +718,186 @@ class OntologySpineRouter:
             ORDER BY objects DESC, ticker
             LIMIT ?
             """,
-            (max(1, int(limit)),),
+            (resolved_limit,),
         ).fetchall()
         return [str(row["ticker"]).upper() for row in rows if str(row["ticker"]).upper() in self._shard_paths]
+
+    def _rank_candidate_tickers(self, question: str, *, limit: int) -> list[str]:
+        terms = _like_terms(question)
+        fts_query = _fts_query(question)
+        scores: defaultdict[str, float] = defaultdict(float)
+        row_limit = max(limit * 6, limit)
+        if fts_query:
+            self._add_weighted_rows(
+                scores,
+                """
+                SELECT ticker, COUNT(*) AS score
+                FROM global_search_fts
+                WHERE global_search_fts MATCH ?
+                GROUP BY ticker
+                ORDER BY score DESC, ticker
+                LIMIT ?
+                """,
+                (fts_query, row_limit),
+                weight=10.0,
+            )
+        if terms:
+            self._add_term_table_scores(
+                scores,
+                table="global_topic_spine",
+                columns=(
+                    "topic_key",
+                    "topic_label",
+                    "topic_summary",
+                    "factor_terms",
+                    "metric_terms",
+                    "entity_terms",
+                    "mechanism_terms",
+                    "impact_channels",
+                ),
+                terms=terms,
+                metric_sql="COUNT(*) + COALESCE(MAX(materiality), 0)",
+                weight=5.0,
+                limit=row_limit,
+            )
+            self._add_term_table_scores(
+                scores,
+                table="global_factor_spine",
+                columns=("factor_key", "factor_label", "factor_family", "benchmark", "impact_channel"),
+                terms=terms,
+                metric_sql="COUNT(*) + COALESCE(MAX(materiality), 0)",
+                weight=4.0,
+                limit=row_limit,
+            )
+            self._add_term_table_scores(
+                scores,
+                table="global_metric_spine",
+                columns=("canonical_metric_key", "metric_name", "trend_direction"),
+                terms=terms,
+                metric_sql="COUNT(*) + COALESCE(MAX(confidence), 0)",
+                weight=3.0,
+                limit=row_limit,
+            )
+            self._add_term_table_scores(
+                scores,
+                table="global_entity_spine",
+                columns=("entity_key", "entity_type", "canonical_name", "aliases"),
+                terms=terms,
+                metric_sql="COUNT(*) + COALESCE(MAX(confidence), 0)",
+                weight=2.5,
+                limit=row_limit,
+            )
+            self._add_term_table_scores(
+                scores,
+                table="global_counterparty_spine",
+                columns=("counterparty_key", "counterparty_name", "relationship_type", "agreement_type", "affected_channels"),
+                terms=terms,
+                metric_sql="COUNT(*) + COALESCE(MAX(materiality), 0)",
+                weight=3.0,
+                limit=row_limit,
+            )
+            self._add_chain_scores(scores, terms=terms, limit=row_limit)
+        return [
+            ticker
+            for ticker, _score in sorted(scores.items(), key=lambda item: (-item[1], item[0]))[:limit]
+            if ticker in self._shard_paths
+        ]
+
+    def _add_weighted_rows(
+        self,
+        scores: defaultdict[str, float],
+        sql: str,
+        params: Sequence[Any],
+        *,
+        weight: float,
+    ) -> None:
+        try:
+            rows = self.conn.execute(sql, tuple(params)).fetchall()
+        except sqlite3.Error:
+            return
+        for row in rows:
+            ticker = str(row["ticker"] or "").upper()
+            if ticker not in self._shard_paths:
+                continue
+            try:
+                value = float(row["score"] or 0)
+            except (TypeError, ValueError):
+                value = 0.0
+            scores[ticker] += value * weight
+
+    def _add_term_table_scores(
+        self,
+        scores: defaultdict[str, float],
+        *,
+        table: str,
+        columns: Sequence[str],
+        terms: Sequence[str],
+        metric_sql: str,
+        weight: float,
+        limit: int,
+    ) -> None:
+        clauses: list[str] = []
+        params: list[Any] = []
+        for term in terms[:8]:
+            for column in columns:
+                clauses.append(f"{column} LIKE ?")
+                params.append(f"%{term}%")
+        if not clauses:
+            return
+        params.append(max(1, int(limit)))
+        self._add_weighted_rows(
+            scores,
+            f"""
+            SELECT ticker, ({metric_sql}) AS score
+            FROM {table}
+            WHERE {" OR ".join(clauses)}
+            GROUP BY ticker
+            ORDER BY score DESC, ticker
+            LIMIT ?
+            """,
+            params,
+            weight=weight,
+        )
+
+    def _add_chain_scores(
+        self,
+        scores: defaultdict[str, float],
+        *,
+        terms: Sequence[str],
+        limit: int,
+    ) -> None:
+        clauses: list[str] = []
+        params: list[Any] = []
+        for term in terms[:8]:
+            clauses.extend(("shared_key LIKE ?", "shared_key_type LIKE ?", "explanation_template LIKE ?"))
+            params.extend((f"%{term}%", f"%{term}%", f"%{term}%"))
+        if not clauses:
+            return
+        params.append(max(1, int(limit)))
+        try:
+            rows = self.conn.execute(
+                f"""
+                SELECT from_ticker, to_ticker,
+                       SUM(COALESCE(weight, 0) * (1.0 - COALESCE(generic_penalty, 0))) AS score
+                FROM global_chain_index
+                WHERE {" OR ".join(clauses)}
+                GROUP BY from_ticker, to_ticker
+                ORDER BY score DESC, from_ticker, to_ticker
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        except sqlite3.Error:
+            return
+        for row in rows:
+            try:
+                value = max(0.0, float(row["score"] or 0))
+            except (TypeError, ValueError):
+                value = 0.0
+            for raw_ticker in (row["from_ticker"], row["to_ticker"]):
+                ticker = str(raw_ticker or "").upper()
+                if ticker in self._shard_paths:
+                    scores[ticker] += value * 2.0
 
     def _store_for_ticker(self, ticker: str | None) -> OntologyStore:
         normalized = str(ticker or "").upper()
@@ -988,6 +1303,22 @@ def _read_json(path: Path) -> dict[str, Any]:
 
 def _count_table(conn: sqlite3.Connection, table_name: str) -> int:
     return int(conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0])
+
+
+def _read_int_env(name: str, default: int, *, min_value: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value >= min_value else default
+
+
+def _fanout_error(exc: Exception) -> str:
+    message = str(exc)
+    return f"{type(exc).__name__}:{message}" if message else type(exc).__name__
 
 
 def _fts_query(text: str) -> str:

@@ -4,6 +4,8 @@ import json
 import sqlite3
 from pathlib import Path
 
+import pytest
+
 import krw_ontology.agent_index.builder as agent_index_builder
 import krw_ontology.agent_index.spine_builder as spine_builder
 from krw_ontology.agent_index.source_artifact_sqlite import (
@@ -316,6 +318,8 @@ def test_build_spine_shard_release_outputs_builds_v3_without_monolith(tmp_path: 
     assert result.progress_path.exists()
     assert (release_root / "source_manifest.json").exists()
     assert not (release_root / "indexes" / "agent_index.sqlite").exists()
+    assert not (release_root / "indexes" / "fragments" / "spine").exists()
+    assert not (release_root / "indexes" / "fragments").exists()
     assert sorted(result.shard_manifest["shards"]) == ["AAPL"]
     shard_entry = result.shard_manifest["shards"]["AAPL"]
     assert shard_entry["quality_summary"]["format"] == "krw-ontology-shard-quality-summary/v1"
@@ -323,6 +327,8 @@ def test_build_spine_shard_release_outputs_builds_v3_without_monolith(tmp_path: 
     assert shard_entry["quality_summary"]["ticker_quality"][0]["ticker"] == "AAPL"
     assert result.build_summary["company_count"] == 1
     assert result.build_summary["progress_path"] == "indexes/build_progress.jsonl"
+    assert result.build_summary["artifact_cleanup"]["spine_fragments"]["removed"] is True
+    assert result.build_summary["artifact_cleanup"]["spine_fragments"]["file_count"] >= 1
     assert result.merge_result.verification["ok"] is True
     progress_events = [
         json.loads(line)
@@ -339,6 +345,7 @@ def test_build_spine_shard_release_outputs_builds_v3_without_monolith(tmp_path: 
     assert ("global_spine_merge", "global_spine_merge:AAPL", "merged") in event_keys
     assert ("global_spine_merge", "global_spine_merge", "complete") in event_keys
     assert ("manifest", "shard_manifest", "complete") in event_keys
+    assert ("artifact_cleanup", "spine_fragments", "complete") in event_keys
     assert ("build_summary", "build_summary", "complete") in event_keys
     assert ("build", "build", "complete") in event_keys
     company_event = next(event for event in progress_events if event["node_id"] == "company_shard:AAPL" and event["status"] == "rebuilt")
@@ -437,6 +444,130 @@ def test_company_shard_runtime_cache_corruption_rebuilds_and_quarantines(tmp_pat
     assert result.shard_path.exists()
     assert not cache_path.read_bytes().startswith(b"not sqlite")
     assert list(cache_path.parent.glob(".corrupt-*.sqlite.*"))
+
+
+def test_cached_company_shard_rebases_paths_to_current_release_root(tmp_path: Path) -> None:
+    cache_root = tmp_path / "cache"
+    first_root = tmp_path / "releases" / "dev" / "first-release"
+    second_root = tmp_path / "releases" / "prod" / "second-release"
+    _write_minimal_context_artifact(first_root, "AAPL")
+    _write_minimal_context_artifact(second_root, "AAPL")
+
+    first = build_spine_shard_release_outputs(
+        first_root,
+        release_id="first-release",
+        cache_root=cache_root,
+        workers=1,
+        generate_links=False,
+    )
+    second = build_spine_shard_release_outputs(
+        second_root,
+        release_id="second-release",
+        cache_root=cache_root,
+        workers=1,
+        generate_links=False,
+    )
+
+    assert first.shard_results[0].cache_hit is False
+    assert second.shard_results[0].cache_hit is True
+    with sqlite3.connect(second.shard_results[0].shard_path) as conn:
+        artifact_index_path, ontology_dir = conn.execute(
+            "SELECT artifact_index_path, ontology_dir FROM documents"
+        ).fetchone()
+        metadata = json.loads(conn.execute("SELECT value FROM metadata WHERE key = 'build'").fetchone()[0])
+    assert artifact_index_path.startswith(str(second_root.resolve()))
+    assert ontology_dir.startswith(str(second_root.resolve()))
+    assert str(first_root.resolve()) not in artifact_index_path
+    assert metadata["artifact_root"] == str(second_root.resolve())
+
+
+def test_rebase_company_shard_updates_object_edge_and_metadata_paths(tmp_path: Path) -> None:
+    old_root = tmp_path / "releases" / "dev" / "old-release"
+    new_root = tmp_path / "releases" / "prod" / "new-release"
+    shard_path = tmp_path / "AAPL.sqlite"
+    _write_synthetic_company_shard(shard_path)
+    old_doc_dir = old_root / "companies" / "AAPL" / "ontology" / "10K" / "FY2025"
+    with sqlite3.connect(shard_path) as conn:
+        conn.execute(
+            "UPDATE documents SET artifact_index_path = ?, ontology_dir = ?",
+            (str(old_doc_dir / "artifact_index.json"), str(old_doc_dir)),
+        )
+        conn.execute("UPDATE objects SET artifact_path = ?", (str(old_doc_dir / "business_factors.jsonl"),))
+        conn.execute("UPDATE edges SET artifact_path = ?", (str(old_doc_dir / "edges.jsonl"),))
+        metadata = {
+            "artifact_root": str(old_root),
+            "build_settings": {
+                "progress_log_path": str(old_root / "indexes" / "progress" / "source_artifact_sqlite" / "AAPL.jsonl")
+            },
+            "index_role": "company_shard",
+        }
+        conn.execute(
+            "INSERT OR REPLACE INTO metadata(key, value) VALUES('build', ?)",
+            (json.dumps(metadata, sort_keys=True),),
+        )
+
+    spine_builder._rebase_company_shard_release_paths(shard_path, release_root=new_root)
+
+    with sqlite3.connect(shard_path) as conn:
+        artifact_index_path, ontology_dir = conn.execute(
+            "SELECT artifact_index_path, ontology_dir FROM documents"
+        ).fetchone()
+        object_path = conn.execute("SELECT artifact_path FROM objects LIMIT 1").fetchone()[0]
+        edge_path = conn.execute("SELECT artifact_path FROM edges LIMIT 1").fetchone()[0]
+        metadata = json.loads(conn.execute("SELECT value FROM metadata WHERE key = 'build'").fetchone()[0])
+    assert artifact_index_path == str(new_root / "companies" / "AAPL" / "ontology" / "10K" / "FY2025" / "artifact_index.json")
+    assert ontology_dir == str(new_root / "companies" / "AAPL" / "ontology" / "10K" / "FY2025")
+    assert object_path == str(new_root / "companies" / "AAPL" / "ontology" / "10K" / "FY2025" / "business_factors.jsonl")
+    assert edge_path == str(new_root / "companies" / "AAPL" / "ontology" / "10K" / "FY2025" / "edges.jsonl")
+    assert metadata["artifact_root"] == str(new_root)
+    assert metadata["build_settings"]["progress_log_path"] == str(
+        new_root / "indexes" / "progress" / "source_artifact_sqlite" / "AAPL.jsonl"
+    )
+
+
+def test_rebase_spine_fragment_updates_source_path_and_metadata(tmp_path: Path) -> None:
+    old_root = tmp_path / "releases" / "dev" / "old-release"
+    new_root = tmp_path / "releases" / "prod" / "new-release"
+    fragment_path = tmp_path / "AAPL-fragment.sqlite"
+    _write_spine_fragment(
+        fragment_path,
+        ticker="AAPL",
+        topic_key="ai_capex_device_demand",
+        topic_label="AI capex device demand",
+    )
+    old_source_path = old_root / "companies" / "AAPL" / "context" / "artifact_index.json"
+    old_shard_path = old_root / "indexes" / "companies" / "AAPL.sqlite"
+    new_shard_path = new_root / "indexes" / "companies" / "AAPL.sqlite"
+    with sqlite3.connect(fragment_path) as conn:
+        conn.execute("UPDATE global_document_catalog SET source_path = ?", (str(old_source_path),))
+        write_global_spine_metadata(
+            conn,
+            {
+                "format": "krw-ontology-spine-fragment/v1",
+                "ticker": "AAPL",
+                "release_id": "old-release",
+                "source_shard_path": str(old_shard_path),
+                "shard_path": "indexes/companies/AAPL.sqlite",
+            },
+        )
+
+    spine_builder._rebase_spine_fragment_release_paths(
+        fragment_path,
+        release_root=new_root,
+        release_id="new-release",
+        source_shard_path=new_shard_path,
+        shard_path_in_release="indexes/companies/AAPL.sqlite",
+    )
+
+    with sqlite3.connect(fragment_path) as conn:
+        source_path = conn.execute("SELECT source_path FROM global_document_catalog").fetchone()[0]
+        metadata = json.loads(conn.execute("SELECT value_json FROM metadata WHERE key = 'release_id'").fetchone()[0])
+        source_shard_path = json.loads(
+            conn.execute("SELECT value_json FROM metadata WHERE key = 'source_shard_path'").fetchone()[0]
+        )
+    assert source_path == str(new_root / "companies" / "AAPL" / "context" / "artifact_index.json")
+    assert metadata == "new-release"
+    assert source_shard_path == str(new_shard_path.resolve())
 
 
 def _write_spine_fragment(path: Path, *, ticker: str, topic_key: str, topic_label: str) -> None:

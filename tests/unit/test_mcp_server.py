@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sqlite3
 from pathlib import Path
 from typing import Any
 
@@ -340,6 +341,39 @@ def test_mcp_tools_use_spine_router_for_v3_release(tmp_path: Path, monkeypatch):
     assert quality["routing"]["fallback"] is False
 
 
+def test_spine_router_tickerless_candidates_use_global_signal_tables(tmp_path: Path):
+    _write_fixture(tmp_path)
+    _clone_fixture_company(tmp_path, source_ticker="VG", target_ticker="XOM")
+    index = _build_v3_runtime(tmp_path)
+    with sqlite3.connect(index["index_path"]) as conn:
+        conn.execute(
+            """
+            INSERT INTO global_topic_spine(
+                topic_id, topic_key, topic_label, topic_summary,
+                ticker, shard_id, materiality
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "topic:XOM:hydrogen-roadmap",
+                "hydrogen_roadmap",
+                "Hydrogen roadmap",
+                "Hydrogen infrastructure roadmap and electrolyzer capacity",
+                "XOM",
+                "XOM",
+                9.0,
+            ),
+        )
+        conn.commit()
+
+    with OntologySpineRouter(index["index_path"]) as router:
+        assert router._candidate_tickers(
+            "hydrogen electrolyzer roadmap",
+            explicit_tickers=None,
+            limit=1,
+        ) == ["XOM"]
+
+
 def test_mcp_tools_report_declared_but_missing_company_shard_without_fallback(
     tmp_path: Path,
     monkeypatch,
@@ -541,6 +575,9 @@ def test_mcp_persistent_store_reuses_sqlite_connection(tmp_path: Path, monkeypat
     assert status["store"]["stores"] == 1
     assert status["store"]["hits"] == 1
     assert status["store"]["misses"] == 1
+    assert status["store"]["global_spine_stores"][0]["release_id"] == "test-v3-runtime"
+    assert status["store"]["global_spine_stores"][0]["global_spine_sha256"]
+    assert status["store"]["global_spine_stores"][0]["shard_manifest_sha256"]
 
 
 def test_mcp_persistent_store_pins_inflight_release_and_rotates_after_current_switch(
@@ -585,9 +622,17 @@ def test_mcp_persistent_store_pins_inflight_release_and_rotates_after_current_sw
             assert inflight_status["store"]["last_rotation"]["previous_resolved_global_spine_path"].endswith(
                 "20260529_010000/indexes/global_spine.sqlite"
             )
+            assert inflight_status["store"]["last_rotation"]["previous_release_id"] == "20260529_010000"
+            assert inflight_status["store"]["last_rotation"]["previous_global_spine_sha256"]
+            assert inflight_status["store"]["last_rotation"]["previous_shard_manifest_sha256"]
             assert inflight_status["store"]["last_rotation"]["new_resolved_global_spine_path"].endswith(
                 "20260529_020000/indexes/global_spine.sqlite"
             )
+            assert inflight_status["store"]["last_rotation"]["new_release_id"] == "20260529_020000"
+            assert inflight_status["store"]["last_rotation"]["new_global_spine_sha256"]
+            assert inflight_status["store"]["last_rotation"]["new_shard_manifest_sha256"]
+            assert inflight_status["store"]["global_spine_stores"][0]["release_id"] == "20260529_020000"
+            assert inflight_status["store"]["retired_global_spine_stores"][0]["release_id"] == "20260529_010000"
             health, health_status = health_payload(root=str(current))
             assert health_status == 200
             assert health["release_id"] == "20260529_020000"
@@ -742,6 +787,7 @@ def test_mcp_compare_quality_topic_and_company_context_report_v3_routing(
     _clone_fixture_company(tmp_path, source_ticker="VG", target_ticker="XOM")
     _build_v3_runtime(tmp_path)
     monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
+    monkeypatch.setenv("KRW_ROUTER_FANOUT_WORKERS", "2")
 
     compare = json.loads(
         compare_tool(
@@ -758,6 +804,10 @@ def test_mcp_compare_quality_topic_and_company_context_report_v3_routing(
     assert compare["routing"]["route_tickers"] == ["VG", "XOM"]
     assert compare["routing"]["fallback"] is False
     assert compare["routing"]["fallback_used"] is False
+    assert compare["routing"]["fanout_parallel"] is True
+    assert compare["routing"]["fanout_workers"] == 2
+    assert compare["fanout_parallel"] is True
+    assert compare["fanout_workers"] == 2
     assert compare["missing_shards"] == {}
     assert compare["unknown_tickers"] == []
     assert set(compare["results"]) == {"VG", "XOM"}
@@ -772,6 +822,9 @@ def test_mcp_compare_quality_topic_and_company_context_report_v3_routing(
     assert quality["routing"]["mode"] == "quality_release_scan"
     assert quality["routing"]["route_tickers"] == ["VG", "XOM"]
     assert quality["routing"]["fallback"] is False
+    assert quality["routing"]["fanout_parallel"] is True
+    assert quality["routing"]["fanout_workers"] == 2
+    assert quality["summary"]["fanout_workers"] == 2
     assert quality["topology"]["mode"] == "global_spine"
     assert quality["topology"]["fallback"] is False
     assert {document["ticker"] for document in quality["documents"]} == {"VG", "XOM"}

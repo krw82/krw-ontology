@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 from collections import OrderedDict
+from dataclasses import dataclass
 from enum import Enum
 import json
 import logging
@@ -49,7 +50,6 @@ LOGGER = logging.getLogger(__name__)
 SLOW_MCP_TOOL_LOG_THRESHOLD_MS = 5_000
 _SLOW_MCP_TOOL_LOG_MARKER = "[krw-ontology:mcp-slow-path]"
 _TRACE_TOOL_CACHE_MAX = 512
-_TRACE_TOOL_CACHE: OrderedDict[tuple[str, int | None, int | None, str], dict[str, Any]] = OrderedDict()
 _TRACE_TOOL_CACHE_LOCK = threading.Lock()
 _MCP_STORE_MODE_ENV = "KRW_MCP_STORE_MODE"
 _MCP_STORE_POOL_MAX_ENV = "KRW_MCP_STORE_POOL_MAX"
@@ -61,6 +61,19 @@ _REPEATED_RETRIEVE_GUIDANCE_MESSAGE = (
     "Prefer query_context, targeted query, trace, or chain for the next step unless another "
     "retrieve is clearly necessary. Do not repeat broad retrieve calls."
 )
+
+
+@dataclass(frozen=True)
+class _IndexSignature:
+    resolved_global_spine_path: str
+    mtime_ns: int | None
+    size: int | None
+    release_id: str | None
+    global_spine_sha256: str | None
+    shard_manifest_sha256: str | None
+
+
+_TRACE_TOOL_CACHE: OrderedDict[tuple[_IndexSignature, str], dict[str, Any]] = OrderedDict()
 
 
 def _read_int_env(name: str, default: int, *, min_value: int) -> int:
@@ -82,18 +95,51 @@ def _persistent_store_enabled() -> bool:
     return _store_mode() == _MCP_STORE_MODE_PERSISTENT
 
 
-def _index_signature(index_path: Path) -> tuple[str, int | None, int | None]:
+def _index_signature(index_path: Path) -> _IndexSignature:
     resolved_path = index_path.expanduser().resolve()
+    release_id, global_spine_sha256, shard_manifest_sha256 = _manifest_signature_fields(resolved_path)
     try:
         stat = resolved_path.stat()
     except OSError:
-        return (str(resolved_path), None, None)
-    return (str(resolved_path), stat.st_mtime_ns, stat.st_size)
+        return _IndexSignature(
+            str(resolved_path),
+            None,
+            None,
+            release_id,
+            global_spine_sha256,
+            shard_manifest_sha256,
+        )
+    return _IndexSignature(
+        str(resolved_path),
+        stat.st_mtime_ns,
+        stat.st_size,
+        release_id,
+        global_spine_sha256,
+        shard_manifest_sha256,
+    )
 
 
-def _trace_cache_key(index_path: Path, object_id: str) -> tuple[str, int | None, int | None, str]:
-    signature = _index_signature(index_path)
-    return (*signature, object_id)
+def _manifest_signature_fields(resolved_index_path: Path) -> tuple[str | None, str | None, str | None]:
+    manifest_path = resolved_index_path.parent.parent / "manifest.json"
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None, None, None
+    if not isinstance(payload, Mapping):
+        return None, None, None
+    indexes = payload.get("indexes") if isinstance(payload.get("indexes"), Mapping) else {}
+    global_spine = indexes.get("global_spine") if isinstance(indexes.get("global_spine"), Mapping) else {}
+    shard_manifest = indexes.get("shard_manifest") if isinstance(indexes.get("shard_manifest"), Mapping) else {}
+    release_id = payload.get("release_id")
+    return (
+        str(release_id) if release_id else None,
+        str(global_spine.get("sha256")) if global_spine.get("sha256") else None,
+        str(shard_manifest.get("sha256")) if shard_manifest.get("sha256") else None,
+    )
+
+
+def _trace_cache_key(index_path: Path, object_id: str) -> tuple[_IndexSignature, str]:
+    return (_index_signature(index_path), object_id)
 
 
 class _StoreBucket:
@@ -101,7 +147,7 @@ class _StoreBucket:
         self,
         *,
         logical_path: str,
-        signature: tuple[str, int | None, int | None],
+        signature: _IndexSignature,
         generation: int,
         retired_at_unix: float | None = None,
     ):
@@ -122,7 +168,7 @@ class _PersistentStoreLease:
         self,
         pool: "_PersistentStorePool",
         logical_path: str,
-        signature: tuple[str, int | None, int | None],
+        signature: _IndexSignature,
         generation: int,
         store: Any,
     ):
@@ -196,7 +242,8 @@ class _PersistentStorePool:
             json.dumps(
                 {
                     "global_spine_path": str(index_path),
-                    "resolved_global_spine_path": signature[0],
+                    "resolved_global_spine_path": signature.resolved_global_spine_path,
+                    "release_id": signature.release_id,
                     "reused": reused,
                 },
                 sort_keys=True,
@@ -207,7 +254,7 @@ class _PersistentStorePool:
     def release(
         self,
         logical_path: str,
-        signature: tuple[str, int | None, int | None],
+        signature: _IndexSignature,
         generation: int,
         store: Any,
     ) -> None:
@@ -304,19 +351,25 @@ class _PersistentStorePool:
         self,
         bucket: _StoreBucket,
         *,
-        replacement_signature: tuple[str, int | None, int | None],
+        replacement_signature: _IndexSignature,
     ) -> None:
         retired_at_unix = time.time()
         while bucket.idle:
             self._close_store(bucket.idle.pop())
         self._last_rotation = {
             "logical_path": bucket.logical_path,
-            "previous_resolved_global_spine_path": bucket.signature[0],
-            "previous_mtime_ns": bucket.signature[1],
-            "previous_size": bucket.signature[2],
-            "new_resolved_global_spine_path": replacement_signature[0],
-            "new_mtime_ns": replacement_signature[1],
-            "new_size": replacement_signature[2],
+            "previous_resolved_global_spine_path": bucket.signature.resolved_global_spine_path,
+            "previous_mtime_ns": bucket.signature.mtime_ns,
+            "previous_size": bucket.signature.size,
+            "previous_release_id": bucket.signature.release_id,
+            "previous_global_spine_sha256": bucket.signature.global_spine_sha256,
+            "previous_shard_manifest_sha256": bucket.signature.shard_manifest_sha256,
+            "new_resolved_global_spine_path": replacement_signature.resolved_global_spine_path,
+            "new_mtime_ns": replacement_signature.mtime_ns,
+            "new_size": replacement_signature.size,
+            "new_release_id": replacement_signature.release_id,
+            "new_global_spine_sha256": replacement_signature.global_spine_sha256,
+            "new_shard_manifest_sha256": replacement_signature.shard_manifest_sha256,
             "retired_leased": bucket.leased,
             "rotated_at_unix": retired_at_unix,
         }
@@ -334,7 +387,7 @@ class _PersistentStorePool:
     def _retired_bucket(
         self,
         logical_path: str,
-        signature: tuple[str, int | None, int | None],
+        signature: _IndexSignature,
         generation: int,
     ) -> _StoreBucket | None:
         for bucket in self._retired_buckets:
@@ -349,9 +402,12 @@ class _PersistentStorePool:
     def _bucket_status(self, bucket: _StoreBucket) -> dict[str, Any]:
         payload = {
             "logical_path": bucket.logical_path,
-            "resolved_global_spine_path": bucket.signature[0],
-            "mtime_ns": bucket.signature[1],
-            "size": bucket.signature[2],
+            "resolved_global_spine_path": bucket.signature.resolved_global_spine_path,
+            "mtime_ns": bucket.signature.mtime_ns,
+            "size": bucket.signature.size,
+            "release_id": bucket.signature.release_id,
+            "global_spine_sha256": bucket.signature.global_spine_sha256,
+            "shard_manifest_sha256": bucket.signature.shard_manifest_sha256,
             "idle": len(bucket.idle),
             "leased": bucket.leased,
             "generation": bucket.generation,

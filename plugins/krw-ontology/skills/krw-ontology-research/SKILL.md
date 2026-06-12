@@ -137,16 +137,28 @@ contracts/events -> AgreementTerm, BusinessEvent, ChangeEvent, ResearchClaim, Ev
 
 Use when default tickers are empty and the user asks about a sector, industry, macro environment, theme, beneficiary group, or broad company set.
 
+First distinguish the tickerless question type:
+
+```text
+Too broad sector/global/macro/universe question:
+use a bounded covered ticker basket before ontology synthesis.
+
+Concrete tickerless question:
+if the user gives a specific factor, channel, product, business model, metric, event type, or company type but no ticker,
+you may use query_context with tickers=[] and limit_tickers <= 5 so the v3 global spine can rank candidate covered tickers.
+```
+
 Do not start with:
 
 ```text
-query_context(question=sector/global brief, tickers=[])
+broad raw Korean topic text
+broad sector/global query_context with tickers=[]
 broad catalog(limit > 5)
 catalog as a sector discovery substitute
 unbounded retrieve
 ```
 
-Flow:
+Flow for too broad sector/global/macro questions:
 
 ```text
 1. Build an ontology/MCP-aware internal English investment brief.
@@ -158,6 +170,16 @@ Flow:
 7. Call query_context with selected tickers, limit_tickers <= 5, limit_results <= 3, and compact/markdown output when available.
 8. If multi-company query_context overflows, do not retry the same broad call. Split into per-ticker or per-channel compact query calls.
 9. Synthesize common signals -> company signals -> financial channels -> interpretation.
+```
+
+Flow for concrete tickerless questions:
+
+```text
+1. Build an ontology/MCP-aware internal English investment brief.
+2. Call query_context with tickers=[], limit_tickers <= 5, limit_results <= 3, and compact/markdown output when available.
+3. Treat ticker candidates as a ranked covered universe, not as a final answer.
+4. Continue with selected candidate tickers only when the first pass gives enough signal or a specific gap remains.
+5. If the first pass is too broad or overflows, split into per-channel or selected-ticker compact calls; do not repeat the same broad call.
 ```
 
 Overflow continuation rule:
@@ -174,7 +196,7 @@ Stop when covered signals are enough for a directional synthesis.
 Bad flow:
 
 ```text
-query_context(question="consumer macro...", tickers=[])
+query_context(question="consumer macro...", tickers=[], limit_tickers=20)
 catalog(limit=50)
 catalog(limit=200)
 query_context(question="...", limit_results=10, limit_tickers=20)
@@ -187,9 +209,13 @@ brief="consumer sector macro read-through: pricing power, volume trends, trade-d
 covered_tickers=[4-6 indexed relevant tickers]
 query_context(question=brief, tickers=covered_tickers, limit_results=3, limit_tickers=5)
 if overflow: query(ticker=one covered ticker, topic=one short channel, limit=3, response_detail="compact")
+
+brief="AI infrastructure capex pressure, cloud backlog, free cash flow, share repurchase trade-off"
+query_context(question=brief, tickers=[], limit_results=3, limit_tickers=5)
+continue with selected covered candidates only
 ```
 
-If no bounded covered ticker basket can be identified, ask one concise clarification question instead of running broad catalog/query loops.
+If a broad question cannot be bounded and the v3 global spine first pass is not appropriate, ask one concise clarification question instead of running broad catalog/query loops.
 
 ### 2.4 Path C: metric/numeric series question
 

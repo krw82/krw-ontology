@@ -4,7 +4,7 @@ This reference is for pipeline, export, audit, and canonical artifact discussion
 
 ## Core rule
 
-Canonical JSONL artifacts are the source of truth. `agent_index.sqlite` is a rebuildable read-optimized serving cache. MCP tools are read-only retrieval and trace interfaces over the serving cache.
+Canonical JSONL artifacts are the source of truth. The v3 release serving index is rebuildable and is composed of `indexes/global_spine.sqlite`, `indexes/companies/<TICKER>.sqlite`, and `indexes/shard_manifest.json`. MCP tools are read-only retrieval and trace interfaces over the serving index.
 
 ## Normal web chat boundary
 

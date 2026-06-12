@@ -368,6 +368,19 @@ def build_spine_shard_release_outputs(
             details={"ticker_count": shard_manifest.get("ticker_count")},
             started_at=manifest_started_at,
         )
+        cleanup_started_at = time.perf_counter()
+        fragment_cleanup = _cleanup_release_spine_fragments(
+            fragments_dir,
+            release_root=resolved_root,
+        )
+        progress.record(
+            "spine_fragments",
+            "artifact_cleanup",
+            "complete",
+            output=fragments_dir,
+            details=fragment_cleanup,
+            started_at=cleanup_started_at,
+        )
         build_summary = {
             "format": V3_BUILD_SUMMARY_FORMAT_VERSION,
             "release_id": release_id,
@@ -395,6 +408,9 @@ def build_spine_shard_release_outputs(
                     "key_count": merge_result.chain_links.key_count,
                     "skipped_generic_keys": merge_result.chain_links.skipped_generic_keys,
                 },
+            },
+            "artifact_cleanup": {
+                "spine_fragments": fragment_cleanup,
             },
             "shards": dict(shard_manifest.get("shards") or {}),
             "created_at": datetime.now(timezone.utc).isoformat(),
@@ -706,6 +722,7 @@ def _build_company_shard_from_plan(
     if not no_cache and company_item.cache_hit:
         try:
             _copy_sqlite_database(company_item.shard_cache_path, resolved_shard_path)
+            _rebase_company_shard_release_paths(resolved_shard_path, release_root=resolved_root)
             verification = verify_source_artifact_sqlite(resolved_shard_path)
             if not verification["ok"]:
                 errors = ", ".join(verification["errors"])
@@ -981,6 +998,7 @@ def _emit_spine_fragments_for_release(
         {
             "shard_result": result,
             "fragment_path": fragments_dir / f"{_safe_ticker_filename(result.ticker)}.sqlite",
+            "release_root": fragments_dir.parent.parent.parent,
             "release_id": release_id,
             "shard_path_in_release": f"indexes/companies/{_safe_ticker_filename(result.ticker)}.sqlite",
             "source_manifest_hash": source_manifest_hash,
@@ -1418,6 +1436,7 @@ def _emit_spine_fragment_cached(
     *,
     shard_result: CompanyShardBuildResult,
     fragment_path: Path,
+    release_root: Path,
     release_id: str,
     shard_path_in_release: str,
     source_manifest_hash: str | None,
@@ -1437,6 +1456,13 @@ def _emit_spine_fragment_cached(
     ):
         try:
             _copy_sqlite_database(cache_path, fragment_path)
+            _rebase_spine_fragment_release_paths(
+                fragment_path,
+                release_root=release_root,
+                release_id=release_id,
+                source_shard_path=shard_result.shard_path,
+                shard_path_in_release=shard_path_in_release,
+            )
             verification = verify_global_spine_schema(fragment_path)
             if not verification["ok"]:
                 errors = ", ".join(verification["errors"])
@@ -1746,6 +1772,172 @@ def _copy_sqlite_database(source_path: Path, target_path: Path) -> None:
     shutil.copy2(source_path, target_path)
 
 
+def _rebase_company_shard_release_paths(sqlite_path: Path, *, release_root: Path) -> None:
+    resolved_root = release_root.expanduser().resolve()
+    with sqlite3.connect(sqlite_path) as conn:
+        _rebase_table_path_columns(
+            conn,
+            resolved_root,
+            {
+                "documents": ("artifact_index_path", "ontology_dir"),
+                "objects": ("artifact_path",),
+                "edges": ("artifact_path",),
+            },
+        )
+        _rebase_metadata_json_values(conn, resolved_root)
+        conn.commit()
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
+        conn.execute("PRAGMA journal_mode=DELETE").fetchall()
+
+
+def _rebase_spine_fragment_release_paths(
+    sqlite_path: Path,
+    *,
+    release_root: Path,
+    release_id: str,
+    source_shard_path: Path,
+    shard_path_in_release: str,
+) -> None:
+    resolved_root = release_root.expanduser().resolve()
+    with sqlite3.connect(sqlite_path) as conn:
+        _rebase_table_path_columns(
+            conn,
+            resolved_root,
+            {
+                "global_document_catalog": ("source_path",),
+            },
+        )
+        _rebase_metadata_json_values(
+            conn,
+            resolved_root,
+            overrides={
+                "release_id": release_id,
+                "source_shard_path": str(source_shard_path.expanduser().resolve()),
+                "shard_path": shard_path_in_release,
+            },
+        )
+        conn.commit()
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
+        conn.execute("PRAGMA journal_mode=DELETE").fetchall()
+
+
+def _rebase_table_path_columns(
+    conn: sqlite3.Connection,
+    release_root: Path,
+    table_columns: Mapping[str, Sequence[str]],
+) -> None:
+    for table_name, column_names in table_columns.items():
+        if not _table_exists(conn, table_name):
+            continue
+        columns = _table_columns(conn, table_name)
+        for column_name in column_names:
+            if column_name not in columns:
+                continue
+            quoted_table = _quote_identifier(table_name)
+            quoted_column = _quote_identifier(column_name)
+            rows = conn.execute(
+                f"SELECT rowid, {quoted_column} AS value FROM {quoted_table} WHERE {quoted_column} IS NOT NULL"
+            ).fetchall()
+            updates = []
+            for rowid, raw_value in rows:
+                if not isinstance(raw_value, str):
+                    continue
+                rebased = _rebase_release_path_string(raw_value, release_root)
+                if rebased != raw_value:
+                    updates.append((rebased, rowid))
+            if updates:
+                conn.executemany(
+                    f"UPDATE {quoted_table} SET {quoted_column} = ? WHERE rowid = ?",
+                    updates,
+                )
+
+
+def _rebase_metadata_json_values(
+    conn: sqlite3.Connection,
+    release_root: Path,
+    *,
+    overrides: Mapping[str, Any] | None = None,
+) -> None:
+    if not _table_exists(conn, "metadata"):
+        return
+    columns = _table_columns(conn, "metadata")
+    value_column = "value_json" if "value_json" in columns else "value" if "value" in columns else None
+    if value_column is None:
+        return
+    key_column = "key" if "key" in columns else None
+    quoted_value_column = _quote_identifier(value_column)
+    if key_column is None:
+        rows = [(row[0], None, row[1]) for row in conn.execute(f"SELECT rowid, {quoted_value_column} FROM metadata")]
+    else:
+        quoted_key_column = _quote_identifier(key_column)
+        rows = conn.execute(
+            f"SELECT rowid, {quoted_key_column}, {quoted_value_column} FROM metadata"
+        ).fetchall()
+    updates = []
+    for rowid, key, raw_value in rows:
+        if not isinstance(raw_value, str):
+            continue
+        override_value = overrides.get(str(key)) if overrides and key is not None else None
+        if override_value is not None:
+            encoded = json.dumps(override_value, sort_keys=True)
+            if encoded != raw_value:
+                updates.append((encoded, rowid))
+            continue
+        try:
+            decoded = json.loads(raw_value)
+        except json.JSONDecodeError:
+            rebased_text = _rebase_release_path_string(raw_value, release_root)
+            if rebased_text != raw_value:
+                updates.append((rebased_text, rowid))
+            continue
+        rebased = _rebase_release_paths(decoded, release_root)
+        if isinstance(rebased, dict) and overrides:
+            rebased.update(dict(overrides))
+        encoded = json.dumps(rebased, sort_keys=True)
+        if encoded != raw_value:
+            updates.append((encoded, rowid))
+    if updates:
+        conn.executemany(
+            f"UPDATE metadata SET {quoted_value_column} = ? WHERE rowid = ?",
+            updates,
+        )
+
+
+def _rebase_release_paths(value: Any, release_root: Path) -> Any:
+    if isinstance(value, str):
+        return _rebase_release_path_string(value, release_root)
+    if isinstance(value, list):
+        return [_rebase_release_paths(item, release_root) for item in value]
+    if isinstance(value, dict):
+        return {key: _rebase_release_paths(item, release_root) for key, item in value.items()}
+    return value
+
+
+def _rebase_release_path_string(value: str, release_root: Path) -> str:
+    if not value or not Path(value).is_absolute():
+        return value
+    path = Path(value)
+    parts = path.parts
+    for index in range(len(parts) - 2):
+        if parts[index] != "releases":
+            continue
+        suffix = parts[index + 3 :]
+        return str(release_root.joinpath(*suffix)) if suffix else str(release_root)
+    for marker in ("companies", "indexes"):
+        if marker in parts:
+            index = parts.index(marker)
+            return str(release_root.joinpath(*parts[index:]))
+    return value
+
+
+def _table_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:
+    return {str(row[1]) for row in conn.execute(f"PRAGMA table_info({_quote_identifier(table_name)})").fetchall()}
+
+
+def _quote_identifier(value: str) -> str:
+    return '"' + value.replace('"', '""') + '"'
+
+
 def _store_sqlite_database_cache(source_path: Path, cache_path: Path) -> None:
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = cache_path.parent / f".{cache_path.name}.{os.getpid()}.{time.time_ns()}.tmp"
@@ -1996,6 +2188,52 @@ def _file_sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _cleanup_release_spine_fragments(fragments_dir: Path, *, release_root: Path) -> dict[str, Any]:
+    resolved_root = release_root.expanduser().resolve()
+    resolved_fragments = fragments_dir.expanduser().resolve()
+    try:
+        resolved_fragments.relative_to(resolved_root)
+    except ValueError as exc:
+        raise ValueError(f"Refusing to clean spine fragments outside release root: {resolved_fragments}") from exc
+
+    details: dict[str, Any] = {
+        "path": _path_label(resolved_root, resolved_fragments),
+        "removed": False,
+        "file_count": 0,
+        "size_bytes": 0,
+    }
+    if not resolved_fragments.exists():
+        return details
+
+    file_count = 0
+    size_bytes = 0
+    for path in resolved_fragments.rglob("*"):
+        if not path.is_file():
+            continue
+        file_count += 1
+        try:
+            size_bytes += path.stat().st_size
+        except OSError:
+            continue
+    shutil.rmtree(resolved_fragments)
+    details.update(
+        {
+            "removed": True,
+            "file_count": file_count,
+            "size_bytes": size_bytes,
+        }
+    )
+
+    parent = resolved_fragments.parent
+    try:
+        if parent != resolved_root and parent.exists() and not any(parent.iterdir()):
+            parent.rmdir()
+            details["parent_removed"] = _path_label(resolved_root, parent)
+    except OSError:
+        details["parent_removed"] = None
+    return details
 
 
 def _write_json(path: Path, payload: Mapping[str, Any]) -> None:

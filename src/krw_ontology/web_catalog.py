@@ -151,13 +151,14 @@ def _export_companies(conn: sqlite3.Connection) -> list[dict[str, Any]]:
         row["ticker"]
         for row in conn.execute(
             """
-            SELECT ticker FROM documents
-            UNION
-            SELECT ticker FROM objects
+            SELECT DISTINCT ticker
+            FROM documents
+            WHERE ticker IS NOT NULL
+              AND ticker != ''
+              AND upper(ticker) != 'UNKNOWN'
             ORDER BY ticker
             """
         ).fetchall()
-        if row["ticker"]
     ]
     return [_export_company(conn, ticker) for ticker in tickers]
 

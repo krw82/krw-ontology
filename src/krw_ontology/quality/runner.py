@@ -61,13 +61,15 @@ def run_repair_jobs(
         "active": 0,
     }
     config = PipelineConfig.load()
+    resolved_root = root.expanduser().resolve()
     for job in jobs:
         if job.kind not in SUPPORTED_RUN_KINDS:
             counts["skipped"] += 1
             continue
         store.mark_running(job)
         try:
-            _run_one(job, root=root, config=config, concurrency=concurrency)
+            _normalize_job_paths_for_running_root(job, root=resolved_root)
+            _run_one(job, root=resolved_root, config=config, concurrency=concurrency)
         except Exception as exc:
             store.mark_failed(job, str(exc))
             counts["failed"] += 1
@@ -146,7 +148,7 @@ async def _retry_batch_failure(
     if not job.period or not job.document_type:
         raise ValueError("retry_batch job is missing document identity")
 
-    ontology_dir = Path(job.ontology_dir).expanduser().resolve()
+    ontology_dir = _resolve_running_root_path(root, job.ontology_dir, field="ontology_dir", must_exist=True)
     worker = ExtractionWorker(
         model=config.model_for_stage(job.stage),
         cwd=root,
@@ -218,17 +220,23 @@ def _resection_document(job: RepairJob, *, root: Path) -> None:
     if not job.document_type:
         raise ValueError("resection job is missing document_type")
 
-    artifact_index_path = Path(job.artifact_index_path).expanduser().resolve()
+    artifact_index_path = _resolve_running_root_path(
+        root,
+        job.artifact_index_path,
+        field="artifact_index_path",
+        must_exist=True,
+    )
     artifact_index = json.loads(artifact_index_path.read_text(encoding="utf-8"))
     sources = artifact_index.get("sources") or {}
     clean_md_path = _resolve_artifact_path(root, sources.get("clean_md"))
     raw_html_path = _resolve_artifact_path(root, sources.get("raw_html"))
     if clean_md_path is None:
         raise ValueError("resection job cannot resolve clean_md source")
+    ontology_dir = _resolve_running_root_path(root, job.ontology_dir, field="ontology_dir", must_exist=True)
     extract_sections(
         clean_md_path,
         raw_html_path=raw_html_path,
-        output_dir=Path(job.ontology_dir).expanduser().resolve(),
+        output_dir=ontology_dir,
         document_type=job.document_type,
     )
     job.payload["repair_outcome"] = "resectioned_needs_verify"
@@ -249,5 +257,64 @@ def _mark_batch_retry_payload(job: RepairJob, *, retry_batch_size: int) -> None:
 def _resolve_artifact_path(root: Path, raw_path: str | None) -> Path | None:
     if not raw_path:
         return None
-    path = Path(raw_path)
-    return path.expanduser().resolve() if path.is_absolute() else (root / path).resolve()
+    return _resolve_running_root_path(root, raw_path, field="artifact_source", must_exist=False)
+
+
+def _normalize_job_paths_for_running_root(job: RepairJob, *, root: Path) -> None:
+    normalized = False
+    if job.ontology_dir:
+        original = job.ontology_dir
+        job.ontology_dir = str(
+            _resolve_running_root_path(root, job.ontology_dir, field="ontology_dir", must_exist=True)
+        )
+        normalized = normalized or job.ontology_dir != original
+    if job.artifact_index_path:
+        original = job.artifact_index_path
+        job.artifact_index_path = str(
+            _resolve_running_root_path(
+                root,
+                job.artifact_index_path,
+                field="artifact_index_path",
+                must_exist=True,
+            )
+        )
+        normalized = normalized or job.artifact_index_path != original
+    if normalized:
+        job.payload["repair_paths_normalized_to_running_root"] = True
+
+
+def _resolve_running_root_path(
+    root: Path,
+    raw_path: str | None,
+    *,
+    field: str,
+    must_exist: bool,
+) -> Path:
+    if not raw_path:
+        raise ValueError(f"{field} is required")
+    root_path = root.expanduser().resolve()
+    candidate = Path(raw_path).expanduser()
+    if candidate.is_absolute():
+        resolved = candidate.resolve()
+        try:
+            resolved.relative_to(root_path)
+        except ValueError:
+            resolved = _map_release_path_to_running_root(root_path, resolved, field=field)
+    else:
+        resolved = (root_path / candidate).resolve()
+    try:
+        resolved.relative_to(root_path)
+    except ValueError as exc:
+        raise ValueError(f"{field} escapes running root: {raw_path}") from exc
+    if must_exist and not resolved.exists():
+        raise FileNotFoundError(f"{field} does not exist under running root: {resolved}")
+    return resolved
+
+
+def _map_release_path_to_running_root(root: Path, path: Path, *, field: str) -> Path:
+    parts = path.parts
+    try:
+        company_index = parts.index("companies")
+    except ValueError as exc:
+        raise ValueError(f"{field} is outside running root and cannot be mapped: {path}") from exc
+    return (root / Path(*parts[company_index:])).resolve()

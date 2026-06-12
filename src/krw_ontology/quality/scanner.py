@@ -25,14 +25,21 @@ from krw_ontology.quality.models import (
 REFERENCE_STAGES = {"reference_validation", "reference_alias_resolution", "relation_validation"}
 NUMERIC_STAGES = {"numeric_guard"}
 QUALITY_SHARD_SUMMARY_FORMAT = "krw-ontology-shard-quality-summary/v1"
-QUALITY_RELEASE_SCAN_MODES = {"bounded", "full"}
+QUALITY_RELEASE_FULL_MODE = "full-release-diagnostic"
+QUALITY_RELEASE_SCAN_MODES = {"bounded", "full", QUALITY_RELEASE_FULL_MODE}
 
 
 def _normalize_release_quality_scan_mode(mode: str) -> str:
-    normalized = str(mode or "bounded").strip().lower()
+    normalized = str(mode or "full").strip().lower()
+    if normalized == QUALITY_RELEASE_FULL_MODE:
+        return "full"
     if normalized not in QUALITY_RELEASE_SCAN_MODES:
         raise ValueError(f"invalid quality scan mode: {mode}")
     return normalized
+
+
+def _release_scan_mode_label(mode: str) -> str:
+    return QUALITY_RELEASE_FULL_MODE if mode == "full" else mode
 
 
 def _ticker_quality_payload(ticker: TickerQuality) -> dict[str, Any]:
@@ -122,7 +129,7 @@ class QualityShardScanner:
                     SELECT category, severity, COALESCE(stage, '') AS stage, COUNT(*) AS count
                     FROM quality_events
                     GROUP BY category, severity, stage
-                    ORDER BY count DESC
+                    ORDER BY count DESC, category, severity, stage
                     """
                 )
             ]
@@ -238,7 +245,7 @@ class QualityShardScanner:
                     FROM quality_events
                     WHERE ticker=?
                     GROUP BY category, severity, stage
-                    ORDER BY count DESC
+                    ORDER BY count DESC, category, severity, stage
                     """,
                     (normalized,),
                 )
@@ -259,7 +266,7 @@ class QualityShardScanner:
                     FROM quality_events
                     WHERE ticker=? AND category='rejected_object'
                     GROUP BY reason
-                    ORDER BY count DESC
+                    ORDER BY count DESC, reason
                     LIMIT ?
                     """,
                     (normalized, limit),
@@ -328,7 +335,7 @@ class QualityShardScanner:
                     FROM quality_events
                     WHERE category='rejected_object'
                     GROUP BY reason
-                    ORDER BY count DESC
+                    ORDER BY count DESC, reason
                     LIMIT ?
                     """,
                     (limit,),
@@ -652,10 +659,11 @@ class QualityReleaseScanner:
         self,
         *,
         min_docs: int = 5,
-        mode: str = "bounded",
+        mode: str = "full",
         sample_limit: int = 20,
     ) -> dict[str, Any]:
         resolved_mode = _normalize_release_quality_scan_mode(mode)
+        mode_label = _release_scan_mode_label(resolved_mode)
         manifest = self._load_manifest()
         shard_entries = self._shard_entries()
         shard_topology = self.shard_topology()
@@ -666,6 +674,8 @@ class QualityReleaseScanner:
         ticker_rows: list[TickerQuality] = []
         opened_shards = 0
         manifest_rollup_shards = 0
+        shard_diagnostics: dict[str, dict[str, Any]] = {}
+        scan_errors: list[str] = []
 
         for ticker, shard_path, entry in shard_entries:
             if not shard_path.is_file():
@@ -676,6 +686,15 @@ class QualityReleaseScanner:
                 opened_shards += 1
             else:
                 manifest_rollup_shards += 1
+            diagnostics = self._shard_manifest_diagnostics(
+                ticker=ticker,
+                shard_path=shard_path,
+                shard_entry=entry,
+                report=report,
+                check_sha256=resolved_mode == "full",
+            )
+            shard_diagnostics[ticker] = diagnostics
+            scan_errors.extend(f"shard:{ticker}:{error}" for error in diagnostics["errors"])
             shard_totals = report.get("totals") or self._manifest_entry_totals(entry)
             totals["documents"] += int(shard_totals.get("documents") or 0)
             totals["tickers"] += int(shard_totals.get("tickers") or 0)
@@ -716,8 +735,14 @@ class QualityReleaseScanner:
             for kind in ticker.problem_kinds(min_docs=min_docs)
         )
         consistency = self.consistency_report(sample_limit=sample_limit, mode=resolved_mode)
-        if consistency["errors"]:
-            kind_counts["release_consistency"] = len(consistency["errors"])
+        consistency_errors = list(consistency["errors"]) + scan_errors
+        consistency = {
+            **consistency,
+            "errors": consistency_errors,
+            "ok": not consistency_errors,
+        }
+        if consistency_errors:
+            kind_counts["release_consistency"] = len(consistency_errors)
             severity_counts["high"] += 1
         rollup_source = (
             "shard_scan"
@@ -731,7 +756,7 @@ class QualityReleaseScanner:
             "release_root": str(self.release_root),
             "metadata": self._build_release_metadata(manifest),
             "scan": {
-                "mode": resolved_mode,
+                "mode": mode_label,
                 "rollup_source": rollup_source,
                 "manifest_rollup_shards": manifest_rollup_shards,
                 "opened_shards": opened_shards,
@@ -740,6 +765,7 @@ class QualityReleaseScanner:
                 "full_consistency": resolved_mode == "full",
             },
             "shards": shard_topology,
+            "shard_diagnostics": shard_diagnostics,
             "totals": dict(totals),
             "section_status": dict(section_status),
             "event_counts": [
@@ -892,6 +918,7 @@ class QualityReleaseScanner:
 
     def consistency_report(self, *, sample_limit: int = 20, mode: str = "full") -> dict[str, Any]:
         resolved_mode = _normalize_release_quality_scan_mode(mode)
+        mode_label = _release_scan_mode_label(resolved_mode)
         manifest = self._load_manifest()
         errors: list[str] = []
         warnings: list[str] = []
@@ -910,10 +937,12 @@ class QualityReleaseScanner:
             errors.append("shard_manifest_missing")
         if not shard_entries:
             errors.append("shard_manifest_empty")
+        errors.extend(self._manifest_file_digest_errors(manifest, "global_spine", self.global_spine_path))
+        errors.extend(self._manifest_file_digest_errors(manifest, "shard_manifest", self.shard_manifest_path))
         if not self.global_spine_path.is_file():
             return {
                 "ok": not errors,
-                "mode": resolved_mode,
+                "mode": mode_label,
                 "full_shard_checks": False,
                 "errors": errors,
                 "warnings": warnings,
@@ -943,7 +972,7 @@ class QualityReleaseScanner:
                         errors.append(f"shard_missing:{ticker}:{shard_path}")
                 return {
                     "ok": not errors,
-                    "mode": resolved_mode,
+                    "mode": mode_label,
                     "full_shard_checks": False,
                     "errors": errors,
                     "warnings": warnings,
@@ -982,7 +1011,7 @@ class QualityReleaseScanner:
                 )
         return {
             "ok": not errors,
-            "mode": resolved_mode,
+            "mode": mode_label,
             "full_shard_checks": True,
             "errors": errors,
             "warnings": warnings,
@@ -1010,6 +1039,84 @@ class QualityReleaseScanner:
             "objects": int(entry.get("object_count") or 0),
             "quality_events": int(entry.get("quality_event_count") or 0),
         }
+
+    @classmethod
+    def _shard_manifest_diagnostics(
+        cls,
+        *,
+        ticker: str,
+        shard_path: Path,
+        shard_entry: Mapping[str, Any],
+        report: Mapping[str, Any],
+        check_sha256: bool,
+    ) -> dict[str, Any]:
+        errors: list[str] = []
+        warnings: list[str] = []
+        actual_summary = cls._quality_summary_from_shard_report(report)
+        expected_summary = shard_entry.get("quality_summary")
+        if not isinstance(expected_summary, Mapping):
+            errors.append("quality_summary_missing")
+        elif expected_summary.get("format") != QUALITY_SHARD_SUMMARY_FORMAT:
+            errors.append("quality_summary_format_mismatch")
+        elif _canonical_json(expected_summary) != _canonical_json(actual_summary):
+            errors.append("quality_summary_mismatch")
+        expected_counts = {
+            "document_count": int((report.get("totals") or {}).get("documents") or 0),
+            "object_count": int((report.get("totals") or {}).get("objects") or 0),
+            "edge_count": cls._shard_edge_count(shard_path),
+            "quality_event_count": int((report.get("totals") or {}).get("quality_events") or 0),
+        }
+        for key, actual in expected_counts.items():
+            expected = shard_entry.get(key)
+            if expected is None:
+                errors.append(f"{key}_missing")
+                continue
+            if int(expected) != actual:
+                errors.append(f"{key}_mismatch:{expected}!={actual}")
+        sha256 = None
+        expected_sha = shard_entry.get("sha256")
+        if not isinstance(expected_sha, str) or not expected_sha:
+            errors.append("sha256_missing")
+        elif check_sha256:
+            sha256 = _file_sha256(shard_path)
+            if sha256 != expected_sha:
+                errors.append("sha256_mismatch")
+        return {
+            "ok": not errors,
+            "errors": errors,
+            "warnings": warnings,
+            "path": str(shard_path),
+            "counts": expected_counts,
+            "sha256_checked": bool(check_sha256 and isinstance(expected_sha, str) and expected_sha),
+            "sha256": sha256,
+            "ticker": ticker,
+        }
+
+    @staticmethod
+    def _quality_summary_from_shard_report(report: Mapping[str, Any]) -> dict[str, Any]:
+        return {
+            "format": QUALITY_SHARD_SUMMARY_FORMAT,
+            "totals": dict(report.get("totals") or {}),
+            "section_status": dict(report.get("section_status") or {}),
+            "event_counts": list(report.get("event_counts") or []),
+            "ticker_quality": list(report.get("ticker_quality") or []),
+            "rejected_reasons": list(report.get("rejected_reasons") or []),
+        }
+
+    @staticmethod
+    def _shard_edge_count(shard_path: Path) -> int:
+        with sqlite3.connect(shard_path) as conn:
+            return QualityReleaseScanner._safe_count(conn, "edges")
+
+    @staticmethod
+    def _manifest_file_digest_errors(manifest: Mapping[str, Any], role: str, path: Path) -> list[str]:
+        output = ((manifest.get("indexes") or {}).get(role) or {}) if manifest else {}
+        expected = output.get("sha256") if isinstance(output, Mapping) else None
+        if not isinstance(expected, str) or not expected:
+            return [f"{role}_sha256_missing"]
+        if not path.is_file():
+            return []
+        return [f"{role}_sha256_mismatch"] if _file_sha256(path) != expected else []
 
     def _load_manifest(self, *, allow_missing: bool = False) -> dict[str, Any]:
         if self._manifest is not None:
@@ -1251,3 +1358,7 @@ def _file_sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _canonical_json(payload: Any) -> str:
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)

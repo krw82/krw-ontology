@@ -69,12 +69,9 @@ def test_quality_cli_check_tickers_explain_and_events_use_v3_release_root(tmp_pa
 
     check = runner.invoke(app, ["quality", "check", "--release-root", str(release_root)])
     assert check.exit_code == 0
-    assert "Scan: mode=bounded rollup=manifest opened_shards=0 full_consistency=False" in check.output
+    assert "Scan: mode=full-release-diagnostic rollup=shard_scan opened_shards=2 full_consistency=True" in check.output
     assert "Problem tickers: 1" in check.output
     assert "section_fail=1" in check.output
-    full_check = runner.invoke(app, ["quality", "check", "--release-root", str(release_root), "--full"])
-    assert full_check.exit_code == 0
-    assert "Scan: mode=full rollup=shard_scan opened_shards=2 full_consistency=True" in full_check.output
 
     def fail_if_ticker_quality_reads_shard(*_args, **_kwargs):
         raise AssertionError("bounded quality tickers must use manifest rollups")
@@ -112,10 +109,10 @@ def test_quality_release_scanner_reads_v3_release_without_monolith(tmp_path: Pat
     report = scanner.scan(min_docs=5)
 
     assert report["metadata"]["format"] == "krw-ontology-release/v3"
-    assert report["scan"]["mode"] == "bounded"
-    assert report["scan"]["rollup_source"] == "manifest"
-    assert report["scan"]["opened_shards"] == 0
-    assert report["scan"]["full_consistency"] is False
+    assert report["scan"]["mode"] == "full-release-diagnostic"
+    assert report["scan"]["rollup_source"] == "shard_scan"
+    assert report["scan"]["opened_shards"] == 2
+    assert report["scan"]["full_consistency"] is True
     assert report["totals"]["documents"] == 6
     assert report["totals"]["tickers"] == 2
     assert report["problem_ticker_count"] == 1
@@ -124,13 +121,14 @@ def test_quality_release_scanner_reads_v3_release_without_monolith(tmp_path: Pat
     assert report["kind_counts"][BATCH_FAILURE] == 1
     assert report["kind_counts"].get("release_consistency", 0) == 0
     assert report["consistency"]["ok"] is True
-    assert report["consistency"]["mode"] == "bounded"
-    assert report["consistency"]["full_shard_checks"] is False
+    assert report["consistency"]["mode"] == "full-release-diagnostic"
+    assert report["consistency"]["full_shard_checks"] is True
     full_report = scanner.scan(min_docs=5, mode="full")
-    assert full_report["scan"]["mode"] == "full"
+    assert full_report["scan"]["mode"] == "full-release-diagnostic"
     assert full_report["scan"]["opened_shards"] == 2
     assert full_report["scan"]["full_consistency"] is True
     assert full_report["consistency"]["full_shard_checks"] is True
+    assert full_report["shard_diagnostics"]["FCX"]["ok"] is True
 
     explanation = scanner.explain_ticker("FCX", min_docs=5)
     assert explanation["summary"]["severity"] == "high"
@@ -166,7 +164,7 @@ def test_quality_release_scanner_reports_declared_missing_company_shards(tmp_pat
     result = runner.invoke(app, ["quality", "check", "--release-root", str(release_root)])
 
     assert result.exit_code == 0
-    assert "Scan: mode=bounded" in result.output
+    assert "Scan: mode=full-release-diagnostic" in result.output
     assert "Shards: declared=2 available=1 missing=1" in result.output
     assert f"- missing shard OK: {missing_shard}" in result.output
     assert "Consistency: fail" in result.output
@@ -836,6 +834,96 @@ def test_normalize_numeric_repair_rebuilds_evidence_without_promoting_rejected(
     assert report["operation"] == "normalize_numeric"
     assert report["candidate_count"] == 1
     assert report["auto_promoted_objects"] == 0
+
+
+def test_repair_run_maps_release_paths_to_running_root(tmp_path: Path):
+    root = tmp_path / "running"
+    ontology_dir = _write_safe_repair_ontology(root)
+    release_ontology_dir = (
+        tmp_path
+        / "releases"
+        / "dev"
+        / "20260612_000000"
+        / "companies"
+        / "FCX"
+        / "ontology"
+        / "10K"
+        / "CY2025"
+    )
+    write_jsonl(release_ontology_dir / "claims.jsonl", [{"id": "release-copy"}])
+    before_release_claims = read_jsonl(release_ontology_dir / "claims.jsonl")
+
+    store = QualityRepairStore(root)
+    job = RepairJob(
+        job_id="qr_test-release-path",
+        plan_id="qr_test",
+        kind=NORMALIZE_NUMERIC,
+        ticker="FCX",
+        document_type="10-K",
+        doc_type_key="10K",
+        period="CY2025",
+        stage="numeric_guard",
+        ontology_dir=str(release_ontology_dir),
+    )
+    plan = store.add_plan(
+        RepairPlan(
+            plan_id="qr_test",
+            global_spine_path="test",
+            release_label="test",
+            min_docs=5,
+            job_ids=[],
+            summary={},
+        ),
+        [job],
+    )
+
+    result = run_repair_jobs(store=store, jobs=store.list_jobs(plan_id=plan.plan_id), root=root)
+
+    assert result["succeeded"] == 1
+    assert result["failed"] == 0
+    repaired = store.list_jobs(plan_id=plan.plan_id)[0]
+    assert repaired.ontology_dir == str(ontology_dir.resolve())
+    assert repaired.payload["repair_paths_normalized_to_running_root"] is True
+    assert Path(repaired.payload["report_path"]).resolve().is_relative_to(root.resolve())
+    assert read_jsonl(release_ontology_dir / "claims.jsonl") == before_release_claims
+
+
+def test_repair_run_refuses_unmappable_external_paths(tmp_path: Path):
+    root = tmp_path / "running"
+    _write_safe_repair_ontology(root)
+    outside_dir = tmp_path / "external" / "ontology"
+    outside_dir.mkdir(parents=True)
+    store = QualityRepairStore(root)
+    job = RepairJob(
+        job_id="qr_test-external-path",
+        plan_id="qr_test",
+        kind=NORMALIZE_NUMERIC,
+        ticker="FCX",
+        document_type="10-K",
+        doc_type_key="10K",
+        period="CY2025",
+        stage="numeric_guard",
+        ontology_dir=str(outside_dir),
+    )
+    plan = store.add_plan(
+        RepairPlan(
+            plan_id="qr_test",
+            global_spine_path="test",
+            release_label="test",
+            min_docs=5,
+            job_ids=[],
+            summary={},
+        ),
+        [job],
+    )
+
+    result = run_repair_jobs(store=store, jobs=store.list_jobs(plan_id=plan.plan_id), root=root)
+
+    assert result["succeeded"] == 0
+    assert result["failed"] == 1
+    repaired = store.list_jobs(plan_id=plan.plan_id)[0]
+    assert repaired.status == "failed"
+    assert "outside running root and cannot be mapped" in (repaired.error or "")
 
 
 def test_repair_reference_rebuilds_tail_without_guessing_references(tmp_path: Path):

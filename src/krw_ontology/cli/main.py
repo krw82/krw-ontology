@@ -757,15 +757,10 @@ def quality_check_cmd(
     releases_root: Optional[Path] = typer.Option(None, "--releases-root", help="Releases root."),
     release_root: Optional[Path] = typer.Option(None, "--release-root", help="Explicit release root."),
     min_docs: int = typer.Option(5, "--min-docs", min=1, help="Minimum expected documents per ticker."),
-    full: bool = typer.Option(
-        False,
-        "--full/--bounded",
-        help="Open every shard and run full consistency checks. Default bounded uses shard manifest rollups.",
-    ),
     sample_limit: int = typer.Option(20, "--sample-limit", min=1, help="Maximum consistency samples per check."),
     json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
 ) -> None:
-    """Check release quality at a glance."""
+    """Run a full v3 release quality diagnostic."""
     try:
         scanner, label, root = _quality_scanner(
             release_root=release_root,
@@ -775,7 +770,7 @@ def quality_check_cmd(
         )
         report = scanner.scan(
             min_docs=min_docs,
-            mode="full" if full else "bounded",
+            mode="full",
             sample_limit=sample_limit,
         )
     except Exception as exc:
@@ -847,7 +842,6 @@ def quality_summary_cmd(
     releases_root: Optional[Path] = typer.Option(None, "--releases-root"),
     release_root: Optional[Path] = typer.Option(None, "--release-root"),
     min_docs: int = typer.Option(5, "--min-docs", min=1),
-    full: bool = typer.Option(False, "--full/--bounded"),
     sample_limit: int = typer.Option(20, "--sample-limit", min=1),
     json_output: bool = typer.Option(False, "--json"),
 ) -> None:
@@ -858,7 +852,6 @@ def quality_summary_cmd(
         releases_root=releases_root,
         release_root=release_root,
         min_docs=min_docs,
-        full=full,
         sample_limit=sample_limit,
         json_output=json_output,
     )

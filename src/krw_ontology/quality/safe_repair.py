@@ -92,7 +92,7 @@ def run_numeric_revalidation(job: RepairJob, *, root: Path) -> dict[str, Any]:
 
     This does not promote rejected objects or mutate AI-authored object fields.
     """
-    ontology_dir = _resolve_ontology_dir(job)
+    ontology_dir = _resolve_ontology_dir(job, root=root)
     identity = _document_identity(ontology_dir, job)
     mutable_paths = [ontology_dir / "numeric_evidence.jsonl"]
 
@@ -164,7 +164,7 @@ def run_numeric_revalidation(job: RepairJob, *, root: Path) -> dict[str, Any]:
 
 def run_reference_rebuild(job: RepairJob, *, root: Path) -> dict[str, Any]:
     """Rebuild deterministic reference tail and report unresolved references."""
-    ontology_dir = _resolve_ontology_dir(job)
+    ontology_dir = _resolve_ontology_dir(job, root=root)
     identity = _document_identity(ontology_dir, job)
     mutable_paths = [
         ontology_dir / "support_links.jsonl",
@@ -300,10 +300,15 @@ def _attach_report_payload(job: RepairJob, report: dict[str, Any], report_path: 
     job.payload["verification_required"] = True
 
 
-def _resolve_ontology_dir(job: RepairJob) -> Path:
+def _resolve_ontology_dir(job: RepairJob, *, root: Path) -> Path:
     if not job.ontology_dir:
         raise ValueError(f"{job.kind} job is missing ontology_dir")
+    root_path = root.expanduser().resolve()
     ontology_dir = Path(job.ontology_dir).expanduser().resolve()
+    try:
+        ontology_dir.relative_to(root_path)
+    except ValueError as exc:
+        raise ValueError(f"{job.kind} job ontology_dir escapes running root: {ontology_dir}") from exc
     if not ontology_dir.exists():
         raise FileNotFoundError(f"ontology_dir does not exist: {ontology_dir}")
     return ontology_dir

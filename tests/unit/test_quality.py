@@ -23,7 +23,7 @@ from krw_ontology.quality.models import (
 from krw_ontology.quality.queue import QualityRepairStore
 from krw_ontology.quality.runner import run_repair_jobs
 from krw_ontology.quality.scanner import QualityReleaseScanner, QualityShardScanner
-from krw_ontology.pipeline.queue import PipelineQueue
+from krw_ontology.pipeline.queue import FILING_UPDATE, FULL_REFRESH, PipelineQueue
 from krw_ontology.release import write_release_manifest_v3
 from krw_ontology.utils.io import read_jsonl, write_jsonl
 
@@ -483,7 +483,7 @@ def test_quality_repair_run_defaults_to_latest_all_background(tmp_path: Path, mo
     assert (root / ".krw_pipeline" / "quality" / "logs" / "worker.log").exists()
 
 
-def test_docs_missing_repair_enqueues_general_pipeline_queue(tmp_path: Path):
+def test_docs_missing_repair_falls_back_to_full_refresh_when_missing_periods_are_ambiguous(tmp_path: Path):
     index_path = _write_quality_index(tmp_path)
     jobs = QualityShardScanner(index_path).build_repair_jobs(plan_id="qr_test", min_docs=5, kinds=[DOCS_MISSING])
     root = tmp_path / "running"
@@ -510,11 +510,120 @@ def test_docs_missing_repair_enqueues_general_pipeline_queue(tmp_path: Path):
     pipeline_jobs = PipelineQueue(root).list_jobs()
     assert len(pipeline_jobs) == 1
     assert pipeline_jobs[0].ticker == "FCX"
-    assert pipeline_jobs[0].job_type == "full_refresh"
+    assert pipeline_jobs[0].job_type == FULL_REFRESH
     assert pipeline_jobs[0].years == 3
     repaired = store.list_jobs(plan_id=plan.plan_id)[0]
     assert repaired.status == "succeeded"
-    assert repaired.payload["pipeline_queue_action"] == "queued_full_refresh"
+    assert repaired.payload["action"] == "full_refresh_fallback"
+    assert repaired.payload["fallback_reason"]
+    assert repaired.payload["pipeline_queue_action"] == "queued_full_refresh_fallback"
+
+
+def test_docs_missing_repair_enqueues_targeted_filing_update_for_inferred_gap(tmp_path: Path):
+    index_path = _write_quality_index(tmp_path)
+    with sqlite3.connect(index_path) as conn:
+        conn.execute("DELETE FROM documents WHERE ticker='FCX'")
+        for period in ["CY2021", "CY2022", "CY2024", "CY2025"]:
+            _insert_doc(
+                conn,
+                ticker="FCX",
+                period=period,
+                status="pass",
+                quality={"status": "pass", "missing_core_sections": [], "fail_reasons": []},
+                root=tmp_path,
+            )
+        conn.commit()
+
+    jobs = QualityShardScanner(index_path).build_repair_jobs(plan_id="qr_test", min_docs=5, kinds=[DOCS_MISSING])
+    assert len(jobs) == 1
+    assert jobs[0].payload["action"] == "targeted_filing_update"
+    assert jobs[0].payload["missing_documents"] == [
+        {
+            "document_type": "10-K",
+            "doc_type_key": "10K",
+            "period": "CY2023",
+            "inference": "annual_period_gap",
+        }
+    ]
+    root = tmp_path / "running"
+    store = QualityRepairStore(root)
+    plan = store.add_plan(
+        RepairPlan(
+            plan_id="qr_test",
+            global_spine_path=str(index_path),
+            release_label="test",
+            min_docs=5,
+            job_ids=[],
+            summary={},
+        ),
+        jobs,
+    )
+
+    result = run_repair_jobs(store=store, jobs=store.list_jobs(plan_id=plan.plan_id), root=root)
+
+    assert result["succeeded"] == 1
+    assert result["failed"] == 0
+    assert result["enqueued"] == 1
+    pipeline_jobs = PipelineQueue(root).list_jobs()
+    assert len(pipeline_jobs) == 1
+    assert pipeline_jobs[0].ticker == "FCX"
+    assert pipeline_jobs[0].job_type == FILING_UPDATE
+    assert pipeline_jobs[0].document_type == "10-K"
+    assert pipeline_jobs[0].periods == ["CY2023"]
+    repaired = store.list_jobs(plan_id=plan.plan_id)[0]
+    assert repaired.payload["pipeline_queue_action"] == "queued_targeted_filing_update"
+    assert repaired.payload["pipeline_queue_job_ids"] == [pipeline_jobs[0].job_id]
+
+
+def test_docs_missing_repair_skips_existing_targeted_update(tmp_path: Path):
+    index_path = _write_quality_index(tmp_path)
+    with sqlite3.connect(index_path) as conn:
+        conn.execute("DELETE FROM documents WHERE ticker='FCX'")
+        for period in ["CY2021", "CY2022", "CY2024", "CY2025"]:
+            _insert_doc(
+                conn,
+                ticker="FCX",
+                period=period,
+                status="pass",
+                quality={"status": "pass", "missing_core_sections": [], "fail_reasons": []},
+                root=tmp_path,
+            )
+        conn.commit()
+
+    jobs = QualityShardScanner(index_path).build_repair_jobs(plan_id="qr_test", min_docs=5, kinds=[DOCS_MISSING])
+    root = tmp_path / "running"
+    pipeline_queue = PipelineQueue(root)
+    active = pipeline_queue.add_update_job(
+        "FCX",
+        document_type="10-K",
+        periods=["CY2023"],
+        latest=False,
+        force=False,
+        publish_root=None,
+    )
+    store = QualityRepairStore(root)
+    plan = store.add_plan(
+        RepairPlan(
+            plan_id="qr_test",
+            global_spine_path=str(index_path),
+            release_label="test",
+            min_docs=5,
+            job_ids=[],
+            summary={},
+        ),
+        jobs,
+    )
+
+    result = run_repair_jobs(store=store, jobs=store.list_jobs(plan_id=plan.plan_id), root=root)
+
+    assert result["succeeded"] == 1
+    assert result["failed"] == 0
+    assert result["enqueued"] == 0
+    assert result["active"] == 1
+    assert len(PipelineQueue(root).list_jobs()) == 1
+    repaired = store.list_jobs(plan_id=plan.plan_id)[0]
+    assert repaired.payload["pipeline_queue_action"] == "skipped_active_filing_update"
+    assert repaired.payload["pipeline_queue_job_ids"] == [active.job_id]
 
 
 def test_docs_missing_repair_skips_existing_active_pipeline_job(tmp_path: Path):

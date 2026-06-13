@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 from collections import Counter
 from pathlib import Path
@@ -27,6 +28,10 @@ NUMERIC_STAGES = {"numeric_guard"}
 QUALITY_SHARD_SUMMARY_FORMAT = "krw-ontology-shard-quality-summary/v1"
 QUALITY_RELEASE_FULL_MODE = "full-release-diagnostic"
 QUALITY_RELEASE_SCAN_MODES = {"bounded", "full", QUALITY_RELEASE_FULL_MODE}
+DOCS_MISSING_TARGETED_ACTION = "targeted_filing_update"
+DOCS_MISSING_FALLBACK_ACTION = "full_refresh_fallback"
+DOCS_MISSING_REPAIRABILITY = "source_repair"
+_PERIOD_RE = re.compile(r"^(?P<prefix>CY|FY)?(?P<year>\d{4})(?:Q(?P<quarter>[1-4]))?$", re.IGNORECASE)
 
 
 def _normalize_release_quality_scan_mode(mode: str) -> str:
@@ -367,13 +372,21 @@ class QualityShardScanner:
                 for ticker, docs in docs_by_ticker.items():
                     if docs >= min_docs:
                         continue
+                    actual_documents = self._actual_documents(conn, ticker)
+                    payload = self._docs_missing_repair_payload(
+                        ticker=ticker,
+                        actual_documents=actual_documents,
+                        actual_count=docs,
+                        min_docs=min_docs,
+                    )
                     jobs.append(
                         self._job(
                             plan_id=plan_id,
                             kind=DOCS_MISSING,
                             ticker=ticker,
-                            reason=f"ticker has {docs} documents; expected at least {min_docs}",
+                            reason=str(payload.get("reason") or f"ticker has {docs} documents; expected at least {min_docs}"),
                             count=max(1, min_docs - docs),
+                            payload=payload,
                         )
                     )
 
@@ -572,6 +585,151 @@ class QualityShardScanner:
             (ticker, doc_type_key, period),
         ).fetchone()
         return row["ontology_dir"] if row else None
+
+    @staticmethod
+    def _actual_documents(conn: sqlite3.Connection, ticker: str) -> list[dict[str, str]]:
+        rows = conn.execute(
+            """
+            SELECT ticker, document_type, doc_type_key, period
+            FROM documents
+            WHERE ticker=?
+            ORDER BY doc_type_key, period
+            """,
+            (ticker,),
+        )
+        return [
+            {
+                "ticker": str(row["ticker"] or "").upper(),
+                "document_type": str(row["document_type"] or ""),
+                "doc_type_key": str(row["doc_type_key"] or ""),
+                "period": str(row["period"] or ""),
+            }
+            for row in rows
+        ]
+
+    @classmethod
+    def _docs_missing_repair_payload(
+        cls,
+        *,
+        ticker: str,
+        actual_documents: list[dict[str, str]],
+        actual_count: int,
+        min_docs: int,
+    ) -> dict[str, Any]:
+        missing_documents = cls._infer_missing_documents(actual_documents)
+        deficit = max(1, int(min_docs) - int(actual_count))
+        base_payload: dict[str, Any] = {
+            "repairability": DOCS_MISSING_REPAIRABILITY,
+            "actual_document_count": int(actual_count),
+            "expected_document_count": int(min_docs),
+            "document_deficit": deficit,
+            "actual_documents": actual_documents,
+            "targeted_candidate_documents": missing_documents,
+        }
+        if len(missing_documents) >= deficit:
+            selected = missing_documents[:deficit]
+            label = ", ".join(f"{doc['document_type']} {doc['period']}" for doc in selected)
+            return {
+                **base_payload,
+                "action": DOCS_MISSING_TARGETED_ACTION,
+                "missing_documents": selected,
+                "targeted_update_count": len(selected),
+                "reason": f"missing {len(selected)} expected filing(s): {label}",
+            }
+        fallback_reason = (
+            "missing document periods could not be inferred from a complete local period sequence"
+            if not missing_documents
+            else (
+                f"inferred {len(missing_documents)} missing filing(s), "
+                f"but {deficit} document(s) are required to satisfy min_docs"
+            )
+        )
+        return {
+            **base_payload,
+            "action": DOCS_MISSING_FALLBACK_ACTION,
+            "missing_documents": [],
+            "fallback_reason": fallback_reason,
+            "years": 3,
+            "reason": f"ticker has {actual_count} documents; expected at least {min_docs}; {fallback_reason}",
+        }
+
+    @classmethod
+    def _infer_missing_documents(cls, actual_documents: list[dict[str, str]]) -> list[dict[str, str]]:
+        grouped: dict[tuple[str, str], list[dict[str, str]]] = {}
+        for document in actual_documents:
+            document_type = document.get("document_type") or _document_type_from_key(document.get("doc_type_key") or "")
+            doc_type_key = document.get("doc_type_key") or document_type.replace("-", "")
+            if not document_type or not doc_type_key or not document.get("period"):
+                continue
+            grouped.setdefault((document_type, doc_type_key), []).append(document)
+
+        missing: list[dict[str, str]] = []
+        for (document_type, doc_type_key), documents in sorted(grouped.items()):
+            missing.extend(
+                cls._infer_missing_documents_for_group(
+                    document_type=document_type,
+                    doc_type_key=doc_type_key,
+                    documents=documents,
+                )
+            )
+        return sorted(missing, key=lambda doc: (_period_sort_key(doc.get("period")), doc.get("document_type") or ""))
+
+    @staticmethod
+    def _infer_missing_documents_for_group(
+        *,
+        document_type: str,
+        doc_type_key: str,
+        documents: list[dict[str, str]],
+    ) -> list[dict[str, str]]:
+        parsed = [
+            _parse_period(document.get("period"))
+            for document in documents
+        ]
+        parsed = [period for period in parsed if period is not None]
+        if len(parsed) < 2:
+            return []
+        prefix_values = {period["prefix"] for period in parsed}
+        if len(prefix_values) != 1:
+            return []
+        prefix = next(iter(prefix_values))
+        quarters = {period["quarter"] for period in parsed}
+        years = sorted({int(period["year"]) for period in parsed})
+        missing: list[dict[str, str]] = []
+        if quarters == {None}:
+            if len(years) < 2:
+                return []
+            present = set(years)
+            for year in range(min(years), max(years) + 1):
+                if year not in present:
+                    missing.append(
+                        {
+                            "document_type": document_type,
+                            "doc_type_key": doc_type_key,
+                            "period": f"{prefix}{year}",
+                            "inference": "annual_period_gap",
+                        }
+                    )
+            return missing
+        quarter_by_year: dict[int, set[int]] = {}
+        for period in parsed:
+            quarter = period["quarter"]
+            if quarter is None:
+                continue
+            quarter_by_year.setdefault(int(period["year"]), set()).add(int(quarter))
+        for year, present_quarters in sorted(quarter_by_year.items()):
+            if len(present_quarters) < 2:
+                continue
+            for quarter in range(min(present_quarters), max(present_quarters) + 1):
+                if quarter not in present_quarters:
+                    missing.append(
+                        {
+                            "document_type": document_type,
+                            "doc_type_key": doc_type_key,
+                            "period": f"{prefix}{year}Q{quarter}",
+                            "inference": "quarterly_period_gap",
+                        }
+                    )
+        return missing
 
     def _job(
         self,
@@ -1362,3 +1520,38 @@ def _file_sha256(path: Path) -> str:
 
 def _canonical_json(payload: Any) -> str:
     return json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+
+
+def _document_type_from_key(doc_type_key: str) -> str:
+    normalized = str(doc_type_key or "").upper()
+    if normalized == "10K":
+        return "10-K"
+    if normalized == "10Q":
+        return "10-Q"
+    return normalized
+
+
+def _parse_period(period: str | None) -> dict[str, Any] | None:
+    if not period:
+        return None
+    match = _PERIOD_RE.match(str(period).strip())
+    if not match:
+        return None
+    prefix = (match.group("prefix") or "").upper()
+    quarter = match.group("quarter")
+    return {
+        "prefix": prefix,
+        "year": int(match.group("year")),
+        "quarter": int(quarter) if quarter else None,
+    }
+
+
+def _period_sort_key(period: str | None) -> tuple[int, int, str]:
+    parsed = _parse_period(period)
+    if parsed is None:
+        return (0, 0, str(period or ""))
+    return (
+        int(parsed["year"]),
+        int(parsed["quarter"] or 0),
+        str(period or ""),
+    )

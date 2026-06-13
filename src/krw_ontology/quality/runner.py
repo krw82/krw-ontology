@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+from typing import Any, Mapping
 
 from krw_ontology.config.settings import PipelineConfig
 from krw_ontology.extraction.worker import ExtractionWorker
@@ -78,10 +79,10 @@ def run_repair_jobs(
         counts["succeeded"] += 1
         counts["resolved"] += int(job.payload.get("resolved_count") or job.payload.get("candidate_now_valid_count") or 0)
         counts["unresolved"] += int(job.payload.get("unresolved_count") or 0)
-        if job.payload.get("pipeline_queue_action") == "queued_full_refresh":
-            counts["enqueued"] += 1
-        if job.payload.get("pipeline_queue_action") == "skipped_active_job":
-            counts["active"] += 1
+        if str(job.payload.get("pipeline_queue_action") or "").startswith("queued_"):
+            counts["enqueued"] += int(job.payload.get("pipeline_queue_job_count") or 1)
+        if str(job.payload.get("pipeline_queue_action") or "").startswith("skipped_active"):
+            counts["active"] += int(job.payload.get("active_pipeline_job_count") or 1)
     return counts
 
 
@@ -113,11 +114,20 @@ def _run_one(
 def _enqueue_docs_missing(job: RepairJob, *, root: Path) -> None:
     queue = PipelineQueue(root)
     queue.ensure_dirs()
+    action = str(job.payload.get("action") or "full_refresh_fallback")
+    if action == "targeted_filing_update":
+        _enqueue_targeted_docs_missing(job, queue=queue)
+        return
+    _enqueue_full_refresh_fallback(job, queue=queue)
+
+
+def _enqueue_full_refresh_fallback(job: RepairJob, *, queue: PipelineQueue) -> None:
     active = queue.active_job_for_ticker(job.ticker)
     if active is not None:
         job.payload["pipeline_queue_action"] = "skipped_active_job"
         job.payload["pipeline_queue_job_id"] = active.job_id
         job.payload["pipeline_queue_status"] = active.status
+        job.payload["active_pipeline_job_count"] = 1
         job.payload["repair_outcome"] = "pipeline_job_already_active"
         job.payload["verification_required"] = True
         return
@@ -127,11 +137,102 @@ def _enqueue_docs_missing(job: RepairJob, *, root: Path) -> None:
         force=False,
         publish_root=None,
     )
-    job.payload["pipeline_queue_action"] = "queued_full_refresh"
+    job.payload["pipeline_queue_action"] = "queued_full_refresh_fallback"
     job.payload["pipeline_queue_job_id"] = pipeline_job.job_id
+    job.payload["pipeline_queue_job_count"] = 1
     job.payload["pipeline_queue_status"] = pipeline_job.status
-    job.payload["repair_outcome"] = "enqueued_pipeline_job"
+    job.payload["repair_outcome"] = "enqueued_full_refresh_fallback"
     job.payload["verification_required"] = True
+
+
+def _enqueue_targeted_docs_missing(job: RepairJob, *, queue: PipelineQueue) -> None:
+    active_full_refresh = queue.active_full_refresh_for_ticker(job.ticker)
+    if active_full_refresh is not None:
+        job.payload["pipeline_queue_action"] = "skipped_active_full_refresh"
+        job.payload["pipeline_queue_job_id"] = active_full_refresh.job_id
+        job.payload["pipeline_queue_status"] = active_full_refresh.status
+        job.payload["active_pipeline_job_count"] = 1
+        job.payload["repair_outcome"] = "full_refresh_already_active"
+        job.payload["verification_required"] = True
+        return
+
+    missing_documents = [
+        document
+        for document in job.payload.get("missing_documents") or []
+        if isinstance(document, Mapping)
+    ]
+    grouped: dict[str, list[str]] = {}
+    skipped_active: list[dict[str, Any]] = []
+    for document in missing_documents:
+        document_type = str(document.get("document_type") or "")
+        period = str(document.get("period") or "")
+        if not document_type or not period:
+            continue
+        active_update = queue.active_update_job_for_filing(
+            job.ticker,
+            document_type=document_type,
+            period=period,
+        )
+        if active_update is not None:
+            skipped_active.append(
+                {
+                    "document_type": document_type,
+                    "period": period,
+                    "job_id": active_update.job_id,
+                    "status": active_update.status,
+                }
+            )
+            continue
+        grouped.setdefault(document_type, []).append(period)
+
+    queued_jobs = []
+    for document_type, periods in sorted(grouped.items()):
+        unique_periods = sorted(set(periods), key=_period_order_key)
+        if not unique_periods:
+            continue
+        queued_jobs.append(
+            queue.add_update_job(
+                job.ticker,
+                document_type=document_type,
+                periods=unique_periods,
+                latest=False,
+                force=False,
+                publish_root=None,
+            )
+        )
+
+    if queued_jobs:
+        job.payload["pipeline_queue_action"] = "queued_targeted_filing_update"
+        job.payload["pipeline_queue_job_ids"] = [queued.job_id for queued in queued_jobs]
+        job.payload["pipeline_queue_job_count"] = len(queued_jobs)
+        job.payload["pipeline_queue_statuses"] = {
+            queued.job_id: queued.status
+            for queued in queued_jobs
+        }
+        job.payload["targeted_update_count"] = sum(len(set(periods)) for periods in grouped.values())
+        job.payload["skipped_active_updates"] = skipped_active
+        job.payload["active_pipeline_job_count"] = len(skipped_active)
+        job.payload["repair_outcome"] = "enqueued_targeted_filing_update"
+        job.payload["verification_required"] = True
+        return
+
+    job.payload["pipeline_queue_action"] = "skipped_active_filing_update"
+    job.payload["pipeline_queue_job_ids"] = [item["job_id"] for item in skipped_active]
+    job.payload["active_pipeline_job_count"] = len(skipped_active)
+    job.payload["skipped_active_updates"] = skipped_active
+    job.payload["repair_outcome"] = "targeted_filing_update_already_active"
+    job.payload["verification_required"] = True
+
+
+def _period_order_key(period: str) -> tuple[int, int, str]:
+    normalized = str(period or "").upper()
+    year_text = normalized[2:6] if normalized.startswith(("CY", "FY")) else normalized[:4]
+    year = int(year_text) if year_text.isdigit() else 0
+    quarter = 0
+    if "Q" in normalized:
+        quarter_text = normalized.rsplit("Q", 1)[-1]
+        quarter = int(quarter_text) if quarter_text.isdigit() else 0
+    return (year, quarter, normalized)
 
 
 async def _retry_batch_failure(

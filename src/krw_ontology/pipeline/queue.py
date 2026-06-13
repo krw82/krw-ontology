@@ -281,6 +281,30 @@ class PipelineQueue:
                 return job
         return None
 
+    def active_full_refresh_for_ticker(self, ticker: str) -> QueueJob | None:
+        normalized = ticker.upper()
+        for job in self.list_jobs(statuses=[PENDING, RUNNING]):
+            if job.ticker == normalized and job.job_type == FULL_REFRESH:
+                return job
+        return None
+
+    def active_update_job_for_filing(
+        self,
+        ticker: str,
+        *,
+        document_type: str,
+        period: str,
+    ) -> QueueJob | None:
+        normalized = ticker.upper()
+        for job in self.list_jobs(statuses=[PENDING, RUNNING]):
+            if job.ticker != normalized or job.job_type != FILING_UPDATE:
+                continue
+            if job.document_type != document_type:
+                continue
+            if period in (job.periods or []):
+                return job
+        return None
+
     def mark_running(self, job: QueueJob) -> QueueJob:
         job.status = RUNNING
         job.attempts += 1

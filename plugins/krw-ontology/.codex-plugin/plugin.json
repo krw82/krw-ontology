@@ -4,8 +4,7 @@
   "description": "Filing-grounded equity research workflow with bounded MCP research, ResearchState packs, selected trace/chain expansion, and Korean Markdown synthesis.",
   "author": {
     "name": "Jeong Woncheol",
-    "email": "local@example.com",
-    "url": "file://~/krw-ontology"
+    "email": "local@example.com"
   },
   "homepage": "file://~/krw-ontology",
   "repository": "file://~/krw-ontology",

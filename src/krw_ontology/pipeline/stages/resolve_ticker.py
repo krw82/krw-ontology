@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from functools import lru_cache
 
 import httpx
 
@@ -20,14 +21,7 @@ def resolve_ticker(ticker: str, config: PipelineConfig) -> dict:
     Returns dict with: cik, company_name, ticker, exchange.
     """
     ticker_upper = ticker.upper()
-    headers = {"User-Agent": config.sec_user_agent}
-
-    try:
-        resp = httpx.get(SEC_TICKERS_URL, headers=headers, timeout=120.0, follow_redirects=True)
-        resp.raise_for_status()
-        data = resp.json()
-    except (httpx.HTTPError, Exception) as e:
-        raise PipelineStageError(f"resolve_ticker: failed to fetch company_tickers.json: {e}") from e
+    data = _fetch_company_tickers(config.sec_user_agent)
 
     for entry in data.values():
         if entry.get("ticker", "").upper() == ticker_upper:
@@ -40,3 +34,17 @@ def resolve_ticker(ticker: str, config: PipelineConfig) -> dict:
             }
 
     raise PipelineStageError(f"resolve_ticker: ticker '{ticker}' not found in SEC company_tickers.json")
+
+
+@lru_cache(maxsize=8)
+def _fetch_company_tickers(user_agent: str) -> dict:
+    headers = {"User-Agent": user_agent}
+    try:
+        resp = httpx.get(SEC_TICKERS_URL, headers=headers, timeout=120.0, follow_redirects=True)
+        resp.raise_for_status()
+        payload = resp.json()
+    except (httpx.HTTPError, Exception) as e:
+        raise PipelineStageError(f"resolve_ticker: failed to fetch company_tickers.json: {e}") from e
+    if not isinstance(payload, dict):
+        raise PipelineStageError("resolve_ticker: company_tickers.json response is not an object")
+    return payload

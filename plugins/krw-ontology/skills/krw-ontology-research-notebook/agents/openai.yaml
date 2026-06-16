@@ -1,0 +1,4 @@
+interface:
+  display_name: "KRW Ontology Research Notebook"
+  short_description: "Refresh one ticker Markdown notebook"
+  default_prompt: "Use $krw-ontology-research-notebook to refresh a ticker's Markdown research notebook from the existing note and recent conversations."

@@ -4,6 +4,7 @@ import json
 import sqlite3
 import hashlib
 from pathlib import Path
+from types import SimpleNamespace
 
 from typer.testing import CliRunner
 
@@ -29,6 +30,42 @@ from krw_ontology.utils.io import read_jsonl, write_jsonl
 
 
 runner = CliRunner()
+
+
+def _patch_expected_filing_discovery(monkeypatch) -> None:
+    def fake_discover_research_filing_targets(ticker: str, *, years: int, config):
+        del years, config
+        return [
+            SimpleNamespace(
+                ticker=ticker.upper(),
+                document_type="10-K",
+                period="CY2023",
+                accession_number="000-test-2023",
+                filing_date="2024-02-01",
+                report_date="2023-12-31",
+            ),
+            SimpleNamespace(
+                ticker=ticker.upper(),
+                document_type="10-K",
+                period="CY2024",
+                accession_number="000-test-2024",
+                filing_date="2025-02-01",
+                report_date="2024-12-31",
+            ),
+            SimpleNamespace(
+                ticker=ticker.upper(),
+                document_type="10-K",
+                period="CY2025",
+                accession_number="000-test-2025",
+                filing_date="2026-02-01",
+                report_date="2025-12-31",
+            ),
+        ]
+
+    monkeypatch.setattr(
+        "krw_ontology.quality.scanner.discover_research_filing_targets",
+        fake_discover_research_filing_targets,
+    )
 
 
 def test_quality_scanner_summarizes_problem_tickers(tmp_path: Path):
@@ -200,6 +237,7 @@ def test_quality_cli_check_defaults_to_configured_v3_current(tmp_path: Path, mon
 
 
 def test_quality_repair_plan_records_v3_fingerprint_and_refuses_stale_run(tmp_path: Path, monkeypatch):
+    _patch_expected_filing_discovery(monkeypatch)
     release_root = _write_v3_quality_release(tmp_path)
     root = tmp_path / "running"
     monkeypatch.setenv("KRW_ONTOLOGY_CLI_CONFIG", str(tmp_path / "config.json"))
@@ -256,6 +294,7 @@ def test_quality_repair_plan_records_v3_fingerprint_and_refuses_stale_run(tmp_pa
 
 
 def test_quality_repair_plan_refuses_stale_shard_manifest(tmp_path: Path, monkeypatch):
+    _patch_expected_filing_discovery(monkeypatch)
     release_root = _write_v3_quality_release(tmp_path)
     root = tmp_path / "running"
     monkeypatch.setenv("KRW_ONTOLOGY_CLI_CONFIG", str(tmp_path / "config.json"))
@@ -304,6 +343,7 @@ def test_quality_repair_plan_refuses_stale_shard_manifest(tmp_path: Path, monkey
 
 
 def test_quality_cli_repair_plan_show_status_list_clear(tmp_path: Path, monkeypatch):
+    _patch_expected_filing_discovery(monkeypatch)
     release_root = _write_v3_quality_release(tmp_path)
     root = tmp_path / "running"
     monkeypatch.setenv("KRW_ONTOLOGY_CLI_CONFIG", str(tmp_path / "config.json"))
@@ -353,6 +393,7 @@ def test_quality_cli_repair_plan_show_status_list_clear(tmp_path: Path, monkeypa
 
 
 def test_quality_repair_run_preview_defaults_to_executable_jobs(tmp_path: Path, monkeypatch):
+    _patch_expected_filing_discovery(monkeypatch)
     release_root = _write_v3_quality_release(tmp_path)
     root = tmp_path / "running"
     monkeypatch.setenv("KRW_ONTOLOGY_CLI_CONFIG", str(tmp_path / "config.json"))
@@ -393,6 +434,7 @@ def test_quality_repair_run_preview_defaults_to_executable_jobs(tmp_path: Path, 
 
 
 def test_quality_repair_run_all_and_watch_once(tmp_path: Path, monkeypatch):
+    _patch_expected_filing_discovery(monkeypatch)
     release_root = _write_v3_quality_release(tmp_path)
     root = tmp_path / "running"
     monkeypatch.setenv("KRW_ONTOLOGY_CLI_CONFIG", str(tmp_path / "config.json"))
@@ -434,6 +476,7 @@ def test_quality_repair_run_all_and_watch_once(tmp_path: Path, monkeypatch):
 
 
 def test_quality_repair_run_defaults_to_latest_all_background(tmp_path: Path, monkeypatch):
+    _patch_expected_filing_discovery(monkeypatch)
     release_root = _write_v3_quality_release(tmp_path)
     root = tmp_path / "running"
     monkeypatch.setenv("KRW_ONTOLOGY_CLI_CONFIG", str(tmp_path / "config.json"))
@@ -517,6 +560,122 @@ def test_docs_missing_repair_falls_back_to_full_refresh_when_missing_periods_are
     assert repaired.payload["action"] == "full_refresh_fallback"
     assert repaired.payload["fallback_reason"]
     assert repaired.payload["pipeline_queue_action"] == "queued_full_refresh_fallback"
+
+
+def test_docs_missing_repair_uses_expected_filing_diff_for_targeted_update(tmp_path: Path):
+    index_path = _write_quality_index(tmp_path)
+
+    def expected_provider(ticker: str):
+        return (
+            [
+                {"ticker": ticker, "document_type": "10-K", "doc_type_key": "10K", "period": "CY2023"},
+                {"ticker": ticker, "document_type": "10-K", "doc_type_key": "10K", "period": "CY2024"},
+                {"ticker": ticker, "document_type": "10-K", "doc_type_key": "10K", "period": "CY2025"},
+                {"ticker": ticker, "document_type": "10-Q", "doc_type_key": "10Q", "period": "CY2026Q1"},
+            ],
+            None,
+        )
+
+    jobs = QualityShardScanner(index_path).build_repair_jobs(
+        plan_id="qr_test",
+        min_docs=5,
+        kinds=[DOCS_MISSING],
+        expected_filing_provider=expected_provider,
+    )
+
+    assert len(jobs) == 1
+    assert jobs[0].payload["action"] == "targeted_filing_update"
+    assert jobs[0].payload["inference_source"] == "expected_filing_diff"
+    assert jobs[0].payload["missing_documents"] == [
+        {
+            "ticker": "FCX",
+            "document_type": "10-K",
+            "doc_type_key": "10K",
+            "period": "CY2023",
+            "inference": "expected_filing_diff",
+        },
+        {
+            "ticker": "FCX",
+            "document_type": "10-K",
+            "doc_type_key": "10K",
+            "period": "CY2024",
+            "inference": "expected_filing_diff",
+        },
+        {
+            "ticker": "FCX",
+            "document_type": "10-Q",
+            "doc_type_key": "10Q",
+            "period": "CY2026Q1",
+            "inference": "expected_filing_diff",
+        },
+    ]
+    root = tmp_path / "running"
+    store = QualityRepairStore(root)
+    plan = store.add_plan(
+        RepairPlan(
+            plan_id="qr_test",
+            global_spine_path=str(index_path),
+            release_label="test",
+            min_docs=5,
+            job_ids=[],
+            summary={},
+        ),
+        jobs,
+    )
+
+    result = run_repair_jobs(store=store, jobs=store.list_jobs(plan_id=plan.plan_id), root=root)
+
+    assert result["succeeded"] == 1
+    assert result["failed"] == 0
+    assert result["enqueued"] == 2
+    pipeline_jobs = PipelineQueue(root).list_jobs()
+    assert [(job.job_type, job.document_type, job.periods) for job in pipeline_jobs] == [
+        (FILING_UPDATE, "10-K", ["CY2023", "CY2024"]),
+        (FILING_UPDATE, "10-Q", ["CY2026Q1"]),
+    ]
+    repaired = store.list_jobs(plan_id=plan.plan_id)[0]
+    assert repaired.payload["pipeline_queue_action"] == "queued_targeted_filing_update"
+    assert repaired.payload["pipeline_queue_job_count"] == 2
+
+
+def test_docs_missing_repair_falls_back_when_expected_filing_discovery_fails(tmp_path: Path):
+    index_path = _write_quality_index(tmp_path)
+
+    def expected_provider(_ticker: str):
+        return ([], "resolve_ticker failed")
+
+    jobs = QualityShardScanner(index_path).build_repair_jobs(
+        plan_id="qr_test",
+        min_docs=5,
+        kinds=[DOCS_MISSING],
+        expected_filing_provider=expected_provider,
+    )
+
+    assert len(jobs) == 1
+    assert jobs[0].payload["action"] == "full_refresh_fallback"
+    assert jobs[0].payload["expected_discovery_error"] == "resolve_ticker failed"
+    assert jobs[0].payload["fallback_reason"] == "expected filing discovery failed: resolve_ticker failed"
+
+
+def test_docs_missing_repair_skips_when_expected_filing_coverage_is_complete(tmp_path: Path):
+    index_path = _write_quality_index(tmp_path)
+
+    def expected_provider(ticker: str):
+        return (
+            [
+                {"ticker": ticker, "document_type": "10-K", "doc_type_key": "10K", "period": "CY2025"},
+            ],
+            None,
+        )
+
+    jobs = QualityShardScanner(index_path).build_repair_jobs(
+        plan_id="qr_test",
+        min_docs=5,
+        kinds=[DOCS_MISSING],
+        expected_filing_provider=expected_provider,
+    )
+
+    assert jobs == []
 
 
 def test_docs_missing_repair_enqueues_targeted_filing_update_for_inferred_gap(tmp_path: Path):

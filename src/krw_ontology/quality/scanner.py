@@ -8,8 +8,10 @@ import re
 import sqlite3
 from collections import Counter
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
+from krw_ontology.config.settings import PipelineConfig
+from krw_ontology.pipeline.research_plan import discover_research_filing_targets
 from krw_ontology.quality.models import (
     BATCH_FAILURE,
     COVERAGE_GAP,
@@ -30,8 +32,11 @@ QUALITY_RELEASE_FULL_MODE = "full-release-diagnostic"
 QUALITY_RELEASE_SCAN_MODES = {"bounded", "full", QUALITY_RELEASE_FULL_MODE}
 DOCS_MISSING_TARGETED_ACTION = "targeted_filing_update"
 DOCS_MISSING_FALLBACK_ACTION = "full_refresh_fallback"
+DOCS_MISSING_NO_REPAIR_ACTION = "expected_filing_coverage_complete"
 DOCS_MISSING_REPAIRABILITY = "source_repair"
+DOCS_MISSING_DISCOVERY_YEARS = 3
 _PERIOD_RE = re.compile(r"^(?P<prefix>CY|FY)?(?P<year>\d{4})(?:Q(?P<quarter>[1-4]))?$", re.IGNORECASE)
+ExpectedFilingProvider = Callable[[str], tuple[list[dict[str, str]], str | None]]
 
 
 def _normalize_release_quality_scan_mode(mode: str) -> str:
@@ -354,6 +359,7 @@ class QualityShardScanner:
         min_docs: int = 5,
         kinds: Iterable[str] | None = None,
         include_warn: bool = False,
+        expected_filing_provider: ExpectedFilingProvider | None = None,
     ) -> list[RepairJob]:
         wanted = {kind for kind in kinds or []}
 
@@ -373,12 +379,24 @@ class QualityShardScanner:
                     if docs >= min_docs:
                         continue
                     actual_documents = self._actual_documents(conn, ticker)
+                    expected_documents: list[dict[str, str]] | None = None
+                    expected_discovery_error: str | None = None
+                    if expected_filing_provider is not None:
+                        try:
+                            expected_documents, expected_discovery_error = expected_filing_provider(ticker)
+                        except Exception as exc:
+                            expected_documents = []
+                            expected_discovery_error = str(exc)
                     payload = self._docs_missing_repair_payload(
                         ticker=ticker,
                         actual_documents=actual_documents,
                         actual_count=docs,
                         min_docs=min_docs,
+                        expected_documents=expected_documents,
+                        expected_discovery_error=expected_discovery_error,
                     )
+                    if payload.get("action") == DOCS_MISSING_NO_REPAIR_ACTION:
+                        continue
                     jobs.append(
                         self._job(
                             plan_id=plan_id,
@@ -615,8 +633,15 @@ class QualityShardScanner:
         actual_documents: list[dict[str, str]],
         actual_count: int,
         min_docs: int,
+        expected_documents: list[dict[str, str]] | None = None,
+        expected_discovery_error: str | None = None,
     ) -> dict[str, Any]:
-        missing_documents = cls._infer_missing_documents(actual_documents)
+        actual_filing_documents = cls._normalize_filing_documents(actual_documents)
+        expected_filing_documents = (
+            cls._normalize_filing_documents(expected_documents)
+            if expected_documents is not None
+            else []
+        )
         deficit = max(1, int(min_docs) - int(actual_count))
         base_payload: dict[str, Any] = {
             "repairability": DOCS_MISSING_REPAIRABILITY,
@@ -624,34 +649,94 @@ class QualityShardScanner:
             "expected_document_count": int(min_docs),
             "document_deficit": deficit,
             "actual_documents": actual_documents,
-            "targeted_candidate_documents": missing_documents,
+            "actual_filing_documents": actual_filing_documents,
+            "expected_filing_documents": expected_filing_documents,
+            "expected_filing_count": len(expected_filing_documents),
+            "expected_discovery_error": expected_discovery_error,
+            "targeted_candidate_documents": [],
         }
-        if len(missing_documents) >= deficit:
-            selected = missing_documents[:deficit]
+        if expected_documents is not None and not expected_discovery_error:
+            missing_from_expected = cls._missing_expected_documents(
+                expected_filing_documents,
+                actual_filing_documents,
+            )
+            base_payload["targeted_candidate_documents"] = missing_from_expected
+            if missing_from_expected:
+                label = ", ".join(f"{doc['document_type']} {doc['period']}" for doc in missing_from_expected)
+                return {
+                    **base_payload,
+                    "action": DOCS_MISSING_TARGETED_ACTION,
+                    "missing_documents": missing_from_expected,
+                    "targeted_update_count": len(missing_from_expected),
+                    "inference_source": "expected_filing_diff",
+                    "reason": f"missing {len(missing_from_expected)} expected filing(s): {label}",
+                }
+            return {
+                **base_payload,
+                "action": DOCS_MISSING_NO_REPAIR_ACTION,
+                "repairability": "no_source_repair_required",
+                "missing_documents": [],
+                "targeted_update_count": 0,
+                "inference_source": "expected_filing_diff",
+                "reason": (
+                    "expected filing discovery found no missing filings; "
+                    "docs deficit is caused by the min_docs heuristic"
+                ),
+            }
+
+        local_missing_documents = cls._infer_missing_documents(actual_documents)
+        base_payload["local_gap_candidate_documents"] = local_missing_documents
+        if expected_discovery_error:
+            base_payload["targeted_candidate_documents"] = local_missing_documents
+        if len(local_missing_documents) >= deficit:
+            selected = local_missing_documents[:deficit]
             label = ", ".join(f"{doc['document_type']} {doc['period']}" for doc in selected)
             return {
                 **base_payload,
                 "action": DOCS_MISSING_TARGETED_ACTION,
                 "missing_documents": selected,
                 "targeted_update_count": len(selected),
+                "inference_source": "local_period_gap",
                 "reason": f"missing {len(selected)} expected filing(s): {label}",
             }
-        fallback_reason = (
-            "missing document periods could not be inferred from a complete local period sequence"
-            if not missing_documents
-            else (
-                f"inferred {len(missing_documents)} missing filing(s), "
-                f"but {deficit} document(s) are required to satisfy min_docs"
-            )
+        fallback_reason = cls._docs_missing_fallback_reason(
+            expected_documents=expected_documents,
+            expected_discovery_error=expected_discovery_error,
+            expected_filing_documents=expected_filing_documents,
+            local_missing_documents=local_missing_documents,
+            deficit=deficit,
         )
         return {
             **base_payload,
             "action": DOCS_MISSING_FALLBACK_ACTION,
             "missing_documents": [],
             "fallback_reason": fallback_reason,
-            "years": 3,
+            "years": DOCS_MISSING_DISCOVERY_YEARS,
             "reason": f"ticker has {actual_count} documents; expected at least {min_docs}; {fallback_reason}",
         }
+
+    @classmethod
+    def _docs_missing_fallback_reason(
+        cls,
+        *,
+        expected_documents: list[dict[str, str]] | None,
+        expected_discovery_error: str | None,
+        expected_filing_documents: list[dict[str, str]],
+        local_missing_documents: list[dict[str, str]],
+        deficit: int,
+    ) -> str:
+        if expected_discovery_error:
+            return f"expected filing discovery failed: {expected_discovery_error}"
+        if expected_documents is not None and not expected_filing_documents:
+            return "expected filing discovery returned no filing targets"
+        if expected_documents is not None:
+            return "expected filing discovery did not identify missing filings despite docs deficit"
+        if not local_missing_documents:
+            return "missing document periods could not be inferred from a complete local period sequence"
+        return (
+            f"inferred {len(local_missing_documents)} missing filing(s), "
+            f"but {deficit} document(s) are required to satisfy min_docs"
+        )
 
     @classmethod
     def _infer_missing_documents(cls, actual_documents: list[dict[str, str]]) -> list[dict[str, str]]:
@@ -673,6 +758,71 @@ class QualityShardScanner:
                 )
             )
         return sorted(missing, key=lambda doc: (_period_sort_key(doc.get("period")), doc.get("document_type") or ""))
+
+    @classmethod
+    def _normalize_filing_documents(cls, documents: list[dict[str, str]] | None) -> list[dict[str, str]]:
+        normalized: list[dict[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for document in documents or []:
+            if not isinstance(document, Mapping):
+                continue
+            payload = cls._normalize_filing_document(document)
+            if payload is None:
+                continue
+            key = (payload["document_type"], payload["period"])
+            if key in seen:
+                continue
+            seen.add(key)
+            normalized.append(payload)
+        return sorted(normalized, key=lambda doc: (_period_sort_key(doc.get("period")), doc.get("document_type") or ""))
+
+    @staticmethod
+    def _normalize_filing_document(document: Mapping[str, Any]) -> dict[str, str] | None:
+        raw_doc_type = str(document.get("document_type") or "")
+        raw_doc_type_key = str(document.get("doc_type_key") or "")
+        document_type = raw_doc_type.strip().upper()
+        doc_type_key = raw_doc_type_key.strip().upper()
+        if not document_type and doc_type_key:
+            document_type = _document_type_from_key(doc_type_key)
+        if not doc_type_key and document_type:
+            doc_type_key = document_type.replace("-", "")
+        if doc_type_key in {"10K", "10Q"}:
+            document_type = _document_type_from_key(doc_type_key)
+        if document_type not in {"10-K", "10-Q"}:
+            return None
+        period = str(document.get("period") or "").strip()
+        if not period or period.upper() == "ALL":
+            return None
+        payload = {
+            "ticker": str(document.get("ticker") or "").upper(),
+            "document_type": document_type,
+            "doc_type_key": doc_type_key or document_type.replace("-", ""),
+            "period": period,
+        }
+        for key in ("accession_number", "filing_date", "report_date", "inference"):
+            value = document.get(key)
+            if value:
+                payload[key] = str(value)
+        return payload
+
+    @classmethod
+    def _missing_expected_documents(
+        cls,
+        expected_documents: list[dict[str, str]],
+        actual_documents: list[dict[str, str]],
+    ) -> list[dict[str, str]]:
+        actual_keys = {
+            (document["document_type"], document["period"])
+            for document in actual_documents
+        }
+        return [
+            {
+                **document,
+                "inference": document.get("inference") or "expected_filing_diff",
+            }
+            for document in expected_documents
+            if (document["document_type"], document["period"]) not in actual_keys
+        ]
 
     @staticmethod
     def _infer_missing_documents_for_group(
@@ -1027,6 +1177,7 @@ class QualityReleaseScanner:
         include_warn: bool = False,
     ) -> list[RepairJob]:
         jobs: list[RepairJob] = []
+        expected_filing_provider = self._expected_filing_provider()
         for _ticker, shard_path, _entry in self._shard_entries():
             if not shard_path.is_file():
                 continue
@@ -1036,9 +1187,47 @@ class QualityReleaseScanner:
                     min_docs=min_docs,
                     kinds=kinds,
                     include_warn=include_warn,
+                    expected_filing_provider=expected_filing_provider,
                 )
             )
         return QualityShardScanner._dedupe_jobs(jobs)
+
+    def _expected_filing_provider(self) -> ExpectedFilingProvider:
+        config = PipelineConfig.load()
+        cache: dict[str, tuple[list[dict[str, str]], str | None]] = {}
+
+        def provider(ticker: str) -> tuple[list[dict[str, str]], str | None]:
+            normalized = ticker.upper()
+            if normalized in cache:
+                return cache[normalized]
+            try:
+                targets = discover_research_filing_targets(
+                    normalized,
+                    years=DOCS_MISSING_DISCOVERY_YEARS,
+                    config=config,
+                )
+            except Exception as exc:
+                result = ([], str(exc))
+            else:
+                result = (
+                    [
+                        {
+                            "ticker": target.ticker,
+                            "document_type": target.document_type,
+                            "doc_type_key": target.document_type.replace("-", ""),
+                            "period": target.period,
+                            "accession_number": target.accession_number,
+                            "filing_date": target.filing_date,
+                            "report_date": target.report_date,
+                        }
+                        for target in targets
+                    ],
+                    None,
+                )
+            cache[normalized] = result
+            return result
+
+        return provider
 
     def fingerprint(self) -> dict[str, Any]:
         manifest = self._load_manifest()

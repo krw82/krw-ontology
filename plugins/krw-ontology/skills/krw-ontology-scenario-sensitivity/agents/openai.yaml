@@ -1,0 +1,4 @@
+interface:
+  display_name: "KRW Ontology Scenario & Sensitivity"
+  short_description: "공시 근거로 투자 가정이 강화·약화·파기되는 조건을 검증합니다"
+  default_prompt: "Use $krw-ontology-scenario-sensitivity to stress-test the filing-grounded investment assumption and identify what strengthens, weakens, or breaks it."

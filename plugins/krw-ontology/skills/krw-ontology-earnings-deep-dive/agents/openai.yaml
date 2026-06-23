@@ -1,0 +1,4 @@
+interface:
+  display_name: "KRW Ontology Earnings Deep Dive"
+  short_description: "최신 분기가 투자 가설을 강화·약화했는지 분석합니다"
+  default_prompt: "Use $krw-ontology-earnings-deep-dive to analyze the latest reported quarter as evidence that updates the filing-supported operating thesis."

@@ -519,30 +519,6 @@ class QualityShardScanner:
                         )
                     )
 
-            if enabled(COVERAGE_GAP):
-                for row in conn.execute(
-                    """
-                    SELECT id, ticker, document_type, doc_type_key, period,
-                           stage, message, json
-                    FROM quality_events
-                    WHERE category='coverage_gap'
-                    ORDER BY ticker
-                    """
-                ):
-                    jobs.append(
-                        self._job(
-                            plan_id=plan_id,
-                            kind=COVERAGE_GAP,
-                            ticker=row["ticker"],
-                            document_type=row["document_type"],
-                            doc_type_key=row["doc_type_key"],
-                            period=row["period"],
-                            stage=row["stage"],
-                            source_event_id=row["id"],
-                            reason=row["message"],
-                            payload=self._loads(row["json"]),
-                        )
-                    )
         return self._dedupe_jobs(jobs)
 
     def _connect(self) -> sqlite3.Connection:

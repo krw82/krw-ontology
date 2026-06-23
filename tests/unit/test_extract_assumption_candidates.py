@@ -150,6 +150,40 @@ def test_extract_assumption_candidates_records_only_failed_batches(tmp_path: Pat
     assert failures[0]["batch_index"] == 0
 
 
+def test_extract_assumption_candidates_marks_provider_transient_failure(tmp_path: Path):
+    write_jsonl(tmp_path / "claims.jsonl", [{
+        "id": "claim:AAPL:FY2025:10K:c0",
+        "type": "ResearchClaim",
+        "claim_text": "Future margins may be volatile and should inform modeling review.",
+        "claim_type": "forward_looking",
+        "supported_by_quotes": [],
+        "related_metrics": ["gross_margin"],
+        "confidence": "medium",
+    }])
+    write_jsonl(tmp_path / "evidence_quotes.jsonl", [])
+
+    class FakeWorker:
+        async def extract(self, prompt_template, input_data, output_schema, stage_name):
+            raise RuntimeError("API Error: 529 [The service may be temporarily overloaded]")
+
+    result = asyncio.run(
+        extract_assumption_candidates(
+            worker=FakeWorker(),
+            ontology_dir=tmp_path,
+            ticker="AAPL",
+            period="FY2025",
+            doc_type="10-K",
+        )
+    )
+
+    failures = read_jsonl(tmp_path / "batch_failures.jsonl")
+    assert result == []
+    assert len(failures) == 1
+    assert failures[0]["provider_transient"] is True
+    assert failures[0]["provider_error_status"] == 529
+    assert failures[0]["provider_error_kind"] == "overload"
+
+
 def test_extract_assumption_candidates_rejects_unknown_aliases(tmp_path: Path):
     quote_id = "quote:AAPL:FY2025:10K:item7_00:0000:001"
     claim_id = "claim:AAPL:FY2025:10K:c0"

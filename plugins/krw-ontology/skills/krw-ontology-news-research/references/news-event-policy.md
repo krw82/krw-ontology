@@ -2,10 +2,10 @@
 
 Use this reference only for `krw-ontology-news-research`.
 
-News mode is news-led and ontology-augmented.
+News research is market-narrative-led and ontology-augmented. The market narrative can come from stock-news discovery, a selected event card, or a user-provided URL.
 
 ```text
-stock-news event discovery = current event and source context
+market narrative = current event, selected event, or user-provided URL context
 KRW ontology = company-specific baseline, financial channel, accounting context, risk channel, and investment meaning
 AI analyst = fused Korean investor interpretation
 ```
@@ -14,7 +14,9 @@ The final answer should not mechanically separate "news" and "filing" sections u
 
 ## 1. When To Search News Events
 
-In news mode, attempt stock-news event discovery before the final answer.
+In news discovery mode, attempt stock-news event discovery before the final answer.
+
+In news research mode, if the web app already provides `selected_news_event_context`, do not run broad new event discovery. Treat the selected context as the narrative to interpret against KRW ontology evidence.
 
 Use it to find:
 
@@ -30,6 +32,43 @@ current market reaction to a known event
 ```
 
 Do not answer from memory if the news event layer can verify the current situation.
+
+## 1.1 User-Provided URL Mode
+
+When `selected_news_event_context.version = user-url-event/v1`, the user pasted a URL. Treat the extracted page text as a market hypothesis:
+
+```text
+if this is directionally true, what changes for the company?
+what does the latest filing baseline say about that channel?
+what remains uncertain or needs follow-up?
+```
+
+Do not frame the answer as a hostile rebuttal. Avoid opening with phrases like:
+
+```text
+신뢰할 수 없는 기사입니다
+공시로 확인되지 않습니다
+이 주장은 틀렸습니다
+공시 기준으로 점검한 결과입니다
+```
+
+Those points may still matter, but they should appear naturally as limits or open questions after the investment implication is clear.
+
+Do not summarize the URL as an article replacement. Use it only to set the research angle.
+
+Even when the user asks for 점검/검증/fact-check, do not turn the output into an audit checklist. Avoid headings and labels like:
+
+```text
+공시 기준 확인 내용
+공시 확인됨
+공시에서 확인되지 않은 주장
+✅ 확인됨
+❌ 미확인
+```
+
+Use softer investor language. Say what would matter if the narrative is true, what the filing baseline suggests, and what remains a question.
+
+Forward-looking claims, rumors, and possible future actions such as equity raises, debt issuance, M&A, product launches, guidance changes, legal outcomes, or organization changes should be treated as scenarios, not filing-presence checks. Do not make "not in filings" the main point. Use the filing baseline to discuss current cash generation, capex commitments, balance-sheet flexibility, dilution or leverage risk, margin sensitivity, and what would need to be watched if the scenario happens.
 
 ## 2. Default Recency Window
 

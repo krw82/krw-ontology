@@ -19,7 +19,9 @@ from krw_ontology.extraction.worker import ExtractionWorker
 from krw_ontology.pipeline.ai_batches import (
     batch_cache_path,
     clear_stage_batch_cache,
+    is_reusable_batch_cache_metadata,
     run_limited_batches,
+    transient_provider_failure_metadata,
     write_batch_cache,
 )
 from krw_ontology.schema.id_utils import generate_quote_local_id, generate_scoped_id
@@ -415,6 +417,8 @@ def _read_quote_batch_cache(
     if not isinstance(data, dict):
         return None
     metadata = data.get("metadata") or {}
+    if not is_reusable_batch_cache_metadata(metadata):
+        return None
     if metadata.get("cache_version") != CACHE_VERSION:
         return None
     if metadata.get("input_hash") != input_hash:
@@ -550,7 +554,7 @@ async def extract_evidence_quotes(
             batch_idx,
             batch_quotes,
             metadata={
-                "status": "ok",
+                "status": "ok" if failed_spans == 0 else "partial_failed",
                 "cache_version": CACHE_VERSION,
                 "input_hash": input_hash,
                 "span_pruning": span_pruning,
@@ -910,6 +914,7 @@ def _record_batch_failure(
         "created_at": datetime.now(timezone.utc).isoformat(),
         "schema_version": SCHEMA_VERSION,
     }
+    failure.update(transient_provider_failure_metadata(error_message, error_type=error_type))
     failures_path.parent.mkdir(parents=True, exist_ok=True)
     with open(failures_path, "a") as f:
         f.write(json.dumps(failure, ensure_ascii=False) + "\n")

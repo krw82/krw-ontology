@@ -66,7 +66,6 @@ class TickerQuality:
             self.section_fail
             + self.section_warn
             + self.batch_failure
-            + self.coverage_gap
         )
 
     def problem_kinds(self, *, min_docs: int) -> list[str]:
@@ -79,14 +78,12 @@ class TickerQuality:
             kinds.append(SECTION_WARN)
         if self.batch_failure:
             kinds.append(BATCH_FAILURE)
-        if self.coverage_gap:
-            kinds.append(COVERAGE_GAP)
         return kinds
 
     def severity(self, *, min_docs: int) -> str:
         if self.docs < min_docs or self.section_fail:
             return "high"
-        if self.section_warn or self.batch_failure or self.coverage_gap:
+        if self.section_warn or self.batch_failure:
             return "medium"
         if self.rejected_object:
             return "low"

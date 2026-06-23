@@ -1019,7 +1019,12 @@ def quality_gate_cmd(
     max_docs_missing: int = typer.Option(0, "--max-docs-missing", min=0),
     max_section_fail: int = typer.Option(0, "--max-section-fail", min=0),
     max_batch_failure: int = typer.Option(0, "--max-batch-failure", min=0),
-    max_coverage_gap: int = typer.Option(0, "--max-coverage-gap", min=0),
+    max_coverage_gap: int = typer.Option(
+        0,
+        "--max-coverage-gap",
+        min=0,
+        help="Deprecated; coverage_gap is advisory and does not fail the gate.",
+    ),
     json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
 ) -> None:
     """Fail if release quality exceeds operator thresholds."""
@@ -1041,7 +1046,6 @@ def quality_gate_cmd(
         QUALITY_DOCS_MISSING: max_docs_missing,
         QUALITY_SECTION_FAIL: max_section_fail,
         QUALITY_BATCH_FAILURE: max_batch_failure,
-        QUALITY_COVERAGE_GAP: max_coverage_gap,
     }
     for kind_name, maximum in thresholds.items():
         actual = int(kind_counts.get(kind_name, 0))
@@ -1470,6 +1474,69 @@ def quality_repair_clear_cmd(
     typer.echo(f"Cleared quality repair state: removed={removed}")
 
 
+@quality_repair_app.command("stop")
+def quality_repair_stop_cmd(
+    root: Optional[Path] = typer.Option(None, "--root", help="Running root for quality repair state."),
+    plan_id: Optional[str] = typer.Option(None, "--plan", "--plan-id", help="Repair plan id."),
+    timeout_seconds: int = typer.Option(10, "--timeout", min=1, help="Seconds to wait before SIGKILL."),
+    requeue_running: bool = typer.Option(
+        True,
+        "--requeue-running/--keep-running-state",
+        help="Move interrupted running jobs back to pending so the plan can resume.",
+    ),
+) -> None:
+    """Stop the quality repair background worker and clean interrupted state."""
+    store = _quality_repair_store(root)
+    pid = store.worker_pid()
+    stopped = False
+    if pid is not None and is_pid_running(pid):
+        _terminate_process_group(pid, timeout_seconds=timeout_seconds)
+        stopped = True
+        typer.echo(f"Stopped quality repair worker pid={pid}")
+    else:
+        typer.echo("Quality repair worker is not running.")
+    store.clear_worker_state(pid)
+    store.clear_worker_pid(pid)
+
+    requeued = 0
+    if requeue_running:
+        plan = _quality_selected_plan(store, plan_id)
+        for job in store.list_jobs(plan_id=plan.plan_id, statuses=[QUALITY_RUNNING]):
+            store.mark_pending(job, "interrupted_by_quality_repair_stop")
+            requeued += 1
+        typer.echo(f"Requeued interrupted running jobs: {requeued}")
+    if not stopped and not requeued:
+        raise typer.Exit(1)
+
+
+def _terminate_process_group(pid: int, *, timeout_seconds: int) -> None:
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    except OSError:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        if not is_pid_running(pid):
+            return
+        time.sleep(0.25)
+    if not is_pid_running(pid):
+        return
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    except OSError:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return
+
+
 @quality_repair_app.command("log")
 def quality_repair_log_cmd(
     root: Optional[Path] = typer.Option(None, "--root", help="Running root for quality repair state."),
@@ -1535,7 +1602,7 @@ def quality_repair_run_cmd(
         None,
         "--concurrency",
         min=1,
-        help="Override Agent SDK batch concurrency for executable repair stages.",
+        help="Override Agent SDK batch concurrency for batch_failure repair. Defaults to 1.",
     ),
     allow_stale_plan: bool = typer.Option(
         False,
@@ -1619,6 +1686,7 @@ def quality_repair_run_cmd(
         typer.echo(f"Started quality repair worker pid={process.pid}")
         typer.echo(f"plan: {plan.plan_id}")
         typer.echo(f"selected_jobs: {len(jobs)}")
+        typer.echo(f"batch_failure_concurrency: {concurrency or 1}")
         typer.echo(f"log: {store.worker_log_path}")
         typer.echo(f"watch: krw-ontology quality repair watch --plan {plan.plan_id}")
         return
@@ -1635,7 +1703,7 @@ def quality_repair_run_cmd(
                     "kind": kind,
                     "all_jobs": all_jobs,
                     "limit": limit,
-                    "concurrency": concurrency,
+                    "concurrency": concurrency or 1,
                     "allow_stale_plan": allow_stale_plan,
                     "foreground": True,
                 },
@@ -1693,7 +1761,7 @@ def quality_repair_worker_cmd(
                     "kind": kind,
                     "all_jobs": all_jobs,
                     "limit": limit,
-                    "concurrency": concurrency,
+                    "concurrency": concurrency or 1,
                     "allow_stale_plan": allow_stale_plan,
                     "foreground": False,
                 },
@@ -1702,6 +1770,7 @@ def quality_repair_worker_cmd(
             if skipped_count:
                 typer.echo(f"Skipped {skipped_count} pending jobs that are deferred or lack executors.")
             typer.echo(f"Selected jobs: {len(jobs)}")
+            typer.echo(f"batch_failure_concurrency: {concurrency or 1}")
             result = run_repair_jobs(
                 store=store,
                 jobs=jobs,
@@ -6645,11 +6714,18 @@ def queue_run_cmd(
             pending_publish_targets: dict[str, _QueueReleasePublishBatch] = {}
 
             def flush_pending_targets() -> None:
-                _queue_publish_pending_releases(
-                    store=store,
-                    publish_targets=pending_publish_targets,
-                    publish_prod=publish_prod,
-                )
+                if pending_publish_targets:
+                    batch_count = len(pending_publish_targets)
+                    ticker_count = sum(
+                        len(list(dict.fromkeys(batch.tickers)))
+                        for batch in pending_publish_targets.values()
+                    )
+                    typer.echo(
+                        f"[{_now_label()}] Skipping automatic queue release publish "
+                        f"for {ticker_count} ticker(s) in {batch_count} batch(es); "
+                        "run `krw-ontology release publish-dev` manually when ready"
+                    )
+                    pending_publish_targets.clear()
                 _queue_refresh_pending_staging_indexes(
                     refresh_targets=pending_refresh_targets,
                 )
@@ -9286,7 +9362,6 @@ def _assert_company_context_publishable(source_root: Path, ticker: str) -> None:
         "edges": "company context graph edges were not generated",
     }
     required_zero = {
-        "quality_events": "company context quality warnings are present",
         "rejected_objects": "company context rejected objects are present",
     }
 
@@ -9299,10 +9374,37 @@ def _assert_company_context_publishable(source_root: Path, ticker: str) -> None:
         value = int(counts.get(key) or 0)
         if value > 0:
             failures.append(f"{key}={value} ({reason})")
+    blocking_quality_events = _blocking_company_context_quality_event_count(source_root, ticker)
+    if blocking_quality_events > 0:
+        failures.append(
+            f"quality_events={blocking_quality_events} "
+            "(company context blocking quality events are present)"
+        )
 
     if failures:
         detail = "; ".join(failures)
         raise RuntimeError(f"Publish blocked for {ticker}: unhealthy company context counts: {detail}")
+
+
+def _blocking_company_context_quality_event_count(source_root: Path, ticker: str) -> int:
+    quality_events_path = source_root / "companies" / ticker / "context" / "quality_events.jsonl"
+    if not quality_events_path.exists():
+        return 0
+    blocking = 0
+    with quality_events_path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                blocking += 1
+                continue
+            if event.get("category") == "coverage_gap":
+                continue
+            blocking += 1
+    return blocking
 
 
 def _replace_tree(source_dir: Path, target_dir: Path) -> None:

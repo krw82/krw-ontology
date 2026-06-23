@@ -52,7 +52,16 @@ def generate_canonical_artifacts(
     xbrl_facts = read_jsonl(ontology_dir / "xbrl_facts.jsonl")
     change_events = read_jsonl(ontology_dir / "change_events.jsonl")
 
-    source_documents = [_source_document(ticker, period, document_type, source_document_id, raw_text_hash, clean_text_hash)]
+    source_documents = [
+        _source_document(
+            ticker,
+            period,
+            document_type,
+            source_document_id,
+            raw_text_hash,
+            clean_text_hash,
+        )
+    ]
     source_locations = [_source_location(span, clean_text_hash) for span in spans if span.get("id")]
     source_tables: list[dict[str, Any]] = []
     source_table_cells: list[dict[str, Any]] = []
@@ -116,7 +125,8 @@ def _source_document(
     raw_text_hash: str | None,
     clean_text_hash: str | None,
 ) -> dict[str, Any]:
-    return {
+    doc_type_key = normalize_doc_type(document_type)
+    document = {
         "id": source_document_id,
         "type": "SourceDocument",
         "object_type": "SourceDocument",
@@ -128,6 +138,7 @@ def _source_document(
         "clean_text_hash": clean_text_hash,
         "schema_version": SCHEMA_VERSION,
     }
+    return document
 
 
 def _source_location(span: dict[str, Any], clean_text_hash: str | None) -> dict[str, Any]:

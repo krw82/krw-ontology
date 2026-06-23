@@ -387,3 +387,42 @@ def test_extract_evidence_quotes_does_not_split_rate_limited_batch(tmp_path):
     assert worker.calls == [2]
     assert len(failures) == 1
     assert failures[0]["error_type"] == "RateLimitError"
+    assert failures[0]["provider_transient"] is True
+    assert failures[0]["provider_error_status"] == 429
+    assert failures[0]["quality_repair_hint"] == "retry_transient_batch"
+    cache_payload = json.loads(
+        (ontology_dir / ".ai_batches" / "extract_evidence_quotes" / "batch_0000.json")
+        .read_text(encoding="utf-8")
+    )
+    assert cache_payload["metadata"]["status"] == "partial_failed"
+
+    class RecoveringWorker:
+        def __init__(self):
+            self.calls = []
+
+        async def extract(self, prompt_template, input_data, output_schema, stage_name):
+            candidates = json.loads(input_data["candidates_json"])
+            self.calls.append(len(candidates))
+            return [
+                {
+                    "candidate_id": candidate["candidate_id"],
+                    "quote_type": "risk_language",
+                    "section_name": candidate["section_name"],
+                    "confidence": "high",
+                }
+                for candidate in candidates
+            ]
+
+    recovered_worker = RecoveringWorker()
+    quotes = asyncio.run(
+        extract_evidence_quotes(
+            worker=recovered_worker,
+            ontology_dir=ontology_dir,
+            ticker="AAPL",
+            period="FY2025",
+            doc_type="10-K",
+        )
+    )
+    assert recovered_worker.calls == [2]
+    assert len(quotes) == 2
+    assert not read_jsonl(ontology_dir / "batch_failures.jsonl")

@@ -10,7 +10,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-from krw_ontology.factor_taxonomy import expected_factors_for_sector, normalize_sector_hint
+from krw_ontology.factor_taxonomy import normalize_sector_hint
 from krw_ontology.schema.objects import SCHEMA_VERSION
 from krw_ontology.sector_packs import choose_sector_pack
 from krw_ontology.utils.io import atomic_write_json, read_jsonl, write_jsonl
@@ -50,7 +50,7 @@ def build_company_context(root: Path, ticker: str) -> dict[str, Any]:
     temporal_links = _build_temporal_links(ticker, docs)
     trend_observations = _build_trend_observations(ticker, docs)
     change_events = _build_change_events(ticker, docs)
-    quality_events = _build_coverage_quality_events(ticker, profile)
+    quality_events: list[dict[str, Any]] = []
     edges = _build_context_edges(
         ticker,
         temporal_links,
@@ -196,40 +196,6 @@ def _build_profile(ticker: str, docs: list[dict[str, Any]]) -> dict[str, Any]:
         "review_status": "accepted",
         "schema_version": SCHEMA_VERSION,
     }
-
-
-def _build_coverage_quality_events(ticker: str, profile: dict[str, Any]) -> list[dict[str, Any]]:
-    """Warn when a company profile implies expected factors not found in evidence.
-
-    These are coverage warnings only. They do not create missing exposure
-    objects because absent evidence should stay absent from the ontology.
-    """
-    expected = expected_factors_for_sector(profile.get("sector"))
-    if not expected:
-        return []
-    observed = set(profile.get("key_external_factors") or [])
-    missing = [factor for factor in expected if factor not in observed]
-    events: list[dict[str, Any]] = []
-    for factor in missing:
-        events.append({
-            "id": f"quality:{ticker}:ALL:COMPANY:coverage_gap:{factor}",
-            "ticker": ticker,
-            "document_type": CONTEXT_DOC_TYPE,
-            "doc_type_key": CONTEXT_DOC_TYPE_KEY,
-            "period": CONTEXT_PERIOD,
-            "severity": "warn",
-            "category": "coverage_gap",
-            "object_id": profile.get("id"),
-            "stage": "build_company_context",
-            "message": (
-                f"Company profile sector {profile.get('sector')} expects factor "
-                f"{factor}, but no accepted ExternalFactorExposure uses it."
-            ),
-            "expected_factor": factor,
-            "sector": profile.get("sector"),
-            "schema_version": SCHEMA_VERSION,
-        })
-    return events
 
 
 def _rank_context_objects(objects: list[dict[str, Any]]) -> list[dict[str, Any]]:

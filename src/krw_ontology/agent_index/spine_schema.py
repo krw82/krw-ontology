@@ -75,7 +75,6 @@ def create_global_spine_schema(conn: sqlite3.Connection) -> None:
             fiscal_year INTEGER,
             fiscal_quarter INTEGER,
             filing_date TEXT,
-            accession_number TEXT,
             source_path TEXT,
             shard_id TEXT NOT NULL,
             shard_path TEXT NOT NULL,
@@ -401,4 +400,3 @@ def verify_global_spine_schema(path: Path) -> dict[str, Any]:
         "tables": tables,
         "metadata": metadata,
     }
-

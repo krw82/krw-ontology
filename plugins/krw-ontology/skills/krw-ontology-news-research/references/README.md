@@ -11,6 +11,9 @@ web-chat-runtime.md
 news-event-policy.md
 - stock-news event discovery, source priority, ontology augmentation, and conflict handling
 
+economic-impact-framework.md
+- causal event-to-company analysis for policy, financing, industry, legal, and macro shocks
+
 tool-policy.md
 - stock-news event tool roles, KRW ontology tool roles, inputs, and normal workflow
 

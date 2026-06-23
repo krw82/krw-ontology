@@ -18,7 +18,9 @@ from krw_ontology.factor_taxonomy import canonical_factor_key, format_factor_tax
 from krw_ontology.pipeline.ai_batches import (
     batch_cache_path,
     clear_stage_batch_cache,
+    is_reusable_batch_cache_metadata,
     run_limited_batches,
+    transient_provider_failure_metadata,
     write_batch_cache,
 )
 from krw_ontology.pipeline.reference_aliases import alias_objects, resolve_references
@@ -185,7 +187,7 @@ async def extract_research_claims(
             batch_idx,
             batch_claims,
             metadata={
-                "status": "ok",
+                "status": "ok" if failed_quotes == 0 else "partial_failed",
                 "input_mode": "evidence_quotes",
                 "cache_version": CACHE_VERSION,
                 "input_hash": input_hash,
@@ -494,6 +496,8 @@ def _read_quote_first_batch_cache(
     if not isinstance(data, dict):
         return None
     metadata = data.get("metadata") or {}
+    if not is_reusable_batch_cache_metadata(metadata):
+        return None
     if metadata.get("input_mode") != "evidence_quotes" or metadata.get("cache_version") != CACHE_VERSION:
         return None
     if metadata.get("input_hash") != input_hash:
@@ -609,6 +613,7 @@ def _record_batch_failure(
         "created_at": datetime.now(timezone.utc).isoformat(),
         "schema_version": SCHEMA_VERSION,
     }
+    failure.update(transient_provider_failure_metadata(error_message, error_type=error_type))
     failures_path.parent.mkdir(parents=True, exist_ok=True)
     with open(failures_path, "a") as f:
         f.write(json.dumps(failure, ensure_ascii=False) + "\n")

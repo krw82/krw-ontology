@@ -211,18 +211,46 @@ def _parse_span_pruning_mode(value: str, default: str) -> str:
 
 def _load_dotenv() -> None:
     """Load project-local .env values without overriding existing environment."""
-    env_path = Path(".env")
-    if not env_path.exists():
-        return
-    for raw_line in env_path.read_text().splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#") or "=" not in line:
+    for env_path in _dotenv_candidates():
+        if not env_path.exists():
             continue
-        key, value = line.split("=", 1)
-        key = key.strip()
-        value = value.strip().strip("\"'")
-        if key and key not in os.environ:
-            os.environ[key] = value
+        for raw_line in env_path.read_text().splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip("\"'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+
+
+def _dotenv_candidates() -> list[Path]:
+    """Return .env candidates in precedence order.
+
+    Queue/quality workers are often launched from operational directories, not
+    from the source checkout. Keep cwd-local .env first, then fall back to the
+    conventional user checkout so both workers resolve the same model config.
+    """
+    candidates: list[Path] = []
+    cwd = Path.cwd().resolve()
+    for base in (cwd, *cwd.parents):
+        candidates.append(base / ".env")
+    candidates.extend(
+        [
+            Path.home() / ".config" / "krw-ontology" / ".env",
+            Path.home() / "krw-ontology" / ".env",
+        ]
+    )
+    seen: set[Path] = set()
+    unique: list[Path] = []
+    for path in candidates:
+        resolved = path.expanduser()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        unique.append(resolved)
+    return unique
 
 
 def _apply_stage_env(config: PipelineConfig) -> None:

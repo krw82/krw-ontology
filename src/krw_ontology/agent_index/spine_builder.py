@@ -2289,7 +2289,6 @@ def _emit_document_catalog(
                 _fiscal_year(row["period"]),
                 _fiscal_quarter(row["period"]),
                 row["generated_at"],
-                None,
                 row["artifact_index_path"],
                 ticker,
                 shard_path,
@@ -2310,15 +2309,62 @@ def _emit_document_catalog(
         """
         INSERT OR REPLACE INTO global_document_catalog(
             document_id, ticker, company_name, document_type, period,
-            fiscal_year, fiscal_quarter, filing_date, accession_number,
-            source_path, shard_id, shard_path, document_hash, object_count,
-            edge_count, quality_event_count, quality_status
+            fiscal_year, fiscal_quarter, filing_date, source_path, shard_id,
+            shard_path, document_hash, object_count, edge_count,
+            quality_event_count, quality_status
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         payload,
     )
     return len(payload)
+
+
+def _document_source_metadata(row: sqlite3.Row) -> dict[str, Any]:
+    artifact_index_path = str(row["artifact_index_path"] or "")
+    if not artifact_index_path:
+        return {}
+    try:
+        doc_root = Path(artifact_index_path).parent
+    except TypeError:
+        return {}
+
+    document_type = str(row["document_type"] or "")
+    doc_type_key = document_type.replace("-", "").upper()
+    period = str(row["period"] or "")
+    candidates: list[tuple[Path, str]] = [
+        (doc_root / "source_documents.jsonl", "jsonl"),
+        (doc_root / "metadata.json", "json"),
+    ]
+    if len(doc_root.parents) >= 3:
+        company_root = doc_root.parents[2]
+        candidates.append((company_root / "sources" / doc_type_key / period / "metadata.json", "json"))
+
+    metadata: dict[str, Any] = {}
+    for path, file_type in candidates:
+        if not path.exists() or path.stat().st_size <= 0:
+            continue
+        try:
+            if file_type == "jsonl":
+                line = path.read_text(encoding="utf-8").splitlines()[0]
+                data = _json_loads(line)
+            else:
+                data = _json_loads(path.read_text(encoding="utf-8"))
+        except (OSError, IndexError, ValueError, TypeError):
+            continue
+        if isinstance(data, dict):
+            for key, value in data.items():
+                if value not in (None, ""):
+                    metadata[key] = value
+    return metadata
+
+
+def _metadata_value(metadata: Mapping[str, Any], *keys: str) -> str | None:
+    for key in keys:
+        value = metadata.get(key)
+        if value not in (None, ""):
+            return str(value)
+    return None
 
 
 def _emit_object_locator_and_search(

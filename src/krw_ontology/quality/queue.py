@@ -143,6 +143,15 @@ class QualityRepairStore:
         self.append_event("failed", job, {"error": error})
         return job
 
+    def mark_pending(self, job: RepairJob, reason: str | None = None) -> RepairJob:
+        job.status = PENDING
+        job.started_at = None
+        job.finished_at = None
+        job.error = reason
+        self.save_job(job)
+        self.append_event("pending", job, {"reason": reason} if reason else None)
+        return job
+
     def mark_cancelled(self, job: RepairJob, reason: str | None = None) -> RepairJob:
         job.status = CANCELLED
         job.finished_at = utc_now()

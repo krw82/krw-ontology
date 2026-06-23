@@ -15,6 +15,10 @@ news-mode answers attempt stock-news event discovery first
 news-mode event evidence is ranked by materiality, source quality, and recency
 news-mode default current-news window is today, yesterday, within 72 hours, plus last 3 US trading sessions fallback unless the user asks for another period
 the answer identifies or uses the current news/report/event before ontology interpretation
+substantive event-impact answers identify what is new versus the filing baseline
+substantive event-impact answers show the transmission channel into a business or financial variable
+substantive event-impact answers separate immediate effects from structural effects when both matter
+substantive event-impact answers include the strongest offset, counterargument, or falsification condition
 answers start from the most recent available filing unless the user asks for a historical period or specific filing
 a newer 10-Q beats an older 10-K for current drivers; a latest 10-K is primary only when no newer 10-Q exists
 three follow-up questions present

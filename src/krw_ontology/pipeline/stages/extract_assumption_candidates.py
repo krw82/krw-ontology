@@ -18,6 +18,7 @@ from krw_ontology.pipeline.ai_batches import (
     clear_stage_batch_cache,
     read_batch_cache,
     run_limited_batches,
+    transient_provider_failure_metadata,
     write_batch_cache,
 )
 from krw_ontology.pipeline.reference_aliases import (
@@ -270,6 +271,7 @@ async def extract_assumption_candidates(
             _record_batch_failure(
                 failures_path, ticker, doc_type, period, source_document_id,
                 doc_type_key, stage_name, batch_idx, [c["id"] for c in batch_claims], str(e),
+                error_type=type(e).__name__,
             )
             logger.error(
                 "%s batch %s failed; continuing: %s",
@@ -461,7 +463,7 @@ def _load_metrics_list(ontology_dir: Path) -> str:
 def _record_batch_failure(
     failures_path: Path, ticker: str, doc_type: str, period: str,
     source_document_id: str, doc_type_key: str, stage: str, batch_index: int,
-    input_span_ids: list[str], error_message: str,
+    input_span_ids: list[str], error_message: str, error_type: str = "ExtractionError",
 ) -> None:
     from datetime import datetime, timezone
 
@@ -476,11 +478,12 @@ def _record_batch_failure(
         "batch_index": batch_index,
         "input_span_ids": input_span_ids,
         "attempts": 3,
-        "error_type": "ExtractionError",
+        "error_type": error_type,
         "error_message": error_message[:500],
         "created_at": datetime.now(timezone.utc).isoformat(),
         "schema_version": SCHEMA_VERSION,
     }
+    failure.update(transient_provider_failure_metadata(error_message, error_type=error_type))
     failures_path.parent.mkdir(parents=True, exist_ok=True)
     with open(failures_path, "a") as f:
         f.write(json.dumps(failure, ensure_ascii=False) + "\n")

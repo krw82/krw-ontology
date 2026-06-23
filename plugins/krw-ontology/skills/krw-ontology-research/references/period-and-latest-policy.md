@@ -23,6 +23,30 @@ Use `Historical context` only for cycle comparison or change over time.
 
 Do not let older 10-K evidence dominate the current judgment when a Current driver is provided.
 
+## Confirmed period boundary
+
+Treat the runtime as-of date and filing availability as separate facts. The current date does not prove that a filing, earnings release, or reporting period exists.
+
+Use an explicit period label such as `CY2026Q1` only when it appears in:
+
+```text
+the runtime Company filing anchor
+retrieved evidence
+the user's request
+```
+
+Do not infer that the next quarter, annual report, or filing is available from the current date or the latest confirmed period. Do not invent an unconfirmed future period label in prose, tables, conclusions, or follow-up prompts.
+
+For unpublished or unconfirmed future evidence, use:
+
+```text
+다음 실적 발표
+향후 공시
+다음 실적 업데이트
+```
+
+If the user explicitly names a future period, repeat it only while clearly describing it as future or not yet confirmed.
+
 ## Default period anchor
 
 Unless the user asks for a specific historical period, specific filing, or long-horizon trend, start with the most recent available filing evidence by filing/period recency.
@@ -54,7 +78,7 @@ the same default applies with extra force: start with the most recent available 
 
 Example: if the available documents are `CY2025 10-K` and `CY2026Q1 10-Q`, lead with `CY2026Q1 10-Q` for current drivers and use `CY2025 10-K` as annual mix/business baseline context.
 
-Example: if `CY2026Q1 10-Q` and `CY2026Q2 10-Q` are both available, lead with `CY2026Q2 10-Q`.
+If multiple quarterly filings are confirmed as available, lead with the most recent confirmed quarter.
 
 Do not say that the latest 10-Q needs to be checked when it was available through tools or provided as the Current driver. Use it as the current driver, or state clearly that the latest 10-Q was not confirmed in the retrieved evidence.
 

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -36,12 +37,15 @@ from krw_ontology.quality.safe_repair import (
     run_numeric_revalidation,
     run_reference_rebuild,
 )
+from krw_ontology.utils.io import read_jsonl, write_jsonl
 
 
 # User-facing queue selection excludes deferred kinds such as normalize_numeric.
 # Keep legacy direct runner support so existing report-only revalidation remains
 # available to tests or explicit internal callers.
 SUPPORTED_RUN_KINDS = EXECUTABLE_REPAIR_KINDS | {NORMALIZE_NUMERIC}
+DEFAULT_BATCH_FAILURE_REPAIR_CONCURRENCY = 1
+DEFAULT_BATCH_FAILURE_REPAIR_MODEL = "glm-5.2"
 
 
 def run_repair_jobs(
@@ -250,67 +254,213 @@ async def _retry_batch_failure(
         raise ValueError("retry_batch job is missing document identity")
 
     ontology_dir = _resolve_running_root_path(root, job.ontology_dir, field="ontology_dir", must_exist=True)
+    model = _quality_model_for_stage(config, job.stage)
+    job.payload["repair_model"] = model
     worker = ExtractionWorker(
-        model=config.model_for_stage(job.stage),
+        model=model,
         cwd=root,
         max_retries=config.max_retries,
         call_timeout_s=config.call_timeout_seconds,
         max_turns=config.max_turns,
     )
-    resolved_concurrency = concurrency or config.concurrency_for_stage(job.stage)
+    resolved_concurrency = concurrency or DEFAULT_BATCH_FAILURE_REPAIR_CONCURRENCY
+    job.payload["repair_concurrency"] = resolved_concurrency
+    job.payload["repair_mode"] = "batch_only" if job.stage == "extract_assumption_candidates" else "manual_review_no_batch_executor"
 
     if job.stage == "extract_evidence_quotes":
-        retry_batch_size = _repair_batch_size(config.batch_size_for_stage(job.stage, 5))
-        await extract_evidence_quotes(
-            worker,
-            ontology_dir,
-            job.ticker,
-            job.period,
-            job.document_type,
-            concurrency=resolved_concurrency,
-            force=False,
-            span_pruning=config.span_pruning,
-            pilot_max_quote_spans=config.pilot_max_quote_spans,
-            batch_size=retry_batch_size,
+        _mark_manual_review(
+            job,
+            reason="batch_only_executor_not_implemented",
+            detail="extract_evidence_quotes repair no longer performs implicit full-stage retry",
         )
-        _mark_batch_retry_payload(job, retry_batch_size=retry_batch_size)
         return
 
     if job.stage == "extract_research_claims":
-        retry_batch_size = _repair_batch_size(config.batch_size_for_stage(job.stage, 8))
-        await extract_research_claims(
-            worker,
-            ontology_dir,
-            job.ticker,
-            job.period,
-            job.document_type,
-            concurrency=resolved_concurrency,
-            force=False,
-            batch_size=retry_batch_size,
+        _mark_manual_review(
+            job,
+            reason="batch_only_executor_not_implemented",
+            detail="extract_research_claims repair no longer performs implicit full-stage retry",
         )
-        _mark_batch_retry_payload(job, retry_batch_size=retry_batch_size)
         return
 
     if job.stage == "extract_assumption_candidates":
-        retry_batch_size = _repair_batch_size(assumption_stage.BATCH_SIZE)
-        original_batch_size = assumption_stage.BATCH_SIZE
         try:
-            assumption_stage.BATCH_SIZE = retry_batch_size
-            await extract_assumption_candidates(
-                worker,
-                ontology_dir,
-                job.ticker,
-                job.period,
-                job.document_type,
-                concurrency=resolved_concurrency,
-                force=False,
+            await _retry_assumption_candidate_batch_only(job, ontology_dir=ontology_dir, worker=worker)
+        except Exception as exc:
+            _mark_manual_review(
+                job,
+                reason="batch_only_retry_failed",
+                detail=str(exc),
             )
-        finally:
-            assumption_stage.BATCH_SIZE = original_batch_size
-        _mark_batch_retry_payload(job, retry_batch_size=retry_batch_size)
         return
 
     raise ValueError(f"unsupported batch retry stage: {job.stage}")
+
+
+def _quality_model_for_stage(config: PipelineConfig, stage_name: str) -> str:
+    suffix = stage_name.upper()
+    return (
+        os.environ.get(f"KRW_QUALITY_STAGE_MODEL_{suffix}")
+        or os.environ.get("KRW_QUALITY_MODEL")
+        or DEFAULT_BATCH_FAILURE_REPAIR_MODEL
+        or config.model_for_stage(stage_name)
+    )
+
+
+async def _retry_assumption_candidate_batch_only(
+    job: RepairJob,
+    *,
+    ontology_dir: Path,
+    worker: ExtractionWorker,
+) -> None:
+    input_claim_ids = [str(value) for value in (job.payload.get("input_span_ids") or []) if value]
+    if not input_claim_ids:
+        _mark_manual_review(job, reason="missing_batch_input_ids")
+        return
+
+    claims = read_jsonl(ontology_dir / "claims.jsonl")
+    quotes = read_jsonl(ontology_dir / "evidence_quotes.jsonl")
+    claim_by_id = {str(claim.get("id")): claim for claim in claims if claim.get("id")}
+    batch_claims = [claim_by_id[claim_id] for claim_id in input_claim_ids if claim_id in claim_by_id]
+    if not batch_claims:
+        _mark_manual_review(job, reason="batch_input_claims_not_found")
+        return
+
+    cue_claims = assumption_stage._filter_modeling_cue_claims(batch_claims)
+    if not cue_claims:
+        _remove_matching_batch_failure(ontology_dir, job)
+        job.payload["repair_outcome"] = "batch_only_no_modeling_cues_needs_verify"
+        job.payload["verification_required"] = True
+        job.payload["batch_input_count"] = len(input_claim_ids)
+        job.payload["repaired_batch_item_count"] = 0
+        return
+
+    quote_lookup = {quote.get("id"): quote for quote in quotes if quote.get("id")}
+    batch_quote_ids = assumption_stage._dedupe_list(
+        [
+            quote_id
+            for claim in cue_claims
+            for quote_id in claim.get("supported_by_quotes", []) or []
+            if quote_id in quote_lookup
+        ]
+    )
+    batch_quotes = [quote_lookup[quote_id] for quote_id in batch_quote_ids]
+    aliased_claims, claim_alias_to_id = assumption_stage.alias_objects(cue_claims, "c")
+    aliased_quotes, quote_alias_to_id = assumption_stage.alias_objects(batch_quotes, "q")
+    quote_id_to_alias = assumption_stage.canonical_to_alias(quote_alias_to_id)
+    input_data = {
+        "claims_json": json.dumps(
+            [
+                {
+                    "id": claim["id"],
+                    "claim_text": claim["claim_text"],
+                    "claim_type": claim.get("claim_type", ""),
+                    "related_metrics": claim.get("related_metrics", []),
+                    "supported_by_quotes": [
+                        quote_id_to_alias[quote_id]
+                        for quote_id in claim.get("supported_by_quotes", []) or []
+                        if quote_id in quote_id_to_alias
+                    ],
+                }
+                for claim in aliased_claims
+            ],
+            ensure_ascii=False,
+        ),
+        "quotes_json": json.dumps(
+            [
+                {
+                    "id": quote["id"],
+                    "quote_text": quote["quote_text"],
+                    "quote_type": quote.get("quote_type", ""),
+                }
+                for quote in aliased_quotes
+            ],
+            ensure_ascii=False,
+        ),
+        "assumption_types": ", ".join(assumption_stage.ASSUMPTION_TYPES),
+        "metrics_list": assumption_stage._load_metrics_list(ontology_dir),
+    }
+    raw_items = await worker.extract(
+        assumption_stage.ASSUMPTION_EXTRACTION_PROMPT,
+        input_data,
+        assumption_stage._SCHEMA,
+        "extract_assumption_candidates",
+    )
+    raw_items = assumption_stage._resolve_assumption_references(
+        raw_items,
+        claim_alias_to_id=claim_alias_to_id,
+        quote_alias_to_id=quote_alias_to_id,
+    )
+    doc_type_key = job.doc_type_key or str(job.document_type or "").replace("-", "")
+    source_document_id = job.payload.get("source_document_id") or f"source:{job.ticker}:{job.period}:{doc_type_key}"
+    repaired_items, rejected_items = assumption_stage._materialize_assumption_items(
+        raw_items=raw_items,
+        ticker=job.ticker,
+        period=str(job.period),
+        doc_type=str(job.document_type),
+        doc_type_key=doc_type_key,
+        source_document_id=str(source_document_id),
+    )
+    _merge_assumption_batch_output(ontology_dir, input_claim_ids=input_claim_ids, repaired_items=repaired_items)
+    if rejected_items:
+        assumption_stage._append_rejected_objects(ontology_dir, rejected_items)
+    _remove_matching_batch_failure(ontology_dir, job)
+    job.payload["repair_outcome"] = "batch_only_retried_needs_verify"
+    job.payload["verification_required"] = True
+    job.payload["batch_input_count"] = len(input_claim_ids)
+    job.payload["repaired_batch_item_count"] = len(repaired_items)
+    job.payload["rejected_batch_item_count"] = len(rejected_items)
+
+
+def _merge_assumption_batch_output(
+    ontology_dir: Path,
+    *,
+    input_claim_ids: list[str],
+    repaired_items: list[dict[str, Any]],
+) -> None:
+    input_claim_set = set(input_claim_ids)
+    output_path = ontology_dir / "assumption_candidates.jsonl"
+    existing = read_jsonl(output_path)
+    retained = [
+        item for item in existing
+        if not (input_claim_set & set(item.get("supported_by_claims") or []))
+    ]
+    by_id = {str(item.get("id")): item for item in retained if item.get("id")}
+    ordered = [item for item in retained if item.get("id")]
+    for item in repaired_items:
+        item_id = str(item.get("id") or "")
+        if item_id and item_id in by_id:
+            by_id[item_id].update(item)
+            continue
+        if item_id:
+            by_id[item_id] = item
+        ordered.append(item)
+    write_jsonl(output_path, ordered)
+
+
+def _remove_matching_batch_failure(ontology_dir: Path, job: RepairJob) -> None:
+    failures_path = ontology_dir / "batch_failures.jsonl"
+    if not failures_path.exists():
+        return
+    failures = [
+        row for row in read_jsonl(failures_path)
+        if not (
+            row.get("stage") == job.stage
+            and row.get("batch_index") == job.batch_index
+            and str(row.get("period") or "") == str(job.period or "")
+        )
+    ]
+    write_jsonl(failures_path, failures)
+
+
+def _mark_manual_review(job: RepairJob, *, reason: str, detail: str | None = None) -> None:
+    job.payload["repair_outcome"] = "needs_manual_review"
+    job.payload["manual_review_required"] = True
+    job.payload["manual_review_reason"] = reason
+    if detail:
+        job.payload["manual_review_detail"] = detail[:1000]
+    job.payload["unresolved_count"] = max(1, int(job.payload.get("unresolved_count") or 0))
+    job.payload["verification_required"] = False
 
 
 def _resection_document(job: RepairJob, *, root: Path) -> None:

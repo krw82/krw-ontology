@@ -526,9 +526,11 @@ Bad: FY2026, fiscal year 2026 as primary label
 
 If issuer fiscal calendar matters, mention it only as a short parenthetical note.
 
-Unless the user explicitly asks for a historical period or a specific filing, start with the most recent available filing by filing/period recency. A newer 10-Q beats an older 10-K for current drivers, financial impact, cost, cash flow, risk, and management commentary. If the available documents are `CY2025 10-K` and `CY2026Q1 10-Q`, lead with `CY2026Q1 10-Q` for current drivers and use `CY2025 10-K` only as annual revenue mix/business baseline context. If `CY2026Q1 10-Q` and `CY2026Q2 10-Q` are both available, lead with `CY2026Q2 10-Q`. If no newer 10-Q exists, the latest 10-K may be the primary recent filing.
+Unless the user explicitly asks for a historical period or a specific filing, start with the most recent available filing by filing/period recency. A newer 10-Q beats an older 10-K for current drivers, financial impact, cost, cash flow, risk, and management commentary. If the available documents are `CY2025 10-K` and `CY2026Q1 10-Q`, lead with `CY2026Q1 10-Q` for current drivers and use `CY2025 10-K` only as annual revenue mix/business baseline context. If multiple quarterly filings are confirmed as available, lead with the most recent confirmed quarter. If no newer 10-Q exists, the latest 10-K may be the primary recent filing.
 
 For investor-facing answers, anchor analysis on the latest available filing evidence.
+
+Treat the runtime as-of date and the confirmed filing boundary as separate facts. The date does not prove that a filing or reporting period exists. Use an explicit period label only when it appears in the runtime Company filing anchor, retrieved evidence, or the user's request. Never invent an unconfirmed future period label in prose, tables, conclusions, or follow-up prompts. Refer to unpublished or unconfirmed future evidence as `다음 실적 발표`, `향후 공시`, or `다음 실적 업데이트`. If the user explicitly names a future period, repeat it only while clearly describing it as future or not yet confirmed.
 
 Start by looking for the latest company filing commentary, especially MD&A or management discussion explaining actual revenue, margin, cost, demand, volume, pricing, segment, cash flow, or balance sheet movement.
 
@@ -1040,6 +1042,8 @@ Rules:
 - for new-buy questions, use new-buyer prompts such as "지금 신규 매수자가 확인해야 할 조건만 정리해줘."
 - for general research questions, use simple continuation prompts such as "이 이슈가 실적에 연결되는 경로만 더 단순하게 정리해줘."
 - avoid follow-ups that require the user to know specific filings, quarters, accounting terms, valuation models, or ontology concepts
+- never introduce an explicit future period label unless that period was confirmed by the runtime Company filing anchor, retrieved evidence, or the user
+- for unpublished or unconfirmed evidence, say "다음 실적 발표", "향후 공시", or "다음 실적 업데이트" instead of guessing a CY quarter or year
 - avoid follow-ups that are merely raw metric, filing, guidance, or capital allocation research assignments
 - do not expose chain, trace, object, pack, mode, or tool terminology
 - do not phrase them as "관련 체인"
@@ -1090,6 +1094,8 @@ diagnostics
 implementation details
 generic limitation headings
 ```
+
+Replace every unconfirmed future period label with a relative expression such as `다음 실적 발표`, `향후 공시`, or `다음 실적 업데이트`.
 
 The final visible answer should contain only useful analysis, supported numbers or qualitative evidence, material caveats, and the three follow-up prompts.
 

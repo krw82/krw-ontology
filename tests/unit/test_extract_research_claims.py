@@ -120,6 +120,14 @@ def test_extract_research_claims_does_not_split_rate_limited_batch(tmp_path: Pat
     assert worker.calls == [2]
     assert len(failures) == 1
     assert failures[0]["error_type"] == "RateLimitError"
+    assert failures[0]["provider_transient"] is True
+    assert failures[0]["provider_error_status"] == 429
+    assert failures[0]["quality_repair_hint"] == "retry_transient_batch"
+    cache_payload = json.loads(
+        (tmp_path / ".ai_batches" / "extract_research_claims" / "batch_0000.json")
+        .read_text(encoding="utf-8")
+    )
+    assert cache_payload["metadata"]["status"] == "partial_failed"
 
 
 def test_extract_research_claims_records_leaf_failure(tmp_path: Path):

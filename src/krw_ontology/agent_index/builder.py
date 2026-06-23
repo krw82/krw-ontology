@@ -4215,7 +4215,12 @@ def _index_artifact(
             category="batch_failure",
             object_id=failure.get("id"),
             stage=failure.get("stage"),
-            message=failure.get("error") or failure.get("message") or "Batch failure",
+            message=(
+                failure.get("error_message")
+                or failure.get("error")
+                or failure.get("message")
+                or "Batch failure"
+            ),
             payload=failure,
         )
         stats["quality_events"] += 1

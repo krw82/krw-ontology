@@ -93,7 +93,7 @@ Good table shape:
 Bad table shape:
 
 ```text
-| Metric | CY2026Q2 | CY2026Q1 | YoY | Interpretation |
+| Metric | 최근 확인 분기 | 이전 확인 분기 | YoY | Interpretation |
 ```
 
 Use exact numbers only when they materially change the judgment, correct a likely misunderstanding, or support a key turning point. Do not fill tables with figures just because the filing provides them.

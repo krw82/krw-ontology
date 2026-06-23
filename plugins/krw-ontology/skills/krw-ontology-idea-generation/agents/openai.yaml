@@ -1,0 +1,4 @@
+interface:
+  display_name: "KRW Ontology Stock Discovery"
+  short_description: "공시 근거로 먼저 볼 종목 후보와 제외 근거를 찾습니다"
+  default_prompt: "Use $krw-ontology-idea-generation to turn the user's screen into filing-grounded covered-company research candidates, false-positive rejection, and research priority."

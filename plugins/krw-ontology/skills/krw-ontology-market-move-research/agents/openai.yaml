@@ -1,0 +1,4 @@
+interface:
+  display_name: "KRW Ontology Market Move Research"
+  short_description: "Explains observed stock moves using market context plus KRW ontology filing evidence"
+  default_prompt: "Use $krw-ontology-market-move-research when a covered-company question starts from an observed stock move, price drop/rally, after-hours move, or asks whether a current move changes the investment view. Treat app-provided market context as bounded observation, then follow the skill's research workflow and reference files. Final output is Korean investor-facing Markdown. Do not expose provider names, raw payloads, MCP/tool/plugin/skill names, internal briefs, or implementation details."

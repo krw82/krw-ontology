@@ -1962,6 +1962,7 @@ class TestReleaseCommand:
             "global_spine_merge",
             "cross_company_links",
             "shard_manifest",
+            "chart_series",
             "release_manifest",
             "verification",
             "promote_current",
@@ -1991,6 +1992,7 @@ class TestReleaseCommand:
         assert (release_root / "manifest.json").exists()
         assert (release_root / "indexes" / "global_spine.sqlite").exists()
         assert (release_root / "indexes" / "shard_manifest.json").exists()
+        assert (release_root / "indexes" / "chart_series.sqlite").exists()
         assert not (release_root / "indexes" / "agent_index.sqlite").exists()
         assert (release_root / "verify" / "release_verify.json").exists()
 

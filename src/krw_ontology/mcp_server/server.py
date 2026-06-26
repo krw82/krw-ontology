@@ -91,6 +91,12 @@ def health_payload(
         require_current_symlink=configured_env == "prod",
         check_sqlite=False,
     )
+    chart_series_verification = startup_verification.get("chart_series_verification")
+    chart_series_verification_ok = (
+        bool(chart_series_verification.get("ok"))
+        if isinstance(chart_series_verification, dict)
+        else None
+    )
     cache_status = mcp_runtime_cache_status()
     store_status = cache_status.get("store") if isinstance(cache_status.get("store"), dict) else {}
     payload = {
@@ -114,6 +120,9 @@ def health_payload(
         "global_spine_path": str(resolved_global_spine_path),
         "global_spine_manifest_path": global_spine_output.get("path"),
         "global_spine_present": resolved_global_spine_path.exists(),
+        "chart_series_path": startup_verification.get("chart_series_path"),
+        "chart_series_present": bool(startup_verification.get("chart_series_present")),
+        "chart_series_verification_ok": chart_series_verification_ok,
         "company_shards_present": bool(company_shards_output.get("required")),
         "global_topic_spine_present": global_topic_spine_count is not None and global_topic_spine_count > 0,
         "global_topic_spine_count": global_topic_spine_count,

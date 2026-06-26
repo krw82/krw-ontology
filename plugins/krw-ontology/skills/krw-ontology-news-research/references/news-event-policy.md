@@ -18,6 +18,8 @@ In news discovery mode, attempt stock-news event discovery before the final answ
 
 In news research mode, if the web app already provides `selected_news_event_context`, do not run broad new event discovery. Treat the selected context as the narrative to interpret against KRW ontology evidence.
 
+If the selected context is primarily an observed stock move or `market-move-context/v1`, route to `krw-ontology-market-move-research` instead of this skill.
+
 Use it to find:
 
 ```text

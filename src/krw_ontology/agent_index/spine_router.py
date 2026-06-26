@@ -10,6 +10,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
+from krw_ontology.agent_index.chart_series import (
+    CHART_SERIES_RELATIVE_PATH,
+    chart_series_index_status,
+    query_chart_series_pack,
+)
 from krw_ontology.agent_index.store import OntologyStore
 from krw_ontology.agent_index.spine_schema import (
     GLOBAL_SPINE_LAYOUT,
@@ -35,6 +40,8 @@ class OntologySpineRouter:
         self._shard_manifest_path = self.index_dir / "shard_manifest.json"
         self._shard_manifest = _read_json(self._shard_manifest_path)
         self._declared_shard_paths, self._shard_paths, self._missing_shard_paths = self._load_shard_paths()
+        self._chart_series_path = self.release_root / CHART_SERIES_RELATIVE_PATH
+        self._chart_series_status = chart_series_index_status(self._chart_series_path)
         self._spine_conn: sqlite3.Connection | None = None
         self._shards: dict[str, OntologyStore] = {}
         self._closed = False
@@ -104,6 +111,8 @@ class OntologySpineRouter:
                 ticker: str(path) for ticker, path in sorted(self._missing_shard_paths.items())
             },
             "open_shards": sorted(self._shards),
+            "chart_series_available": bool(self._chart_series_status.get("available")),
+            "chart_series_path": str(self._chart_series_path),
             "fallback_enabled": False,
             "fallback": False,
         }
@@ -217,6 +226,7 @@ class OntologySpineRouter:
                 "query_context": True,
                 "global_spine": True,
                 "company_shards": True,
+                "chart_series": bool(self._chart_series_status.get("available")),
                 "fallback": False,
             }
         if include_quality_summary:
@@ -306,6 +316,13 @@ class OntologySpineRouter:
                 available_tickers=candidate_tickers,
                 documents=self.list_documents(),
             )
+            _attach_chart_series_pack(
+                payload,
+                question=question,
+                requested_tickers=route_tickers,
+                chart_series_path=self._chart_series_path,
+                chart_series_status=self._chart_series_status,
+            )
             return payload
         routing = self._route_payload("global_spine_fanout", route_tickers)
         routing.update(self._fanout_diagnostics(worker_count, shard_errors))
@@ -321,6 +338,13 @@ class OntologySpineRouter:
             requested_tickers=route_tickers,
             available_tickers=candidate_tickers,
             documents=self.list_documents(),
+        )
+        _attach_chart_series_pack(
+            payload,
+            question=question,
+            requested_tickers=route_tickers,
+            chart_series_path=self._chart_series_path,
+            chart_series_status=self._chart_series_status,
         )
         return payload
 
@@ -1244,6 +1268,116 @@ def _attach_spine_cross_company_pack(
             "fallback_used": False,
         },
     }
+
+
+def _attach_chart_series_pack(
+    payload: dict[str, Any],
+    *,
+    question: str,
+    requested_tickers: Sequence[str] | None,
+    chart_series_path: Path,
+    chart_series_status: Mapping[str, Any],
+) -> None:
+    if not _should_attach_chart_series(question):
+        return
+    research_pack = payload.setdefault("research_pack", {})
+    if not isinstance(research_pack, dict):
+        return
+    diagnostics = payload.setdefault("search_diagnostics", {})
+    if not isinstance(diagnostics, dict):
+        diagnostics = {}
+        payload["search_diagnostics"] = diagnostics
+    diagnostics["chart_series"] = {
+        "available": bool(chart_series_status.get("available")),
+        "path": str(chart_series_path),
+        "source": "chart_series_sidecar",
+    }
+    if not chart_series_status.get("available"):
+        diagnostics["chart_series"]["disabled_reason"] = chart_series_status.get("reason")
+        return
+    pack = query_chart_series_pack(
+        chart_series_path,
+        question=question,
+        tickers=[ticker for ticker in (requested_tickers or []) if ticker],
+    )
+    if not pack:
+        diagnostics["chart_series"]["matched"] = False
+        return
+    diagnostics["chart_series"]["matched"] = True
+    diagnostics["chart_series"]["series_count"] = len(pack.get("series") or [])
+    existing = research_pack.get("metric_series_pack")
+    if isinstance(existing, Mapping) and existing.get("series"):
+        research_pack["dynamic_metric_series_pack"] = existing
+    research_pack["chart_series_pack"] = pack
+    research_pack["metric_series_pack"] = pack
+
+
+def _should_attach_chart_series(question: str) -> bool:
+    text = str(question or "").lower()
+    chart_terms = (
+        "chart",
+        "graph",
+        "trend",
+        "series",
+        "yoy",
+        "qoq",
+        "annual",
+        "quarterly",
+        "차트",
+        "그래프",
+        "추이",
+        "추세",
+        "시계열",
+        "비교",
+        "비중",
+        "구성",
+        "흐름",
+        "변화",
+        "연도별",
+        "분기별",
+        "제품별",
+        "지역별",
+        "전년",
+        "전분기",
+    )
+    metric_terms = (
+        "revenue",
+        "sales",
+        "income",
+        "margin",
+        "cash flow",
+        "fcf",
+        "capex",
+        "debt",
+        "eps",
+        "repurchase",
+        "buyback",
+        "sbc",
+        "r&d",
+        "m&a",
+        "매출",
+        "영업이익",
+        "순이익",
+        "마진",
+        "비중",
+        "비용",
+        "판관비",
+        "영업비용",
+        "현금흐름",
+        "잉여현금",
+        "설비투자",
+        "자본지출",
+        "부채",
+        "서비스",
+        "아이폰",
+        "제품별",
+        "지역별",
+        "자사주",
+        "주식보상",
+        "연구개발",
+        "인수",
+    )
+    return any(term in text for term in chart_terms) and any(term in text for term in metric_terms)
 
 
 def _merge_discovery_payloads(

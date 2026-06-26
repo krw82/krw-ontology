@@ -13,6 +13,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from krw_ontology.agent_index.chart_series import (
+    CHART_SERIES_RELATIVE_PATH,
+    CHART_SERIES_SCHEMA_VERSION,
+    verify_chart_series_index,
+)
 from krw_ontology.agent_index.spine_schema import (
     GLOBAL_SPINE_LAYOUT,
     GLOBAL_SPINE_RELATIVE_PATH,
@@ -203,7 +208,7 @@ def _build_release_index_outputs_v3(
         ),
     )
     shard_entries = _read_v3_shard_entries(root_path, shard_manifest_path)
-    return {
+    outputs: dict[str, Any] = {
         "global_spine": {
             "path": _relative_or_absolute(global_spine_path, root_path),
             "sha256": _file_sha256(global_spine_path) if global_spine_path.is_file() else None,
@@ -223,6 +228,18 @@ def _build_release_index_outputs_v3(
             "required": True,
         },
     }
+    chart_series_path = root_path / CHART_SERIES_RELATIVE_PATH
+    if chart_series_path.is_file():
+        chart_verification = verify_chart_series_index(chart_series_path)
+        outputs["chart_series"] = {
+            "path": _relative_or_absolute(chart_series_path, root_path),
+            "sha256": _file_sha256(chart_series_path),
+            "schema_version": CHART_SERIES_SCHEMA_VERSION,
+            "required": False,
+            "counts": chart_verification.get("counts") or {},
+            "verification_ok": bool(chart_verification.get("ok")),
+        }
+    return outputs
 
 
 def _read_v3_shard_entries(root_path: Path, shard_manifest_path: Path) -> dict[str, Any]:
@@ -368,6 +385,7 @@ def _verify_release_root_v3(
         "global_spine_path": str(global_spine_path),
         "global_spine_present": global_spine_path.exists(),
         "global_spine_verification": spine_shard_verification.get("global_spine_verification"),
+        "chart_series_verification": spine_shard_verification.get("chart_series_verification"),
         "spine_shard_verification": spine_shard_verification,
         "smoke_verification": None,
         "current_symlink": _is_current_symlink_path(supplied_root),
@@ -407,6 +425,7 @@ def verify_release_startup_v3(
         errors.append("manifest_env_mismatch")
 
     global_spine_path = _resolve_v3_global_spine_path(root_path, manifest)
+    chart_series_path = _resolve_optional_chart_series_path(root_path, manifest)
     spine_verification: dict[str, Any] | None = None
     if not global_spine_path.exists():
         errors.append("global_spine_missing")
@@ -424,6 +443,31 @@ def verify_release_startup_v3(
             "verification_mode": "startup",
         }
 
+    chart_series_verification: dict[str, Any] | None = None
+    chart_series_output = ((manifest.get("indexes") or {}).get("chart_series") or {}) if manifest else {}
+    chart_series_required = bool(
+        isinstance(chart_series_output, Mapping) and chart_series_output.get("required") is True
+    )
+    if chart_series_path is not None:
+        if chart_series_path.exists() and chart_series_path.is_file():
+            if check_sqlite:
+                chart_series_verification = verify_chart_series_index(chart_series_path)
+                if chart_series_required and not chart_series_verification.get("ok"):
+                    errors.extend(
+                        f"chart_series:{error}"
+                        for error in chart_series_verification.get("errors") or []
+                    )
+            else:
+                chart_series_verification = {
+                    "ok": True,
+                    "errors": [],
+                    "path": str(chart_series_path),
+                    "sqlite_checked": False,
+                    "verification_mode": "startup",
+                }
+        elif chart_series_required:
+            errors.append("chart_series_missing")
+
     return {
         "ok": not errors,
         "errors": errors,
@@ -437,6 +481,9 @@ def verify_release_startup_v3(
         "global_spine_path": str(global_spine_path),
         "global_spine_present": global_spine_path.exists(),
         "global_spine_verification": spine_verification,
+        "chart_series_path": str(chart_series_path) if chart_series_path is not None else None,
+        "chart_series_present": bool(chart_series_path is not None and chart_series_path.exists()),
+        "chart_series_verification": chart_series_verification,
         "current_symlink": _is_current_symlink_path(supplied_root),
         "verification_mode": "startup-v3",
     }
@@ -493,9 +540,36 @@ def _release_manifest_startup_errors_v3(root_path: Path, manifest: Mapping[str, 
             errors.append("manifest_indexes_shard_manifest_path_missing")
         else:
             errors.extend(_release_manifest_relative_file_startup_errors(root_path, "shard_manifest", raw_path))
+    chart_series = outputs.get("chart_series")
+    if isinstance(chart_series, Mapping):
+        raw_path = chart_series.get("path")
+        if chart_series.get("required") is True:
+            if not isinstance(raw_path, str) or not raw_path:
+                errors.append("manifest_indexes_chart_series_path_missing")
+            else:
+                errors.extend(_release_manifest_relative_file_startup_errors(root_path, "chart_series", raw_path))
+        elif isinstance(raw_path, str) and raw_path:
+            errors.extend(_release_manifest_relative_optional_file_errors(root_path, "chart_series", raw_path))
     debug_monolith = outputs.get("debug_monolith")
     if isinstance(debug_monolith, Mapping) and debug_monolith.get("required") is True:
         errors.append("manifest_debug_monolith_required")
+    return errors
+
+
+def _release_manifest_relative_optional_file_errors(root_path: Path, role: str, raw_path: str) -> list[str]:
+    errors: list[str] = []
+    candidate = Path(raw_path)
+    if candidate.is_absolute():
+        errors.append(f"manifest_indexes_{role}_path_not_relative")
+        resolved = candidate.expanduser().resolve()
+    else:
+        resolved = (root_path / candidate).resolve()
+    try:
+        resolved.relative_to(root_path)
+    except ValueError:
+        errors.append(f"manifest_indexes_{role}_path_outside_root")
+    if resolved.exists() and not resolved.is_file():
+        errors.append(f"manifest_indexes_{role}_not_file")
     return errors
 
 
@@ -532,6 +606,22 @@ def _resolve_v3_global_spine_path(root_path: Path, manifest: Mapping[str, Any]) 
         candidate = Path(raw_path)
         return candidate.expanduser().resolve() if candidate.is_absolute() else (root_path / candidate).resolve()
     return (root_path / GLOBAL_SPINE_RELATIVE_PATH).resolve()
+
+
+def _resolve_optional_chart_series_path(root_path: Path, manifest: Mapping[str, Any]) -> Path | None:
+    outputs = manifest.get("indexes")
+    if not isinstance(outputs, Mapping):
+        default_path = root_path / CHART_SERIES_RELATIVE_PATH
+        return default_path.resolve() if default_path.exists() else None
+    chart_series = outputs.get("chart_series")
+    if not isinstance(chart_series, Mapping):
+        default_path = root_path / CHART_SERIES_RELATIVE_PATH
+        return default_path.resolve() if default_path.exists() else None
+    raw_path = chart_series.get("path")
+    if not isinstance(raw_path, str) or not raw_path:
+        return None
+    candidate = Path(raw_path)
+    return candidate.expanduser().resolve() if candidate.is_absolute() else (root_path / candidate).resolve()
 
 
 def _verify_global_spine_startup(path: Path) -> dict[str, Any]:
@@ -799,6 +889,13 @@ def _release_file_trace_light(root: Path, *, manifest: Mapping[str, Any] | None 
     add(global_spine_path)
     shard_manifest_path = _manifest_index_file_path(root, manifest, "shard_manifest", default="indexes/shard_manifest.json")
     add(shard_manifest_path)
+    chart_series_path = _manifest_index_file_path(
+        root,
+        manifest,
+        "chart_series",
+        default=CHART_SERIES_RELATIVE_PATH.as_posix(),
+    )
+    add(chart_series_path)
     add(root / "indexes" / "build_summary.json")
     shard_manifest = _read_json_object(shard_manifest_path)
     shards = shard_manifest.get("shards") if isinstance(shard_manifest, Mapping) else None
@@ -858,6 +955,8 @@ def _release_file_role(relative_path: Path) -> str:
         return "global_spine"
     if path_text == "indexes/shard_manifest.json":
         return "shard_manifest"
+    if path_text == CHART_SERIES_RELATIVE_PATH.as_posix():
+        return "chart_series"
     if len(parts) >= 3 and parts[0] == "indexes" and parts[1] == "companies" and relative_path.suffix == ".sqlite":
         return "company_shard"
     if parts and parts[0] == "indexes":

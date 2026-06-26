@@ -314,6 +314,8 @@ def test_build_spine_shard_release_outputs_builds_v3_without_monolith(tmp_path: 
     assert result.shard_manifest_path.exists()
     assert result.build_plan_path.exists()
     assert result.build_summary_path.exists()
+    assert result.chart_series_path is not None
+    assert result.chart_series_path.exists()
     assert result.progress_path is not None
     assert result.progress_path.exists()
     assert (release_root / "source_manifest.json").exists()
@@ -327,6 +329,9 @@ def test_build_spine_shard_release_outputs_builds_v3_without_monolith(tmp_path: 
     assert shard_entry["quality_summary"]["ticker_quality"][0]["ticker"] == "AAPL"
     assert result.build_summary["company_count"] == 1
     assert result.build_summary["progress_path"] == "indexes/build_progress.jsonl"
+    assert result.build_summary["chart_series"]["status"] == "complete"
+    assert result.build_summary["chart_series"]["path"] == "indexes/chart_series.sqlite"
+    assert result.build_summary["chart_series"]["verification"]["ok"] is True
     assert result.build_summary["artifact_cleanup"]["spine_fragments"]["removed"] is True
     assert result.build_summary["artifact_cleanup"]["spine_fragments"]["file_count"] >= 1
     assert result.merge_result.verification["ok"] is True
@@ -345,6 +350,7 @@ def test_build_spine_shard_release_outputs_builds_v3_without_monolith(tmp_path: 
     assert ("global_spine_merge", "global_spine_merge:AAPL", "merged") in event_keys
     assert ("global_spine_merge", "global_spine_merge", "complete") in event_keys
     assert ("manifest", "shard_manifest", "complete") in event_keys
+    assert ("chart_series", "chart_series", "complete") in event_keys
     assert ("artifact_cleanup", "spine_fragments", "complete") in event_keys
     assert ("build_summary", "build_summary", "complete") in event_keys
     assert ("build", "build", "complete") in event_keys
@@ -358,6 +364,7 @@ def test_build_spine_shard_release_outputs_builds_v3_without_monolith(tmp_path: 
 
     assert verification["ok"] is True, verification["errors"]
     assert verification["verification_mode"] == "release-root-v3-light"
+    assert verification["chart_series_verification"]["ok"] is True
 
 
 def test_build_spine_shard_release_outputs_retries_process_pool_sequentially(

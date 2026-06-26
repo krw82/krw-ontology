@@ -9,6 +9,10 @@ from pathlib import Path
 from collections.abc import Mapping
 from typing import Any
 
+from krw_ontology.agent_index.chart_series import (
+    CHART_SERIES_RELATIVE_PATH,
+    verify_chart_series_index,
+)
 from krw_ontology.agent_index.source_artifact_sqlite import verify_source_artifact_sqlite
 from krw_ontology.agent_index.spine_builder import (
     SHARD_QUALITY_SUMMARY_FORMAT_VERSION,
@@ -59,10 +63,35 @@ def verify_spine_shard_release(
     global_spine_path = _manifest_file_path(root, manifest, "global_spine", default="indexes/global_spine.sqlite")
     shard_manifest_path = _manifest_file_path(root, manifest, "shard_manifest", default="indexes/shard_manifest.json")
     company_shards_dir = _manifest_dir_path(root, manifest, "company_shards", default="indexes/companies")
+    chart_series_path = _optional_manifest_file_path(
+        root,
+        manifest,
+        "chart_series",
+        default=CHART_SERIES_RELATIVE_PATH.as_posix(),
+    )
 
     if manifest and deep:
         errors.extend(_manifest_file_digest_errors(manifest, "global_spine", global_spine_path))
         errors.extend(_manifest_file_digest_errors(manifest, "shard_manifest", shard_manifest_path))
+    chart_series_verification: dict[str, Any] | None = None
+    chart_series_output = ((manifest.get("indexes") or {}).get("chart_series") or {}) if manifest else {}
+    chart_series_required = bool(
+        isinstance(chart_series_output, Mapping) and chart_series_output.get("required") is True
+    )
+    if chart_series_path is not None:
+        chart_series_issues: list[str] = []
+        if manifest and deep and isinstance(chart_series_output, Mapping):
+            chart_series_issues.extend(_optional_manifest_file_digest_errors(manifest, "chart_series", chart_series_path))
+        if chart_series_path.is_file():
+            chart_series_verification = verify_chart_series_index(chart_series_path)
+            chart_series_issues.extend(str(error) for error in chart_series_verification.get("errors") or [])
+        elif chart_series_required:
+            chart_series_issues.append("chart_series_missing")
+        if chart_series_issues:
+            if chart_series_required:
+                errors.extend(f"chart_series:{issue}" for issue in chart_series_issues)
+            else:
+                warnings.extend(f"chart_series:{issue}" for issue in chart_series_issues)
     spine_verification = (
         verify_global_spine_schema(global_spine_path)
         if deep
@@ -125,8 +154,10 @@ def verify_spine_shard_release(
         "global_spine_path": str(global_spine_path),
         "shard_manifest_path": str(shard_manifest_path),
         "company_shards_dir": str(company_shards_dir),
+        "chart_series_path": str(chart_series_path) if chart_series_path is not None else None,
         "counts": counts,
         "global_spine_verification": spine_verification,
+        "chart_series_verification": chart_series_verification,
         "shards": shard_results,
         "verification_mode": "spine-shard-release-deep" if deep else "spine-shard-release-light",
         "manifest_required": require_manifest,
@@ -373,6 +404,18 @@ def _manifest_file_digest_errors(manifest: dict[str, Any], role: str, path: Path
     return [f"{role}_sha256_mismatch"] if _file_sha256(path) != expected else []
 
 
+def _optional_manifest_file_digest_errors(manifest: dict[str, Any], role: str, path: Path) -> list[str]:
+    output = ((manifest.get("indexes") or {}).get(role) or {}) if manifest else {}
+    if not isinstance(output, dict):
+        return []
+    expected = output.get("sha256")
+    if not isinstance(expected, str) or not expected:
+        return [f"{role}_sha256_missing"]
+    if not path.is_file():
+        return [f"{role}_missing"]
+    return [f"{role}_sha256_mismatch"] if _file_sha256(path) != expected else []
+
+
 def _expected_shard_sha256(manifest: dict[str, Any], ticker: str, shard_entry: Any) -> str | None:
     manifest_entry = (
         ((((manifest.get("indexes") or {}).get("company_shards") or {}).get("tickers") or {}).get(ticker))
@@ -496,6 +539,16 @@ def _manifest_file_path(root: Path, manifest: dict[str, Any], role: str, *, defa
     raw = (((manifest.get("indexes") or {}).get(role) or {}).get("path")) if manifest else None
     if not isinstance(raw, str) or not raw:
         raw = default
+    candidate = Path(raw)
+    return candidate.expanduser().resolve() if candidate.is_absolute() else (root / candidate).resolve()
+
+
+def _optional_manifest_file_path(root: Path, manifest: dict[str, Any], role: str, *, default: str) -> Path | None:
+    output = ((manifest.get("indexes") or {}).get(role) or {}) if manifest else {}
+    raw = output.get("path") if isinstance(output, Mapping) else None
+    if not isinstance(raw, str) or not raw:
+        fallback = (root / default).resolve()
+        return fallback if fallback.exists() else None
     candidate = Path(raw)
     return candidate.expanduser().resolve() if candidate.is_absolute() else (root / candidate).resolve()
 

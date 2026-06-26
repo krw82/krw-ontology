@@ -13,7 +13,7 @@ It is not a final-answer skill.
 market-news discovery -> Korean event cards -> hidden ontology bridge brief
 ```
 
-The selected card will later be analyzed by the normal `krw-ontology-research` workflow. Do not call KRW Ontology tools in this skill.
+The selected card will later be analyzed by the normal news-research workflow. Do not call KRW Ontology tools in this skill.
 
 ## Operating Contract
 
@@ -35,7 +35,7 @@ Do not write a long answer, investment conclusion, valuation judgment, filing ba
 
 ## Source Priority
 
-Discovery cards must be based on market-news or financial-news sources.
+Discovery cards must be based on market-news, financial-news, or app-normalized provider results. Provider names and raw API payloads are internal implementation details, not visible card content.
 
 Prefer:
 
@@ -96,7 +96,7 @@ krw_ontology_chain
 krw_ontology_compare
 ```
 
-For company/ticker questions, call `search_company_news_events` with market-news discovery intent:
+For company/ticker questions, use the app-provided market/news card pipeline when available. If this skill is running with stock-news tools instead, call `search_company_news_events` with market-news discovery intent:
 
 ```json
 {
@@ -164,10 +164,18 @@ likely business/risk axes
 suggested ontology questions
 ```
 
+If the card is generated from an app-normalized provider result, the hidden brief must also preserve:
+
+```text
+candidate explanation
+source timing when available
+whether the event appears company-specific, market-driven, sector-driven, mixed, or unknown
+```
+
 Do not expose the English brief in visible chat text.
 
 ## Final Output
 
-Write only the short Korean 안내문. The web runtime will create structured cards from the stock-news tool result.
+Write only the short Korean 안내문. The web runtime will create structured cards from the market/news provider or stock-news tool result.
 
 Do not print JSON or Markdown cards yourself.

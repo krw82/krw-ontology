@@ -22,6 +22,11 @@ from krw_ontology.agent_index.cross_company_links import (
     CrossCompanyLinkGenerationResult,
     generate_cross_company_links,
 )
+from krw_ontology.agent_index.chart_series import (
+    CHART_SERIES_RELATIVE_PATH,
+    ChartSeriesBuildResult,
+    build_chart_series_index,
+)
 from krw_ontology.agent_index.source_artifact_sqlite import (
     SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION,
     SOURCE_ARTIFACT_SQLITE_SCHEMA_VERSION,
@@ -102,6 +107,8 @@ class SpineShardReleaseBuildResult:
     merge_result: GlobalSpineMergeResult
     shard_manifest: Mapping[str, Any]
     build_summary: Mapping[str, Any]
+    chart_series_path: Path | None = None
+    chart_series_result: ChartSeriesBuildResult | None = None
     progress_path: Path | None = None
 
 
@@ -125,6 +132,7 @@ def build_spine_shard_release_outputs(
     fragments_dir = indexes_dir / "fragments" / "spine"
     global_spine_path = indexes_dir / "global_spine.sqlite"
     shard_manifest_path = indexes_dir / "shard_manifest.json"
+    chart_series_path = resolved_root / CHART_SERIES_RELATIVE_PATH
     build_plan_path = indexes_dir / "build_plan.json"
     build_summary_path = indexes_dir / "build_summary.json"
     resolved_source_manifest_path = (
@@ -368,6 +376,55 @@ def build_spine_shard_release_outputs(
             details={"ticker_count": shard_manifest.get("ticker_count")},
             started_at=manifest_started_at,
         )
+        chart_series_started_at = time.perf_counter()
+        chart_series_result: ChartSeriesBuildResult | None = None
+        chart_series_summary: dict[str, Any]
+        progress.record(
+            "chart_series",
+            "chart_series",
+            "started",
+            output=chart_series_path,
+        )
+        try:
+            chart_series_result = build_chart_series_index(
+                resolved_root,
+                shard_manifest_path=shard_manifest_path,
+                output_path=chart_series_path,
+                release_id=release_id,
+                source_manifest_hash=plan.source_manifest_hash,
+            )
+            chart_series_summary = {
+                "status": "complete",
+                "path": _path_label(resolved_root, chart_series_result.path),
+                "counts": dict(chart_series_result.counts),
+                "verification": dict(chart_series_result.verification),
+                "elapsed_ms": chart_series_result.elapsed_ms,
+            }
+            progress.record(
+                "chart_series",
+                "chart_series",
+                "complete",
+                output=chart_series_result.path,
+                details={
+                    "counts": dict(chart_series_result.counts),
+                    "ok": bool(chart_series_result.verification.get("ok")),
+                },
+                started_at=chart_series_started_at,
+            )
+        except Exception as exc:
+            chart_series_summary = {
+                "status": "failed",
+                "path": _path_label(resolved_root, chart_series_path),
+                "error": str(exc),
+            }
+            progress.record(
+                "chart_series",
+                "chart_series",
+                "failed",
+                output=chart_series_path,
+                error=str(exc),
+                started_at=chart_series_started_at,
+            )
         cleanup_started_at = time.perf_counter()
         fragment_cleanup = _cleanup_release_spine_fragments(
             fragments_dir,
@@ -409,6 +466,7 @@ def build_spine_shard_release_outputs(
                     "skipped_generic_keys": merge_result.chain_links.skipped_generic_keys,
                 },
             },
+            "chart_series": chart_series_summary,
             "artifact_cleanup": {
                 "spine_fragments": fragment_cleanup,
             },
@@ -436,6 +494,9 @@ def build_spine_shard_release_outputs(
                 "artifact_count": len(plan.items),
                 "company_count": len(shard_results),
                 "global_spine": _path_label(resolved_root, global_spine_path),
+                "chart_series": _path_label(resolved_root, chart_series_path)
+                if chart_series_path.exists()
+                else None,
             },
             started_at=build_started_at,
         )
@@ -452,6 +513,8 @@ def build_spine_shard_release_outputs(
             merge_result=merge_result,
             shard_manifest=shard_manifest,
             build_summary=build_summary,
+            chart_series_path=chart_series_path if chart_series_path.exists() else None,
+            chart_series_result=chart_series_result,
             progress_path=resolved_progress_path,
         )
     except Exception as exc:
@@ -477,6 +540,7 @@ def plan_spine_shard_release_outputs(
     fragments_dir = indexes_dir / "fragments" / "spine"
     global_spine_path = indexes_dir / "global_spine.sqlite"
     shard_manifest_path = indexes_dir / "shard_manifest.json"
+    chart_series_path = resolved_root / CHART_SERIES_RELATIVE_PATH
     build_plan_path = indexes_dir / "build_plan.json"
     build_summary_path = indexes_dir / "build_summary.json"
     resolved_source_manifest_path = (
@@ -607,9 +671,17 @@ def plan_spine_shard_release_outputs(
             "status": "planned",
         },
         {
+            "id": "chart_series",
+            "stage": "chart_series",
+            "depends_on": ["shard_manifest"],
+            "output": _path_label(resolved_root, chart_series_path),
+            "cache_hit": False,
+            "status": "planned",
+        },
+        {
             "id": "release_manifest",
             "stage": "manifest",
-            "depends_on": ["global_spine_merge", "shard_manifest"],
+            "depends_on": ["global_spine_merge", "shard_manifest", "chart_series"],
             "output": "manifest.json",
             "cache_hit": False,
             "status": "planned",

@@ -14,6 +14,7 @@ import pytest
 from krw_ontology.agent_index import builder as agent_index_builder
 from krw_ontology.agent_index import store as agent_index_store
 from krw_ontology.agent_index import OntologySpineRouter, build_spine_shard_release_outputs
+from krw_ontology.agent_index.chart_series import query_chart_series_pack
 from krw_ontology.agent_index.builder import build_agent_index as _build_legacy_agent_index
 from krw_ontology.agent_index.store import OntologyStore
 from krw_ontology.mcp_server.http_server import prepare_mcp_runtime
@@ -1333,6 +1334,88 @@ def test_mcp_query_context_includes_metric_series_research_pack(
     assert payload["research_pack"]["chain_pack"]["mode"] == "lazy_root_candidates"
 
 
+def test_mcp_query_context_attaches_chart_series_sidecar_pack(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _write_chart_metric_fixture(tmp_path)
+    index = _build_v3_runtime(tmp_path)
+    monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
+
+    assert index["build_result"].chart_series_path is not None
+    assert index["build_result"].chart_series_path.exists()
+
+    payload = json.loads(
+        query_context_tool(
+            question="AAPL 매출 추이 차트로 보여줘.",
+            ticker="AAPL",
+            limit_results=5,
+        )
+    )
+
+    metric_pack = payload["research_pack"]["metric_series_pack"]
+    assert metric_pack["mode"] == "chart_series_sidecar"
+    assert payload["search_diagnostics"]["chart_series"]["matched"] is True
+    revenue = next(series for series in metric_pack["series"] if series["canonical_metric"] == "revenue")
+    assert revenue["series_key"].startswith("AAPL|revenue|company_total:company_total|USD|annual|")
+    assert [point["period"] for point in revenue["points"]] == ["CY2024", "CY2025"]
+    assert [point["value"] for point in revenue["points"]] == [110.0, 130.0]
+    assert revenue["basis"] == "company_reported"
+    assert revenue["duration"] == "period"
+
+
+def test_mcp_health_reports_chart_series_sidecar_status(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _write_chart_metric_fixture(tmp_path)
+    index = _build_v3_runtime(tmp_path)
+    monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
+
+    payload, status_code = health_payload(root=str(tmp_path))
+
+    assert status_code == 200
+    assert payload["ok"] is True
+    assert payload["chart_series_present"] is True
+    assert payload["chart_series_path"] == str(index["build_result"].chart_series_path.resolve())
+    assert payload["chart_series_verification_ok"] is True
+
+
+def test_chart_series_sidecar_opens_extended_metrics_from_start(tmp_path: Path):
+    _write_chart_metric_fixture(tmp_path)
+    index = _build_v3_runtime(tmp_path)
+    chart_series_path = index["build_result"].chart_series_path
+    assert chart_series_path is not None
+
+    pack = query_chart_series_pack(
+        chart_series_path,
+        question="AAPL EPS 마진 자사주 R&D SBC M&A adjusted FCF 추이 차트",
+        tickers=["AAPL"],
+        limit_series=20,
+    )
+
+    assert pack is not None
+    assert pack["render_hints"]["hide_raw_y_axis_amounts"] is True
+    assert pack["render_hints"]["prefer_indexed_axis"] is True
+    metrics = {series["canonical_metric"] for series in pack["series"]}
+    assert {
+        "adjusted_free_cash_flow",
+        "eps",
+        "gross_margin",
+        "ma_cash_outflow",
+        "ma_related_costs",
+        "operating_margin",
+        "research_and_development",
+        "share_repurchase",
+        "stock_based_compensation",
+    }.issubset(metrics)
+    ma_series = [series for series in pack["series"] if series["canonical_metric"].startswith("ma_")]
+    assert {series["source_class"] for series in ma_series} == {
+        "cash_flow_statement",
+        "fcf_reconciliation",
+    }
+
+
 def test_mcp_query_context_risk_thesis_router_skips_metric_deep_path(
     tmp_path: Path,
     monkeypatch,
@@ -2516,6 +2599,7 @@ def _write_metric_dimension_fixture(root: Path) -> None:
             ),
         ],
     )
+
     write_company_metrics(
         "GOOGL",
         [
@@ -2574,6 +2658,238 @@ def _write_metric_dimension_fixture(root: Path) -> None:
                 "xbrl_facts": len(service_facts),
             },
         },
+    )
+
+
+def _write_chart_metric_fixture(root: Path) -> None:
+    def write_period(period: str, metrics: list[dict[str, Any]]) -> None:
+        ontology_dir = root / "companies" / "AAPL" / "ontology" / "10K" / period
+        ontology_dir.mkdir(parents=True, exist_ok=True)
+        write_jsonl(ontology_dir / "metric_observations.jsonl", metrics)
+        atomic_write_json(
+            ontology_dir / "artifact_index.json",
+            {
+                "ticker": "AAPL",
+                "document_type": "10-K",
+                "doc_type_key": "10K",
+                "period": period,
+                "files": {
+                    "metric_observations": f"companies/AAPL/ontology/10K/{period}/metric_observations.jsonl",
+                },
+                "counts": {"metric_observations": len(metrics)},
+            },
+        )
+
+    def metric_observation(
+        suffix: str,
+        *,
+        document_period: str,
+        fiscal_year: int,
+        canonical_metric: str,
+        value: str,
+        unit: str = "USD",
+        metric_name: str | None = None,
+        text: str | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "id": f"metric_observation:AAPL:{document_period}:10K:{suffix}",
+            "type": "MetricObservation",
+            "object_type": "MetricObservation",
+            "ticker": "AAPL",
+            "source_document_id": f"source:AAPL:{document_period}:10K",
+            "document_type": "10-K",
+            "period": document_period,
+            "period_end": f"{fiscal_year}-12-31",
+            "fiscal_year": fiscal_year,
+            "metric_name": metric_name or canonical_metric,
+            "canonical_metric": canonical_metric,
+            "value": value,
+            "unit": unit,
+            "dimensions": {},
+            "text": text or f"{document_period} {canonical_metric}: {value} {unit}.",
+            "review_status": "accepted",
+        }
+
+    def revenue_metric(suffix: str, *, document_period: str, fiscal_year: int, value: str) -> dict[str, Any]:
+        return metric_observation(
+            suffix,
+            document_period=document_period,
+            fiscal_year=fiscal_year,
+            canonical_metric="revenue",
+            value=value,
+            text=f"{document_period} revenue: ${value}.",
+        )
+
+    extended_2024 = [
+        metric_observation(
+            "eps-2024",
+            document_period="CY2024",
+            fiscal_year=2024,
+            canonical_metric="eps",
+            value="8.00",
+            unit="USD/share",
+        ),
+        metric_observation(
+            "gross-margin-2024",
+            document_period="CY2024",
+            fiscal_year=2024,
+            canonical_metric="gross_margin",
+            value="41",
+            unit="%",
+        ),
+        metric_observation(
+            "operating-margin-2024",
+            document_period="CY2024",
+            fiscal_year=2024,
+            canonical_metric="operating_margin",
+            value="30",
+            unit="%",
+        ),
+        metric_observation(
+            "repurchase-2024",
+            document_period="CY2024",
+            fiscal_year=2024,
+            canonical_metric="share_repurchase",
+            value="90",
+        ),
+        metric_observation(
+            "rd-2024",
+            document_period="CY2024",
+            fiscal_year=2024,
+            canonical_metric="research_and_development",
+            value="25",
+        ),
+        metric_observation(
+            "sbc-2024",
+            document_period="CY2024",
+            fiscal_year=2024,
+            canonical_metric="stock_based_compensation",
+            value="12",
+        ),
+        metric_observation(
+            "ma-cash-2024",
+            document_period="CY2024",
+            fiscal_year=2024,
+            canonical_metric="business_combinations_net_of_cash_acquired",
+            metric_name="Business combinations, net of cash acquired",
+            value="4",
+        ),
+        metric_observation(
+            "ma-costs-2024",
+            document_period="CY2024",
+            fiscal_year=2024,
+            canonical_metric="business_combination_and_other_related_costs",
+            metric_name="Business combination and other related costs",
+            value="1",
+        ),
+        metric_observation(
+            "adjusted-fcf-2024",
+            document_period="CY2024",
+            fiscal_year=2024,
+            canonical_metric="adjusted_free_cash_flow",
+            value="65",
+        ),
+    ]
+    extended_2025 = [
+        metric_observation(
+            "eps-2025",
+            document_period="CY2025",
+            fiscal_year=2025,
+            canonical_metric="eps",
+            value="9.00",
+            unit="USD/share",
+        ),
+        metric_observation(
+            "gross-margin-2025",
+            document_period="CY2025",
+            fiscal_year=2025,
+            canonical_metric="gross_margin",
+            value="42",
+            unit="%",
+        ),
+        metric_observation(
+            "operating-margin-2025",
+            document_period="CY2025",
+            fiscal_year=2025,
+            canonical_metric="operating_margin",
+            value="31",
+            unit="%",
+        ),
+        metric_observation(
+            "repurchase-2025",
+            document_period="CY2025",
+            fiscal_year=2025,
+            canonical_metric="share_repurchase",
+            value="95",
+        ),
+        metric_observation(
+            "rd-2025",
+            document_period="CY2025",
+            fiscal_year=2025,
+            canonical_metric="research_and_development",
+            value="30",
+        ),
+        metric_observation(
+            "sbc-2025",
+            document_period="CY2025",
+            fiscal_year=2025,
+            canonical_metric="stock_based_compensation",
+            value="14",
+        ),
+        metric_observation(
+            "ma-cash-2025",
+            document_period="CY2025",
+            fiscal_year=2025,
+            canonical_metric="business_combinations_net_of_cash_acquired",
+            metric_name="Business combinations, net of cash acquired",
+            value="18",
+        ),
+        metric_observation(
+            "ma-costs-2025",
+            document_period="CY2025",
+            fiscal_year=2025,
+            canonical_metric="business_combination_and_other_related_costs",
+            metric_name="Business combination and other related costs",
+            value="2",
+        ),
+        metric_observation(
+            "adjusted-fcf-2025",
+            document_period="CY2025",
+            fiscal_year=2025,
+            canonical_metric="adjusted_free_cash_flow",
+            value="70",
+        ),
+    ]
+
+    write_period(
+        "CY2024",
+        [
+            revenue_metric(
+                "current-2024",
+                document_period="CY2024",
+                fiscal_year=2024,
+                value="100",
+            ),
+            *extended_2024,
+        ],
+    )
+    write_period(
+        "CY2025",
+        [
+            revenue_metric(
+                "comparative-2024",
+                document_period="CY2025",
+                fiscal_year=2024,
+                value="110",
+            ),
+            revenue_metric(
+                "current-2025",
+                document_period="CY2025",
+                fiscal_year=2025,
+                value="130",
+            ),
+            *extended_2025,
+        ],
     )
 
 

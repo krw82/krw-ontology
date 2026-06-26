@@ -1,0 +1,4 @@
+interface:
+  display_name: "KRW Ontology Router"
+  short_description: "Routes KRW Ontology web-chat questions to the owning research workflow"
+  default_prompt: "Use $krw-ontology-router only to classify a KRW Ontology web-chat question into the correct run_kind. Do not research, use tools, write final answers, resolve tickers, or return anything except JSON with run_kind."

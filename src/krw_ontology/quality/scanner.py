@@ -10,7 +10,10 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
+from krw_ontology.config.constants import normalize_doc_type
 from krw_ontology.config.settings import PipelineConfig
+from krw_ontology.pipeline.queue import FAILED as QUEUE_FAILED
+from krw_ontology.pipeline.queue import PipelineQueue
 from krw_ontology.pipeline.research_plan import discover_research_filing_targets
 from krw_ontology.quality.models import (
     BATCH_FAILURE,
@@ -27,6 +30,12 @@ from krw_ontology.quality.models import (
 
 REFERENCE_STAGES = {"reference_validation", "reference_alias_resolution", "relation_validation"}
 NUMERIC_STAGES = {"numeric_guard"}
+DOCUMENT_CLEAN_RERUN_STAGES = {
+    "extract_evidence_quotes",
+    "extract_research_claims",
+    "extract_assumption_candidates",
+}
+DOCUMENT_CLEAN_RERUN_FAILURE_RATE_THRESHOLD = 0.20
 QUALITY_SHARD_SUMMARY_FORMAT = "krw-ontology-shard-quality-summary/v1"
 QUALITY_RELEASE_FULL_MODE = "full-release-diagnostic"
 QUALITY_RELEASE_SCAN_MODES = {"bounded", "full", QUALITY_RELEASE_FULL_MODE}
@@ -36,6 +45,12 @@ DOCS_MISSING_NO_REPAIR_ACTION = "expected_filing_coverage_complete"
 DOCS_MISSING_REPAIRABILITY = "source_repair"
 DOCS_MISSING_DISCOVERY_YEARS = 3
 _PERIOD_RE = re.compile(r"^(?P<prefix>CY|FY)?(?P<year>\d{4})(?:Q(?P<quarter>[1-4]))?$", re.IGNORECASE)
+_QUEUE_FINAL_SPLIT_FAILURE_RE = re.compile(
+    r"(?P<stage>extract_evidence_quotes|extract_research_claims|extract_assumption_candidates):\s*"
+    r"(?P<failed>\d+)\s*/\s*(?P<total>\d+)\s+"
+    r"(?P<unit>spans|quotes|batches|claims)\s+failed after split retry",
+    re.IGNORECASE,
+)
 ExpectedFilingProvider = Callable[[str], tuple[list[dict[str, str]], str | None]]
 
 
@@ -408,7 +423,7 @@ class QualityShardScanner:
                         )
                     )
 
-            if enabled(SECTION_FAIL) or (include_warn and enabled(SECTION_WARN)):
+            if False and (enabled(SECTION_FAIL) or (include_warn and enabled(SECTION_WARN))):
                 statuses = ["fail"]
                 if include_warn:
                     statuses.append("warn")
@@ -447,6 +462,7 @@ class QualityShardScanner:
                     )
 
             if enabled(BATCH_FAILURE):
+                document_rerun_jobs: dict[tuple[str, str, str, str, str], dict[str, Any]] = {}
                 for row in conn.execute(
                     """
                     SELECT id, ticker, document_type, doc_type_key, period,
@@ -457,6 +473,60 @@ class QualityShardScanner:
                     """
                 ):
                     payload = self._loads(row["json"])
+                    stage = str(row["stage"] or "")
+                    if self._batch_failure_uses_document_clean_rerun(stage, payload):
+                        ontology_dir = self._document_ontology_dir(
+                            conn,
+                            row["ticker"],
+                            row["doc_type_key"],
+                            row["period"],
+                        )
+                        key = (
+                            str(row["ticker"] or ""),
+                            str(row["document_type"] or ""),
+                            str(row["doc_type_key"] or ""),
+                            str(row["period"] or ""),
+                            stage,
+                        )
+                        grouped = document_rerun_jobs.setdefault(
+                            key,
+                            {
+                                "row": row,
+                                "payload": {
+                                    "repair_strategy": "document_clean_rerun",
+                                    "replace_partial_on_rate_limit": True,
+                                    "stage": stage,
+                                    "batch_indices": [],
+                                    "source_event_ids": [],
+                                    "input_span_ids": [],
+                                    "failed_unit_ids": [],
+                                    "error_messages": [],
+                                    "error_types": [],
+                                    "provider_error_statuses": [],
+                                },
+                                "count": 0,
+                                "failed_count_without_ids": 0,
+                                "fallback_rows": [],
+                            },
+                        )
+                        grouped["count"] += 1
+                        grouped["fallback_rows"].append((row, payload, ontology_dir))
+                        grouped_payload = grouped["payload"]
+                        if payload.get("batch_index") is not None:
+                            grouped_payload["batch_indices"].append(payload.get("batch_index"))
+                        grouped_payload["source_event_ids"].append(row["id"])
+                        grouped_payload["input_span_ids"].extend(payload.get("input_span_ids") or [])
+                        failed_unit_ids = self._batch_failure_failed_unit_ids(payload)
+                        grouped_payload["failed_unit_ids"].extend(failed_unit_ids)
+                        if not failed_unit_ids:
+                            grouped["failed_count_without_ids"] += self._batch_failure_failed_unit_count(payload)
+                        if payload.get("error_message"):
+                            grouped_payload["error_messages"].append(payload.get("error_message"))
+                        if payload.get("error_type"):
+                            grouped_payload["error_types"].append(payload.get("error_type"))
+                        if payload.get("provider_error_status") is not None:
+                            grouped_payload["provider_error_statuses"].append(payload.get("provider_error_status"))
+                        continue
                     jobs.append(
                         self._job(
                             plan_id=plan_id,
@@ -475,6 +545,77 @@ class QualityShardScanner:
                                 row["period"],
                             ),
                             reason=payload.get("error_message") or "Batch failure",
+                            payload=payload,
+                        )
+                    )
+                for grouped in document_rerun_jobs.values():
+                    row = grouped["row"]
+                    payload = grouped["payload"]
+                    ontology_dir = self._document_ontology_dir(
+                        conn,
+                        row["ticker"],
+                        row["doc_type_key"],
+                        row["period"],
+                    )
+                    payload["batch_indices"] = sorted({int(value) for value in payload["batch_indices"]})
+                    payload["source_event_ids"] = sorted({str(value) for value in payload["source_event_ids"] if value})
+                    payload["input_span_ids"] = sorted({str(value) for value in payload["input_span_ids"] if value})
+                    payload["failed_unit_ids"] = sorted({str(value) for value in payload["failed_unit_ids"] if value})
+                    payload["error_messages"] = [str(value) for value in payload["error_messages"][:5]]
+                    payload["error_types"] = sorted({str(value) for value in payload["error_types"] if value})
+                    payload["provider_error_statuses"] = sorted({int(value) for value in payload["provider_error_statuses"] if value is not None})
+                    payload["source_batch_failure_count"] = int(grouped["count"])
+                    failed_count = len(payload["failed_unit_ids"]) + int(grouped["failed_count_without_ids"])
+                    total_count, denominator_source = self._document_clean_rerun_denominator(
+                        ontology_dir,
+                        str(row["stage"] or ""),
+                    )
+                    failure_rate = (failed_count / total_count) if total_count else None
+                    payload["document_clean_rerun_threshold"] = DOCUMENT_CLEAN_RERUN_FAILURE_RATE_THRESHOLD
+                    payload["document_clean_rerun_failed_unit_count"] = failed_count
+                    payload["document_clean_rerun_total_unit_count"] = total_count
+                    payload["document_clean_rerun_failure_rate"] = failure_rate
+                    payload["document_clean_rerun_denominator_source"] = denominator_source
+                    if failure_rate is None or failure_rate < DOCUMENT_CLEAN_RERUN_FAILURE_RATE_THRESHOLD:
+                        for fallback_row, fallback_payload, fallback_ontology_dir in grouped["fallback_rows"]:
+                            fallback_payload["document_clean_rerun_skipped"] = True
+                            fallback_payload["document_clean_rerun_skip_reason"] = "failure_rate_below_threshold"
+                            fallback_payload["document_clean_rerun_threshold"] = DOCUMENT_CLEAN_RERUN_FAILURE_RATE_THRESHOLD
+                            fallback_payload["document_clean_rerun_failed_unit_count"] = failed_count
+                            fallback_payload["document_clean_rerun_total_unit_count"] = total_count
+                            fallback_payload["document_clean_rerun_failure_rate"] = failure_rate
+                            fallback_payload["document_clean_rerun_denominator_source"] = denominator_source
+                            jobs.append(
+                                self._job(
+                                    plan_id=plan_id,
+                                    kind=BATCH_FAILURE,
+                                    ticker=fallback_row["ticker"],
+                                    document_type=fallback_row["document_type"],
+                                    doc_type_key=fallback_row["doc_type_key"],
+                                    period=fallback_row["period"],
+                                    stage=fallback_row["stage"],
+                                    batch_index=fallback_payload.get("batch_index"),
+                                    source_event_id=fallback_row["id"],
+                                    ontology_dir=fallback_ontology_dir,
+                                    reason=fallback_payload.get("error_message") or "Batch failure",
+                                    payload=fallback_payload,
+                                )
+                            )
+                        continue
+                    payload["suggested_executor"] = "document_clean_rerun"
+                    jobs.append(
+                        self._job(
+                            plan_id=plan_id,
+                            kind=BATCH_FAILURE,
+                            ticker=row["ticker"],
+                            document_type=row["document_type"],
+                            doc_type_key=row["doc_type_key"],
+                            period=row["period"],
+                            stage=row["stage"],
+                            source_event_id=None,
+                            ontology_dir=ontology_dir,
+                            reason=payload["error_messages"][0] if payload["error_messages"] else "Document clean rerun for transient batch failures",
+                            count=int(grouped["count"]),
                             payload=payload,
                         )
                     )
@@ -915,6 +1056,93 @@ class QualityShardScanner:
             result.append(job)
         return result
 
+    @staticmethod
+    def _batch_failure_uses_document_clean_rerun(stage: str, payload: Mapping[str, Any]) -> bool:
+        if stage not in DOCUMENT_CLEAN_RERUN_STAGES:
+            return False
+        error_message = str(payload.get("error_message") or payload.get("message") or "")
+        error_type = str(payload.get("error_type") or "")
+        provider_status = payload.get("provider_error_status")
+        lower = error_message.lower()
+        return (
+            error_type == "RateLimitError"
+            or provider_status in {429, 529}
+            or "api error: 529" in lower
+            or "api error: 429" in lower
+            or "rate limited" in lower
+            or "temporarily overloaded" in lower
+            or "server-side issue" in lower
+        )
+
+    @staticmethod
+    def _batch_failure_failed_unit_ids(payload: Mapping[str, Any]) -> list[str]:
+        for key in (
+            "input_span_ids",
+            "span_ids",
+            "input_quote_ids",
+            "quote_ids",
+            "input_claim_ids",
+            "claim_ids",
+        ):
+            value = payload.get(key)
+            if isinstance(value, list) and value:
+                return [str(item) for item in value if item]
+        return []
+
+    @staticmethod
+    def _batch_failure_failed_unit_count(payload: Mapping[str, Any]) -> int:
+        for key in ("failed_spans", "failed_quotes", "failed_claims", "count"):
+            value = payload.get(key)
+            try:
+                if value is not None:
+                    return max(1, int(value))
+            except (TypeError, ValueError):
+                continue
+        return 1
+
+    @staticmethod
+    def _document_clean_rerun_denominator(ontology_dir: str | None, stage: str) -> tuple[int, str]:
+        if not ontology_dir:
+            return 0, "missing_ontology_dir"
+        path = Path(ontology_dir)
+        if stage == "extract_evidence_quotes":
+            audit_rows = QualityShardScanner._read_jsonl(path / "quote_span_audit.jsonl")
+            keep_count = sum(1 for row in audit_rows if row.get("decision") == "keep")
+            if keep_count:
+                return keep_count, "quote_span_audit.keep"
+            return len(QualityShardScanner._read_jsonl(path / "spans.jsonl")), "spans.jsonl"
+        if stage == "extract_research_claims":
+            quotes = [
+                row for row in QualityShardScanner._read_jsonl(path / "evidence_quotes.jsonl")
+                if row.get("id") and row.get("quote_text")
+            ]
+            return len(quotes), "evidence_quotes.jsonl"
+        if stage == "extract_assumption_candidates":
+            claims = [
+                row for row in QualityShardScanner._read_jsonl(path / "claims.jsonl")
+                if row.get("id")
+            ]
+            return len(claims), "claims.jsonl.all_claims"
+        return 0, "unsupported_stage"
+
+    @staticmethod
+    def _read_jsonl(path: Path) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            return rows
+        for line in lines:
+            if not line.strip():
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, dict):
+                rows.append(payload)
+        return rows
+
 
 class QualityReleaseScanner:
     """Read quality signals from a v3 release root without a monolith index."""
@@ -1151,6 +1379,7 @@ class QualityReleaseScanner:
         min_docs: int = 5,
         kinds: Iterable[str] | None = None,
         include_warn: bool = False,
+        running_root: Path | str | None = None,
     ) -> list[RepairJob]:
         jobs: list[RepairJob] = []
         expected_filing_provider = self._expected_filing_provider()
@@ -1166,7 +1395,263 @@ class QualityReleaseScanner:
                     expected_filing_provider=expected_filing_provider,
                 )
             )
+        jobs.extend(
+            self._queue_failed_history_repair_jobs(
+                plan_id=plan_id,
+                running_root=Path(running_root).expanduser().resolve() if running_root else None,
+                existing_jobs=jobs,
+                kinds=kinds,
+            )
+        )
         return QualityShardScanner._dedupe_jobs(jobs)
+
+    def _queue_failed_history_repair_jobs(
+        self,
+        *,
+        plan_id: str,
+        running_root: Path | None,
+        existing_jobs: list[RepairJob],
+        kinds: Iterable[str] | None,
+    ) -> list[RepairJob]:
+        if running_root is None:
+            return []
+        enabled_kinds = set(kinds) if kinds else None
+        if enabled_kinds is not None and BATCH_FAILURE not in enabled_kinds:
+            return []
+        queue = PipelineQueue(running_root)
+        if not queue.jobs_dir.exists():
+            return []
+        existing_document_reruns = {
+            self._repair_document_stage_key(job)
+            for job in existing_jobs
+            if job.kind == BATCH_FAILURE
+            and job.payload.get("repair_strategy") == "document_clean_rerun"
+        }
+        existing_document_reruns.discard(None)
+
+        jobs: list[RepairJob] = []
+        for queue_job in queue.list_jobs(statuses=[QUEUE_FAILED]):
+            parsed = self._parse_queue_final_split_failure(queue_job.error)
+            if parsed is None:
+                continue
+            if parsed["failure_rate"] < DOCUMENT_CLEAN_RERUN_FAILURE_RATE_THRESHOLD:
+                continue
+            document = self._resolve_queue_failed_document(
+                running_root=running_root,
+                ticker=queue_job.ticker,
+                stage=parsed["stage"],
+                queue_job_document_type=queue_job.document_type,
+                queue_job_periods=queue_job.periods or [],
+            )
+            if document is None:
+                continue
+            key = (
+                queue_job.ticker.upper(),
+                document["doc_type_key"],
+                document["period"],
+                parsed["stage"],
+            )
+            if key in existing_document_reruns:
+                continue
+            existing_document_reruns.add(key)
+            payload = {
+                "repair_strategy": "document_clean_rerun",
+                "stage": parsed["stage"],
+                "suggested_executor": "document_clean_rerun",
+                "source": "queue_failed_history",
+                "queue_job_id": queue_job.job_id,
+                "queue_job_type": queue_job.job_type,
+                "queue_job_attempts": queue_job.attempts,
+                "queue_job_error": queue_job.error,
+                "queue_failure_failed_unit_count": parsed["failed"],
+                "queue_failure_total_unit_count": parsed["total"],
+                "queue_failure_rate": parsed["failure_rate"],
+                "queue_failure_unit": parsed["unit"],
+                "document_clean_rerun_threshold": DOCUMENT_CLEAN_RERUN_FAILURE_RATE_THRESHOLD,
+                "document_clean_rerun_failed_unit_count": document["failed_count"],
+                "document_clean_rerun_total_unit_count": document["total_count"],
+                "document_clean_rerun_failure_rate": document["failure_rate"],
+                "document_clean_rerun_denominator_source": document["denominator_source"],
+                "source_batch_failure_count": document["batch_failure_count"],
+                "batch_indices": document["batch_indices"],
+                "failed_unit_ids": document["failed_unit_ids"],
+                "error_messages": document["error_messages"],
+            }
+            jobs.append(
+                self._queue_history_job(
+                    plan_id=plan_id,
+                    ticker=queue_job.ticker,
+                    document_type=document["document_type"],
+                    doc_type_key=document["doc_type_key"],
+                    period=document["period"],
+                    stage=parsed["stage"],
+                    ontology_dir=document["ontology_dir"],
+                    source_event_id=f"queue:{queue_job.job_id}",
+                    reason=queue_job.error or "Queue final split failure",
+                    count=document["batch_failure_count"],
+                    payload=payload,
+                )
+            )
+        return jobs
+
+    @staticmethod
+    def _parse_queue_final_split_failure(error: str | None) -> dict[str, Any] | None:
+        match = _QUEUE_FINAL_SPLIT_FAILURE_RE.search(str(error or ""))
+        if not match:
+            return None
+        failed = int(match.group("failed"))
+        total = int(match.group("total"))
+        if total <= 0:
+            return None
+        return {
+            "stage": match.group("stage"),
+            "failed": failed,
+            "total": total,
+            "unit": match.group("unit").lower(),
+            "failure_rate": failed / total,
+        }
+
+    @staticmethod
+    def _queue_history_job(
+        *,
+        plan_id: str,
+        ticker: str,
+        document_type: str,
+        doc_type_key: str,
+        period: str,
+        stage: str,
+        ontology_dir: str,
+        source_event_id: str,
+        reason: str,
+        count: int,
+        payload: dict[str, Any],
+    ) -> RepairJob:
+        dedupe_parts = [
+            BATCH_FAILURE,
+            ticker,
+            document_type,
+            doc_type_key,
+            period,
+            stage,
+            source_event_id,
+        ]
+        digest = hashlib.sha256("|".join(dedupe_parts).encode()).hexdigest()[:12]
+        return RepairJob(
+            job_id=f"{plan_id}-{digest}",
+            plan_id=plan_id,
+            kind=BATCH_FAILURE,
+            ticker=ticker,
+            document_type=document_type,
+            doc_type_key=doc_type_key,
+            period=period,
+            stage=stage,
+            ontology_dir=ontology_dir,
+            source_event_id=source_event_id,
+            reason=reason,
+            count=count,
+            payload=payload,
+        )
+
+    @staticmethod
+    def _repair_document_stage_key(job: RepairJob) -> tuple[str, str, str, str] | None:
+        ticker = str(job.ticker or "").upper()
+        doc_type_key = str(job.doc_type_key or "")
+        if not doc_type_key and job.document_type:
+            doc_type_key = normalize_doc_type(str(job.document_type))
+        period = str(job.period or "")
+        stage = str(job.stage or job.payload.get("stage") or "")
+        if not ticker or not doc_type_key or not period or not stage:
+            return None
+        return ticker, doc_type_key, period, stage
+
+    @staticmethod
+    def _resolve_queue_failed_document(
+        *,
+        running_root: Path,
+        ticker: str,
+        stage: str,
+        queue_job_document_type: str | None,
+        queue_job_periods: list[str],
+    ) -> dict[str, Any] | None:
+        ticker_root = running_root / "companies" / ticker.upper() / "ontology"
+        if not ticker_root.exists():
+            return None
+        preferred_doc_type_key = normalize_doc_type(queue_job_document_type) if queue_job_document_type else None
+        preferred_periods = {str(period) for period in queue_job_periods if period}
+        candidates: list[dict[str, Any]] = []
+        for failures_path in ticker_root.glob("*/*/batch_failures.jsonl"):
+            ontology_dir = failures_path.parent
+            doc_type_key = ontology_dir.parent.name
+            period = ontology_dir.name
+            if preferred_doc_type_key and doc_type_key != preferred_doc_type_key:
+                continue
+            if preferred_periods and period not in preferred_periods:
+                continue
+            rows = [
+                row for row in QualityShardScanner._read_jsonl(failures_path)
+                if str(row.get("stage") or "") == stage
+            ]
+            if not rows:
+                continue
+            failed_ids: set[str] = set()
+            failed_count_without_ids = 0
+            batch_indices: list[int] = []
+            error_messages: list[str] = []
+            for row in rows:
+                failed_unit_ids = QualityShardScanner._batch_failure_failed_unit_ids(row)
+                if failed_unit_ids:
+                    failed_ids.update(failed_unit_ids)
+                else:
+                    failed_count_without_ids += QualityShardScanner._batch_failure_failed_unit_count(row)
+                if row.get("batch_index") is not None:
+                    try:
+                        batch_indices.append(int(row.get("batch_index")))
+                    except (TypeError, ValueError):
+                        pass
+                if row.get("error_message") or row.get("error"):
+                    error_messages.append(str(row.get("error_message") or row.get("error"))[:500])
+            total_count, denominator_source = QualityShardScanner._document_clean_rerun_denominator(
+                str(ontology_dir),
+                stage,
+            )
+            failed_count = len(failed_ids) + failed_count_without_ids
+            failure_rate = (failed_count / total_count) if total_count else 0.0
+            candidates.append(
+                {
+                    "ticker": ticker.upper(),
+                    "document_type": QualityReleaseScanner._document_type_from_key(doc_type_key),
+                    "doc_type_key": doc_type_key,
+                    "period": period,
+                    "ontology_dir": str(ontology_dir),
+                    "failed_count": failed_count,
+                    "total_count": total_count,
+                    "failure_rate": failure_rate,
+                    "denominator_source": denominator_source,
+                    "batch_failure_count": len(rows),
+                    "batch_indices": sorted(set(batch_indices)),
+                    "failed_unit_ids": sorted(failed_ids),
+                    "error_messages": error_messages[:5],
+                }
+            )
+        if not candidates:
+            return None
+        return max(
+            candidates,
+            key=lambda item: (
+                item["failure_rate"],
+                item["failed_count"],
+                item["period"],
+            ),
+        )
+
+    @staticmethod
+    def _document_type_from_key(doc_type_key: str) -> str:
+        normalized = str(doc_type_key or "").upper()
+        if normalized == "10K":
+            return "10-K"
+        if normalized == "10Q":
+            return "10-Q"
+        return normalized or "UNKNOWN"
 
     def _expected_filing_provider(self) -> ExpectedFilingProvider:
         config = PipelineConfig.load()

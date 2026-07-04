@@ -35,12 +35,34 @@ what could make a candidate worth researching now
 
 Do not use a theme label alone as the screen.
 
+Minimum viable screen:
+
+```text
+At least one concrete business driver, product/channel exposure, financial
+condition, risk condition, event type, company type, named ticker list, or
+explicit exclusion.
+```
+
+If the user provides no usable screen, do not run broad discovery. Offer a
+short choice set of ontology-friendly prompts instead:
+
+```text
+AI data-center power demand beneficiaries
+companies with improving cash-flow conversion but manageable capex burden
+companies where margin pressure is easing rather than worsening
+companies with direct memory-price upside and visible demand commentary
+companies with lower tariff/regulatory exposure than peers
+```
+
 Bad:
 
 ```text
 AI beneficiary
 memory winner
 defensive consumer company
+good stocks
+companies to enter now
+what should I buy
 ```
 
 Good:
@@ -85,7 +107,16 @@ top reason = investment conclusion
 candidate route = final ranking
 ```
 
-## 3. Semantic Exposure Layer
+## 3. URL-Based Candidate Route
+
+When the discovery input is a user-provided URL, follow
+`url-screen-compression.md` before using this search order.
+
+That reference owns URL screen compression, multi-surface URL boundaries, and
+the tickerless `query_context` budget. This search-order document only defines
+which ontology layers to inspect after a URL screen has been selected.
+
+## 4. Semantic Exposure Layer
 
 After candidates are routed, validate direct exposure before metrics.
 
@@ -108,7 +139,7 @@ Is the exposure direct, operationally related, or only thematic?
 
 If exposure is only thematic, downgrade to C or Reject.
 
-## 4. Recent Change And Why-Now Layer
+## 5. Recent Change And Why-Now Layer
 
 After exposure is real, check whether the latest filing makes the candidate
 more or less important to research now.
@@ -136,7 +167,7 @@ Why-now does not mean stock timing. It means research timing: the filing made
 the exposure, conversion path, burden, or rejection risk important enough to
 prioritize.
 
-## 5. Financial Pathway And Burden Layer
+## 6. Financial Pathway And Burden Layer
 
 Only after semantic exposure is real, check whether the driver can reach a
 financial line item.
@@ -161,7 +192,7 @@ Does the benefit have a cost, capex, working-capital, concentration, or financin
 Do not use raw numbers to decorate the answer. Use numbers only when they
 change the A / B / C / Reject classification.
 
-## 6. Evidence Verification Layer
+## 7. Evidence Verification Layer
 
 Use these only after a candidate or rejection path is selected:
 
@@ -185,7 +216,7 @@ resolving a conflict between candidate route and actual filing evidence
 Do not start broad discovery from quotes. Quotes verify selected routes; they
 do not define the candidate universe.
 
-## 7. Stop Rule
+## 8. Stop Rule
 
 Stop once each material candidate can be classified:
 

@@ -141,6 +141,12 @@ First distinguish the tickerless question type:
 Too broad sector/global/macro/universe question:
 use a bounded covered ticker basket before ontology synthesis.
 
+Conditionless discovery question:
+if the user asks "good stocks", "companies to enter now", "what should I buy",
+or a similarly open-ended candidate question without a factor, channel, product,
+metric, event, company type, exclusion, or investment screen, do not launch
+broad ontology discovery. First turn it into a narrow user-facing choice set.
+
 Concrete tickerless question:
 if the user gives a specific factor, channel, product, business model, metric, event type, or company type but no ticker,
 you may use query_context with tickers=[] and limit_tickers <= 5 so the v3 global spine can rank candidate covered tickers.
@@ -154,6 +160,19 @@ broad sector/global query_context with tickers=[]
 broad catalog(limit > 5)
 catalog as a sector discovery substitute
 unbounded retrieve
+```
+
+Flow for conditionless discovery questions:
+
+```text
+1. Do not run broad query_context, broad query, broad retrieve, compare, or catalog scans.
+2. Explain briefly that the search needs one concrete axis to be useful and fast.
+3. Offer 3-5 ready-to-send narrowing prompts based on ontology-friendly axes:
+   - business driver: AI data-center power demand, memory pricing, GLP-1 demand, cloud capex
+   - financial path: margin improvement, FCF conversion, capex burden, debt reduction
+   - risk path: tariff exposure, regulatory pressure, customer concentration, supply-chain pressure
+   - company type: software subscription, semiconductor equipment, power infrastructure, healthcare tools
+4. Keep the answer short and actionable. The next turn can use the selected axis as a concrete tickerless question.
 ```
 
 Flow for too broad sector/global/macro questions:
@@ -174,10 +193,11 @@ Flow for concrete tickerless questions:
 
 ```text
 1. Build an ontology/MCP-aware internal English investment brief.
-2. Call query_context with tickers=[], limit_tickers <= 5, limit_results <= 3, and compact/markdown output when available.
+2. Make one bounded global-spine candidate route call through query_context with tickers=[], limit_tickers <= 5, limit_results <= 3, and compact/markdown output when available.
 3. Treat ticker candidates as a ranked covered universe, not as a final answer.
 4. Continue with selected candidate tickers only when the first pass gives enough signal or a specific gap remains.
 5. If the first pass is too broad or overflows, split into per-channel or selected-ticker compact calls; do not repeat the same broad call.
+6. Do not promote a candidate from route score, hit count, or generic theme language alone.
 ```
 
 Overflow continuation rule:
@@ -525,6 +545,8 @@ Bad: FY2026, fiscal year 2026 as primary label
 If issuer fiscal calendar matters, mention it only as a short parenthetical note.
 
 Unless the user explicitly asks for a historical period or a specific filing, start with the most recent available filing by filing/period recency. A newer 10-Q beats an older 10-K for current drivers, financial impact, cost, cash flow, risk, and management commentary. If the available documents are `CY2025 10-K` and `CY2026Q1 10-Q`, lead with `CY2026Q1 10-Q` for current drivers and use `CY2025 10-K` only as annual revenue mix/business baseline context. If `CY2026Q1 10-Q` and `CY2026Q2 10-Q` are both available, lead with `CY2026Q2 10-Q`. If no newer 10-Q exists, the latest 10-K may be the primary recent filing.
+
+When MCP returns `filing_document_roles`, follow it over generic document ordering: `current_driver` is the latest 10-Q when available, otherwise latest 10-K; `annual_baseline` is the latest 10-K; `current_document_anchors` is only compatibility shorthand for `current_driver`.
 
 For investor-facing answers, anchor analysis on the latest available filing evidence.
 
@@ -1023,9 +1045,11 @@ Rules:
 
 ```text
 - exactly 3 concise English questions
+- render them as a numbered Markdown list using `1.`, `2.`, `3.`
 - no extra tool calls to create them
 - derive from the current answer's business mechanism, risk channel, metric gap, or comparison axis
 - prefer investment interpretation follow-ups: business mechanism, margin durability, cash-flow conversion, capital allocation, risk channel, valuation-assumption sensitivity
+- include at least one scenario/sensitivity follow-up such as upside/downside/sideways checkpoints or conditions that would change the view
 - avoid follow-ups that are merely raw numeric table requests unless the current answer genuinely depends on a missing metric
 - do not expose chain, trace, object, pack, mode, or tool terminology
 - do not phrase them as "관련 체인"

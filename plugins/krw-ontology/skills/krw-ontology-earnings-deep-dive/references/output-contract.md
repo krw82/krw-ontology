@@ -53,12 +53,12 @@ change the thesis status
 
 ## Follow-Ups
 
-End with exactly three short same-company prompts.
+End with exactly three same-company prompts the user can send immediately, rendered as a numbered Markdown list using `1.`, `2.`, `3.`.
 
-Use this pattern:
+Prefer this pattern:
 
 ```text
-- 다음 분기에 이 판단이 강화되는 회사 코멘트만 정리해줘.
-- 이번 분기 현금흐름이 일시적인지 구조적인지 더 자세히 봐줘.
-- 투자 가설이 깨지는 실적 신호만 따로 뽑아줘.
+1. 이 분기 판단이 유지되는 조건과 깨지는 조건을 나눠줘.
+2. 상승·하락·횡보 시나리오별 체크포인트를 보여줘.
+3. 다음 실적 업데이트에서 먼저 확인할 회사 코멘트만 뽑아줘.
 ```

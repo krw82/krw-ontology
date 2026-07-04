@@ -75,12 +75,12 @@ Normal answers end with:
 이어서 볼 질문
 ```
 
-Include exactly 3 concise Korean follow-up questions. Prefer prompts the user can send immediately:
+Include exactly 3 concise Korean follow-up questions as a numbered Markdown list using `1.`, `2.`, `3.`. Prefer prompts the user can send immediately:
 
 ```text
-이번 뉴스가 매출·마진·현금흐름 중 어디에 연결되는지 공시 기준으로 봐줘.
-이 이슈가 일회성 노이즈인지 구조적 리스크인지 최신 공시로 확인해줘.
-이번 하락을 무시해도 되는 조건과 진짜 위험해지는 조건을 공시 기준으로 나눠줘.
+1. 이번 뉴스가 매출·마진·현금흐름 중 어디에 연결되는지 추가로 확인해줘.
+2. 이 이슈가 일회성 노이즈인지 구조적 리스크인지 추가로 확인해줘.
+3. 상승·하락·횡보 시나리오별 체크포인트를 보여줘.
 ```
 
 Follow-ups must bridge the observed move/news candidate into filing-based research. Do not end with generic prompts such as "사업 구조를 정리해줘" or peer-comparison prompts unless the user asked for them.

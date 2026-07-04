@@ -11,6 +11,27 @@ Bad: FY2026, FY 2026
 
 If the issuer fiscal calendar matters, add only a short parenthetical note.
 
+## Fiscal calendar label guard
+
+The ontology period label is the default user-facing label. Some issuers'
+fiscal quarters do not match the calendar quarter in the ontology label.
+
+When retrieved evidence or source text uses an issuer fiscal label that differs
+from the ontology CY label, show both labels on first mention:
+
+```text
+Korean: CY2026Q2 / Micron FY2026 Q3 10-Q
+English: CY2026Q2 (Micron fiscal Q3 2026 10-Q)
+```
+
+After first mention, prefer `the latest 10-Q`, `latest quarter`, or the
+ontology CY label. Do not write `Q3`, `FY2026 Q3`, or `third quarter` alone
+when that can be confused with the ontology period.
+
+Do not infer that a newer CY period exists because a filing's source text says
+issuer fiscal Q3/Q4. Treat issuer fiscal labels as aliases for the confirmed
+filing period, not proof of another document.
+
 ## Default period anchor
 
 Unless the user asks for a specific historical period, specific filing, or long-horizon trend, start with the most recent available filing evidence by filing/period recency.
@@ -23,6 +44,31 @@ business model baseline
 historical trend
 change, persistence, improvement, or deterioration
 ```
+
+## MCP filing document roles
+
+When MCP responses include `filing_document_roles`, follow those roles before generic document ordering.
+
+The role contract is 10-Q/10-K only:
+
+```text
+filing_document_roles.<TICKER>.current_driver
+  latest available 10-Q when it exists
+  otherwise latest available 10-K
+  use as the latest reported financial baseline for current/news-event interpretation
+
+filing_document_roles.<TICKER>.annual_baseline
+  latest available 10-K
+  use for annual business mix, segment structure, annual revenue/cost baseline, and historical risk baseline
+
+filing_document_roles.<TICKER>.latest_available
+  latest available 10-Q/10-K filing
+  usually the same as current_driver
+```
+
+`current_document_anchors` is compatibility shorthand for `filing_document_roles.<TICKER>.current_driver`.
+
+Do not introduce other filing-form roles. In this ontology workflow, the document-role boundary is `10-Q` and `10-K`.
 
 ## Recent/latest questions
 

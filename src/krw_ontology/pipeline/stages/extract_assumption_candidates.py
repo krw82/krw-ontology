@@ -240,7 +240,17 @@ async def extract_assumption_candidates(
 
         try:
             items = await worker.extract(
-                ASSUMPTION_EXTRACTION_PROMPT, input_data, _SCHEMA, stage_name
+                ASSUMPTION_EXTRACTION_PROMPT,
+                input_data,
+                _SCHEMA,
+                stage_name,
+                call_metadata={
+                    "batch_index": batch_idx,
+                    "claim_count": len(batch_claims),
+                    "quote_count": len(batch_quotes),
+                    "split_retry": False,
+                    "split_depth": 0,
+                },
             )
             items = _resolve_assumption_references(
                 items,

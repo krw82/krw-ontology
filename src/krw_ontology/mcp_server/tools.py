@@ -1752,6 +1752,43 @@ def _markdown_query_context(payload: Mapping[str, Any]) -> str:
     if stop_guard:
         lines.append(f"- cannot_answer_reason: {stop_guard.get('cannot_answer_reason')}")
     research_pack = payload.get("research_pack") if isinstance(payload.get("research_pack"), Mapping) else {}
+    current_anchors = payload.get("current_document_anchors")
+    if not isinstance(current_anchors, Mapping) and isinstance(research_pack, Mapping):
+        current_anchors = research_pack.get("current_document_anchors")
+    if isinstance(current_anchors, Mapping) and current_anchors:
+        anchor_text = ", ".join(
+            str(anchor.get("source_label") or f"{ticker} {anchor.get('period')} {anchor.get('document_type')}")
+            for ticker, anchor in current_anchors.items()
+            if isinstance(anchor, Mapping)
+        )
+        if anchor_text:
+            lines.append(f"- current_document_anchors: {anchor_text}")
+    filing_roles = payload.get("filing_document_roles")
+    if not isinstance(filing_roles, Mapping) and isinstance(research_pack, Mapping):
+        filing_roles = research_pack.get("filing_document_roles")
+    if isinstance(filing_roles, Mapping) and filing_roles:
+        role_parts: list[str] = []
+        for ticker, role_payload in filing_roles.items():
+            if not isinstance(role_payload, Mapping):
+                continue
+            current_driver = role_payload.get("current_driver")
+            annual_baseline = role_payload.get("annual_baseline")
+            current_label = (
+                current_driver.get("source_label")
+                if isinstance(current_driver, Mapping)
+                else None
+            )
+            annual_label = (
+                annual_baseline.get("source_label")
+                if isinstance(annual_baseline, Mapping)
+                else None
+            )
+            role_parts.append(
+                f"{ticker} current_driver={current_label or 'n/a'} "
+                f"annual_baseline={annual_label or 'n/a'}"
+            )
+        if role_parts:
+            lines.append(f"- filing_document_roles: {'; '.join(role_parts)}")
     cross_company_pack = (
         research_pack.get("cross_company_signal_pack")
         if isinstance(research_pack, Mapping)

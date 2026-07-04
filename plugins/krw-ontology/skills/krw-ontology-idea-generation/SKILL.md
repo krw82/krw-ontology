@@ -54,6 +54,7 @@ These shared rules govern:
 internal English investment briefs
 query_context-first research
 v3 global-spine candidate routing
+MCP `filing_document_roles` for candidate validation current_driver / annual_baseline
 latest 10-Q as current driver
 latest 10-K as annual baseline
 selected trace/chain verification
@@ -74,6 +75,18 @@ the normal exactly-three follow-up requirement
 ## 3. Internal Idea-Screen Brief
 
 Before calling KRW ontology tools, convert the user's request into a concise internal English idea-screen brief.
+
+If the user did not provide a usable screen, do not invent one silently.
+A usable screen needs at least one concrete axis:
+
+```text
+business driver, product/channel exposure, financial condition, risk condition,
+event type, company type, named ticker list, or explicit exclusion
+```
+
+For conditionless requests such as "good stocks", "companies to enter now", or
+"what should I buy", first ask the user to choose a screen by offering 3-5
+ready-to-send examples. Do not run broad discovery just to fill the answer.
 
 The brief must preserve:
 
@@ -148,6 +161,7 @@ A. Theme or beneficiary discovery
 B. Financial or business-condition screen
 C. User-provided candidate-list triage
 D. False-positive or weak-exposure filtering
+E. User-provided URL idea-screen extraction
 ```
 
 This skill is not for:
@@ -189,6 +203,9 @@ Use a three-phase workflow:
 
 ### 5.1 Theme or condition without a ticker list
 
+Only use this path when the user has provided a concrete theme, driver,
+financial condition, risk condition, company type, event type, or exclusion.
+
 Start with one bounded v3 global-spine discovery call:
 
 ```text
@@ -211,7 +228,23 @@ repeat the same broad query_context with slightly different wording
 advance a candidate from keyword relevance alone
 ```
 
-### 5.2 User-provided ticker list
+### 5.2 User-provided URL context
+
+Use this path when the user attaches a URL and asks the discovery workflow to
+turn the article, event, or external source into covered-company research
+candidates.
+
+Before searching, read and follow:
+
+```text
+references/url-screen-compression.md
+```
+
+This reference owns URL screen compression, the boundary between discover URL
+and company/news URL behavior, and the tickerless query budget. Do not duplicate
+or improvise a different URL compression policy.
+
+### 5.3 User-provided ticker list
 
 Use only the named, covered tickers.
 
@@ -225,7 +258,7 @@ split into bounded batches, then reconcile on the same evaluation axes
 
 Exclude unavailable tickers silently unless their absence materially changes the requested screen.
 
-### 5.3 Candidate validation
+### 5.4 Candidate validation
 
 Validate the top candidates with the smallest useful evidence path:
 
@@ -359,14 +392,14 @@ Do not describe ontology objects, candidate scores, ranking internals, search di
 
 ## 10. Handoff
 
-End with actionable same-company deep-research prompts, not generic follow-up questions.
+End with actionable same-company deep-research prompts, not generic follow-up questions. Render them as a numbered Markdown list so the user can pick the next investigation directly.
 
 Good:
 
 ```text
-- VST의 데이터센터 전력 수요가 실제 매출과 현금흐름으로 연결되는지 자세히 분석해줘.
-- ETN의 최근 수주 신호가 매출총이익률 개선으로 이어지는지 확인해줘.
-- XYL이 B 후보에 머문 핵심 근거 공백만 자세히 봐줘.
+1. VST의 데이터센터 전력 수요가 실제 매출과 현금흐름으로 연결되는지 자세히 분석해줘.
+2. ETN의 최근 수주 신호가 매출총이익률 개선으로 이어지는지 확인해줘.
+3. XYL이 B 후보에 머문 핵심 근거 공백만 자세히 봐줘.
 ```
 
 Do not introduce new peer companies in the handoff unless the user requested a comparison.

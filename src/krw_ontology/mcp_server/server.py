@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import sqlite3
 from contextlib import closing
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, TypeVar
 
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
@@ -51,12 +52,94 @@ READ_ONLY = ToolAnnotations(
     openWorldHint=False,
 )
 
+_T = TypeVar("_T")
+_LANE_FAST = "fast"
+_LANE_BROAD = "broad"
+_LANE_DIAGNOSTIC = "diagnostic"
+_LANE_CONCURRENCY_DEFAULTS = {
+    _LANE_FAST: 8,
+    _LANE_BROAD: 2,
+    _LANE_DIAGNOSTIC: 1,
+}
+_LANE_CONCURRENCY_ENVS = {
+    _LANE_FAST: "KRW_MCP_FAST_LANE_CONCURRENCY",
+    _LANE_BROAD: "KRW_MCP_BROAD_LANE_CONCURRENCY",
+    _LANE_DIAGNOSTIC: "KRW_MCP_DIAGNOSTIC_LANE_CONCURRENCY",
+}
+_LANE_SEMAPHORES: dict[tuple[int, str], asyncio.Semaphore] = {}
+
 
 def health_payload(
     *,
     root: str | None = None,
 ) -> tuple[dict, int]:
-    """Return lightweight health metadata for the configured ontology release."""
+    """Return health metadata for the configured ontology release."""
+    return _release_payload(root=root, include_runtime_cache=True)
+
+
+def ready_payload(
+    *,
+    root: str | None = None,
+) -> tuple[dict, int]:
+    """Return lightweight worker-admission readiness metadata."""
+    return _release_payload(root=root, include_runtime_cache=False)
+
+
+def live_payload() -> tuple[dict, int]:
+    """Return process liveness without touching release files or SQLite."""
+    return {
+        "ok": True,
+        "service": "krw_ontology_mcp",
+    }, 200
+
+
+async def _run_tool_in_lane(
+    lane: str,
+    func: Callable[..., _T],
+    /,
+    **kwargs: Any,
+) -> _T:
+    """Run blocking tool code off the event loop behind a lane semaphore."""
+    semaphore = _lane_semaphore(lane)
+    async with semaphore:
+        return await asyncio.to_thread(func, **kwargs)
+
+
+def _lane_semaphore(lane: str) -> asyncio.Semaphore:
+    running_loop_id = id(asyncio.get_running_loop())
+    key = (running_loop_id, lane)
+    semaphore = _LANE_SEMAPHORES.get(key)
+    if semaphore is None:
+        semaphore = asyncio.Semaphore(_lane_concurrency(lane))
+        _LANE_SEMAPHORES[key] = semaphore
+    return semaphore
+
+
+def _lane_concurrency(lane: str) -> int:
+    env_name = _LANE_CONCURRENCY_ENVS.get(lane)
+    default = _LANE_CONCURRENCY_DEFAULTS.get(lane, 1)
+    if not env_name:
+        return default
+    raw_value = os.environ.get(env_name)
+    try:
+        value = int(str(raw_value or "").strip())
+    except ValueError:
+        return default
+    return max(1, value)
+
+
+def _has_ticker_scope(*, ticker: str | None = None, tickers: list[str] | None = None) -> bool:
+    if str(ticker or "").strip():
+        return True
+    return any(str(item or "").strip() for item in (tickers or []))
+
+
+def _release_payload(
+    *,
+    root: str | None,
+    include_runtime_cache: bool,
+) -> tuple[dict, int]:
+    """Return release-serving metadata without live SQLite row counts."""
     supplied_root_path = _supplied_root_path(root)
     root_path = supplied_root_path.resolve()
     release_manifest, release_manifest_path = load_release_manifest(
@@ -97,8 +180,6 @@ def health_payload(
         if isinstance(chart_series_verification, dict)
         else None
     )
-    cache_status = mcp_runtime_cache_status()
-    store_status = cache_status.get("store") if isinstance(cache_status.get("store"), dict) else {}
     payload = {
         "ok": False,
         "root": str(root_path),
@@ -128,8 +209,16 @@ def health_payload(
         "global_topic_spine_count": global_topic_spine_count,
         "company_shards_dir": release_manifest.get("company_shards_dir") or company_shards_output.get("dir"),
         "company_shard_count": company_shard_count,
-        "cache": cache_status,
-        "mcp_store_hot_swap": {
+        "documents": document_count,
+        "objects": object_count,
+        "sqlite_checked": False,
+        "tools": sorted(tool.name for tool in mcp._tool_manager.list_tools()),
+    }
+    if include_runtime_cache:
+        cache_status = mcp_runtime_cache_status()
+        store_status = cache_status.get("store") if isinstance(cache_status.get("store"), dict) else {}
+        payload["cache"] = cache_status
+        payload["mcp_store_hot_swap"] = {
             "mode": store_status.get("mode"),
             "rotations": store_status.get("rotations"),
             "active_stores": store_status.get("active_stores"),
@@ -140,12 +229,7 @@ def health_payload(
             "retired_oldest_age_sec": store_status.get("retired_oldest_age_sec"),
             "last_rotation": store_status.get("last_rotation"),
             "retired_global_spine_stores": store_status.get("retired_global_spine_stores") or [],
-        },
-        "documents": document_count,
-        "objects": object_count,
-        "sqlite_checked": False,
-        "tools": sorted(tool.name for tool in mcp._tool_manager.list_tools()),
-    }
+        }
     if configured_env == "prod" and not current_symlink["root_is_current_symlink"]:
         payload["error"] = "prod_current_symlink_required"
         return payload, 503
@@ -376,6 +460,20 @@ def _prometheus_escape(value: str) -> str:
     return value.replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
 
 
+@mcp.custom_route("/livez", methods=["GET"], include_in_schema=False)
+async def krw_ontology_livez(_request: Request) -> JSONResponse:
+    """Process liveness endpoint for supervisors and service managers."""
+    payload, status_code = live_payload()
+    return JSONResponse(payload, status_code=status_code)
+
+
+@mcp.custom_route("/readyz", methods=["GET"], include_in_schema=False)
+async def krw_ontology_readyz(_request: Request) -> JSONResponse:
+    """Readiness endpoint for worker admission checks."""
+    payload, status_code = ready_payload()
+    return JSONResponse(payload, status_code=status_code)
+
+
 @mcp.custom_route("/health", methods=["GET"], include_in_schema=False)
 async def krw_ontology_health(_request: Request) -> JSONResponse:
     """Health endpoint for local web and agent clients."""
@@ -393,7 +491,7 @@ async def krw_ontology_metrics(_request: Request) -> PlainTextResponse:
 @mcp.custom_route("/diagnostics", methods=["GET"], include_in_schema=False)
 async def krw_ontology_diagnostics(_request: Request) -> JSONResponse:
     """Diagnostics endpoint for explicit operator checks."""
-    payload, status_code = diagnostics_payload()
+    payload, status_code = await _run_tool_in_lane(_LANE_DIAGNOSTIC, diagnostics_payload)
     return JSONResponse(payload, status_code=status_code)
 
 
@@ -410,7 +508,9 @@ async def krw_ontology_catalog(
     response_format: ResponseFormat = ResponseFormat.JSON,
 ) -> str:
     """List indexed companies, document types, periods, and document metadata."""
-    return catalog_tool(
+    return await _run_tool_in_lane(
+        _LANE_FAST,
+        catalog_tool,
         ticker=ticker,
         document_types=document_types,
         limit=limit,
@@ -432,7 +532,10 @@ async def krw_ontology_index_context(
     response_format: ResponseFormat = ResponseFormat.JSON,
 ) -> str:
     """Return index schema, capabilities, coverage, and answerability policy."""
-    return index_context_tool(
+    lane = _LANE_DIAGNOSTIC if allow_expensive or include_counts or include_quality_summary else _LANE_FAST
+    return await _run_tool_in_lane(
+        lane,
+        index_context_tool,
         include_counts=include_counts,
         include_capabilities=include_capabilities,
         include_quality_summary=include_quality_summary,
@@ -455,7 +558,9 @@ async def krw_ontology_company_context(
     response_format: ResponseFormat = ResponseFormat.JSON,
 ) -> str:
     """Return evidence-derived company topic profiles for search planning."""
-    return company_context_tool(
+    return await _run_tool_in_lane(
+        _LANE_FAST,
+        company_context_tool,
         ticker=ticker,
         document_types=document_types,
         periods=periods,
@@ -483,7 +588,10 @@ async def krw_ontology_query_context(
     response_format: ResponseFormat = ResponseFormat.JSON,
 ) -> str:
     """Return a compact query-specific context pack with answerability guidance."""
-    return query_context_tool(
+    lane = _LANE_FAST if _has_ticker_scope(ticker=ticker, tickers=tickers) else _LANE_BROAD
+    return await _run_tool_in_lane(
+        lane,
+        query_context_tool,
         question=question,
         ticker=ticker,
         tickers=tickers,
@@ -523,7 +631,10 @@ async def krw_ontology_query(
     response_detail: ResponseDetail = ResponseDetail.COMPACT,
 ) -> str:
     """Search accepted ontology objects and return source-grounded evidence bundles."""
-    return query_tool(
+    lane = _LANE_FAST if _has_ticker_scope(ticker=ticker, tickers=tickers) else _LANE_BROAD
+    return await _run_tool_in_lane(
+        lane,
+        query_tool,
         topic=topic,
         ticker=ticker,
         tickers=tickers,
@@ -558,7 +669,9 @@ async def krw_ontology_topic_map(
     response_format: ResponseFormat = ResponseFormat.JSON,
 ) -> str:
     """Return company-specific vocabulary for planning ontology searches."""
-    return topic_map_tool(
+    return await _run_tool_in_lane(
+        _LANE_FAST,
+        topic_map_tool,
         ticker=ticker,
         document_types=document_types,
         periods=periods,
@@ -589,7 +702,10 @@ async def krw_ontology_retrieve(
     agent_context: dict[str, Any] | None = None,
 ) -> str:
     """Run the deterministic local planner for a natural-language ontology question."""
-    return retrieve_tool(
+    lane = _LANE_FAST if _has_ticker_scope(ticker=ticker, tickers=tickers) else _LANE_BROAD
+    return await _run_tool_in_lane(
+        lane,
+        retrieve_tool,
         question=question,
         ticker=ticker,
         tickers=tickers,
@@ -617,7 +733,9 @@ async def krw_ontology_trace(
     response_format: ResponseFormat = ResponseFormat.JSON,
 ) -> str:
     """Trace an object id to its source document, supporting quotes, spans, and quality."""
-    return trace_tool(
+    return await _run_tool_in_lane(
+        _LANE_FAST,
+        trace_tool,
         object_id=object_id,
         response_format=response_format,
     )
@@ -636,7 +754,9 @@ async def krw_ontology_chain(
     response_format: ResponseFormat = ResponseFormat.JSON,
 ) -> str:
     """Return evidence, semantic-neighbor, and temporal-context chains around an object."""
-    return chain_tool(
+    return await _run_tool_in_lane(
+        _LANE_FAST,
+        chain_tool,
         object_id=object_id,
         max_depth=max_depth,
         direction=direction,
@@ -659,7 +779,9 @@ async def krw_ontology_quality(
     response_format: ResponseFormat = ResponseFormat.JSON,
 ) -> str:
     """Return rejected-object, batch-failure, and section-quality events."""
-    return quality_tool(
+    return await _run_tool_in_lane(
+        _LANE_DIAGNOSTIC,
+        quality_tool,
         ticker=ticker,
         document_type=document_type,
         period=period,
@@ -688,7 +810,9 @@ async def krw_ontology_compare(
     response_detail: ResponseDetail = ResponseDetail.COMPACT,
 ) -> str:
     """Compare two or more companies by evidence topic or canonical metric."""
-    return compare_tool(
+    return await _run_tool_in_lane(
+        _LANE_BROAD,
+        compare_tool,
         tickers=tickers,
         ticker=ticker,
         ticker_a=ticker_a,
@@ -713,7 +837,9 @@ async def krw_ontology_plan_query(
     response_format: ResponseFormat = ResponseFormat.JSON,
 ) -> str:
     """Return the deterministic QueryPlan without executing a search."""
-    return plan_query_tool(
+    return await _run_tool_in_lane(
+        _LANE_FAST,
+        plan_query_tool,
         question=question,
         response_format=response_format,
     )

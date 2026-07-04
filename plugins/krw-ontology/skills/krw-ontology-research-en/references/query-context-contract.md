@@ -31,9 +31,36 @@ ticker_candidates
 results_by_ticker
 search_diagnostics
 kernel
+current_document_anchors
+filing_document_roles
 ```
 
 Do not assume pack fields are top-level. In normal JSON responses they are usually nested under `research_pack`, `agent_autonomy`, or `kernel`.
+
+## Filing document roles
+
+Current MCP builds may return `filing_document_roles` at the top level, under `research_pack`, or under routing diagnostics.
+
+Use it as the authoritative document-role map when present:
+
+```text
+filing_document_roles.<TICKER>.current_driver
+  latest available 10-Q when it exists, otherwise latest available 10-K
+  use for current/latest/recent questions and current investor interpretation
+
+filing_document_roles.<TICKER>.annual_baseline
+  latest available 10-K
+  use for business mix, segment structure, annual baseline, historical risk baseline
+
+filing_document_roles.<TICKER>.latest_available
+  latest available 10-Q/10-K filing
+```
+
+`current_document_anchors` is compatibility shorthand for `filing_document_roles.<TICKER>.current_driver`.
+
+When both fields exist, follow `filing_document_roles` and use `current_document_anchors` only as a quick label.
+
+The role contract is intentionally limited to 10-Q and 10-K. Do not infer or invent other filing-form roles.
 
 ## Compatibility fallback
 
@@ -122,3 +149,7 @@ business model / product platform / customer demand
 For broad sector/global/macro questions, pair the internal English investment brief with a bounded covered universe when possible.
 
 For concrete tickerless questions with a specific factor, channel, product, business model, metric, event type, or company type, query_context may receive `tickers=[]` with `limit_tickers <= 5` and `limit_results <= 3`. Treat the v3 global spine result as candidate ticker ranking and evidence routing, not as the final answer.
+
+Use only one bounded global-spine route for the first tickerless pass. Do not repeat the same broad query_context with slightly different wording. If the route is weak, narrow by channel, selected ticker, or user-facing follow-up prompt.
+
+Do not use `tickers=[]` for conditionless discovery questions such as "good stocks", "companies to enter now", or "what should I buy" when the user did not provide a concrete factor, channel, product, business model, metric, event type, company type, or exclusion. In that case, first present a short set of ontology-friendly narrowing prompts rather than running broad retrieval.

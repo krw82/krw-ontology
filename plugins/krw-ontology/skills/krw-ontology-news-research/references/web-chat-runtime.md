@@ -42,10 +42,12 @@ generic limitation sections
 Normal answers should end with:
 
 ```text
-다음으로 파고들 질문
+이어서 볼 질문
 ```
 
-Include exactly 3 concise Korean questions. Do not run tools to create them. Do not call them chains. Do not mention internal concepts.
+Include exactly 3 concise Korean questions as a numbered Markdown list using `1.`, `2.`, `3.`. Do not run tools to create them. Do not call them chains. Do not mention internal concepts.
+
+Prefer "추가로 확인" over "공시로 확인" in follow-up prompts. At least one follow-up should invite scenario/sensitivity work, such as upside/downside/sideways checkpoints or conditions that would change the view.
 
 ## Evidence handling
 

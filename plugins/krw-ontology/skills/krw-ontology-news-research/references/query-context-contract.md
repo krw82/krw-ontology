@@ -31,9 +31,36 @@ ticker_candidates
 results_by_ticker
 search_diagnostics
 kernel
+current_document_anchors
+filing_document_roles
 ```
 
 Do not assume pack fields are top-level. In normal JSON responses they are usually nested under `research_pack`, `agent_autonomy`, or `kernel`.
+
+## Filing document roles
+
+Current MCP builds may return `filing_document_roles` at the top level, under `research_pack`, or under routing diagnostics.
+
+Use it as the authoritative document-role map when present:
+
+```text
+filing_document_roles.<TICKER>.current_driver
+  latest available 10-Q when it exists, otherwise latest available 10-K
+  use as the latest reported financial baseline for current/news-event interpretation
+
+filing_document_roles.<TICKER>.annual_baseline
+  latest available 10-K
+  use for business mix, segment structure, annual baseline, historical risk baseline
+
+filing_document_roles.<TICKER>.latest_available
+  latest available 10-Q/10-K filing
+```
+
+`current_document_anchors` is compatibility shorthand for `filing_document_roles.<TICKER>.current_driver`.
+
+When both fields exist, follow `filing_document_roles` and use `current_document_anchors` only as a quick label.
+
+The role contract is intentionally limited to 10-Q and 10-K. Do not infer or invent other filing-form roles.
 
 ## Compatibility fallback
 

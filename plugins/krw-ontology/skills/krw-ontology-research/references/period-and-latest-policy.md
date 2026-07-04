@@ -11,6 +11,27 @@ Bad: FY2026, FY 2026
 
 If the issuer fiscal calendar matters, add only a short parenthetical note.
 
+## Fiscal calendar label guard
+
+The ontology period label is the default user-facing label. Some issuers'
+fiscal quarters do not match the calendar quarter in the ontology label.
+
+When retrieved evidence or source text uses an issuer fiscal label that differs
+from the ontology CY label, show both labels on first mention:
+
+```text
+Korean: CY2026Q2 / Micron FY2026 Q3 10-Q
+English: CY2026Q2 (Micron fiscal Q3 2026 10-Q)
+```
+
+After first mention, prefer `the latest 10-Q`, `latest quarter`, or the
+ontology CY label. Do not write `Q3`, `FY2026 Q3`, or `third quarter` alone
+when that can be confused with the ontology period.
+
+Do not infer that a newer CY period exists because a filing's source text says
+issuer fiscal Q3/Q4. Treat issuer fiscal labels as aliases for the confirmed
+filing period, not proof of another document.
+
 ## Runtime filing anchor
 
 If the web runtime context provides a `Company filing anchor`, obey it.
@@ -22,6 +43,31 @@ Use the provided `Annual baseline` only for annual business mix, historical tren
 Use `Historical context` only for cycle comparison or change over time.
 
 Do not let older 10-K evidence dominate the current judgment when a Current driver is provided.
+
+## MCP filing document roles
+
+When MCP responses include `filing_document_roles`, follow those roles before generic document ordering.
+
+The role contract is 10-Q/10-K only:
+
+```text
+filing_document_roles.<TICKER>.current_driver
+  latest available 10-Q when it exists
+  otherwise latest available 10-K
+  use for current changes, latest quarter evidence, financial impact, cost, cash flow, risk, and management commentary
+
+filing_document_roles.<TICKER>.annual_baseline
+  latest available 10-K
+  use for business mix, segment structure, annual revenue/cost baseline, long-term risk baseline, and historical context
+
+filing_document_roles.<TICKER>.latest_available
+  latest available 10-Q/10-K filing
+  usually the same as current_driver
+```
+
+If `current_document_anchors` and `filing_document_roles` both exist, treat `current_document_anchors` as compatibility shorthand for `filing_document_roles.<TICKER>.current_driver`.
+
+Do not introduce other filing-form roles. In this ontology workflow, the document-role boundary is `10-Q` and `10-K`.
 
 ## Confirmed period boundary
 

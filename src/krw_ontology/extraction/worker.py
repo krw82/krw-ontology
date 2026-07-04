@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 import json
 import logging
 import random
 import re
+import time
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +44,7 @@ class ExtractionWorker:
         self.max_retries = max_retries
         self.call_timeout_s = call_timeout_s
         self.max_turns = max_turns
+        self.call_log_context: dict[str, Any] = {}
 
     async def extract(
         self,
@@ -49,6 +52,7 @@ class ExtractionWorker:
         input_data: dict,
         output_schema: dict,
         stage_name: str,
+        call_metadata: dict[str, Any] | None = None,
     ) -> list[dict]:
         """Run extraction with retry and validation.
 
@@ -56,18 +60,29 @@ class ExtractionWorker:
         Raises ExtractionError after max retries exhausted.
         """
         user_prompt = prompt_template.format(**input_data)
-        data = await self._call_with_retry(user_prompt, output_schema, stage_name)
+        metadata = {**self.call_log_context, **(call_metadata or {})}
+        data = await self._call_with_retry(user_prompt, output_schema, stage_name, metadata)
         return parse_structured_data(data, stage_name)
 
     async def _call_with_retry(
-        self, prompt_text: str, output_schema: dict, stage_name: str
+        self,
+        prompt_text: str,
+        output_schema: dict,
+        stage_name: str,
+        call_metadata: dict[str, Any] | None = None,
     ) -> Any:
         """Agent SDK call with exponential backoff retry."""
         sdk_schema = _wrap_items_schema(output_schema)
         delay = 5
         for attempt in range(self.max_retries):
             try:
-                return await self._call_once(prompt_text, sdk_schema, stage_name)
+                return await self._call_once(
+                    prompt_text,
+                    sdk_schema,
+                    stage_name,
+                    call_metadata=call_metadata,
+                    attempt=attempt + 1,
+                )
             except RateLimitError as e:
                 if attempt < self.max_retries - 1:
                     sleep_for = min(delay, _MAX_DELAY) + random.uniform(0, min(delay, _MAX_DELAY))
@@ -98,8 +113,19 @@ class ExtractionWorker:
                     ) from e
         raise ExtractionError(f"{stage_name} failed after {self.max_retries} attempts")
 
-    async def _call_once(self, prompt_text: str, sdk_schema: dict, stage_name: str) -> Any:
+    async def _call_once(
+        self,
+        prompt_text: str,
+        sdk_schema: dict,
+        stage_name: str,
+        *,
+        call_metadata: dict[str, Any] | None = None,
+        attempt: int,
+    ) -> Any:
         """Run one Claude Code structured-output request with a hard subprocess timeout."""
+        started_monotonic = time.monotonic()
+        metadata = dict(call_metadata or {})
+        log_path = self._agent_call_log_path(stage_name, metadata)
         cli_path = await asyncio.to_thread(
             lambda: SubprocessCLITransport(
                 prompt=prompt_text,
@@ -135,6 +161,20 @@ class ExtractionWorker:
             stderr=asyncio.subprocess.PIPE,
             cwd=str(self.cwd),
         )
+        self._write_agent_call_log(
+            log_path,
+            {
+                "event": "start",
+                "stage": stage_name,
+                "model": self.model,
+                "attempt": attempt,
+                "max_retries": self.max_retries,
+                "pid": proc.pid,
+                "timeout_seconds": self.call_timeout_s,
+                "max_turns": self.max_turns,
+                **metadata,
+            },
+        )
         try:
             stdout, stderr = await asyncio.wait_for(
                 proc.communicate(prompt_text.encode()),
@@ -143,6 +183,19 @@ class ExtractionWorker:
         except TimeoutError as e:
             proc.kill()
             await proc.wait()
+            self._write_agent_call_log(
+                log_path,
+                self._agent_call_end_payload(
+                    stage_name,
+                    metadata,
+                    started_monotonic=started_monotonic,
+                    attempt=attempt,
+                    pid=proc.pid,
+                    status="timeout",
+                    error_preview=f"Claude call timed out after {self.call_timeout_s}s",
+                    returncode=proc.returncode,
+                ),
+            )
             raise ExtractionError(
                 f"{stage_name}: Claude call timed out after {self.call_timeout_s}s"
             ) from e
@@ -151,6 +204,20 @@ class ExtractionWorker:
         stderr_text = stderr.decode(errors="replace").strip()
         if proc.returncode != 0:
             message = stderr_text or stdout_text[:500]
+            status = "rate_limited" if _is_rate_limit_message(message) else "error"
+            self._write_agent_call_log(
+                log_path,
+                self._agent_call_end_payload(
+                    stage_name,
+                    metadata,
+                    started_monotonic=started_monotonic,
+                    attempt=attempt,
+                    pid=proc.pid,
+                    status=status,
+                    error_preview=message,
+                    returncode=proc.returncode,
+                ),
+            )
             if _is_rate_limit_message(message):
                 raise RateLimitError(
                     f"{stage_name}: Claude CLI rate limited: {message}"
@@ -160,11 +227,37 @@ class ExtractionWorker:
                 f"{message}"
             )
         if not stdout_text:
+            self._write_agent_call_log(
+                log_path,
+                self._agent_call_end_payload(
+                    stage_name,
+                    metadata,
+                    started_monotonic=started_monotonic,
+                    attempt=attempt,
+                    pid=proc.pid,
+                    status="error",
+                    error_preview="empty response from Claude CLI",
+                    returncode=proc.returncode,
+                ),
+            )
             raise ExtractionError(f"{stage_name}: empty response from Claude CLI")
 
         try:
             data = json.loads(stdout_text)
         except json.JSONDecodeError as e:
+            self._write_agent_call_log(
+                log_path,
+                self._agent_call_end_payload(
+                    stage_name,
+                    metadata,
+                    started_monotonic=started_monotonic,
+                    attempt=attempt,
+                    pid=proc.pid,
+                    status="error",
+                    error_preview=f"failed to parse Claude CLI JSON: {e}; {stdout_text[:500]}",
+                    returncode=proc.returncode,
+                ),
+            )
             raise ExtractionError(
                 f"{stage_name}: failed to parse Claude CLI JSON: {e}\n"
                 f"Raw output preview: {stdout_text[:500]}"
@@ -172,14 +265,102 @@ class ExtractionWorker:
 
         if data.get("is_error"):
             message = str(data.get("subtype") or data)
+            status = "rate_limited" if _is_rate_limit_message(message) else "error"
+            self._write_agent_call_log(
+                log_path,
+                self._agent_call_end_payload(
+                    stage_name,
+                    metadata,
+                    started_monotonic=started_monotonic,
+                    attempt=attempt,
+                    pid=proc.pid,
+                    status=status,
+                    error_preview=message,
+                    returncode=proc.returncode,
+                ),
+            )
             if _is_rate_limit_message(message):
                 raise RateLimitError(f"{stage_name}: Claude CLI rate limited: {message}")
             raise ExtractionError(f"{stage_name}: Claude CLI result error: {data.get('subtype')}")
+        self._write_agent_call_log(
+            log_path,
+            self._agent_call_end_payload(
+                stage_name,
+                metadata,
+                started_monotonic=started_monotonic,
+                attempt=attempt,
+                pid=proc.pid,
+                status="success",
+                returncode=proc.returncode,
+                output_preview=_safe_preview(stdout_text),
+            ),
+        )
         if "structured_output" in data:
             return data["structured_output"]
         if "result" in data:
             return data["result"]
         return data
+
+    def _agent_call_log_path(self, stage_name: str, metadata: dict[str, Any]) -> Path | None:
+        job_id = str(metadata.get("job_id") or "").strip()
+        if not job_id:
+            return None
+        batch_index = metadata.get("batch_index")
+        suffix = "call" if batch_index is None else f"batch-{batch_index}"
+        return (
+            self.cwd
+            / ".krw_pipeline"
+            / "quality"
+            / "logs"
+            / "agent-calls"
+            / _safe_filename(job_id)
+            / f"{_safe_filename(stage_name)}-{_safe_filename(suffix)}.log"
+        )
+
+    def _write_agent_call_log(self, path: Path | None, payload: dict[str, Any]) -> None:
+        if path is None:
+            return
+        row = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            **payload,
+        }
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+        except OSError:
+            logger.debug("failed to write agent call log: %s", path, exc_info=True)
+
+    def _agent_call_end_payload(
+        self,
+        stage_name: str,
+        metadata: dict[str, Any],
+        *,
+        started_monotonic: float,
+        attempt: int,
+        pid: int | None,
+        status: str,
+        returncode: int | None = None,
+        error_preview: str | None = None,
+        output_preview: str | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "event": "end",
+            "stage": stage_name,
+            "model": self.model,
+            "attempt": attempt,
+            "pid": pid,
+            "status": status,
+            "duration_ms": int((time.monotonic() - started_monotonic) * 1000),
+            "timeout_seconds": self.call_timeout_s,
+            "returncode": returncode,
+            **metadata,
+        }
+        if error_preview:
+            payload["error_preview"] = _safe_preview(error_preview)
+        if output_preview:
+            payload["output_preview"] = output_preview
+        return payload
 
 
 def _wrap_items_schema(item_schema: dict) -> dict:
@@ -209,6 +390,15 @@ def _is_rate_limit_message(message: str) -> bool:
             "overloaded",
         )
     )
+
+
+def _safe_filename(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value or ""))[:160] or "unknown"
+
+
+def _safe_preview(value: str, limit: int = 1000) -> str:
+    text = str(value or "").replace("\x00", "")
+    return text[:limit]
 
 
 def parse_structured_output(

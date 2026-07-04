@@ -161,6 +161,31 @@ _SEMANTIC_NEIGHBOR_TYPES = {
     "ExternalFactorExposure",
     "AssumptionCandidate",
 }
+_CURRENT_FILING_INTENT_TERMS = {
+    "current",
+    "currently",
+    "latest",
+    "newest",
+    "recent",
+    "recently",
+}
+_CURRENT_FILING_INTENT_MARKERS = (
+    "공시상",
+    "공시 기준",
+    "공시자료",
+    "최신",
+    "최근",
+    "현재",
+    "이번 분기",
+    "latest filing",
+    "current filing",
+    "most recent",
+)
+_DOCUMENT_TYPE_RECENCY_PRIORITY = {
+    "10-Q": 50,
+    "10-K": 45,
+}
+_FILING_ROLE_DOCUMENT_TYPES = {"10-Q", "10-K"}
 
 _COMPARE_TICKER_CACHE_MAX = 256
 _COMPARE_TICKER_CACHE: OrderedDict[tuple[Any, ...], tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any]]] = OrderedDict()
@@ -1207,10 +1232,18 @@ class OntologyStore:
         limit: int = 20,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         """Return evidence bundles plus deterministic search diagnostics."""
+        result_limit = max(1, int(limit))
         original_tickers = list(tickers) if tickers is not None else None
         tickers, unavailable_tickers = self._query_available_tickers(original_tickers)
         if original_tickers is not None and not tickers:
             return [], _ticker_guard_query_diagnostics(topic, unavailable_tickers)
+        current_prior = self._current_document_prior_context(
+            topic=topic,
+            tickers=tickers,
+            document_types=document_types,
+            periods=periods,
+        )
+        query_limit = _current_document_prior_candidate_limit(result_limit, current_prior)
         explicit_object_types = object_types is not None
         selected_types = tuple(object_types or DEFAULT_QUERY_TYPES)
         search_strategy: dict[str, Any] | None = None
@@ -1235,7 +1268,7 @@ class OntologyStore:
                 periods=metric_periods,
                 object_types=selected_types,
                 include_rejected=include_rejected,
-                limit=limit,
+                limit=query_limit,
                 normalization=metric_profile["normalization"],
             )
             if not rows and topic:
@@ -1251,7 +1284,7 @@ class OntologyStore:
                         periods=metric_periods,
                         object_types=fallback_types,
                         include_rejected=include_rejected,
-                        limit=min(limit, 10),
+                        limit=min(query_limit, 20),
                     )
                     search_strategy["fallback"] = fallback_strategy
                     search_strategy["fallback_used"] = True
@@ -1266,7 +1299,7 @@ class OntologyStore:
                 periods=periods,
                 object_types=selected_types,
                 include_rejected=include_rejected,
-                limit=limit,
+                limit=query_limit,
             )
             if not rows and topic:
                 rows, fallback_strategy = self._query_fts_with_strategy(
@@ -1276,7 +1309,7 @@ class OntologyStore:
                     periods=periods,
                     object_types=selected_types,
                     include_rejected=include_rejected,
-                    limit=min(limit, 10),
+                    limit=min(query_limit, 20),
                 )
                 search_strategy["fallback"] = fallback_strategy
                 search_strategy["fallback_used"] = True
@@ -1288,7 +1321,7 @@ class OntologyStore:
                 periods=periods,
                 object_types=selected_types,
                 include_rejected=include_rejected,
-                limit=limit,
+                limit=query_limit,
             )
         else:
             rows = self._query_objects(
@@ -1297,8 +1330,9 @@ class OntologyStore:
                 periods=periods,
                 object_types=selected_types,
                 include_rejected=include_rejected,
-                limit=limit,
+                limit=query_limit,
             )
+        rows = self._apply_current_document_prior(rows, current_prior, limit=result_limit)
         bundles = [self.bundle(row["id"]) for row in rows if row["id"]]
         diagnostics = _search_diagnostics(
             topic,
@@ -1316,6 +1350,8 @@ class OntologyStore:
             diagnostics["warnings"].append("ticker_not_available")
             diagnostics["unavailable_tickers"] = unavailable_tickers
             diagnostics["ticker_guard"] = True
+        if current_prior.get("enabled"):
+            diagnostics["current_document_prior"] = current_prior
         return bundles, diagnostics
 
     def query_compact_with_diagnostics(
@@ -1330,12 +1366,20 @@ class OntologyStore:
         limit: int = 20,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         """Return row-level compact query results without eager evidence expansion."""
+        result_limit = max(1, int(limit))
         original_tickers = list(tickers) if tickers is not None else None
         tickers, unavailable_tickers = self._query_available_tickers(original_tickers)
         if original_tickers is not None and not tickers:
             return [], _ticker_guard_query_diagnostics(topic, unavailable_tickers, compact=True)
         document_types = list(document_types) if document_types is not None else None
         periods = list(periods) if periods is not None else None
+        current_prior = self._current_document_prior_context(
+            topic=topic,
+            tickers=tickers,
+            document_types=document_types,
+            periods=periods,
+        )
+        query_limit = _current_document_prior_candidate_limit(result_limit, current_prior)
         explicit_object_types = object_types is not None
         object_types = list(object_types) if object_types is not None else None
         selected_types = tuple(object_types or DEFAULT_QUERY_TYPES)
@@ -1394,7 +1438,7 @@ class OntologyStore:
                 periods=metric_periods,
                 object_types=selected_types,
                 include_rejected=include_rejected,
-                limit=limit,
+                limit=query_limit,
                 normalization=metric_profile["normalization"],
             )
             if not rows and topic:
@@ -1410,7 +1454,7 @@ class OntologyStore:
                         periods=metric_periods,
                         object_types=fallback_types,
                         include_rejected=include_rejected,
-                        limit=min(limit, 10),
+                        limit=min(query_limit, 20),
                     )
                     search_strategy["fallback"] = fallback_strategy
                     search_strategy["fallback_used"] = True
@@ -1425,7 +1469,7 @@ class OntologyStore:
                 periods=periods,
                 object_types=selected_types,
                 include_rejected=include_rejected,
-                limit=limit,
+                limit=query_limit,
             )
             if not rows and topic:
                 rows, fallback_strategy = self._query_fts_with_strategy(
@@ -1435,7 +1479,7 @@ class OntologyStore:
                     periods=periods,
                     object_types=selected_types,
                     include_rejected=include_rejected,
-                    limit=min(limit, 10),
+                    limit=min(query_limit, 20),
                 )
                 search_strategy["fallback"] = fallback_strategy
                 search_strategy["fallback_used"] = True
@@ -1447,7 +1491,7 @@ class OntologyStore:
                 periods=periods,
                 object_types=selected_types,
                 include_rejected=include_rejected,
-                limit=limit,
+                limit=query_limit,
             )
         else:
             rows = self._query_objects(
@@ -1456,8 +1500,9 @@ class OntologyStore:
                 periods=periods,
                 object_types=selected_types,
                 include_rejected=include_rejected,
-                limit=limit,
+                limit=query_limit,
             )
+        rows = self._apply_current_document_prior(rows, current_prior, limit=result_limit)
         bundles = self._compact_bundles_from_rows(rows)
         diagnostics = _search_diagnostics(
             topic,
@@ -1476,9 +1521,94 @@ class OntologyStore:
             diagnostics["warnings"].append("ticker_not_available")
             diagnostics["unavailable_tickers"] = unavailable_tickers
             diagnostics["ticker_guard"] = True
+        if current_prior.get("enabled"):
+            diagnostics["current_document_prior"] = current_prior
         result = (bundles, diagnostics)
         _query_compact_cache_set(cache_key, result)
         return result
+
+    def _current_document_prior_context(
+        self,
+        *,
+        topic: str | None,
+        tickers: Sequence[str] | None,
+        document_types: Iterable[str] | None,
+        periods: Iterable[str] | None,
+    ) -> dict[str, Any]:
+        if not _query_wants_current_document_prior(topic):
+            return {"enabled": False, "reason": "no_current_filing_intent"}
+        if _query_has_explicit_period(topic, periods):
+            return {"enabled": False, "reason": "explicit_period_scope"}
+        roles = self._filing_document_roles(
+            tickers=tickers,
+            document_types=document_types,
+        )
+        anchors = _current_driver_anchors_from_roles(roles)
+        if not anchors:
+            return {"enabled": False, "reason": "no_current_document_anchor"}
+        return {
+            "enabled": True,
+            "reason": "current_filing_intent",
+            "latest_documents": anchors,
+            "filing_document_roles": roles,
+            "policy": (
+                "Prefer current_driver for current/latest questions. Use annual_baseline for "
+                "business mix, long-term structure, and historical baseline unless the user asked "
+                "for a past period."
+            ),
+        }
+
+    def _filing_document_roles(
+        self,
+        *,
+        tickers: Sequence[str] | None,
+        document_types: Iterable[str] | None,
+    ) -> dict[str, dict[str, Any]]:
+        documents: list[dict[str, Any]] = []
+        ticker_values = [str(ticker).upper() for ticker in tickers or [] if str(ticker or "").strip()]
+        if ticker_values:
+            for ticker in ticker_values:
+                documents.extend(self.list_documents(ticker=ticker, document_types=document_types))
+        else:
+            documents = self.list_documents(document_types=document_types)
+        return filing_document_roles_from_documents(documents, tickers=ticker_values or None)
+
+    def _apply_current_document_prior(
+        self,
+        rows: Sequence[sqlite3.Row],
+        prior: Mapping[str, Any],
+        *,
+        limit: int,
+    ) -> list[sqlite3.Row]:
+        if not rows:
+            return []
+        if not prior.get("enabled"):
+            return list(rows)[: max(1, int(limit))]
+        anchors = prior.get("latest_documents")
+        if not isinstance(anchors, Mapping) or not anchors:
+            return list(rows)[: max(1, int(limit))]
+
+        def row_key(index_and_row: tuple[int, sqlite3.Row]) -> tuple[int, tuple[int, int], int, int]:
+            index, row = index_and_row
+            ticker = str(row["ticker"] or "").upper()
+            period = str(row["period"] or "")
+            document_type = str(row["document_type"] or "")
+            anchor = anchors.get(ticker)
+            latest_doc_hit = 0
+            if isinstance(anchor, Mapping):
+                latest_doc_hit = int(
+                    str(anchor.get("period") or "") == period
+                    and str(anchor.get("document_type") or "") == document_type
+                )
+            return (
+                latest_doc_hit,
+                _period_recency_key(period),
+                _document_type_recency_priority(document_type),
+                -index,
+            )
+
+        ranked = sorted(enumerate(rows), key=row_key, reverse=True)
+        return [row for _index, row in ranked[: max(1, int(limit))]]
 
     def _query_available_tickers(
         self,
@@ -6383,6 +6513,151 @@ def _discovery_search_topic(topic: str | None) -> str:
 
 def _query_terms(topic: str | None) -> list[str]:
     return _unique(term.lower() for term in _TERM_RE.findall(topic or "") if len(term) > 1)
+
+
+def _query_wants_current_document_prior(topic: str | None) -> bool:
+    text = str(topic or "").strip()
+    if not text:
+        return False
+    lowered = text.lower()
+    terms = set(_query_terms(text))
+    if terms.intersection(_CURRENT_FILING_INTENT_TERMS):
+        return True
+    return any(marker in lowered or marker in text for marker in _CURRENT_FILING_INTENT_MARKERS)
+
+
+def _query_has_explicit_period(topic: str | None, periods: Iterable[str] | None) -> bool:
+    if any(str(period or "").strip() for period in periods or []):
+        return True
+    text = str(topic or "")
+    return bool(re.search(r"\b(?:CY|FY)?(?:19|20)\d{2}(?:Q[1-4])?\b", text, flags=re.IGNORECASE))
+
+
+def _current_document_prior_candidate_limit(limit: int, prior: Mapping[str, Any]) -> int:
+    resolved = max(1, int(limit))
+    if not prior.get("enabled"):
+        return resolved
+    return max(resolved, min(max(resolved * 4, resolved + 12), 80))
+
+
+def _period_recency_key(period: Any) -> tuple[int, int]:
+    text = str(period or "").upper().strip()
+    match = re.search(r"(?:CY|FY)?((?:19|20)\d{2})(?:\s*Q([1-4]))?", text)
+    if not match:
+        match = re.search(r"Q([1-4]).*((?:19|20)\d{2})", text)
+        if match:
+            return int(match.group(2)), int(match.group(1))
+        return 0, 0
+    year = int(match.group(1))
+    quarter = int(match.group(2) or 5)
+    return year, quarter
+
+
+def _document_type_recency_priority(document_type: Any) -> int:
+    return _DOCUMENT_TYPE_RECENCY_PRIORITY.get(str(document_type or "").upper(), 0)
+
+
+def _document_recency_key(document: Mapping[str, Any]) -> tuple[tuple[int, int], int]:
+    return (
+        _period_recency_key(document.get("period")),
+        _document_type_recency_priority(document.get("document_type") or document.get("doc_type_key")),
+    )
+
+
+def _document_anchor(document: Mapping[str, Any], *, ticker: str, role: str) -> dict[str, Any]:
+    document_type = document.get("document_type") or document.get("doc_type_key")
+    period = document.get("period")
+    return {
+        "ticker": ticker,
+        "period": period,
+        "document_type": document_type,
+        "role": role,
+        "source_label": " ".join(
+            str(part)
+            for part in (
+                ticker,
+                period,
+                document_type,
+            )
+            if part
+        ),
+    }
+
+
+def filing_document_roles_from_documents(
+    documents: Sequence[Mapping[str, Any]],
+    *,
+    tickers: Iterable[str] | None = None,
+) -> dict[str, dict[str, Any]]:
+    requested = {str(ticker).upper() for ticker in tickers or [] if str(ticker or "").strip()}
+    by_ticker: dict[str, list[Mapping[str, Any]]] = {}
+    for document in documents:
+        ticker = str(document.get("ticker") or "").upper()
+        document_type = str(document.get("document_type") or document.get("doc_type_key") or "").upper()
+        period = str(document.get("period") or "").strip()
+        if not ticker or (requested and ticker not in requested):
+            continue
+        if document_type not in _FILING_ROLE_DOCUMENT_TYPES:
+            continue
+        if not period or period.upper() == "ALL":
+            continue
+        by_ticker.setdefault(ticker, []).append(document)
+
+    roles: dict[str, dict[str, Any]] = {}
+    for ticker, ticker_documents in sorted(by_ticker.items()):
+        latest_available = max(ticker_documents, key=_document_recency_key)
+        annual_candidates = [
+            document
+            for document in ticker_documents
+            if str(document.get("document_type") or document.get("doc_type_key") or "").upper() == "10-K"
+        ]
+        annual_baseline = max(annual_candidates, key=_document_recency_key) if annual_candidates else None
+        role_payload: dict[str, Any] = {
+            "ticker": ticker,
+            "current_driver": _document_anchor(latest_available, ticker=ticker, role="current_driver"),
+            "latest_available": _document_anchor(latest_available, ticker=ticker, role="latest_available"),
+            "available_document_types": sorted(
+                {
+                    str(document.get("document_type") or document.get("doc_type_key") or "").upper()
+                    for document in ticker_documents
+                    if document.get("document_type") or document.get("doc_type_key")
+                }
+            ),
+            "policy": (
+                "Use current_driver for recent changes/current quarter evidence. "
+                "Use annual_baseline for business mix, segment structure, and long-term baseline."
+            ),
+        }
+        if annual_baseline is not None:
+            role_payload["annual_baseline"] = _document_anchor(
+                annual_baseline,
+                ticker=ticker,
+                role="annual_baseline",
+            )
+        else:
+            role_payload["annual_baseline"] = None
+        roles[ticker] = role_payload
+    return roles
+
+
+def _current_driver_anchors_from_roles(roles: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    anchors: dict[str, dict[str, Any]] = {}
+    for ticker, role_payload in roles.items():
+        if not isinstance(role_payload, Mapping):
+            continue
+        current_driver = role_payload.get("current_driver")
+        if isinstance(current_driver, Mapping):
+            anchors[str(ticker)] = dict(current_driver)
+    return anchors
+
+
+def latest_document_anchors_from_documents(
+    documents: Sequence[Mapping[str, Any]],
+    *,
+    tickers: Iterable[str] | None = None,
+) -> dict[str, dict[str, Any]]:
+    roles = filing_document_roles_from_documents(documents, tickers=tickers)
+    return _current_driver_anchors_from_roles(roles)
 
 
 def _normalize_metric_lookup_topic(

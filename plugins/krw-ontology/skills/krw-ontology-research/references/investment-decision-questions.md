@@ -289,7 +289,7 @@ HBM 수주 가시성이 더 명확해지고, 고마진 제품 믹스가 유지�
 마진 회복이 지연되고 수요 개선이 가격/재고 개선으로 연결되지 않는 흐름이 반복되면 손절 판단이 강해진다.
 ```
 
-For these triggered questions, the three final follow-ups must be direct prompts the user can send immediately, not abstract analyst research topics, generic research questions, raw metric prompts, or requests for personal inputs.
+For these triggered questions, the three final follow-ups must be direct prompts the user can send immediately, not abstract analyst research topics, generic research questions, raw metric prompts, or requests for personal inputs. Render them as a numbered Markdown list using `1.`, `2.`, `3.`.
 
 The goal is to reduce the user's next-step burden and create a natural second question. Do not ask the user to provide investment period, risk tolerance, target price, position size, cost basis, allocation, or other personal inputs unless the user already supplied them.
 
@@ -306,25 +306,25 @@ Choose the set that matches the user's intent:
 General investment-decision follow-ups:
 
 ```text
-- 이 판단이 유지되는 조건과 깨지는 조건을 나눠줘.
-- 상승·하락·횡보 시나리오별 체크포인트를 보여줘.
-- 반대로 봐야 할 리스크 신호만 따로 정리해줘.
+1. 이 판단이 유지되는 조건과 깨지는 조건을 나눠줘.
+2. 상승·하락·횡보 시나리오별 체크포인트를 보여줘.
+3. 반대로 봐야 할 리스크 신호만 따로 정리해줘.
 ```
 
 Holder / stuck position / sell-risk follow-ups:
 
 ```text
-- 보유자가 계속 봐도 되는 조건만 정리해줘.
-- 매도 판단이 강해지는 신호만 따로 뽑아줘.
-- 이 종목을 버티기 어려워지는 공시 코멘트가 있는지 봐줘.
+1. 보유자가 계속 봐도 되는 조건만 정리해줘.
+2. 매도 판단이 강해지는 신호만 따로 뽑아줘.
+3. 상승·하락·횡보 시나리오별 체크포인트를 보여줘.
 ```
 
 New-buy follow-ups:
 
 ```text
-- 지금 신규 매수자가 확인해야 할 조건만 정리해줘.
-- 기다려야 하는 이유와 지금 봐도 되는 이유를 나눠줘.
-- 이 종목이 비싸 보일 수 있는 가정만 점검해줘.
+1. 지금 신규 매수자가 확인해야 할 조건만 정리해줘.
+2. 기다려야 하는 이유와 지금 봐도 되는 이유를 나눠줘.
+3. 상승·하락·횡보 시나리오별 체크포인트를 보여줘.
 ```
 
 Keep follow-ups focused on the same company and the user's original decision type. Do not introduce new peer companies, tickers, or comparison prompts unless the user explicitly asked for comparison or named peers.

@@ -293,6 +293,7 @@ async def _extract_batch_with_split_retry(
     metrics_list: str,
     factor_taxonomy_list: str,
     batch_index: int,
+    split_depth: int = 0,
     failures_path: Path,
     ticker: str,
     doc_type: str,
@@ -311,6 +312,10 @@ async def _extract_batch_with_split_retry(
             metrics_list=metrics_list,
             factor_taxonomy_list=factor_taxonomy_list,
             stage_name=stage_name,
+            batch_index=batch_index,
+            quote_count=len(batch_quotes),
+            source_span_count=len(_quote_source_span_ids(batch_quotes)),
+            split_depth=split_depth,
         ), 0
     except RateLimitError as e:
         span_ids = _quote_source_span_ids(batch_quotes)
@@ -357,6 +362,7 @@ async def _extract_batch_with_split_retry(
             metrics_list=metrics_list,
             factor_taxonomy_list=factor_taxonomy_list,
             batch_index=batch_index * 10 + 1,
+            split_depth=split_depth + 1,
             failures_path=failures_path,
             ticker=ticker,
             doc_type=doc_type,
@@ -372,6 +378,7 @@ async def _extract_batch_with_split_retry(
             metrics_list=metrics_list,
             factor_taxonomy_list=factor_taxonomy_list,
             batch_index=batch_index * 10 + 2,
+            split_depth=split_depth + 1,
             failures_path=failures_path,
             ticker=ticker,
             doc_type=doc_type,
@@ -391,6 +398,10 @@ async def _extract_quote_batch(
     metrics_list: str,
     factor_taxonomy_list: str,
     stage_name: str,
+    batch_index: int,
+    quote_count: int,
+    source_span_count: int,
+    split_depth: int,
 ) -> list[dict]:
     source_context = _source_context_for_quotes(batch_quotes, spans_by_id)
     aliased_quotes, quote_alias_to_id = alias_objects(batch_quotes, "q")
@@ -428,7 +439,19 @@ async def _extract_quote_batch(
         ],
         ensure_ascii=False,
     )
-    items = await worker.extract(CLAIM_EXTRACTION_PROMPT, input_data, _SCHEMA, stage_name)
+    items = await worker.extract(
+        CLAIM_EXTRACTION_PROMPT,
+        input_data,
+        _SCHEMA,
+        stage_name,
+        call_metadata={
+            "batch_index": batch_index,
+            "quote_count": quote_count,
+            "source_span_count": source_span_count,
+            "split_retry": split_depth > 0,
+            "split_depth": split_depth,
+        },
+    )
     for item in items:
         resolved, unknown = resolve_references(item.get("supported_by_quotes"), quote_alias_to_id)
         item["supported_by_quotes"] = resolved

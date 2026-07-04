@@ -223,6 +223,14 @@ release_app = typer.Typer(
     ),
     no_args_is_help=True,
 )
+release_cache_app = typer.Typer(
+    name="cache",
+    help=(
+        "Inspect and garbage-collect release index caches. By default this keeps "
+        "cache files referenced by the selected release and deletes nothing unless --yes is passed."
+    ),
+    no_args_is_help=True,
+)
 observability_app = typer.Typer(
     name="observability",
     help=(
@@ -275,6 +283,7 @@ app.add_typer(prod_app, name="prod")
 index_app.add_typer(index_cache_app, name="cache")
 app.add_typer(index_app, name="index")
 app.add_typer(source_manifest_app, name="source-manifest")
+release_app.add_typer(release_cache_app, name="cache")
 app.add_typer(release_app, name="release")
 app.add_typer(observability_app, name="observability")
 quality_app.add_typer(quality_repair_app, name="repair")
@@ -1092,16 +1101,17 @@ def quality_repair_plan_cmd(
             releases_root=releases_root,
         )
         resolved_plan_id = plan_id or default_plan_id()
+        store = _quality_repair_store(root)
         jobs = scanner.build_repair_jobs(
             plan_id=resolved_plan_id,
             min_docs=min_docs,
             kinds=kind,
             include_warn=include_warn,
+            running_root=store.root,
         )
         deferred_jobs = [job for job in jobs if job.kind in QUALITY_DEFERRED_REPAIR_KINDS]
         if not include_deferred:
             jobs = [job for job in jobs if job.kind not in QUALITY_DEFERRED_REPAIR_KINDS]
-        store = _quality_repair_store(root)
         fingerprint = _quality_plan_fingerprint(scanner)
         plan = RepairPlan(
             plan_id=resolved_plan_id,
@@ -1639,8 +1649,20 @@ def quality_repair_run_cmd(
         return
 
     if preview or not yes:
+        dispatch_jobs = [job for job in jobs if job.kind in {QUALITY_BATCH_FAILURE, QUALITY_DOCS_MISSING}]
+        worker_jobs = [job for job in jobs if job.kind == QUALITY_REPAIR_REFERENCE]
+        worker_job_ids = {job.job_id for job in worker_jobs}
+        other_jobs = [
+            job
+            for job in jobs
+            if job.kind not in {QUALITY_BATCH_FAILURE, QUALITY_DOCS_MISSING, QUALITY_REPAIR_REFERENCE}
+        ]
         typer.echo(f"Repair plan: {plan.plan_id}")
         typer.echo(f"Selected jobs: {len(jobs)}")
+        typer.echo(f"Dispatch to pipeline queue: {len(dispatch_jobs)}")
+        typer.echo(f"Background reference jobs: {len(worker_jobs)}")
+        if other_jobs:
+            typer.echo(f"Other foreground jobs: {len(other_jobs)}")
         if all_jobs:
             typer.echo("Selection: all executable pending jobs")
         for job in jobs:
@@ -1652,6 +1674,84 @@ def quality_repair_run_cmd(
         if store.worker_is_running():
             typer.echo("Quality repair worker is already running.")
             raise typer.Exit(1)
+        from krw_ontology.quality.runner import run_repair_jobs
+
+        dispatch_jobs = [job for job in jobs if job.kind in {QUALITY_BATCH_FAILURE, QUALITY_DOCS_MISSING}]
+        worker_jobs = [job for job in jobs if job.kind == QUALITY_REPAIR_REFERENCE]
+        other_jobs = [
+            job
+            for job in jobs
+            if job.kind not in {QUALITY_BATCH_FAILURE, QUALITY_DOCS_MISSING, QUALITY_REPAIR_REFERENCE}
+        ]
+        dispatch_result = {
+            "succeeded": 0,
+            "failed": 0,
+            "skipped": 0,
+            "resolved": 0,
+            "unresolved": 0,
+            "enqueued": 0,
+            "active": 0,
+        }
+        if dispatch_jobs:
+            with FileProcessLock(store.worker_lock_path):
+                dispatch_result = run_repair_jobs(
+                    store=store,
+                    jobs=dispatch_jobs,
+                    root=store.root,
+                    concurrency=concurrency,
+                )
+
+        foreground_result = {
+            "succeeded": 0,
+            "failed": 0,
+            "skipped": 0,
+            "resolved": 0,
+            "unresolved": 0,
+            "enqueued": 0,
+            "active": 0,
+        }
+        if other_jobs:
+            with FileProcessLock(store.worker_lock_path):
+                foreground_result = run_repair_jobs(
+                    store=store,
+                    jobs=other_jobs,
+                    root=store.root,
+                    concurrency=concurrency,
+                )
+
+        pending_reference_jobs = [
+            job
+            for job in store.list_jobs(plan_id=plan.plan_id, statuses=[QUALITY_PENDING])
+            if job.kind == QUALITY_REPAIR_REFERENCE
+        ]
+        worker_jobs = pending_reference_jobs if all_jobs else [
+            job for job in pending_reference_jobs if job.job_id in worker_job_ids
+        ]
+
+        typer.echo(f"Repair plan: {plan.plan_id}")
+        typer.echo(
+            "Pipeline dispatch complete: "
+            f"jobs={len(dispatch_jobs)} "
+            f"succeeded={dispatch_result['succeeded']} "
+            f"failed={dispatch_result['failed']} "
+            f"skipped={dispatch_result['skipped']} "
+            f"enqueued={dispatch_result.get('enqueued', 0)} "
+            f"active={dispatch_result.get('active', 0)}"
+        )
+        if other_jobs:
+            typer.echo(
+                "Foreground repair complete: "
+                f"jobs={len(other_jobs)} "
+                f"succeeded={foreground_result['succeeded']} "
+                f"failed={foreground_result['failed']} "
+                f"skipped={foreground_result['skipped']}"
+            )
+
+        if not worker_jobs:
+            typer.echo("No pending repair_reference jobs selected.")
+            typer.echo("Next: krw-ontology queue status")
+            return
+
         command = [
             sys.executable,
             "-c",
@@ -1661,20 +1761,20 @@ def quality_repair_run_cmd(
             str(store.root),
             "--plan",
             plan.plan_id,
+            "--kind",
+            QUALITY_REPAIR_REFERENCE,
         ]
-        if kind:
-            command.extend(["--kind", kind])
         if all_jobs:
             command.append("--all")
         else:
-            command.extend(["--limit", str(limit)])
+            command.extend(["--limit", str(len(worker_jobs))])
         if concurrency is not None:
             command.extend(["--concurrency", str(concurrency)])
         if allow_stale_plan:
             command.append("--allow-stale-plan")
         store.ensure_dirs()
         with store.worker_log_path.open("a", encoding="utf-8") as log_handle:
-            log_handle.write(f"\n[{_now_label()}] quality repair launching background worker\n")
+            log_handle.write(f"\n[{_now_label()}] quality repair launching reference worker\n")
             log_handle.flush()
             process = subprocess.Popen(
                 command,
@@ -1683,12 +1783,11 @@ def quality_repair_run_cmd(
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
             )
-        typer.echo(f"Started quality repair worker pid={process.pid}")
-        typer.echo(f"plan: {plan.plan_id}")
-        typer.echo(f"selected_jobs: {len(jobs)}")
-        typer.echo(f"batch_failure_concurrency: {concurrency or 1}")
+        typer.echo(f"Started quality repair reference worker pid={process.pid}")
+        typer.echo(f"reference_jobs: {len(worker_jobs)}")
         typer.echo(f"log: {store.worker_log_path}")
         typer.echo(f"watch: krw-ontology quality repair watch --plan {plan.plan_id}")
+        typer.echo("queue: krw-ontology queue status")
         return
 
     from krw_ontology.quality.runner import run_repair_jobs
@@ -5372,6 +5471,258 @@ def release_gc_cmd(
             raise RuntimeError(f"Refusing to delete non-directory release candidate: {path}")
         shutil.rmtree(path)
     typer.echo(f"deleted: {len(candidates)}")
+
+
+@release_cache_app.command("status")
+def release_cache_status_cmd(
+    releases_root: Optional[Path] = typer.Option(None, "--releases-root", help="Local releases root."),
+    env: str = typer.Option("dev", "--env", help="Ontology environment: dev, staging, or prod."),
+    keep: str = typer.Option(
+        "current",
+        "--keep",
+        help="Release cache generation to preserve: current, latest, or a concrete release id.",
+    ),
+    workers: Optional[int] = typer.Option(None, "--workers", min=1, help="Planned artifact compile worker count."),
+    limit: int = typer.Option(20, "--limit", min=0, help="Maximum candidate entries to print."),
+) -> None:
+    """Show release index cache reachability for the selected release."""
+    target = _release_cache_target(releases_root=releases_root, env=env, keep=keep)
+    snapshot = _v3_index_cache_snapshot(
+        target["release_root"],
+        target["cache_root"],
+        workers=workers,
+        source_manifest_path=None,
+    )
+    candidates = [
+        entry
+        for entry in snapshot["entries"]
+        if entry.get("referenced") is False and not entry.get("missing")
+    ]
+    candidate_bytes = sum(int(entry.get("size_bytes") or 0) for entry in candidates)
+    typer.echo("Release cache status")
+    typer.echo(f"env: {target['env']}")
+    typer.echo(f"keep: {target['keep']} release={target['release_id']}")
+    typer.echo(f"release_root: {target['release_root']}")
+    typer.echo(f"cache_root: {snapshot['cache_root']}")
+    typer.echo(
+        "entries: "
+        f"total={snapshot['entry_count']} "
+        f"referenced={snapshot['referenced_existing_count']} "
+        f"missing_referenced={snapshot['missing_referenced_count']} "
+        f"unreferenced={snapshot['unreferenced_count']}"
+    )
+    typer.echo(f"bytes: total={snapshot['total_size_bytes']} reclaimable={candidate_bytes}")
+    for entry in candidates[:limit]:
+        typer.echo(f"candidate: {entry['kind']} {entry['path']} ({entry['size_bytes']} bytes)")
+    if len(candidates) > limit:
+        typer.echo(f"... {len(candidates) - limit} more")
+
+
+@release_cache_app.command("gc")
+def release_cache_gc_cmd(
+    releases_root: Optional[Path] = typer.Option(None, "--releases-root", help="Local releases root."),
+    env: str = typer.Option("dev", "--env", help="Ontology environment: dev, staging, or prod."),
+    keep: str = typer.Option(
+        "current",
+        "--keep",
+        help="Release cache generation to preserve: current, latest, or a concrete release id.",
+    ),
+    workers: Optional[int] = typer.Option(None, "--workers", min=1, help="Planned artifact compile worker count."),
+    include_unreferenced: bool = typer.Option(
+        True,
+        "--unreferenced/--no-unreferenced",
+        help="Delete cache files not referenced by the selected release.",
+    ),
+    include_tmp: bool = typer.Option(
+        True,
+        "--tmp/--no-tmp",
+        help="Delete orphan cache temp files older than --tmp-minutes.",
+    ),
+    tmp_minutes: int = typer.Option(
+        60,
+        "--tmp-minutes",
+        min=1,
+        help="Minimum age in minutes for orphan cache temp file deletion.",
+    ),
+    yes: bool = typer.Option(False, "--yes", help="Delete candidates. Without this flag this is a dry run."),
+    limit: int = typer.Option(50, "--limit", min=0, help="Maximum candidate entries to print."),
+) -> None:
+    """Garbage-collect release index caches while preserving the selected release generation."""
+    target = _release_cache_target(releases_root=releases_root, env=env, keep=keep)
+    snapshot = _v3_index_cache_snapshot(
+        target["release_root"],
+        target["cache_root"],
+        workers=workers,
+        source_manifest_path=None,
+    )
+    candidates: list[dict[str, Any]] = []
+    if include_unreferenced:
+        candidates.extend(
+            {
+                **entry,
+                "reason": "unreferenced",
+            }
+            for entry in snapshot["entries"]
+            if entry.get("referenced") is False and not entry.get("missing")
+        )
+    if include_tmp:
+        now = time.time()
+        minimum_age_seconds = tmp_minutes * 60
+        for path in _iter_release_cache_tmp_files(target["cache_root"]):
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            age_seconds = max(0, int(now - stat.st_mtime))
+            if age_seconds < minimum_age_seconds:
+                continue
+            candidates.append(
+                {
+                    "kind": "tmp",
+                    "ticker": None,
+                    "cache_key": None,
+                    "path": str(path),
+                    "referenced": False,
+                    "missing": False,
+                    "size_bytes": stat.st_size,
+                    "reason": f"tmp_older_than_{tmp_minutes}m",
+                }
+            )
+
+    deleted_count = 0
+    deleted_bytes = 0
+    if yes:
+        for entry in candidates:
+            path = Path(str(entry["path"]))
+            removed_bytes = _delete_release_cache_candidate(path, target["cache_root"])
+            deleted_count += 1 if removed_bytes >= 0 else 0
+            deleted_bytes += max(0, removed_bytes)
+        _prune_empty_release_cache_dirs(target["cache_root"])
+
+    candidate_bytes = sum(int(entry.get("size_bytes") or 0) for entry in candidates)
+    typer.echo(f"Release cache GC: {'deleted' if yes else 'dry-run'}")
+    typer.echo(f"env: {target['env']}")
+    typer.echo(f"keep: {target['keep']} release={target['release_id']}")
+    typer.echo(f"release_root: {target['release_root']}")
+    typer.echo(f"cache_root: {snapshot['cache_root']}")
+    typer.echo(
+        "entries: "
+        f"total={snapshot['entry_count']} "
+        f"referenced={snapshot['referenced_existing_count']} "
+        f"missing_referenced={snapshot['missing_referenced_count']} "
+        f"unreferenced={snapshot['unreferenced_count']}"
+    )
+    typer.echo(f"candidates: {len(candidates)} bytes={candidate_bytes}")
+    typer.echo(f"deleted: {deleted_count} bytes={deleted_bytes}")
+    for entry in candidates[:limit]:
+        typer.echo(
+            f"candidate: {entry.get('reason')} {entry['kind']} "
+            f"{entry['path']} ({entry['size_bytes']} bytes)"
+        )
+    if len(candidates) > limit:
+        typer.echo(f"... {len(candidates) - limit} more")
+
+
+def _release_cache_target(
+    *,
+    releases_root: Path | None,
+    env: str,
+    keep: str,
+) -> dict[str, Any]:
+    resolved_env = normalize_ontology_env(env)
+    resolved_releases_root = _resolve_configured_releases_root(releases_root, env=resolved_env)
+    env_root = release_env_root(resolved_releases_root, resolved_env).expanduser().resolve()
+    keep_label = keep.strip()
+    if keep_label in ("", "current"):
+        release_id = current_release_id(env_root)
+        if not release_id:
+            raise typer.BadParameter(f"No current release found under {env_root}")
+        resolved_keep = "current"
+    elif keep_label == "latest":
+        release_ids = list_release_ids(env_root)
+        if not release_ids:
+            raise typer.BadParameter(f"No releases found under {env_root}")
+        release_id = release_ids[0]
+        resolved_keep = "latest"
+    else:
+        release_id = keep_label
+        resolved_keep = "release-id"
+
+    release_root = (env_root / release_id).expanduser().resolve()
+    if not release_root.is_dir():
+        raise typer.BadParameter(f"Release directory not found: {release_root}")
+    return {
+        "env": resolved_env,
+        "keep": resolved_keep,
+        "release_id": release_id,
+        "release_root": release_root,
+        "cache_root": env_root / ".index_fragment_cache",
+    }
+
+
+def _iter_release_cache_tmp_files(cache_root: Path) -> list[Path]:
+    resolved_cache_root = cache_root.expanduser().resolve()
+    if not resolved_cache_root.is_dir():
+        return []
+    paths: list[Path] = []
+    for path in resolved_cache_root.rglob("*.tmp"):
+        try:
+            resolved = path.expanduser().resolve()
+        except OSError:
+            continue
+        if not resolved.is_file() or not _path_inside(resolved, resolved_cache_root):
+            continue
+        paths.append(resolved)
+    return sorted(paths)
+
+
+def _delete_release_cache_candidate(path: Path, cache_root: Path) -> int:
+    resolved_cache_root = cache_root.expanduser().resolve()
+    resolved_path = path.expanduser().resolve()
+    if not _path_inside(resolved_path, resolved_cache_root):
+        raise RuntimeError(f"Refusing to delete cache file outside cache root: {resolved_path}")
+    if resolved_path.suffix not in (".sqlite", ".tmp"):
+        raise RuntimeError(f"Refusing to delete non-cache candidate: {resolved_path}")
+    size = 0
+    for candidate in _sqlite_cache_file_family(resolved_path):
+        try:
+            size += candidate.stat().st_size
+        except FileNotFoundError:
+            continue
+        candidate.unlink()
+    return size
+
+
+def _sqlite_cache_file_family(path: Path) -> tuple[Path, ...]:
+    if path.suffix == ".sqlite":
+        return (
+            path,
+            Path(f"{path}-wal"),
+            Path(f"{path}-shm"),
+            Path(f"{path}-journal"),
+        )
+    return (path,)
+
+
+def _prune_empty_release_cache_dirs(cache_root: Path) -> None:
+    resolved_cache_root = cache_root.expanduser().resolve()
+    if not resolved_cache_root.is_dir():
+        return
+    for path in sorted(resolved_cache_root.rglob("*"), reverse=True):
+        if not path.is_dir():
+            continue
+        try:
+            path.rmdir()
+        except OSError:
+            pass
+
+
+def _path_inside(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+    except ValueError:
+        return False
+    return True
 
 
 def _read_json_object(path: Path) -> dict[str, object] | None:

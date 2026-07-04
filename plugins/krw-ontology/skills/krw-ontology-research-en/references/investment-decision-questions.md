@@ -285,7 +285,7 @@ The view becomes more positive if HBM order visibility improves and evidence bui
 The thesis-break risk rises if margin recovery stalls and demand improvement does not translate into pricing or inventory improvement.
 ```
 
-For these triggered questions, the three final follow-ups must be action-oriented decision continuations, not generic research questions or raw metric prompts. Each follow-up must stay on the same company and include one of these decision-action frames: `new-buy checklist`, `sell signals`, `thesis-break judgment`, `hold conditions`, `risk improvement/deterioration conditions`, or `view-change conditions`.
+For these triggered questions, the three final follow-ups must be action-oriented decision continuations, not generic research questions or raw metric prompts. Render them as a numbered Markdown list using `1.`, `2.`, `3.`. Each follow-up must stay on the same company and include one of these decision-action frames: `new-buy checklist`, `sell signals`, `thesis-break judgment`, `hold conditions`, `risk improvement/deterioration conditions`, or `view-change conditions`.
 
 Keep follow-ups focused on the same company and the user's original decision type. Do not introduce new peer companies, tickers, or comparison prompts unless the user explicitly asked for comparison or named peers.
 

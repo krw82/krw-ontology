@@ -230,6 +230,6 @@ Normal answers should end with:
 이어서 볼 질문
 ```
 
-Include exactly 3 concise Korean follow-up questions unless the user asks for no follow-ups or asks for raw/debug/status output.
+Include exactly 3 concise Korean follow-up questions as a numbered Markdown list using `1.`, `2.`, `3.` unless the user asks for no follow-ups or asks for raw/debug/status output.
 
-Follow-ups must bridge the observed price/news move into KRW ontology research. They should ask how the candidate news connects to disclosed revenue, margin, cash flow, balance sheet, dilution, capital allocation, risk factors, or company comments. Do not use generic company research follow-ups.
+Follow-ups must bridge the observed price/news move into KRW ontology research without sounding like a compliance task. Prefer "추가로 확인" over "공시로 확인" in user-facing prompts. Ask how the candidate news connects to revenue, margin, cash flow, balance sheet, dilution, capital allocation, risk factors, or company comments. At least one follow-up should invite scenario/sensitivity work such as upside/downside/sideways checkpoints or conditions that would change the view. Do not use generic company research follow-ups.

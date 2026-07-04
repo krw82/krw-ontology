@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import shutil
 import sqlite3
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -18,8 +21,16 @@ from krw_ontology.agent_index.chart_series import query_chart_series_pack
 from krw_ontology.agent_index.builder import build_agent_index as _build_legacy_agent_index
 from krw_ontology.agent_index.store import OntologyStore
 from krw_ontology.mcp_server.http_server import prepare_mcp_runtime
+from krw_ontology.mcp_server import server as mcp_server
 from krw_ontology.mcp_server import tools as mcp_tools
-from krw_ontology.mcp_server.server import diagnostics_payload, health_payload, metrics_payload, mcp
+from krw_ontology.mcp_server.server import (
+    diagnostics_payload,
+    health_payload,
+    live_payload,
+    metrics_payload,
+    mcp,
+    ready_payload,
+)
 from krw_ontology.mcp_server.tools import (
     _normalize_object_types,
     catalog_tool,
@@ -1253,6 +1264,167 @@ def test_mcp_query_context_includes_cross_company_signal_pack(
     assert "evidence:" in markdown
 
 
+def test_mcp_query_context_uses_latest_document_anchors_for_cross_company_pack(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _write_fixture(tmp_path, period="FY2024", text="Revenue growth was slower on softer customer demand.")
+    _write_fixture(tmp_path, period="FY2026", text="Revenue growth accelerated on current customer demand.")
+    _clone_fixture_company(tmp_path, source_ticker="VG", target_ticker="XOM")
+    _build_v3_runtime(tmp_path)
+    monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
+
+    payload = json.loads(
+        query_context_tool(
+            question="Across VG and XOM, what does latest filing commentary say about revenue growth?",
+            tickers=["VG", "XOM"],
+            limit_results=5,
+        )
+    )
+
+    anchors = payload["current_document_anchors"]
+    assert anchors["VG"]["period"] == "FY2026"
+    assert anchors["XOM"]["period"] == "FY2026"
+    signal_pack = payload["research_pack"]["cross_company_signal_pack"]
+    assert signal_pack["current_document_anchors"]["VG"]["period"] == "FY2026"
+    assert {row["period"] for row in signal_pack["company_evidence_rows"]} == {"FY2026"}
+
+    markdown = query_context_tool(
+        question="Across VG and XOM, what does latest filing commentary say about revenue growth?",
+        tickers=["VG", "XOM"],
+        limit_results=5,
+        response_format=ResponseFormat.MARKDOWN,
+    )
+    assert "current_document_anchors: VG FY2026 10-K, XOM FY2026 10-K" in markdown
+
+
+def test_mcp_query_context_exposes_10q_current_driver_and_10k_annual_baseline(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _write_fixture(tmp_path, period="CY2025", text="Revenue growth reflected annual customer demand.")
+    _write_fixture(
+        tmp_path,
+        period="CY2026Q1",
+        document_type="10-Q",
+        text="Revenue growth reflected current quarter customer demand.",
+    )
+    _build_v3_runtime(tmp_path)
+    monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
+
+    payload = json.loads(
+        query_context_tool(
+            question="VG 공시상 최근 매출 성장 흐름을 확인해줘.",
+            ticker="VG",
+            limit_results=5,
+        )
+    )
+
+    roles = payload["filing_document_roles"]["VG"]
+    assert roles["current_driver"]["period"] == "CY2026Q1"
+    assert roles["current_driver"]["document_type"] == "10-Q"
+    assert roles["annual_baseline"]["period"] == "CY2025"
+    assert roles["annual_baseline"]["document_type"] == "10-K"
+    assert roles["latest_available"]["period"] == "CY2026Q1"
+    assert payload["current_document_anchors"]["VG"] == roles["current_driver"]
+    assert payload["research_pack"]["filing_document_roles"]["VG"] == roles
+
+    markdown = query_context_tool(
+        question="VG 공시상 최근 매출 성장 흐름을 확인해줘.",
+        ticker="VG",
+        limit_results=5,
+        response_format=ResponseFormat.MARKDOWN,
+    )
+    assert "filing_document_roles: VG current_driver=VG CY2026Q1 10-Q" in markdown
+    assert "annual_baseline=VG CY2025 10-K" in markdown
+
+
+def test_mcp_query_context_partial_answerable_when_one_requested_ticker_is_unknown(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _write_fixture(tmp_path)
+    _build_v3_runtime(tmp_path)
+    monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
+
+    payload = json.loads(
+        query_context_tool(
+            question="Across VG and WMT, check latest filing commentary on revenue demand.",
+            tickers=["VG", "WMT"],
+            limit_results=5,
+        )
+    )
+
+    assert payload["research_status"] == "partial_answerable_from_current_release"
+    assert payload["answerability"]["recommended_answer_mode"] == "partial_answerable_from_current_release"
+    assert payload["unknown_tickers"] == ["WMT"]
+    assert payload["partial_answerability"]["available_tickers"] == ["VG"]
+    assert payload["partial_answerability"]["missing_tickers"] == ["WMT"]
+    assert payload["current_document_anchors"]["VG"]["period"] == "FY2025"
+
+
+def test_mcp_query_prioritizes_latest_filing_when_current_intent_is_present(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _write_fixture(tmp_path, period="FY2024", text="Revenue growth reflected older customer demand.")
+    _write_fixture(tmp_path, period="FY2026", text="Revenue growth reflects current customer demand.")
+    _build_v3_runtime(tmp_path)
+    monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
+
+    payload = json.loads(query_tool(topic="latest revenue growth", ticker="VG", limit=1))
+
+    assert payload["results"][0]["period"] == "FY2026"
+    prior = payload["search_diagnostics"]["current_document_prior"]
+    assert prior["enabled"] is True
+    assert prior["latest_documents"]["VG"]["period"] == "FY2026"
+
+
+def test_mcp_query_current_prior_uses_10q_current_driver(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _write_fixture(tmp_path, period="CY2025", text="Revenue growth reflected annual customer demand.")
+    _write_fixture(
+        tmp_path,
+        period="CY2026Q1",
+        document_type="10-Q",
+        text="Revenue growth reflected current quarter customer demand.",
+    )
+    _build_v3_runtime(tmp_path)
+    monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
+
+    payload = json.loads(query_tool(topic="latest revenue growth", ticker="VG", limit=1))
+
+    assert payload["results"][0]["period"] == "CY2026Q1"
+    assert payload["results"][0]["document_type"] == "10-Q"
+    prior = payload["search_diagnostics"]["current_document_prior"]
+    assert prior["latest_documents"]["VG"]["period"] == "CY2026Q1"
+    assert prior["filing_document_roles"]["VG"]["annual_baseline"]["period"] == "CY2025"
+
+
+def test_mcp_query_does_not_override_explicit_period_with_latest_prior(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _write_fixture(tmp_path, period="FY2024", text="Revenue growth reflected older customer demand.")
+    _write_fixture(tmp_path, period="FY2026", text="Revenue growth reflects current customer demand.")
+    _build_v3_runtime(tmp_path)
+    monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
+
+    payload = json.loads(
+        query_tool(
+            topic="latest revenue growth",
+            ticker="VG",
+            periods=["FY2024"],
+            limit=1,
+        )
+    )
+
+    assert payload["results"][0]["period"] == "FY2024"
+    assert "current_document_prior" not in payload["search_diagnostics"]
+
+
 def test_mcp_query_context_stops_out_of_scope_valuation(
     tmp_path: Path,
     monkeypatch,
@@ -1341,6 +1513,7 @@ def test_mcp_query_context_attaches_chart_series_sidecar_pack(
     _write_chart_metric_fixture(tmp_path)
     index = _build_v3_runtime(tmp_path)
     monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
+    monkeypatch.setenv("KRW_CHART_SERIES_ENABLED", "1")
 
     assert index["build_result"].chart_series_path is not None
     assert index["build_result"].chart_series_path.exists()
@@ -1362,6 +1535,32 @@ def test_mcp_query_context_attaches_chart_series_sidecar_pack(
     assert [point["value"] for point in revenue["points"]] == [110.0, 130.0]
     assert revenue["basis"] == "company_reported"
     assert revenue["duration"] == "period"
+
+
+def test_mcp_query_context_does_not_attach_chart_series_sidecar_by_default(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _write_chart_metric_fixture(tmp_path)
+    index = _build_v3_runtime(tmp_path)
+    monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
+    monkeypatch.delenv("KRW_CHART_SERIES_ENABLED", raising=False)
+
+    assert index["build_result"].chart_series_path is not None
+    assert index["build_result"].chart_series_path.exists()
+
+    payload = json.loads(
+        query_context_tool(
+            question="AAPL 매출 추이 차트로 보여줘.",
+            ticker="AAPL",
+            limit_results=5,
+        )
+    )
+
+    metric_pack = payload["research_pack"]["metric_series_pack"]
+    assert metric_pack is None or metric_pack.get("mode") != "chart_series_sidecar"
+    assert "chart_series" not in payload.get("search_diagnostics", {})
+    assert "chart_series_pack" not in payload["research_pack"]
 
 
 def test_mcp_health_reports_chart_series_sidecar_status(
@@ -1891,6 +2090,200 @@ def test_mcp_health_payload_reports_manifest_counts_without_sqlite_count(
     assert payload["mcp_store_hot_swap"]["retired_global_spine_stores"] == []
 
 
+def test_mcp_tool_lane_runs_blocking_work_off_event_loop():
+    def blocking_work() -> int:
+        return threading.get_ident()
+
+    async def run() -> tuple[int, int]:
+        loop_thread_id = threading.get_ident()
+        worker_thread_id = await mcp_server._run_tool_in_lane("fast", blocking_work)
+        return loop_thread_id, worker_thread_id
+
+    loop_thread_id, worker_thread_id = asyncio.run(run())
+
+    assert worker_thread_id != loop_thread_id
+
+
+def test_mcp_broad_lane_limits_blocking_work_concurrency(monkeypatch):
+    monkeypatch.setenv("KRW_MCP_BROAD_LANE_CONCURRENCY", "1")
+    active = 0
+    max_active = 0
+    lock = threading.Lock()
+
+    def blocking_work() -> str:
+        nonlocal active, max_active
+        with lock:
+            active += 1
+            max_active = max(max_active, active)
+        try:
+            time.sleep(0.02)
+            return "ok"
+        finally:
+            with lock:
+                active -= 1
+
+    async def run() -> list[str]:
+        return await asyncio.gather(
+            mcp_server._run_tool_in_lane("broad", blocking_work),
+            mcp_server._run_tool_in_lane("broad", blocking_work),
+        )
+
+    assert asyncio.run(run()) == ["ok", "ok"]
+    assert max_active == 1
+
+
+def test_mcp_query_context_wrapper_routes_tickerless_calls_to_broad_lane(monkeypatch):
+    calls: list[dict[str, Any]] = []
+
+    async def fake_run_tool_in_lane(lane: str, func, **kwargs):
+        calls.append({"lane": lane, "func": func, "kwargs": kwargs})
+        return "ok"
+
+    monkeypatch.setattr(mcp_server, "_run_tool_in_lane", fake_run_tool_in_lane)
+
+    result = asyncio.run(mcp_server.krw_ontology_query_context(question="AI datacenter beneficiaries"))
+
+    assert result == "ok"
+    assert calls[0]["lane"] == "broad"
+    assert calls[0]["func"] is mcp_server.query_context_tool
+
+
+def test_mcp_query_context_wrapper_routes_scoped_calls_to_fast_lane(monkeypatch):
+    calls: list[dict[str, Any]] = []
+
+    async def fake_run_tool_in_lane(lane: str, func, **kwargs):
+        calls.append({"lane": lane, "func": func, "kwargs": kwargs})
+        return "ok"
+
+    monkeypatch.setattr(mcp_server, "_run_tool_in_lane", fake_run_tool_in_lane)
+
+    result = asyncio.run(mcp_server.krw_ontology_query_context(question="AI capex", ticker="AAPL"))
+
+    assert result == "ok"
+    assert calls[0]["lane"] == "fast"
+    assert calls[0]["kwargs"]["ticker"] == "AAPL"
+
+
+def test_spine_router_tickerless_query_context_caps_candidate_fanout(monkeypatch):
+    monkeypatch.delenv("KRW_ROUTER_TICKERLESS_QUERY_CONTEXT_MAX_TICKERS", raising=False)
+    router = object.__new__(OntologySpineRouter)
+    captured: dict[str, Any] = {}
+
+    def fake_candidate_tickers(question: str, *, explicit_tickers, limit: int) -> list[str]:
+        captured["question"] = question
+        captured["explicit_tickers"] = explicit_tickers
+        captured["candidate_limit"] = limit
+        return ["AAPL", "MSFT", "NVDA", "AVGO", "META"]
+
+    def fake_store_fanout(tickers, callback):
+        captured["fanout_tickers"] = list(tickers)
+        return {}, {}, 0
+
+    router._candidate_tickers = fake_candidate_tickers
+    router._store_fanout = fake_store_fanout
+    router._route_payload = lambda mode, tickers: {"mode": mode, "tickers": list(tickers)}
+    router._fanout_diagnostics = lambda worker_count, errors: {
+        "fanout_parallel": False,
+        "fanout_workers": worker_count,
+    }
+    router._attach_missing_release_parts = lambda payload, tickers: None
+    router.list_documents = lambda: []
+    router._chart_series_path = Path("chart_series.sqlite")
+    router._chart_series_status = {}
+
+    payload = OntologySpineRouter.query_context(
+        router,
+        question="AI datacenter beneficiaries",
+        limit_tickers=20,
+    )
+
+    assert captured["candidate_limit"] == 5
+    assert captured["fanout_tickers"] == ["AAPL", "MSFT", "NVDA", "AVGO", "META"]
+    assert payload["routing"]["requested_limit_tickers"] == 20
+    assert payload["routing"]["effective_limit_tickers"] == 5
+    assert payload["routing"]["tickerless_candidate_cap"] == 5
+
+
+def test_spine_router_scoped_query_context_keeps_requested_candidate_limit(monkeypatch):
+    monkeypatch.delenv("KRW_ROUTER_TICKERLESS_QUERY_CONTEXT_MAX_TICKERS", raising=False)
+    router = object.__new__(OntologySpineRouter)
+    captured: dict[str, Any] = {}
+
+    def fake_candidate_tickers(question: str, *, explicit_tickers, limit: int) -> list[str]:
+        captured["explicit_tickers"] = list(explicit_tickers or [])
+        captured["candidate_limit"] = limit
+        return list(explicit_tickers or [])
+
+    def fake_store_fanout(tickers, callback):
+        captured["fanout_tickers"] = list(tickers)
+        return {}, {}, 0
+
+    router._candidate_tickers = fake_candidate_tickers
+    router._store_fanout = fake_store_fanout
+    router._route_payload = lambda mode, tickers: {"mode": mode, "tickers": list(tickers)}
+    router._fanout_diagnostics = lambda worker_count, errors: {
+        "fanout_parallel": False,
+        "fanout_workers": worker_count,
+    }
+    router._attach_missing_release_parts = lambda payload, tickers: None
+    router.list_documents = lambda: []
+    router._chart_series_path = Path("chart_series.sqlite")
+    router._chart_series_status = {}
+
+    payload = OntologySpineRouter.query_context(
+        router,
+        question="AI capex",
+        tickers=["AAPL", "MSFT", "NVDA"],
+        limit_tickers=20,
+    )
+
+    assert captured["candidate_limit"] == 20
+    assert captured["fanout_tickers"] == ["AAPL", "MSFT", "NVDA"]
+    assert payload["routing"]["requested_limit_tickers"] == 20
+    assert payload["routing"]["effective_limit_tickers"] == 20
+    assert "tickerless_candidate_cap" not in payload["routing"]
+
+
+def test_mcp_live_payload_does_not_read_release_state(monkeypatch):
+    def fail_load_manifest(*_args, **_kwargs):
+        raise AssertionError("live_payload must not inspect release state")
+
+    monkeypatch.setattr("krw_ontology.mcp_server.server.load_release_manifest", fail_load_manifest)
+
+    payload, status_code = live_payload()
+
+    assert status_code == 200
+    assert payload == {"ok": True, "service": "krw_ontology_mcp"}
+
+
+def test_mcp_ready_payload_skips_runtime_cache_for_worker_admission(
+    tmp_path: Path,
+    monkeypatch,
+):
+    current = _write_v3_current_release(tmp_path, release_id="20260612_020000")
+
+    def fail_runtime_cache_status():
+        raise AssertionError("ready_payload must not inspect runtime store/cache state")
+
+    def fail_connect(*_args, **_kwargs):
+        raise AssertionError("ready_payload must not open SQLite")
+
+    monkeypatch.setattr("krw_ontology.mcp_server.server.mcp_runtime_cache_status", fail_runtime_cache_status)
+    monkeypatch.setattr("krw_ontology.mcp_server.server.sqlite3.connect", fail_connect)
+
+    payload, status_code = ready_payload(root=str(current))
+
+    assert status_code == 200
+    assert payload["ok"] is True
+    assert payload["root"] == str(current.resolve())
+    assert payload["documents"] == 2
+    assert payload["objects"] >= 1
+    assert payload["sqlite_checked"] is False
+    assert "krw_ontology_topic_map" in payload["tools"]
+    assert "cache" not in payload
+    assert "mcp_store_hot_swap" not in payload
+
+
 def test_mcp_metrics_payload_exposes_release_and_hot_swap_metrics(tmp_path: Path):
     current = _write_v3_current_release(tmp_path, release_id="20260612_020000")
 
@@ -1941,29 +2334,32 @@ def _write_fixture(
     *,
     period: str = "FY2025",
     text: str = "Revenue growth accelerated because customer demand increased for LNG volumes.",
+    document_type: str = "10-K",
+    doc_type_key: str | None = None,
 ) -> None:
-    ontology_dir = root / "companies" / "VG" / "ontology" / "10K" / period
-    sources_dir = root / "companies" / "VG" / "sources" / "10K" / period
+    doc_key = doc_type_key or document_type.replace("-", "")
+    ontology_dir = root / "companies" / "VG" / "ontology" / doc_key / period
+    sources_dir = root / "companies" / "VG" / "sources" / doc_key / period
     ontology_dir.mkdir(parents=True)
     sources_dir.mkdir(parents=True)
 
-    source_document_id = f"source:VG:{period}:10K"
-    span_id = f"span:VG:{period}:10K:0001"
-    quote_id = f"quote:VG:{period}:10K:0001"
-    claim_id = f"claim:VG:{period}:10K:revenue-growth"
-    risk_claim_id = f"claim:VG:{period}:10K:regulatory-risk"
-    driver_id = f"business_factor:VG:{period}:10K:revenue-growth"
-    risk_id = f"business_factor:VG:{period}:10K:regulatory-risk"
-    unsupported_risk_id = f"business_factor:VG:{period}:10K:unsupported-risk"
-    activity_id = f"business_activity:VG:{period}:10K:lng-sales"
-    exposure_id = f"external_factor_exposure:VG:{period}:10K:natural-gas-price-operating-margin"
-    agreement_id = f"agreement:VG:{period}:10K:spa-termination"
+    source_document_id = f"source:VG:{period}:{doc_key}"
+    span_id = f"span:VG:{period}:{doc_key}:0001"
+    quote_id = f"quote:VG:{period}:{doc_key}:0001"
+    claim_id = f"claim:VG:{period}:{doc_key}:revenue-growth"
+    risk_claim_id = f"claim:VG:{period}:{doc_key}:regulatory-risk"
+    driver_id = f"business_factor:VG:{period}:{doc_key}:revenue-growth"
+    risk_id = f"business_factor:VG:{period}:{doc_key}:regulatory-risk"
+    unsupported_risk_id = f"business_factor:VG:{period}:{doc_key}:unsupported-risk"
+    activity_id = f"business_activity:VG:{period}:{doc_key}:lng-sales"
+    exposure_id = f"external_factor_exposure:VG:{period}:{doc_key}:natural-gas-price-operating-margin"
+    agreement_id = f"agreement:VG:{period}:{doc_key}:spa-termination"
     span = {
         "id": span_id,
         "type": "SourceSpan",
         "ticker": "VG",
         "source_document_id": source_document_id,
-        "document_type": "10-K",
+        "document_type": document_type,
         "period": period,
         "section_name": "item7",
         "section_key": "item7",
@@ -1976,7 +2372,7 @@ def _write_fixture(
         "type": "EvidenceQuote",
         "ticker": "VG",
         "source_document_id": source_document_id,
-        "document_type": "10-K",
+        "document_type": document_type,
         "period": period,
         "source_span_id": span_id,
         "quote_text": text,
@@ -1989,7 +2385,7 @@ def _write_fixture(
         "type": "ResearchClaim",
         "ticker": "VG",
         "source_document_id": source_document_id,
-        "document_type": "10-K",
+        "document_type": document_type,
         "period": period,
         "claim_text": "Revenue growth accelerated because customer demand increased.",
         "claim_type": "business_update",
@@ -2002,7 +2398,7 @@ def _write_fixture(
         "type": "ResearchClaim",
         "ticker": "VG",
         "source_document_id": source_document_id,
-        "document_type": "10-K",
+        "document_type": document_type,
         "period": period,
         "claim_text": "Regulatory risk could delay project approvals.",
         "claim_type": "risk_assessment",
@@ -2015,7 +2411,7 @@ def _write_fixture(
         "type": "BusinessFactor",
         "ticker": "VG",
         "source_document_id": source_document_id,
-        "document_type": "10-K",
+        "document_type": document_type,
         "period": period,
         "name": "Revenue growth",
         "factor_roles": ["growth_driver"],
@@ -2029,7 +2425,7 @@ def _write_fixture(
         "type": "BusinessFactor",
         "ticker": "VG",
         "source_document_id": source_document_id,
-        "document_type": "10-K",
+        "document_type": document_type,
         "period": period,
         "name": "Regulatory risk",
         "factor_roles": ["risk"],
@@ -2043,7 +2439,7 @@ def _write_fixture(
         "type": "BusinessFactor",
         "ticker": "VG",
         "source_document_id": source_document_id,
-        "document_type": "10-K",
+        "document_type": document_type,
         "period": period,
         "name": "Unsupported risk",
         "factor_roles": ["risk"],
@@ -2057,7 +2453,7 @@ def _write_fixture(
         "type": "BusinessActivity",
         "ticker": "VG",
         "source_document_id": source_document_id,
-        "document_type": "10-K",
+        "document_type": document_type,
         "period": period,
         "name": "LNG sales",
         "activity_type": "lng_sales",
@@ -2071,7 +2467,7 @@ def _write_fixture(
         "type": "ExternalFactorExposure",
         "ticker": "VG",
         "source_document_id": source_document_id,
-        "document_type": "10-K",
+        "document_type": document_type,
         "period": period,
         "factor": "natural_gas_price",
         "factor_category": "commodity_price",
@@ -2088,7 +2484,7 @@ def _write_fixture(
         "type": "AgreementTerm",
         "ticker": "VG",
         "source_document_id": source_document_id,
-        "document_type": "10-K",
+        "document_type": document_type,
         "period": period,
         "name": "SPA termination and debt acceleration",
         "agreement_type": "sale and purchase agreement",
@@ -2106,7 +2502,7 @@ def _write_fixture(
             "type": "Edge",
             "ticker": "VG",
             "source_document_id": source_document_id,
-            "document_type": "10-K",
+            "document_type": document_type,
             "period": period,
             "from_id": quote_id,
             "to_id": claim_id,
@@ -2119,7 +2515,7 @@ def _write_fixture(
             "type": "Edge",
             "ticker": "VG",
             "source_document_id": source_document_id,
-            "document_type": "10-K",
+            "document_type": document_type,
             "period": period,
             "from_id": claim_id,
             "to_id": driver_id,
@@ -2132,7 +2528,7 @@ def _write_fixture(
             "type": "Edge",
             "ticker": "VG",
             "source_document_id": source_document_id,
-            "document_type": "10-K",
+            "document_type": document_type,
             "period": period,
             "from_id": risk_claim_id,
             "to_id": risk_id,
@@ -2158,18 +2554,18 @@ def _write_fixture(
         ontology_dir / "artifact_index.json",
         {
             "ticker": "VG",
-            "document_type": "10-K",
-            "doc_type_key": "10K",
+            "document_type": document_type,
+            "doc_type_key": doc_key,
             "period": period,
             "files": {
-                "spans": f"companies/VG/ontology/10K/{period}/spans.jsonl",
-                "evidence_quotes": f"companies/VG/ontology/10K/{period}/evidence_quotes.jsonl",
-                "claims": f"companies/VG/ontology/10K/{period}/claims.jsonl",
-                "business_factors": f"companies/VG/ontology/10K/{period}/business_factors.jsonl",
-                "business_activities": f"companies/VG/ontology/10K/{period}/business_activities.jsonl",
-                "external_factor_exposures": f"companies/VG/ontology/10K/{period}/external_factor_exposures.jsonl",
-                "agreement_terms": f"companies/VG/ontology/10K/{period}/agreement_terms.jsonl",
-                "edges": f"companies/VG/ontology/10K/{period}/edges.jsonl",
+                "spans": f"companies/VG/ontology/{doc_key}/{period}/spans.jsonl",
+                "evidence_quotes": f"companies/VG/ontology/{doc_key}/{period}/evidence_quotes.jsonl",
+                "claims": f"companies/VG/ontology/{doc_key}/{period}/claims.jsonl",
+                "business_factors": f"companies/VG/ontology/{doc_key}/{period}/business_factors.jsonl",
+                "business_activities": f"companies/VG/ontology/{doc_key}/{period}/business_activities.jsonl",
+                "external_factor_exposures": f"companies/VG/ontology/{doc_key}/{period}/external_factor_exposures.jsonl",
+                "agreement_terms": f"companies/VG/ontology/{doc_key}/{period}/agreement_terms.jsonl",
+                "edges": f"companies/VG/ontology/{doc_key}/{period}/edges.jsonl",
             },
             "counts": {
                 "spans": 1,

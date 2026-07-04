@@ -50,12 +50,12 @@ Do not expose internal object or schema labels.
 
 ## Follow-Ups
 
-End with exactly three short same-company prompts the user can send immediately.
+End with exactly three short same-company prompts the user can send immediately. Render them as a numbered Markdown list using `1.`, `2.`, `3.`.
 
 Use this pattern:
 
 ```text
-- 이 판단이 강해지는 회사 코멘트만 정리해줘.
-- 하방 시나리오에서 현금이 먼저 압박받는 경로를 더 자세히 봐줘.
-- 다음 공시에서 가정 파기 신호만 확인해줘.
+1. 이 판단이 강해지는 회사 코멘트만 정리해줘.
+2. 하방 시나리오에서 현금이 먼저 압박받는 경로를 더 자세히 봐줘.
+3. 다음 실적 업데이트에서 가정 파기 신호만 확인해줘.
 ```

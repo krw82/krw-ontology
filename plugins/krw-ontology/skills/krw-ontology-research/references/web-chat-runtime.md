@@ -41,7 +41,7 @@ Normal answers should end with:
 ### 이어서 볼 질문
 ```
 
-Include exactly 3 concise Korean follow-up prompts. Write them as direct prompts the user can send immediately, not as abstract analyst research topics. Do not run tools to create them. Do not call them chains. Do not mention internal concepts.
+Include exactly 3 concise Korean follow-up prompts as a numbered Markdown list using `1.`, `2.`, `3.`. Write them as direct prompts the user can send immediately, not as abstract analyst research topics. Do not run tools to create them. Do not call them chains. Do not mention internal concepts.
 
 Default pattern:
 
@@ -51,12 +51,14 @@ Default pattern:
 3. opposite view such as weak assumptions, thesis-break signals, or conflicting company comments
 ```
 
+At least one normal follow-up should naturally route to scenario/sensitivity work, usually by asking for upside/downside/sideways checkpoints or judgment-change conditions.
+
 For normal research answers, prefer prompts like:
 
 ```text
-- 이 이슈가 실적에 연결되는 경로만 더 단순하게 정리해줘.
-- 좋게 볼 근거와 나쁘게 볼 근거를 나눠줘.
-- 가장 먼저 확인해야 할 회사 코멘트 3개만 뽑아줘.
+1. 이 판단이 유지되는 조건과 깨지는 조건을 나눠줘.
+2. 상승·하락·횡보 시나리오별 체크포인트를 보여줘.
+3. 반대로 봐야 할 리스크 신호만 따로 정리해줘.
 ```
 
 Avoid prompts that require the user to know specific filings, quarters, accounting terms, valuation models, or personal investment inputs.

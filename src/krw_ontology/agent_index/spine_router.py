@@ -15,7 +15,11 @@ from krw_ontology.agent_index.chart_series import (
     chart_series_index_status,
     query_chart_series_pack,
 )
-from krw_ontology.agent_index.store import OntologyStore
+from krw_ontology.agent_index.store import (
+    OntologyStore,
+    filing_document_roles_from_documents,
+    latest_document_anchors_from_documents,
+)
 from krw_ontology.agent_index.spine_schema import (
     GLOBAL_SPINE_LAYOUT,
     GLOBAL_SPINE_SCHEMA_VERSION,
@@ -24,8 +28,12 @@ from krw_ontology.agent_index.spine_schema import (
 )
 
 _ROUTER_FANOUT_WORKERS_ENV = "KRW_ROUTER_FANOUT_WORKERS"
+_CHART_SERIES_ENABLED_ENV = "KRW_CHART_SERIES_ENABLED"
+_TICKERLESS_QUERY_CONTEXT_MAX_TICKERS_ENV = "KRW_ROUTER_TICKERLESS_QUERY_CONTEXT_MAX_TICKERS"
 _DEFAULT_ROUTER_FANOUT_WORKERS = 8
 _MAX_ROUTER_FANOUT_WORKERS = 16
+_DEFAULT_TICKERLESS_QUERY_CONTEXT_MAX_TICKERS = 5
+_TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
 
 
 class OntologySpineRouter:
@@ -282,10 +290,16 @@ class OntologySpineRouter:
         **kwargs: Any,
     ) -> dict[str, Any]:
         scoped_tickers = _normalize_tickers([ticker] if ticker else tickers)
+        requested_limit_tickers = max(1, int(limit_tickers or 5))
+        candidate_limit = (
+            requested_limit_tickers
+            if scoped_tickers
+            else _tickerless_query_context_limit(requested_limit_tickers)
+        )
         candidate_tickers = self._candidate_tickers(
             question,
             explicit_tickers=scoped_tickers,
-            limit=max(1, int(limit_tickers or 5)),
+            limit=candidate_limit,
         )
         route_tickers = scoped_tickers or candidate_tickers
         contexts: list[dict[str, Any]] = []
@@ -308,7 +322,20 @@ class OntologySpineRouter:
             payload = contexts[0]
             payload["routing"] = self._route_payload("company_shard", route_tickers)
             payload["routing"].update(self._fanout_diagnostics(worker_count, shard_errors))
+            payload["routing"].update(
+                _candidate_budget_payload(
+                    scoped=bool(scoped_tickers),
+                    requested_limit=requested_limit_tickers,
+                    effective_limit=candidate_limit,
+                )
+            )
             self._attach_missing_release_parts(payload, route_tickers)
+            _attach_current_document_anchors(
+                payload,
+                requested_tickers=route_tickers,
+                available_tickers=candidate_tickers,
+                documents=self.list_documents(),
+            )
             _attach_spine_cross_company_pack(
                 payload,
                 question=question,
@@ -326,12 +353,25 @@ class OntologySpineRouter:
             return payload
         routing = self._route_payload("global_spine_fanout", route_tickers)
         routing.update(self._fanout_diagnostics(worker_count, shard_errors))
+        routing.update(
+            _candidate_budget_payload(
+                scoped=bool(scoped_tickers),
+                requested_limit=requested_limit_tickers,
+                effective_limit=candidate_limit,
+            )
+        )
         payload = _merge_query_contexts(
             contexts,
             question=question,
             routing=routing,
         )
         self._attach_missing_release_parts(payload, route_tickers)
+        _attach_current_document_anchors(
+            payload,
+            requested_tickers=route_tickers,
+            available_tickers=candidate_tickers,
+            documents=self.list_documents(),
+        )
         _attach_spine_cross_company_pack(
             payload,
             question=question,
@@ -1149,10 +1189,12 @@ class OntologySpineRouter:
         }
 
     def _attach_missing_release_parts(self, payload: dict[str, Any], tickers: Iterable[str] | None) -> None:
+        normalized = _normalize_tickers(tickers) or []
         missing_shards = self._missing_shards_for_tickers(tickers)
         unknown_tickers = self._unknown_tickers(tickers)
         if not missing_shards and not unknown_tickers:
             return
+        available_tickers = [ticker for ticker in normalized if ticker in self._shard_paths]
         payload["missing_shards"] = missing_shards
         payload["unknown_tickers"] = unknown_tickers
         missing_parts = list(payload.get("missing_parts") or [])
@@ -1161,6 +1203,41 @@ class OntologySpineRouter:
         if unknown_tickers and "ticker_shard_not_found" not in missing_parts:
             missing_parts.append("ticker_shard_not_found")
         payload["missing_parts"] = missing_parts
+        if available_tickers:
+            payload["research_status"] = "partial_answerable_from_current_release"
+            payload["answerability"] = {
+                **(
+                    payload.get("answerability")
+                    if isinstance(payload.get("answerability"), Mapping)
+                    else {}
+                ),
+                "direct_answerable": True,
+                "related_context_available": True,
+                "negative_answer_supported": False,
+                "needs_user_clarification": False,
+                "recommended_answer_mode": "partial_answerable_from_current_release",
+            }
+            autonomy = (
+                dict(payload.get("agent_autonomy"))
+                if isinstance(payload.get("agent_autonomy"), Mapping)
+                else {}
+            )
+            if autonomy.get("mode") == "blocked_by_release_integrity":
+                autonomy.pop("allowed_next_tools", None)
+                autonomy.pop("max_additional_tool_calls", None)
+            autonomy.setdefault("mode", "bounded")
+            autonomy.setdefault("may_continue_research", True)
+            payload["agent_autonomy"] = autonomy
+            payload["partial_answerability"] = {
+                "available_tickers": available_tickers,
+                "missing_tickers": [ticker for ticker in normalized if ticker not in available_tickers],
+                "instruction": (
+                    "Answer using available tickers only, state missing tickers briefly, "
+                    "and do not treat one missing shard as a failure for the whole basket."
+                ),
+            }
+            return
+
         payload.setdefault("research_status", "not_answerable_from_current_release")
         payload.setdefault(
             "answerability",
@@ -1210,6 +1287,40 @@ def _merge_query_contexts(
     }
 
 
+def _attach_current_document_anchors(
+    payload: dict[str, Any],
+    *,
+    requested_tickers: Sequence[str] | None,
+    available_tickers: Sequence[str],
+    documents: Sequence[Mapping[str, Any]],
+) -> None:
+    requested = [ticker for ticker in (requested_tickers or []) if ticker]
+    available = [ticker for ticker in available_tickers if ticker]
+    anchor_tickers = available or requested
+    roles = filing_document_roles_from_documents(documents, tickers=anchor_tickers)
+    anchors = latest_document_anchors_from_documents(documents, tickers=anchor_tickers)
+    if not anchors and not roles:
+        return
+    policy = (
+        "Use current_driver for latest/current changes and annual_baseline for business mix, "
+        "segment structure, and long-term baseline. Only 10-Q and 10-K filings are used for these roles."
+    )
+    payload["current_document_anchors"] = anchors
+    payload["current_document_anchor_policy"] = policy
+    payload["filing_document_roles"] = roles
+    payload["filing_document_role_policy"] = policy
+    research_pack = payload.setdefault("research_pack", {})
+    if isinstance(research_pack, dict):
+        research_pack["current_document_anchors"] = anchors
+        research_pack["current_document_anchor_policy"] = policy
+        research_pack["filing_document_roles"] = roles
+        research_pack["filing_document_role_policy"] = policy
+    routing = payload.get("routing")
+    if isinstance(routing, dict):
+        routing["current_document_anchors"] = anchors
+        routing["filing_document_roles"] = roles
+
+
 def _attach_spine_cross_company_pack(
     payload: dict[str, Any],
     *,
@@ -1228,19 +1339,20 @@ def _attach_spine_cross_company_pack(
     if isinstance(existing, Mapping) and existing:
         return
     available = [ticker for ticker in available_tickers if ticker]
-    document_by_ticker: dict[str, Mapping[str, Any]] = {}
-    for document in documents:
-        ticker = str(document.get("ticker") or "").upper()
-        if ticker and ticker not in document_by_ticker:
-            document_by_ticker[ticker] = document
+    roles_by_ticker = filing_document_roles_from_documents(documents, tickers=available)
+    document_by_ticker = latest_document_anchors_from_documents(documents, tickers=available)
     evidence_rows: list[dict[str, Any]] = []
     for ticker in available:
         document = document_by_ticker.get(ticker, {})
+        roles = roles_by_ticker.get(ticker, {})
+        annual_baseline = roles.get("annual_baseline") if isinstance(roles, Mapping) else None
         evidence_rows.append(
             {
                 "ticker": ticker,
                 "period": document.get("period"),
                 "document_type": document.get("document_type"),
+                "current_driver": document,
+                "annual_baseline": annual_baseline if isinstance(annual_baseline, Mapping) else None,
                 "signal": "filing_commentary",
                 "evidence_strength": "medium",
                 "commentary_summary": (
@@ -1252,6 +1364,13 @@ def _attach_spine_cross_company_pack(
     research_pack["cross_company_signal_pack"] = {
         "mode": "cross_company_signal_synthesis",
         "answer_policy": "Use this as compact cross-company evidence; cite shard evidence before strong claims.",
+        "latest_period_anchor": ", ".join(
+            str(anchor.get("source_label") or "")
+            for anchor in document_by_ticker.values()
+            if isinstance(anchor, Mapping)
+        ),
+        "current_document_anchors": document_by_ticker,
+        "filing_document_roles": roles_by_ticker,
         "ticker_basket": requested,
         "available_tickers": available,
         "missing_tickers": [ticker for ticker in requested if ticker not in available],
@@ -1278,6 +1397,8 @@ def _attach_chart_series_pack(
     chart_series_path: Path,
     chart_series_status: Mapping[str, Any],
 ) -> None:
+    if not _chart_series_runtime_enabled():
+        return
     if not _should_attach_chart_series(question):
         return
     research_pack = payload.setdefault("research_pack", {})
@@ -1310,6 +1431,11 @@ def _attach_chart_series_pack(
         research_pack["dynamic_metric_series_pack"] = existing
     research_pack["chart_series_pack"] = pack
     research_pack["metric_series_pack"] = pack
+
+
+def _chart_series_runtime_enabled() -> bool:
+    raw = os.getenv(_CHART_SERIES_ENABLED_ENV)
+    return str(raw or "").strip().lower() in _TRUE_ENV_VALUES
 
 
 def _should_attach_chart_series(question: str) -> bool:
@@ -1448,6 +1574,35 @@ def _read_int_env(name: str, default: int, *, min_value: int) -> int:
     except ValueError:
         return default
     return value if value >= min_value else default
+
+
+def _tickerless_query_context_limit(requested_limit: int) -> int:
+    cap = _read_int_env(
+        _TICKERLESS_QUERY_CONTEXT_MAX_TICKERS_ENV,
+        _DEFAULT_TICKERLESS_QUERY_CONTEXT_MAX_TICKERS,
+        min_value=1,
+    )
+    return max(1, min(max(1, int(requested_limit)), cap))
+
+
+def _candidate_budget_payload(
+    *,
+    scoped: bool,
+    requested_limit: int,
+    effective_limit: int,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "candidate_stage": "global_spine",
+        "requested_limit_tickers": max(1, int(requested_limit)),
+        "effective_limit_tickers": max(1, int(effective_limit)),
+    }
+    if not scoped:
+        payload["tickerless_candidate_cap"] = _read_int_env(
+            _TICKERLESS_QUERY_CONTEXT_MAX_TICKERS_ENV,
+            _DEFAULT_TICKERLESS_QUERY_CONTEXT_MAX_TICKERS,
+            min_value=1,
+        )
+    return payload
 
 
 def _fanout_error(exc: Exception) -> str:

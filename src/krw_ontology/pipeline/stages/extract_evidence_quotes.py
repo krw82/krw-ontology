@@ -685,6 +685,7 @@ async def _extract_batch_with_split_retry(
     worker: ExtractionWorker,
     batch: list[dict],
     batch_index: int,
+    split_depth: int = 0,
     failures_path: Path,
     ticker: str,
     doc_type: str,
@@ -698,7 +699,15 @@ async def _extract_batch_with_split_retry(
         return [], 0
 
     try:
-        return await _extract_candidate_batch(worker, candidates, stage_name), 0
+        return await _extract_candidate_batch(
+            worker,
+            candidates,
+            stage_name,
+            batch_index=batch_index,
+            span_count=len(batch),
+            candidate_count=len(candidates),
+            split_depth=split_depth,
+        ), 0
     except RateLimitError as e:
         batch_span_ids = [s["id"] for s in batch]
         logger.warning(
@@ -757,6 +766,7 @@ async def _extract_batch_with_split_retry(
             worker=worker,
             batch=batch[:midpoint],
             batch_index=batch_index * 10 + 1,
+            split_depth=split_depth + 1,
             failures_path=failures_path,
             ticker=ticker,
             doc_type=doc_type,
@@ -769,6 +779,7 @@ async def _extract_batch_with_split_retry(
             worker=worker,
             batch=batch[midpoint:],
             batch_index=batch_index * 10 + 2,
+            split_depth=split_depth + 1,
             failures_path=failures_path,
             ticker=ticker,
             doc_type=doc_type,
@@ -794,6 +805,11 @@ async def _extract_candidate_batch(
     worker: ExtractionWorker,
     candidates: list[dict],
     stage_name: str,
+    *,
+    batch_index: int,
+    span_count: int,
+    candidate_count: int,
+    split_depth: int,
 ) -> list[dict]:
     input_data = {
         "candidates_json": json.dumps(
@@ -811,7 +827,17 @@ async def _extract_candidate_batch(
         "signal_types": ", ".join(SIGNAL_TYPES),
     }
     return await worker.extract(
-        QUOTE_EXTRACTION_PROMPT, input_data, _SCHEMA, stage_name
+        QUOTE_EXTRACTION_PROMPT,
+        input_data,
+        _SCHEMA,
+        stage_name,
+        call_metadata={
+            "batch_index": batch_index,
+            "span_count": span_count,
+            "candidate_count": candidate_count,
+            "split_retry": split_depth > 0,
+            "split_depth": split_depth,
+        },
     )
 
 

@@ -41,7 +41,9 @@ Normal answers should end with:
 Next Questions To Dig Into
 ```
 
-Include exactly 3 concise English questions. Do not run tools to create them. Do not call them chains. Do not mention internal concepts.
+Include exactly 3 concise English questions as a numbered Markdown list using `1.`, `2.`, `3.`. Do not run tools to create them. Do not call them chains. Do not mention internal concepts.
+
+At least one normal follow-up should naturally route to scenario/sensitivity work, usually by asking for upside/downside/sideways checkpoints or judgment-change conditions.
 
 ## Evidence handling
 

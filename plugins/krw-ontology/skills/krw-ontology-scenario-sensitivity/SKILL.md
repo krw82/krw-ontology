@@ -56,6 +56,7 @@ These rules govern:
 ```text
 internal English investment briefs
 query_context-first research
+MCP `filing_document_roles` for current_driver / annual_baseline
 latest 10-Q as current driver
 latest 10-K as annual business baseline
 selected trace/chain verification

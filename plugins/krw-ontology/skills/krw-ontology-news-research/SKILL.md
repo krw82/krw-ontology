@@ -293,6 +293,8 @@ filing period = financial baseline period
 
 If `CY2025 10-K` and `CY2026Q1 10-Q` are both available, use `CY2026Q1` as the current driver and `CY2025` as annual/business baseline.
 
+When MCP returns `filing_document_roles`, follow it over generic document ordering: `current_driver` is the latest 10-Q when available, otherwise latest 10-K; `annual_baseline` is the latest 10-K; `current_document_anchors` is only compatibility shorthand for `current_driver`.
+
 ## 11. Financial Interpretation Guardrails
 
 Preserve these accounting boundaries:
@@ -372,12 +374,12 @@ Use investor-facing language:
 Normal answers should end with:
 
 ```text
-다음으로 파고들 질문
+이어서 볼 질문
 ```
 
-Include exactly 3 concise Korean questions unless the user explicitly asks for no follow-ups, asks for raw/debug/status output, or the answer is a very short clarification.
+Include exactly 3 concise Korean questions as a numbered Markdown list using `1.`, `2.`, `3.` unless the user explicitly asks for no follow-ups, asks for raw/debug/status output, or the answer is a very short clarification.
 
-Do not run tools to create follow-up questions.
+Do not run tools to create follow-up questions. Prefer "추가로 확인" over "공시로 확인" in user-facing follow-up prompts. At least one follow-up should invite scenario/sensitivity work such as upside/downside/sideways checkpoints or conditions that would change the view.
 
 ## 16. References
 

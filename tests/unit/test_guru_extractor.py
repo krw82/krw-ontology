@@ -4,7 +4,9 @@ import asyncio
 import json
 from pathlib import Path
 
+from krw_ontology.errors import RateLimitError
 from krw_ontology.guru.extractor import (
+    _build_batches,
     _normalize_candidate_payload,
     build_extraction_prompt,
     extract_guru_ontology,
@@ -153,6 +155,80 @@ def test_extract_guru_ontology_executes_batches_concurrently(tmp_path: Path):
     ]
     assert manifest.concurrency == 2
     assert worker.max_active_calls == 2
+
+
+def test_extract_guru_ontology_splits_failed_batch(tmp_path: Path):
+    root, running_root = _write_parsed_workspace(tmp_path, span_count=2)
+
+    class FakeWorker:
+        def __init__(self):
+            self.calls: list[int] = []
+
+        async def extract(self, _prompt_template, input_data, _output_schema, _stage_name, **_kwargs):
+            spans = json.loads(input_data["span_payload_json"])
+            self.calls.append(len(spans))
+            if len(spans) > 1:
+                raise TimeoutError("batch too large")
+            span = spans[0]
+            return [
+                {
+                    "candidate_id": f"marks:concept:{span['span_id'].split(':')[-1]}",
+                    "author_key": "marks",
+                    "object_type": "concept",
+                    "label_ko": "분할 재시도 후보",
+                    "summary_ko": "큰 배치를 쪼갠 뒤 보존된 후보.",
+                    "supporting_span_ids": [span["span_id"]],
+                    "confidence": "medium",
+                }
+            ]
+
+    worker = FakeWorker()
+    manifest = extract_guru_ontology(
+        root,
+        running_root=running_root,
+        execute_agent_sdk=True,
+        model="claude-test",
+        batch_spans=2,
+        worker=worker,
+    )
+
+    assert worker.calls == [2, 1, 1]
+    assert manifest.batches[0].status == "completed"
+    assert manifest.batches[0].error is None
+    rows = [
+        json.loads(line)
+        for line in (running_root / "generated" / "ontology_candidates.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert len(rows) == 2
+
+
+def test_extract_guru_ontology_does_not_split_rate_limited_batch(tmp_path: Path):
+    root, running_root = _write_parsed_workspace(tmp_path, span_count=2)
+
+    class FakeWorker:
+        def __init__(self):
+            self.calls: list[int] = []
+
+        async def extract(self, _prompt_template, input_data, _output_schema, _stage_name, **_kwargs):
+            spans = json.loads(input_data["span_payload_json"])
+            self.calls.append(len(spans))
+            raise RateLimitError("HTTP 529 overloaded")
+
+    worker = FakeWorker()
+    manifest = extract_guru_ontology(
+        root,
+        running_root=running_root,
+        execute_agent_sdk=True,
+        model="claude-test",
+        batch_spans=2,
+        worker=worker,
+    )
+
+    assert worker.calls == [2]
+    assert manifest.batches[0].status == "error"
+    assert "HTTP 529 overloaded" in str(manifest.batches[0].error)
 
 
 def test_extract_guru_ontology_reuses_existing_batch_response(tmp_path: Path):
@@ -341,6 +417,45 @@ def test_normalize_candidate_payload_maps_object_type_aliases():
     )
 
     assert payload["object_type"] == "decision_criterion"
+
+
+def test_build_batches_excludes_official_index_spans():
+    """official_index spans are link listings and must not consume batch budget."""
+    substantive = GuruPrivateSpanRecord(
+        span_id="marks:2024-memo:span:0000",
+        source_id="marks:2024-memo",
+        span_type="paragraph",
+        position=0,
+        text_hash="hash-0",
+        author_key="marks",
+        title="2024 Memo",
+        official_url="https://example.com/memo",
+        text="Margin of safety matters.",
+        char_count=26,
+    )
+    index_span = GuruPrivateSpanRecord(
+        span_id="marks:official_index:span:0000",
+        source_id="marks:official_index",
+        span_type="paragraph",
+        position=0,
+        text_hash="hash-idx",
+        author_key="marks",
+        title="Howard Marks official source index",
+        official_url="https://example.com/index",
+        text="Archive of memos. Links to PDFs.",
+        char_count=31,
+    )
+
+    batches = _build_batches(
+        [substantive, index_span],
+        batch_spans=8,
+        batch_chars=14_000,
+    )
+
+    assert len(batches) == 1
+    span_ids = [span.span_id for span in batches[0]]
+    assert "marks:2024-memo:span:0000" in span_ids
+    assert "marks:official_index:span:0000" not in span_ids
 
 
 def _write_parsed_workspace(tmp_path: Path, span_count: int = 1) -> tuple[Path, Path]:

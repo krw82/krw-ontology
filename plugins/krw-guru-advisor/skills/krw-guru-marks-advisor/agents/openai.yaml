@@ -1,5 +1,4 @@
 interface:
   display_name: "KRW Guru Marks Advisor"
   short_description: "Howard Marks lens adapter backed by Guru ResearchPack"
-  default_prompt: "Use $krw-guru-marks-advisor only when Howard Marks is already selected. Call krw_guru_query_context with author_keys=[\"marks\"]. Do not hard-code Marks principles; use only the returned ResearchPack."
-
+  default_prompt: "Use $krw-guru-marks-advisor only when Howard Marks is already selected. First build a private internal guru consultation brief optimized for Guru MCP retrieval, then call krw_guru_query_context with author_keys=[\"marks\"] and the brief-optimized question. Do not hard-code Marks principles; use only the returned ResearchPack. Apply the skill-local references/answer-style.md for voice, texture, and analogy rendering without inventing lenses."

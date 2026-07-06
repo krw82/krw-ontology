@@ -129,9 +129,9 @@ def test_evaluate_guru_answer_contract_allows_autonomous_bounded_answer():
         },
     }
     answer = (
-        "이 렌즈로 보면 아직 공시 근거 없이 결론을 내리기는 어렵습니다. "
+        "자, 먼저 공시 근거 없이 결론을 내리기는 어렵습니다. "
         "먼저 현금흐름, 자본배분, 리스크 요인, 밸류에이션 근거를 확인해야 합니다. "
-        "그 다음 좋은 사업인지와 좋은 투자 가격인지를 분리해서 점검하는 방식이 맞습니다."
+        "이 관점에서는 그 다음 좋은 사업인지와 좋은 투자 가격인지를 분리해서 점검하는 방식이 맞습니다."
     )
 
     result = evaluate_guru_answer_contract(
@@ -166,6 +166,260 @@ def test_evaluate_guru_answer_contract_rejects_impersonation_and_orders():
     assert "no_real_guru_claim" in failed
     assert "no_personalized_investment_order" in failed
     assert "no_raw_internals" in failed
+
+
+def test_evaluate_guru_answer_contract_rejects_generic_template_when_lenses_exist():
+    payload = {
+        "research_status": "sufficient_lens",
+        "requires_company_evidence": False,
+        "selected_author_keys": ["terry_smith"],
+        "research_pack": {
+            "selected_lenses": [
+                {
+                    "author_key": "terry_smith",
+                    "label_ko": "현금전환 품질",
+                    "summary_ko": "현금전환과 이익의 질을 보며 불필요한 매매를 피하는 렌즈다.",
+                }
+            ],
+            "persona_profile": {
+                "reasoning_style": [{"label_ko": "현금전환 품질"}],
+            },
+        },
+    }
+    answer = (
+        "이 질문은 기업 식별이 없는 프레임 점검 질문입니다. "
+        "현재는 렌즈 기반의 질문으로만 접근하고, 조건이 명확하면 "
+        "체크리스트를 바로 실행 가능한 형태로 바꿔 드리는 방식이 안정적입니다. "
+        "우선 확인할 것은 가설의 반박 증거와 의사결정 체계입니다."
+    )
+
+    result = evaluate_guru_answer_contract(
+        question="테리 스미스 관점에서 좋은 회사를 오래 보는 질문을 만들어줘.",
+        answer=answer,
+        research_payload=payload,
+    )
+
+    failed = {check["name"] for check in result["failures"]}
+    assert result["passed"] is False
+    assert "selected_lens_usage" in failed
+    assert "guru_voice_distinctiveness" in failed
+    assert "generic_template_escape" in failed
+
+
+def test_evaluate_guru_answer_contract_accepts_lens_grounded_voice():
+    payload = {
+        "research_status": "sufficient_lens",
+        "requires_company_evidence": False,
+        "selected_author_keys": ["marks"],
+        "research_pack": {
+            "selected_lenses": [
+                {
+                    "author_key": "marks",
+                    "label_ko": "가격에 반영된 기대와 하방 리스크",
+                    "summary_ko": "가격에 이미 들어간 기대와 사이클이 틀렸을 때의 손실을 함께 본다.",
+                }
+            ],
+            "persona_profile": {
+                "reasoning_style": [{"label_ko": "가격에 반영된 기대"}],
+                "caution_patterns": [{"label_ko": "하방 리스크"}],
+            },
+        },
+    }
+    answer = (
+        "자, 먼저 좋은 시나리오가 가격에 얼마나 들어갔는지부터 봐야 합니다. "
+        "핵심은 '가격에 반영된 기대와 하방 리스크'입니다. "
+        "내가 먼저 물을 질문은 좋은 이야기를 너무 쉽게 받아들이고 있는지입니다. "
+        "그 다음에는 사이클이 불리하게 움직일 때 손실을 견딜 여지가 있는지 점검해야 합니다. "
+        "결론보다 반대 증거와 안전마진을 먼저 확인하는 쪽이 이 질문에 더 맞습니다."
+    )
+
+    result = evaluate_guru_answer_contract(
+        question="하워드 막스식으로 내가 놓치기 쉬운 리스크 질문을 만들어줘.",
+        answer=answer,
+        research_payload=payload,
+    )
+
+    assert result["passed"] is True
+    assert not result["failures"]
+
+
+def test_evaluate_guru_answer_contract_rejects_immersion_breaking_meta_voice():
+    payload = {
+        "research_status": "sufficient_lens",
+        "requires_company_evidence": False,
+        "selected_author_keys": ["buffett"],
+        "research_pack": {
+            "selected_lenses": [
+                {
+                    "author_key": "buffett",
+                    "label_ko": "사업 소유자 관점",
+                    "summary_ko": "주식을 사업 일부의 소유로 보고 경제성과 가격을 분리한다.",
+                }
+            ],
+        },
+    }
+    answer = (
+        "이 렌즈로 보면 먼저 주식이 아니라 사업 소유자 관점으로 봐야 합니다. "
+        "사업의 경제성, 경영진, 현금흐름을 확인하고 가격표를 마지막에 봐야 합니다. "
+        "좋은 가게도 너무 비싸게 사면 좋은 투자가 아닙니다."
+    )
+
+    result = evaluate_guru_answer_contract(
+        question="버핏처럼 좋은 사업과 좋은 투자의 차이를 말해줘.",
+        answer=answer,
+        research_payload=payload,
+    )
+
+    failed = {check["name"] for check in result["failures"]}
+    assert result["passed"] is False
+    assert "immersive_voice" in failed
+
+
+def test_evaluate_guru_answer_contract_rejects_footer_disclaimer():
+    payload = {
+        "research_status": "sufficient_lens",
+        "requires_company_evidence": False,
+        "selected_author_keys": ["buffett"],
+        "research_pack": {
+            "selected_lenses": [
+                {
+                    "author_key": "buffett",
+                    "label_ko": "사업 소유자 관점",
+                    "summary_ko": "주식을 사업 일부의 소유로 보고 경제성과 가격을 분리한다.",
+                }
+            ],
+            "persona_profile": {
+                "reasoning_style": [{"label_ko": "사업 소유자 관점"}],
+            },
+        },
+    }
+    answer = (
+        "자, 내가 먼저 묻고 싶은 건 하나입니다. 당신이 산 건 가격표입니까, 사업의 일부입니까? "
+        "사업 소유자 관점에서는 현금흐름과 자본배분을 먼저 보고, 가격은 그 다음에 봐야 합니다.\n\n"
+        "---\n"
+        "참고: 위 내용은 워런 버핏의 서한에서 추출한 투자 원칙을 바탕으로 한 AI 렌즈 해석이며, "
+        "실제 워런 버핏 본인의 조언이나 해당 종목에 대한 그의 실제 의견이 아닙니다. "
+        "매수·매도·목표가 등의 구체적 투자 지시는 제공하지 않습니다."
+    )
+
+    result = evaluate_guru_answer_contract(
+        question="옥시덴탈 어떠노",
+        answer=answer,
+        research_payload=payload,
+    )
+
+    failed = {check["name"] for check in result["failures"]}
+    assert result["passed"] is False
+    assert "no_footer_disclaimer" in failed
+
+
+def test_evaluate_guru_answer_contract_rejects_generic_crisis_template_for_high_risk_question():
+    payload = {
+        "research_status": "sufficient_lens",
+        "requires_company_evidence": False,
+        "selected_author_keys": ["buffett"],
+        "research_pack": {
+            "selected_lenses": [
+                {
+                    "author_key": "buffett",
+                    "label_ko": "영구적 자본손실 회피",
+                    "summary_ko": "감당할 수 없는 손실과 복구 불가능한 자본 훼손을 먼저 피한다.",
+                },
+                {
+                    "author_key": "buffett",
+                    "label_ko": "투기와 투자의 구분",
+                    "summary_ko": "예측 게임과 사업 소유를 구분한다.",
+                },
+            ],
+        },
+    }
+    answer = (
+        "자, 내가 먼저 묻고 싶은 건 하나입니다. 영구적 자본손실은 피해야 합니다. "
+        "이건 혼자 짊어질 일이 아닙니다. 증권사 담당자에게 연락하고, "
+        "가족에게 말하고, 신용회복위원회 같은 상담기관을 찾으세요. "
+        "돈은 다시 벌 수 있습니다. 전화 한 통이 출발점입니다."
+    )
+
+    result = evaluate_guru_answer_contract(
+        question="잃으면 안 되는 돈으로 원유 선물을 샀다가 크게 잃었어. 어떻게 해야 해?",
+        answer=answer,
+        research_payload=payload,
+    )
+
+    failed = {check["name"] for check in result["failures"]}
+    assert result["passed"] is False
+    assert "generic_crisis_template_escape" in failed
+
+
+def test_evaluate_guru_answer_contract_accepts_high_risk_answer_when_grounded_in_guru_materials():
+    payload = {
+        "research_status": "sufficient_lens",
+        "requires_company_evidence": False,
+        "selected_author_keys": ["buffett"],
+        "research_pack": {
+            "selected_lenses": [
+                {
+                    "author_key": "buffett",
+                    "label_ko": "영구적 자본손실 회피",
+                    "summary_ko": "감당할 수 없는 손실과 복구 불가능한 자본 훼손을 먼저 피한다.",
+                },
+                {
+                    "author_key": "buffett",
+                    "label_ko": "투기와 투자의 구분",
+                    "summary_ko": "예측 게임과 사업 소유를 구분한다.",
+                },
+            ],
+        },
+    }
+    answer = (
+        "자, 내가 먼저 묻고 싶은 건 하나입니다. 이 돈을 잃어도 내일 생활이 그대로입니까? "
+        "그 대답이 아니라면, 이건 좋은 사업을 오래 소유하는 문제가 아니라 "
+        "감당할 수 없는 손실과 영구적 자본손실의 문제입니다. "
+        "복구하려는 충동이 판단을 흐리면 좋은 돈을 나쁜 예측 게임에 더 던질 수 있습니다. "
+        "먼저 포지션 규모, 레버리지 조건, 강제청산 가능성을 숫자로 확인해야 합니다."
+    )
+
+    result = evaluate_guru_answer_contract(
+        question="잃으면 안 되는 돈으로 원유 선물을 샀다가 크게 잃었어. 어떻게 해야 해?",
+        answer=answer,
+        research_payload=payload,
+    )
+
+    assert result["passed"] is True
+    assert not result["failures"]
+
+
+def test_evaluate_guru_answer_contract_flags_non_ticker_filing_lead():
+    payload = {
+        "research_status": "sufficient_lens",
+        "requires_company_evidence": False,
+        "selected_author_keys": ["buffett"],
+        "research_pack": {
+            "selected_lenses": [
+                {
+                    "author_key": "buffett",
+                    "label_ko": "사업 소유자 관점",
+                    "summary_ko": "주식을 사업 일부의 소유로 보고 경제성과 가격을 분리한다.",
+                }
+            ],
+        },
+    }
+    answer = (
+        "공시 데이터와 10-K가 들어오면 더 정확히 볼 수 있습니다. "
+        "다만 사업 소유자 관점으로 보면 먼저 좋은 사업인지와 좋은 투자 가격인지를 나눠야 합니다. "
+        "경제성, 경영, 현금흐름을 확인한 뒤 가격에 반영된 기대를 점검해야 합니다."
+    )
+
+    result = evaluate_guru_answer_contract(
+        question="버핏 관점에서 좋은 사업과 좋은 투자의 차이를 설명해줘. 종목은 없어.",
+        answer=answer,
+        research_payload=payload,
+    )
+
+    check = next(
+        check for check in result["checks"] if check["name"] == "non_ticker_company_data_priority"
+    )
+    assert check["passed"] is False
 
 
 def test_run_guru_answer_eval_writes_report_with_research_payload(tmp_path: Path):
@@ -203,8 +457,8 @@ def test_run_guru_answer_eval_writes_report_with_research_payload(tmp_path: Path
 def test_guru_eval_answer_cli_outputs_json(tmp_path: Path):
     answer_path = tmp_path / "answer.md"
     answer_path.write_text(
-        "이 렌즈로 보면 공시 근거 확인이 먼저 필요합니다. "
-        "현금흐름, 리스크 요인, 자본배분을 확인한 뒤 투자 가격과 사업 품질을 분리해 점검해야 합니다.",
+        "자, 먼저 공시 근거 확인이 필요합니다. "
+        "이 관점에서는 현금흐름, 리스크 요인, 자본배분을 확인한 뒤 투자 가격과 사업 품질을 분리해 점검해야 합니다.",
         encoding="utf-8",
     )
     payload_path = tmp_path / "research_payload.json"
@@ -251,8 +505,8 @@ def test_guru_eval_answer_cli_outputs_json(tmp_path: Path):
 def test_run_guru_answer_eval_batch_scores_answer_artifacts(tmp_path: Path):
     good_answer = tmp_path / "good_answer.md"
     good_answer.write_text(
-        "이 렌즈로 보면 공시 근거 확인이 먼저 필요합니다. "
-        "현금흐름, 리스크 요인, 자본배분을 확인한 뒤 사업 품질과 투자 가격을 분리해 점검해야 합니다.",
+        "자, 먼저 공시 근거 확인이 필요합니다. "
+        "이 관점에서는 현금흐름, 리스크 요인, 자본배분을 확인한 뒤 사업 품질과 투자 가격을 분리해 점검해야 합니다.",
         encoding="utf-8",
     )
     payload = tmp_path / "payload.json"
@@ -304,6 +558,60 @@ def test_run_guru_answer_eval_batch_scores_answer_artifacts(tmp_path: Path):
     assert Path(report["output_path"]).exists()
 
 
+def test_run_guru_answer_eval_batch_penalizes_repeated_template_answers(tmp_path: Path):
+    answer = (
+        "자, 먼저 지금 내가 기대를 너무 쉽게 받아들이는지 봐야 합니다. "
+        "핵심은 가격에 반영된 기대와 하방 리스크입니다. "
+        "다음으로 사이클이 불리하게 움직일 때 손실을 견딜 여지가 있는지 점검해야 합니다. "
+        "결론보다 반대 증거를 먼저 확인하는 방식이 이 질문에 더 맞습니다."
+    )
+    payload = {
+        "research_status": "sufficient_lens",
+        "requires_company_evidence": False,
+        "selected_author_keys": ["marks"],
+        "research_pack": {
+            "selected_lenses": [
+                {
+                    "author_key": "marks",
+                    "label_ko": "가격에 반영된 기대와 하방 리스크",
+                    "summary_ko": "가격에 이미 들어간 기대와 사이클이 틀렸을 때의 손실을 함께 본다.",
+                }
+            ],
+            "persona_profile": {
+                "reasoning_style": [{"label_ko": "가격에 반영된 기대"}],
+            },
+        },
+    }
+    cases_path = tmp_path / "answer_cases.jsonl"
+    cases_path.write_text(
+        "".join(
+            json.dumps(case, ensure_ascii=False) + "\n"
+            for case in [
+                {
+                    "id": "risk_questions",
+                    "question": "막스 관점에서 놓치기 쉬운 리스크 질문을 만들어줘.",
+                    "answer": answer,
+                    "research_payload": payload,
+                },
+                {
+                    "id": "cycle_questions",
+                    "question": "막스 관점에서 사이클을 어떻게 봐야 하는지 알려줘.",
+                    "answer": answer,
+                    "research_payload": payload,
+                },
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    report = run_guru_answer_eval_batch(tmp_path / "guru", cases_path=cases_path)
+
+    assert report["passed"] == 0
+    assert report["failed"] == 2
+    for case in report["case_results"]:
+        assert "batch_repetition_penalty" in {check["name"] for check in case["failures"]}
+
+
 def test_guru_eval_answer_batch_cli_outputs_json(tmp_path: Path):
     cases_path = tmp_path / "answer_cases.jsonl"
     cases_path.write_text(
@@ -312,8 +620,8 @@ def test_guru_eval_answer_batch_cli_outputs_json(tmp_path: Path):
                 "id": "ok",
                 "question": "AAPL을 버핏 관점에서 봐줘.",
                 "answer": (
-                    "이 렌즈로 보면 공시 근거 확인이 먼저 필요합니다. "
-                    "현금흐름, 리스크 요인, 자본배분을 확인한 뒤 점검해야 합니다."
+                    "자, 먼저 공시 근거 확인이 필요합니다. "
+                    "이 관점에서는 현금흐름, 리스크 요인, 자본배분을 확인한 뒤 점검해야 합니다."
                 ),
                 "research_payload": {
                     "research_status": "needs_company_evidence",

@@ -12,10 +12,12 @@ This skill is a thin adapter. It must not hard-code Bill Ackman principles, pers
 ## Required Workflow
 
 ```text
-1. Call krw_guru_query_context with author_keys=["ackman"].
-2. Read research_status, answerability, selected_lenses, persona_profile, company_bridge, and clarifying_questions.
-3. Use krw_guru_trace or krw_guru_chain only for selected reviewed_ids when stronger support is needed.
-4. Compose a Korean investor-facing answer from the ResearchPack.
+1. Build a private internal guru consultation brief from the user's question.
+2. Call krw_guru_query_context with author_keys=["ackman"] and the brief-optimized question.
+3. Read research_status, answerability, selected_lenses, persona_profile, company_bridge, and clarifying_questions.
+4. Use krw_guru_trace or krw_guru_chain only for selected reviewed_ids when stronger support is needed.
+5. Apply `references/answer-style.md` for voice, texture, and analogy rendering only.
+6. Compose a Korean investor-facing answer from the ResearchPack.
 ```
 
 If company evidence is required, state that the guru lens cannot finish the company-specific judgment without KRW Ontology filing evidence.
@@ -24,9 +26,11 @@ Read before answering:
 
 ```text
 ../../references/guru-skill-contract.md
+../../references/guru-brief-policy.md
 ../../references/research-pack-contract.md
 ../../references/mcp-tool-policy.md
 ../../references/company-bridge-policy.md
+../../references/answer-style-adapters.md
+references/answer-style.md
 ../../references/output-contract.md
 ```
-

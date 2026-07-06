@@ -11,6 +11,10 @@ import re
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
+from krw_ontology.guru.index import (
+    guru_index_status,
+    load_guru_index_bundle,
+)
 from krw_ontology.guru.models import (
     GuruAnswerability,
     GuruResearchIntent,
@@ -189,6 +193,7 @@ def guru_status_tool(
     reviewed_dir = root_path / "reviewed"
     report_path = reviewed_dir / "curation_report.json"
     report = _read_json(report_path)
+    index_status = guru_index_status(root_path)
     files = {
         name: {
             "path": str(reviewed_dir / filename),
@@ -207,6 +212,13 @@ def guru_status_tool(
         "curation_report_present": report_path.is_file(),
         "schema_version": report.get("schema_version") if isinstance(report, Mapping) else None,
         "generated_at": report.get("generated_at") if isinstance(report, Mapping) else None,
+        "runtime": {
+            "mode": index_status["runtime_mode"],
+            "index_present": index_status["present"],
+            "index_usable": index_status["usable"],
+            "index_manifest_path": index_status["manifest_path"],
+        },
+        "index": index_status,
         "counts": {
             "guru_objects": files["guru_objects"]["rows"],
             "consultation_objects": files["consultation_objects"]["rows"],
@@ -226,6 +238,50 @@ def guru_status_tool(
     return _json(payload)
 
 
+def guru_index_context_tool(
+    *,
+    root: str | Path | None = None,
+    response_format: GuruResponseFormat = GuruResponseFormat.JSON,
+) -> str:
+    """Return author-shard index status and MCP runtime policy."""
+    root_path = _resolve_root(root)
+    status = guru_index_status(root_path)
+    payload = {
+        "index_context_version": "krw-guru-index-context/v1",
+        "root": str(root_path),
+        "status": status,
+        "mcp_runtime_policy": {
+            "default_first_tool": "krw_guru_query_context",
+            "preferred_read_path": "author_shard" if status["usable"] else "reviewed_jsonl",
+            "fallback": "reviewed_jsonl",
+            "source_of_truth": "reviewed_jsonl",
+        },
+        "optimization": {
+            "sharding_key": "author_key",
+            "reason": (
+                "Guru consultations normally target one persona. Per-author shards avoid "
+                "loading unrelated gurus while preserving multi-guru fan-out."
+            ),
+            "global_index_policy": (
+                "Use the manifest as a lightweight global map; do not build a heavy "
+                "company-style global graph unless cross-author traversal becomes a "
+                "dominant product path."
+            ),
+        },
+    }
+    if response_format == GuruResponseFormat.MARKDOWN:
+        lines = [
+            "# KRW Guru Index",
+            "",
+            f"- runtime: {status['runtime_mode']}",
+            f"- manifest: {status['manifest_path']}",
+            f"- usable: {str(status['usable']).lower()}",
+            f"- authors: {', '.join(status.get('authors', {}).keys()) or '(none)'}",
+        ]
+        return "\n".join(lines)
+    return _json(payload)
+
+
 def guru_search_tool(
     *,
     query: str,
@@ -242,7 +298,7 @@ def guru_search_tool(
 ) -> str:
     """Search reviewed guru lens and consultation objects."""
     root_path = _resolve_root(root)
-    bundle = _load_reviewed_bundle(root_path)
+    bundle = _load_reviewed_bundle(root_path, author_keys=author_keys)
     rows = _filter_rows(
         _iter_searchable_rows(bundle, DEFAULT_GURU_SEARCH_FAMILIES),
         author_keys=author_keys,
@@ -277,6 +333,7 @@ def guru_search_tool(
     payload = {
         "query": query,
         "root": str(root_path),
+        "runtime": _bundle_runtime(bundle),
         "total": total,
         "count": len(result_rows),
         "offset": max(0, offset),
@@ -345,11 +402,11 @@ def guru_context_tool(
 ) -> str:
     """Build a compact guru consultation context pack for an investor question."""
     root_path = _resolve_root(root)
-    bundle = _load_reviewed_bundle(root_path)
     requested_authors = _clean_list(author_keys)
     selected_authors = requested_authors or _infer_author_keys(question)
     if not selected_authors:
         selected_authors = _default_authors_for_question(question)
+    bundle = _load_reviewed_bundle(root_path, author_keys=selected_authors)
     inferred_intent = _clean_optional(intent_family) or _infer_intent_family(question)
 
     lens_rows = _rank_and_take(
@@ -538,7 +595,10 @@ def guru_evidence_tool(
 ) -> str:
     """Return one reviewed guru object with relationships and source support metadata."""
     root_path = _resolve_root(root)
-    bundle = _load_reviewed_bundle(root_path)
+    bundle = _load_reviewed_bundle(
+        root_path,
+        author_keys=_author_keys_from_reviewed_id(reviewed_id),
+    )
     object_row = bundle["objects_by_id"].get(reviewed_id)
     if object_row is None:
         return _json(
@@ -625,7 +685,10 @@ def guru_chain_tool(
 ) -> str:
     """Return bounded ontology neighbors around one selected guru object."""
     root_path = _resolve_root(root)
-    bundle = _load_reviewed_bundle(root_path)
+    bundle = _load_reviewed_bundle(
+        root_path,
+        author_keys=_author_keys_from_reviewed_id(reviewed_id),
+    )
     object_row = bundle["objects_by_id"].get(reviewed_id)
     if object_row is None:
         return _json(
@@ -707,8 +770,8 @@ def guru_data_needs_tool(
 ) -> str:
     """Return guru-derived data needs for bridging a consultation to filing research."""
     root_path = _resolve_root(root)
-    bundle = _load_reviewed_bundle(root_path)
     selected_authors = _clean_list(author_keys) or _infer_author_keys(question)
+    bundle = _load_reviewed_bundle(root_path, author_keys=selected_authors or None)
     inferred_intent = _clean_optional(intent_family) or _infer_intent_family(question)
     rows = _filter_rows(
         bundle["data_needs"],
@@ -796,8 +859,8 @@ def _build_guru_research_context(
     limit_data_needs: int,
 ) -> dict[str, Any]:
     root_path = _resolve_root(root)
-    bundle = _load_reviewed_bundle(root_path)
     selected_authors = _selected_author_keys(question, author_keys)
+    bundle = _load_reviewed_bundle(root_path, author_keys=selected_authors)
     inferred_intent = _clean_optional(intent_family) or _infer_intent_family(question)
     lens_limit = _limit(limit_lens, maximum=10)
     if len(selected_authors) > 1:
@@ -955,6 +1018,7 @@ def _build_guru_research_context(
         "research_status": pack_dict["research_status"],
         "answerability": pack_dict["answerability"],
         "intent": pack_dict["intent"],
+        "runtime": _bundle_runtime(bundle),
         "selected_author_keys": selected_authors,
         "selected_authors": [
             {"author_key": key, "display_name": AUTHOR_DISPLAY_NAMES.get(key, key)}
@@ -1420,7 +1484,14 @@ def _resolve_root(root: str | Path | None) -> Path:
     return guru_root(None)
 
 
-def _load_reviewed_bundle(root_path: Path) -> dict[str, Any]:
+def _load_reviewed_bundle(
+    root_path: Path,
+    *,
+    author_keys: Sequence[str] | None = None,
+) -> dict[str, Any]:
+    indexed = load_guru_index_bundle(root_path, author_keys=author_keys)
+    if indexed is not None:
+        return indexed
     reviewed_dir = root_path / "reviewed"
     files = {
         family: _read_jsonl(reviewed_dir / filename)
@@ -1449,7 +1520,31 @@ def _load_reviewed_bundle(root_path: Path) -> dict[str, Any]:
         **files,
         "objects_by_id": objects_by_id,
         "relationships_by_id": relationships_by_id,
+        "_index": {
+            "enabled": False,
+            "runtime_mode": "reviewed_jsonl",
+            "author_keys": _clean_list(author_keys),
+        },
     }
+
+
+def _bundle_runtime(bundle: Mapping[str, Any]) -> dict[str, Any]:
+    index_payload = bundle.get("_index")
+    if not isinstance(index_payload, Mapping):
+        return {"mode": "reviewed_jsonl", "index_enabled": False}
+    return {
+        "mode": index_payload.get("runtime_mode", "reviewed_jsonl"),
+        "index_enabled": bool(index_payload.get("enabled")),
+        "index_manifest_path": index_payload.get("manifest_path"),
+        "author_keys": list(index_payload.get("author_keys") or []),
+    }
+
+
+def _author_keys_from_reviewed_id(reviewed_id: str) -> list[str] | None:
+    parts = str(reviewed_id or "").split(":")
+    if len(parts) >= 3 and parts[0] == "guru" and parts[1] in AUTHOR_DISPLAY_NAMES:
+        return [parts[1]]
+    return None
 
 
 def _iter_searchable_rows(

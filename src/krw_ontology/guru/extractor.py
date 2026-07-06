@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Iterable
 
 from krw_ontology.config.settings import PipelineConfig
+from krw_ontology.errors import RateLimitError
 from krw_ontology.extraction.worker import ExtractionWorker
 from krw_ontology.guru.models import (
     ANSWER_SECTION_TYPES,
@@ -308,29 +309,26 @@ async def _execute_batches(
                 return existing_candidates
 
             try:
-                items = await worker.extract(
-                    _PROMPT_TEMPLATE,
-                    {
-                        "batch_id": batch.batch_id,
-                        "span_payload_json": _span_payload_json(spans),
-                    },
-                    item_schema,
-                    EXTRACTION_STAGE_NAME,
-                    call_metadata={
-                        "job_id": "guru-ontology",
-                        "batch_index": batch_index,
-                        "batch_id": batch.batch_id,
-                        "model": model,
-                    },
+                batch_candidates, split_errors = await _extract_spans_with_split_retry(
+                    worker=worker,
+                    spans=spans,
+                    item_schema=item_schema,
+                    batch_index=batch_index,
+                    batch_id=batch.batch_id,
+                    model=model,
                 )
-                batch_candidates = _candidate_models_from_items(items, batch.batch_id)
                 _write_jsonl_atomic(
                     Path(batch.output_path),
                     (candidate.model_dump(mode="json") for candidate in batch_candidates),
                 )
-                batch.status = "completed"
+                batch.status = "completed" if batch_candidates else "error"
                 batch.agent_sdk_called = True
-                batch.error = None
+                batch.error = (
+                    f"{len(split_errors)} split sub-batches failed: "
+                    + " | ".join(split_errors[:3])
+                    if split_errors
+                    else None
+                )
                 return batch_candidates
             except Exception as exc:
                 batch.status = "error"
@@ -347,6 +345,84 @@ async def _execute_batches(
         )
     )
     return [candidate for candidates in batch_results for candidate in candidates]
+
+
+async def _extract_spans_with_split_retry(
+    *,
+    worker: ExtractionWorker,
+    spans: list[GuruPrivateSpanRecord],
+    item_schema: dict,
+    batch_index: int,
+    batch_id: str,
+    model: str,
+    split_depth: int = 0,
+) -> tuple[list[GuruOntologyCandidate], list[str]]:
+    if not spans:
+        return [], []
+    try:
+        items = await worker.extract(
+            _PROMPT_TEMPLATE,
+            {
+                "batch_id": batch_id,
+                "span_payload_json": _span_payload_json(spans),
+            },
+            item_schema,
+            EXTRACTION_STAGE_NAME,
+            call_metadata={
+                "job_id": "guru-ontology",
+                "batch_index": batch_index,
+                "batch_id": batch_id,
+                "model": model,
+                "split_retry": split_depth > 0,
+                "split_depth": split_depth,
+                "span_count": len(spans),
+            },
+        )
+        return _candidate_models_from_items(items, batch_id), []
+    except RateLimitError:
+        # Provider capacity failures are already retried by ExtractionWorker.
+        # Splitting them would increase load without improving recovery.
+        raise
+    except Exception as exc:
+        if len(spans) <= 1:
+            logger.error(
+                "%s leaf guru batch %s failed after split retry: %s",
+                EXTRACTION_STAGE_NAME,
+                batch_id,
+                exc,
+                extra={"stage": EXTRACTION_STAGE_NAME, "batch_id": batch_id},
+            )
+            return [], [f"{batch_id}: {exc}"]
+
+        midpoint = max(1, len(spans) // 2)
+        logger.warning(
+            "%s guru batch %s failed; retrying as %s and %s span sub-batches: %s",
+            EXTRACTION_STAGE_NAME,
+            batch_id,
+            midpoint,
+            len(spans) - midpoint,
+            exc,
+            extra={"stage": EXTRACTION_STAGE_NAME, "batch_id": batch_id},
+        )
+        left_candidates, left_errors = await _extract_spans_with_split_retry(
+            worker=worker,
+            spans=spans[:midpoint],
+            item_schema=item_schema,
+            batch_index=batch_index * 10 + 1,
+            batch_id=f"{batch_id}-s{split_depth + 1}a",
+            model=model,
+            split_depth=split_depth + 1,
+        )
+        right_candidates, right_errors = await _extract_spans_with_split_retry(
+            worker=worker,
+            spans=spans[midpoint:],
+            item_schema=item_schema,
+            batch_index=batch_index * 10 + 2,
+            batch_id=f"{batch_id}-s{split_depth + 1}b",
+            model=model,
+            split_depth=split_depth + 1,
+        )
+        return [*left_candidates, *right_candidates], [*left_errors, *right_errors]
 
 
 def _candidate_models_from_items(
@@ -424,16 +500,26 @@ def _load_span_records(parsed_manifest: GuruParsedManifest) -> Iterable[GuruPriv
                 yield GuruPrivateSpanRecord.model_validate_json(line)
 
 
+def _is_corpus_metadata_span(span: GuruPrivateSpanRecord) -> bool:
+    """Index/archive spans carry link listings, not substantive guru content."""
+    return "official_index" in span.source_id
+
+
 def _build_batches(
     spans: list[GuruPrivateSpanRecord],
     *,
     batch_spans: int,
     batch_chars: int,
 ) -> list[list[GuruPrivateSpanRecord]]:
+    # Index/archive spans (official_index) are link listings that consume batch
+    # budget without yielding lenses, principles, or consultation objects.
+    # Exclude them from extraction batches; corpus metadata is recorded in the
+    # raw/parsed manifests and can be synthesized during curation if needed.
+    substantive = [span for span in spans if not _is_corpus_metadata_span(span)]
     batches: list[list[GuruPrivateSpanRecord]] = []
     current: list[GuruPrivateSpanRecord] = []
     current_chars = 0
-    for span in spans:
+    for span in substantive:
         span_chars = len(span.text)
         if current and (len(current) >= batch_spans or current_chars + span_chars > batch_chars):
             batches.append(current)

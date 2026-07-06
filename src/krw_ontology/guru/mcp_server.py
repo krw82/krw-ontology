@@ -15,6 +15,7 @@ from krw_ontology.guru.mcp_tools import (
     guru_data_needs_tool,
     guru_eval_questions_tool,
     guru_evidence_tool,
+    guru_index_context_tool,
     guru_query_context_tool,
     guru_search_tool,
     guru_status_tool,
@@ -48,6 +49,23 @@ async def krw_guru_status(
     """Return reviewed guru ontology counts, files, and curation quality metadata."""
     return await _run_tool(
         guru_status_tool,
+        root=Path(root).expanduser() if root else None,
+        response_format=response_format,
+    )
+
+
+@mcp.tool(
+    name="krw_guru_index_context",
+    title="Return KRW guru shard index status",
+    annotations=READ_ONLY,
+)
+async def krw_guru_index_context(
+    root: str | None = None,
+    response_format: GuruResponseFormat = GuruResponseFormat.JSON,
+) -> str:
+    """Return author-shard index status and runtime policy for Guru MCP."""
+    return await _run_tool(
+        guru_index_context_tool,
         root=Path(root).expanduser() if root else None,
         response_format=response_format,
     )

@@ -247,6 +247,53 @@ def test_guru_verify_command(tmp_path: Path):
     assert payload["ok"] is True
 
 
+def test_guru_build_index_command_outputs_json(tmp_path: Path, monkeypatch):
+    captured = {}
+
+    def fake_build_guru_shard_index(root=None, **kwargs):
+        captured["root"] = root
+        captured.update(kwargs)
+        return {
+            "schema_version": "krw-guru-shard-index/v1",
+            "manifest_path": str(tmp_path / "guru" / "indexes" / "guru_shard_manifest.json"),
+            "authors": {
+                "buffett": {
+                    "counts": {
+                        "guru_objects": 1,
+                        "consultation_objects": 1,
+                        "data_needs": 1,
+                        "relationships": 1,
+                    }
+                }
+            },
+        }
+
+    import krw_ontology.guru.cli as guru_cli
+
+    monkeypatch.setattr(guru_cli, "build_guru_shard_index", fake_build_guru_shard_index)
+
+    result = runner.invoke(
+        app,
+        [
+            "guru",
+            "build-index",
+            "--root",
+            str(tmp_path / "guru"),
+            "--index-dir",
+            str(tmp_path / "guru-index"),
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["schema_version"] == "krw-guru-shard-index/v1"
+    assert captured == {
+        "root": tmp_path / "guru",
+        "index_dir": tmp_path / "guru-index",
+    }
+
+
 def test_guru_select_lenses_command_outputs_json(tmp_path: Path, monkeypatch):
     captured = {}
 

@@ -1,5 +1,4 @@
 interface:
   display_name: "KRW Guru Flatt Advisor"
   short_description: "Bruce Flatt lens adapter backed by Guru ResearchPack"
-  default_prompt: "Use $krw-guru-flatt-advisor only when Bruce Flatt is already selected. Call krw_guru_query_context with author_keys=[\"flatt\"]. Do not hard-code Flatt principles; use only the returned ResearchPack."
-
+  default_prompt: "Use $krw-guru-flatt-advisor only when Bruce Flatt is already selected. First build a private internal guru consultation brief optimized for Guru MCP retrieval, then call krw_guru_query_context with author_keys=[\"flatt\"] and the brief-optimized question. Do not hard-code Flatt principles; use only the returned ResearchPack. Apply the skill-local references/answer-style.md for voice, texture, and analogy rendering without inventing lenses."

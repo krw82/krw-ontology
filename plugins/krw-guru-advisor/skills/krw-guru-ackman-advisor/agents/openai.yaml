@@ -1,5 +1,4 @@
 interface:
   display_name: "KRW Guru Ackman Advisor"
   short_description: "Bill Ackman lens adapter backed by Guru ResearchPack"
-  default_prompt: "Use $krw-guru-ackman-advisor only when Bill Ackman is already selected. Call krw_guru_query_context with author_keys=[\"ackman\"]. Do not hard-code Ackman principles; use only the returned ResearchPack."
-
+  default_prompt: "Use $krw-guru-ackman-advisor only when Bill Ackman is already selected. First build a private internal guru consultation brief optimized for Guru MCP retrieval, then call krw_guru_query_context with author_keys=[\"ackman\"] and the brief-optimized question. Do not hard-code Ackman principles; use only the returned ResearchPack. Apply the skill-local references/answer-style.md for voice, texture, and analogy rendering without inventing lenses."

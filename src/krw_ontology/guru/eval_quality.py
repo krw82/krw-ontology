@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from pathlib import Path
@@ -17,6 +18,12 @@ GURU_QUALITY_REPORT_FORMAT = "krw-guru-quality-report/v1"
 GURU_ANSWER_EVAL_REPORT_FORMAT = "krw-guru-answer-eval-report/v1"
 GURU_ANSWER_EVAL_BATCH_REPORT_FORMAT = "krw-guru-answer-eval-batch-report/v1"
 DEFAULT_GURU_ANSWER_PASS_THRESHOLD = 0.82
+NON_NEGOTIABLE_ANSWER_CHECKS = {
+    "no_raw_internals",
+    "no_footer_disclaimer",
+    "no_real_guru_claim",
+    "no_personalized_investment_order",
+}
 DEFAULT_GURU_GOLD_EVAL_PATH = (
     Path(__file__).resolve().parents[3]
     / "plugins"
@@ -43,6 +50,129 @@ _RAW_INTERNAL_RE = re.compile(
     r"|guru:[a-z_]+:",
     re.IGNORECASE,
 )
+_GENERIC_TEMPLATE_ESCAPE_PHRASES = (
+    "프레임 점검 질문입니다",
+    "렌즈 기반의 질문으로만 접근",
+    "종목별 결론은 공시 데이터",
+    "체크리스트를 바로 실행 가능한 형태",
+    "수익성/리스크/의사결정 체계",
+)
+_HIGH_RISK_INVESTMENT_TERMS = (
+    "선물",
+    "옵션",
+    "파생",
+    "레버리지",
+    "마진",
+    "강제청산",
+    "반대매매",
+    "빚",
+    "대출",
+    "신용",
+    "담보",
+    "잃으면 안 되는 돈",
+    "생활비",
+    "전재산",
+    "몰빵",
+    "손실 복구",
+    "복구",
+    "물타기",
+    "평단",
+    "평균단가",
+)
+_GENERIC_CRISIS_TEMPLATE_PHRASES = (
+    "증권사 담당자",
+    "가족에게 말",
+    "상담 기관",
+    "상담기관",
+    "신용회복위원회",
+    "혼자 짊어",
+    "돈은 다시 벌 수",
+    "당신은 정리 대상",
+    "전화 한 통",
+    "믿을 수 있는 사람",
+    "처음 겪는 일이 아닙니다",
+    "삶의 얘기",
+    "자책은 거두",
+)
+_IMMERSION_BREAKING_PHRASES = (
+    "렌즈로 보면",
+    "렌즈로 본다면",
+    "이 렌즈로",
+    "이 렌즈에서",
+    "말투로 바꾸면",
+    "언어로 바꾸면",
+    "현재 온톨로지",
+    "온톨로지 근거",
+)
+_FOOTER_DISCLAIMER_RE = re.compile(
+    r"참고\s*[:：]|"
+    r"위\s*내용은.{0,40}(AI|렌즈|해석)|"
+    r"AI\s*렌즈\s*해석|"
+    r"실제\s*(?:워런\s*버핏|버핏|하워드\s*막스|막스|빌\s*애크먼|애크먼|브루스\s*플랫|플랫|테리\s*스미스)?.{0,40}"
+    r"(?:본인의\s*조언|실제\s*의견|조언이\s*아닙니다|의견이\s*아닙니다)|"
+    r"(?:매수|매도|목표가).{0,24}(?:구체적\s*)?투자\s*지시.{0,12}(?:제공하지\s*않|아닙니다)",
+    re.IGNORECASE,
+)
+_COMPANY_EVIDENCE_TERMS = (
+    "공시",
+    "10-k",
+    "10k",
+    "사업보고서",
+    "연차보고서",
+    "filing",
+    "annual report",
+    "sec",
+    "회사 데이터",
+)
+_AUTHOR_VOICE_CUES = {
+    "buffett": (
+        "사업",
+        "소유",
+        "경제성",
+        "경영",
+        "자본배분",
+        "현금",
+        "가격",
+    ),
+    "marks": (
+        "리스크",
+        "사이클",
+        "확률",
+        "기대",
+        "불확실",
+        "방어",
+        "반대",
+        "가격",
+    ),
+    "ackman": (
+        "가설",
+        "thesis",
+        "촉매",
+        "개선",
+        "경영",
+        "구조",
+        "하방",
+        "검증",
+    ),
+    "flatt": (
+        "현금흐름",
+        "자산",
+        "장기",
+        "재투자",
+        "사이클",
+        "내구",
+        "복원력",
+    ),
+    "terry_smith": (
+        "품질",
+        "roce",
+        "현금전환",
+        "성장",
+        "오래",
+        "불필요한",
+        "매매",
+    ),
+}
 
 
 def run_guru_quality_eval(
@@ -170,6 +300,7 @@ def run_guru_answer_eval_batch(
         )
         for case in cases
     ]
+    _apply_batch_repetition_penalty(case_results)
     passed = [case for case in case_results if case["passed"]]
     failed = [case for case in case_results if not case["passed"]]
     total_score = sum(float(case["score"]) for case in case_results)
@@ -219,25 +350,38 @@ def evaluate_guru_answer_contract(
     checks = [
         _check_answer_has_substance(answer),
         _check_no_raw_internals(answer),
+        _check_no_footer_disclaimer(answer),
         _check_no_real_guru_claim(answer),
         _check_no_investment_order(answer),
         _check_company_evidence_boundary(answer, context, filing_evidence_provided),
         _check_clarification_handling(answer, context),
         _check_direct_source_boundary(answer, context),
         _check_practical_next_checks(answer),
+        _check_selected_lens_usage(answer, context),
+        _check_guru_voice_distinctiveness(answer, context),
+        _check_non_ticker_company_data_priority(answer, context),
+        _check_generic_template_escape(answer, context),
+        _check_immersive_voice(answer, context),
+        _check_generic_crisis_template_escape(question, answer, context),
     ]
     score = sum(check["weight"] for check in checks if check["passed"])
     max_score = sum(check["weight"] for check in checks)
     ratio = round(score / max_score, 4) if max_score else 0.0
+    hard_failures = [
+        check
+        for check in checks
+        if not check["passed"] and check["name"] in NON_NEGOTIABLE_ANSWER_CHECKS
+    ]
     return {
         "answer_eval_version": "krw-guru-answer-contract/v1",
-        "passed": ratio >= pass_threshold,
+        "passed": ratio >= pass_threshold and not hard_failures,
         "score": score,
         "max_score": max_score,
         "score_ratio": ratio,
         "pass_threshold": pass_threshold,
         "context": context,
         "checks": checks,
+        "hard_failures": hard_failures,
         "failures": [check for check in checks if not check["passed"]],
         "question": question,
     }
@@ -249,6 +393,19 @@ def _answer_eval_context(research_payload: Mapping[str, Any] | None) -> dict[str
     answerability = _mapping(payload.get("answerability") or pack.get("answerability"))
     intent = _mapping(payload.get("intent") or pack.get("intent"))
     company_bridge = _mapping(payload.get("company_bridge") or pack.get("company_bridge"))
+    pack_meta = _mapping(pack.get("pack_meta"))
+    selected_lenses = _list_of_mappings(
+        pack.get("selected_lenses") or payload.get("selected_lenses")
+    )
+    consultation_moves = _list_of_mappings(
+        pack.get("consultation_moves") or payload.get("consultation_moves")
+    )
+    data_needs = _list_of_mappings(pack.get("data_needs") or payload.get("data_needs"))
+    selected_author_keys = _string_list(
+        payload.get("selected_author_keys")
+        or pack_meta.get("guru_keys")
+        or [row.get("author_key") for row in selected_lenses if row.get("author_key")]
+    )
     research_status = str(
         payload.get("research_status")
         or pack.get("research_status")
@@ -264,6 +421,7 @@ def _answer_eval_context(research_payload: Mapping[str, Any] | None) -> dict[str
         or intent.get("requires_company_evidence")
         or company_bridge.get("requires_company_evidence")
     )
+    ticker = _clean_optional(payload.get("ticker") or intent.get("ticker"))
     direct_source_match = answerability.get("direct_source_match")
     return {
         "research_status": research_status or None,
@@ -274,6 +432,12 @@ def _answer_eval_context(research_payload: Mapping[str, Any] | None) -> dict[str
         else None,
         "requires_company_evidence": requires_company_evidence,
         "requires_identifier_clarification": requires_identifier_clarification,
+        "ticker": ticker,
+        "selected_author_keys": selected_author_keys,
+        "selected_lenses": _answer_materials(selected_lenses),
+        "consultation_moves": _answer_materials(consultation_moves),
+        "data_needs": _answer_materials(data_needs),
+        "persona_profile": _mapping(pack.get("persona_profile") or payload.get("persona_profile")),
         "clarifying_questions": _string_list(
             payload.get("clarifying_questions") or pack.get("clarifying_questions")
         ),
@@ -300,6 +464,17 @@ def _check_no_raw_internals(answer: str) -> dict[str, Any]:
         "no MCP/plugin/schema/raw reviewed IDs in investor answer",
         {"matched": matches},
         1,
+    )
+
+
+def _check_no_footer_disclaimer(answer: str) -> dict[str, Any]:
+    matches = sorted({match.group(0) for match in _FOOTER_DISCLAIMER_RE.finditer(answer)})
+    return _weighted_check(
+        "no_footer_disclaimer",
+        not matches,
+        "no source/footer disclaimer or AI-lens explanation in immersive advisor answer",
+        {"matched": matches},
+        2,
     )
 
 
@@ -392,20 +567,24 @@ def _check_direct_source_boundary(answer: str, context: Mapping[str, Any]) -> di
     passed = _contains_any(
         answer,
         (
-            "렌즈",
-            "관점",
-            "적용",
-            "직접 근거",
-            "근거가 약",
-            "부분적",
-            "현재 온톨로지",
+            "내가 지금 볼 수 있는 자료",
+            "지금 볼 수 있는 자료",
             "자료상",
+            "손에 있는 자료",
+            "아직 단정하면 안",
+            "아직 말할 수 없",
+            "여기까지 말할 수",
+            "더 봐야 할",
+            "결론을 내리기 어렵",
+            "판단을 내리기 어렵",
+            "공시 근거 없이",
+            "근거 확인이 필요",
         ),
     )
     return _weighted_check(
         "direct_source_boundary",
         passed,
-        "weak matches must be framed as lens application, not direct guru advice",
+        "weak matches must show natural confidence limits without source/disclaimer footers",
         {"direct_source_match": direct_source_match},
         1,
     )
@@ -425,19 +604,185 @@ def _check_practical_next_checks(answer: str) -> dict[str, Any]:
     )
 
 
+def _check_selected_lens_usage(answer: str, context: Mapping[str, Any]) -> dict[str, Any]:
+    materials = _list_of_mappings(context.get("selected_lenses"))
+    if not materials:
+        return _weighted_check(
+            "selected_lens_usage",
+            True,
+            "selected lenses not provided",
+            "not required",
+            2,
+        )
+    matches = _matched_material_terms(answer, materials[:3])
+    passed = bool(matches)
+    return _weighted_check(
+        "selected_lens_usage",
+        passed,
+        "answer visibly uses at least one selected lens label or core phrase",
+        {
+            "matched": matches,
+            "candidate_labels": [row.get("label_ko") for row in materials[:3]],
+        },
+        2,
+    )
+
+
+def _check_guru_voice_distinctiveness(answer: str, context: Mapping[str, Any]) -> dict[str, Any]:
+    author_keys = _string_list(context.get("selected_author_keys"))
+    if not author_keys:
+        return _weighted_check(
+            "guru_voice_distinctiveness",
+            True,
+            "selected authors not provided",
+            "not required",
+            2,
+        )
+    matched_by_author: dict[str, list[str]] = {}
+    for author_key in author_keys:
+        cues = _AUTHOR_VOICE_CUES.get(author_key, ())
+        matched = [cue for cue in cues if cue.lower() in answer.lower()]
+        if matched:
+            matched_by_author[author_key] = matched[:5]
+    persona_matches = _matched_persona_terms(answer, _mapping(context.get("persona_profile")))
+    passed = bool(matched_by_author) or bool(persona_matches)
+    return _weighted_check(
+        "guru_voice_distinctiveness",
+        passed,
+        "answer carries the selected author's voice or texture without impersonation",
+        {
+            "matched_author_cues": matched_by_author,
+            "matched_persona_terms": persona_matches,
+            "selected_author_keys": author_keys,
+        },
+        2,
+    )
+
+
+def _check_non_ticker_company_data_priority(answer: str, context: Mapping[str, Any]) -> dict[str, Any]:
+    if context.get("requires_company_evidence") or context.get("ticker"):
+        return _weighted_check(
+            "non_ticker_company_data_priority",
+            True,
+            "company evidence is required or ticker is present",
+            "not required",
+            1,
+        )
+    if not context.get("selected_lenses") and not context.get("consultation_moves"):
+        return _weighted_check(
+            "non_ticker_company_data_priority",
+            True,
+            "no guru answer materials provided",
+            "not required",
+            1,
+        )
+    opening = answer.strip()[:240]
+    first_company_pos = _first_term_position(opening, _COMPANY_EVIDENCE_TERMS)
+    first_lens_pos = _first_term_position(
+        opening,
+        (
+            "관점",
+            "먼저 물을",
+            "먼저 묻",
+            "내가 먼저",
+            "자,",
+            "이 질문",
+            "핵심",
+        ),
+    )
+    company_caveat_first = first_company_pos is not None
+    lens_first = first_lens_pos is not None and (
+        first_company_pos is None or first_lens_pos < first_company_pos
+    )
+    return _weighted_check(
+        "non_ticker_company_data_priority",
+        not company_caveat_first or lens_first,
+        "non-ticker answers should lead with guru lens, not filing caveats",
+        {
+            "company_caveat_in_opening": company_caveat_first,
+            "lens_language_in_opening": lens_first,
+            "first_company_pos": first_company_pos,
+            "first_lens_pos": first_lens_pos,
+        },
+        1,
+    )
+
+
+def _check_generic_template_escape(answer: str, context: Mapping[str, Any]) -> dict[str, Any]:
+    if not context.get("selected_lenses"):
+        return _weighted_check(
+            "generic_template_escape",
+            True,
+            "selected lenses not provided",
+            "not required",
+            8,
+        )
+    matched = [
+        phrase for phrase in _GENERIC_TEMPLATE_ESCAPE_PHRASES if phrase.lower() in answer.lower()
+    ]
+    lens_matches = _matched_material_terms(answer, _list_of_mappings(context.get("selected_lenses"))[:3])
+    return _weighted_check(
+        "generic_template_escape",
+        not matched or bool(lens_matches),
+        "avoid generic safety boilerplate that ignores selected lenses",
+        {"matched_generic_phrases": matched, "matched_lens_terms": lens_matches},
+        8,
+    )
+
+
+def _check_immersive_voice(answer: str, context: Mapping[str, Any]) -> dict[str, Any]:
+    if not context.get("selected_lenses") and not context.get("selected_author_keys"):
+        return _weighted_check(
+            "immersive_voice",
+            True,
+            "guru voice materials not provided",
+            "not required",
+            8,
+        )
+    matched = [
+        phrase for phrase in _IMMERSION_BREAKING_PHRASES if phrase.lower() in answer.lower()
+    ]
+    return _weighted_check(
+        "immersive_voice",
+        not matched,
+        "answer should start as advisor speech, not meta lens/rendering commentary",
+        {"matched_immersion_breakers": matched},
+        8,
+    )
+
+
+def _check_generic_crisis_template_escape(
+    question: str,
+    answer: str,
+    context: Mapping[str, Any],
+) -> dict[str, Any]:
+    high_risk_question = _contains_any(question, _HIGH_RISK_INVESTMENT_TERMS)
+    if not high_risk_question or (
+        not context.get("selected_lenses") and not context.get("selected_author_keys")
+    ):
+        return _weighted_check(
+            "generic_crisis_template_escape",
+            True,
+            "not a high-risk guru answer with selected materials",
+            "not required",
+            8,
+        )
+    matched = [
+        phrase for phrase in _GENERIC_CRISIS_TEMPLATE_PHRASES if phrase.lower() in answer.lower()
+    ]
+    return _weighted_check(
+        "generic_crisis_template_escape",
+        not matched,
+        "high-risk investment answers should use selected guru ontology, not generic crisis boilerplate",
+        {"matched_generic_crisis_phrases": matched},
+        8,
+    )
+
+
 def _answer_mentions_filing_basis(answer: str) -> bool:
     return _contains_any(
         answer,
-        (
-            "공시",
-            "10-k",
-            "10k",
-            "사업보고서",
-            "연차보고서",
-            "filing",
-            "annual report",
-            "sec",
-        ),
+        _COMPANY_EVIDENCE_TERMS,
     )
 
 
@@ -456,6 +801,113 @@ def _answer_acknowledges_missing_company_evidence(answer: str) -> bool:
 def _contains_any(text: str, needles: Sequence[str]) -> bool:
     lowered = text.lower()
     return any(needle.lower() in lowered for needle in needles)
+
+
+def _first_term_position(text: str, needles: Sequence[str]) -> int | None:
+    lowered = text.lower()
+    positions = [lowered.find(needle.lower()) for needle in needles if needle.lower() in lowered]
+    positions = [position for position in positions if position >= 0]
+    return min(positions) if positions else None
+
+
+def _answer_materials(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    materials: list[dict[str, Any]] = []
+    for row in rows:
+        materials.append(
+            {
+                "author_key": row.get("author_key"),
+                "author_name": row.get("author_name"),
+                "label_ko": row.get("label_ko"),
+                "label_en": row.get("label_en"),
+                "summary_ko": row.get("summary_ko"),
+                "lens_role": row.get("lens_role"),
+                "answer_role": row.get("answer_role"),
+                "object_type": row.get("object_type"),
+            }
+        )
+    return materials
+
+
+def _matched_material_terms(
+    answer: str,
+    materials: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    answer_lower = answer.lower()
+    matches: list[dict[str, Any]] = []
+    for material in materials:
+        label = str(material.get("label_ko") or material.get("label_en") or "")
+        if label and label.lower() in answer_lower:
+            matches.append({"label": label, "term": label})
+            continue
+        terms = _material_terms(material)
+        matched_terms = [term for term in terms if term.lower() in answer_lower]
+        if len(matched_terms) >= 2 or (matched_terms and len(matched_terms[0]) >= 4):
+            matches.append({"label": label, "terms": matched_terms[:4]})
+    return matches
+
+
+def _material_terms(material: Mapping[str, Any]) -> list[str]:
+    text = " ".join(
+        str(value or "")
+        for value in (
+            material.get("label_ko"),
+            material.get("label_en"),
+            material.get("summary_ko"),
+        )
+    )
+    return _salient_terms(text)
+
+
+def _matched_persona_terms(answer: str, persona_profile: Mapping[str, Any]) -> list[str]:
+    rows: list[Mapping[str, Any]] = []
+    for key in ("derived_traits", "reasoning_style", "caution_patterns"):
+        rows.extend(_list_of_mappings(persona_profile.get(key)))
+    terms: list[str] = []
+    for row in rows:
+        terms.extend(_salient_terms(str(row.get("label_ko") or "")))
+    answer_lower = answer.lower()
+    matched: list[str] = []
+    for term in terms:
+        if term.lower() in answer_lower and term not in matched:
+            matched.append(term)
+    return matched[:6]
+
+
+def _salient_terms(text: str) -> list[str]:
+    raw_terms = re.findall(r"[가-힣A-Za-z0-9]{2,}", text)
+    stop_terms = {
+        "것",
+        "수",
+        "때",
+        "및",
+        "the",
+        "and",
+        "for",
+        "with",
+        "that",
+        "this",
+        "company",
+        "investment",
+        "answer",
+        "lens",
+    }
+    terms: list[str] = []
+    for term in raw_terms:
+        normalized = term.lower()
+        if normalized in stop_terms:
+            continue
+        if len(term) < 2:
+            continue
+        if term not in terms:
+            terms.append(term)
+    return terms[:16]
+
+
+def _clean_optional(value: Any) -> str | None:
+    if value is None:
+        return None
+    stripped = str(value).strip()
+    return stripped or None
 
 
 def _read_answer_eval_cases(path: Path) -> list[dict[str, Any]]:
@@ -507,8 +959,42 @@ def _evaluate_answer_case(
         "answer_path": str(answer_path) if answer_path else None,
         "research_payload_path": str(research_payload_path) if research_payload_path else None,
         "filing_evidence_provided": bool(case.get("filing_evidence_provided")),
+        "answer_fingerprint": _answer_fingerprint(answer),
         **evaluation,
     }
+
+
+def _apply_batch_repetition_penalty(case_results: list[dict[str, Any]]) -> None:
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for result in case_results:
+        fingerprint = str(result.get("answer_fingerprint") or "")
+        if fingerprint:
+            groups.setdefault(fingerprint, []).append(result)
+    for duplicate_group in groups.values():
+        if len(duplicate_group) < 2:
+            continue
+        ids = [str(result.get("id") or "") for result in duplicate_group]
+        for result in duplicate_group:
+            check = _weighted_check(
+                "batch_repetition_penalty",
+                False,
+                "different eval questions should not receive the same substantive answer",
+                {"duplicate_case_ids": ids},
+                16,
+            )
+            result["checks"].append(check)
+            result["failures"].append(check)
+            result["max_score"] += check["weight"]
+            result["score_ratio"] = round(result["score"] / result["max_score"], 4)
+            result["passed"] = result["score_ratio"] >= float(result.get("pass_threshold") or 0.0)
+
+
+def _answer_fingerprint(answer: str) -> str:
+    normalized = re.sub(r"\s+", "", answer.lower())
+    normalized = re.sub(r"[0-9a-f]{6,}", "", normalized)
+    if len(normalized) < 80:
+        return ""
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
 def _case_path(value: Any, base_dir: Path) -> Path | None:

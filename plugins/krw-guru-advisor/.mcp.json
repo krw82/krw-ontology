@@ -10,7 +10,7 @@
       ],
       "env": {
         "KRW_GURU_ROOT": "~/krw-ontology-guru",
-        "KRW_GURU_RUNNING_ROOT": "~/krw-ontology-guru-running-v2-3docs-20260705-224618"
+        "KRW_GURU_RUNNING_ROOT": "~/krw-ontology-guru-running-20260706-212951"
       }
     }
   }

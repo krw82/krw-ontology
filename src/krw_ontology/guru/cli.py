@@ -20,6 +20,7 @@ from krw_ontology.guru.eval_quality import (
 )
 from krw_ontology.guru.extractor import DEFAULT_AGENT_SDK_CONCURRENCY, extract_guru_ontology
 from krw_ontology.guru.fetcher import fetch_guru_sources
+from krw_ontology.guru.index import build_guru_shard_index, guru_index_status
 from krw_ontology.guru.lens_selector import select_guru_lenses
 from krw_ontology.guru.parser import parse_guru_sources
 from krw_ontology.guru.pipeline import run_guru_pipeline
@@ -321,6 +322,7 @@ def guru_status(
     """Show whether a guru planning workspace exists."""
     payload = guru_workspace_status(root, running_root=running_root)
     payload["background"] = guru_background_status(running_root)
+    payload["index"] = guru_index_status(root)
     typer.echo(
         json.dumps(
             payload,
@@ -329,6 +331,35 @@ def guru_status(
             sort_keys=True,
         )
     )
+
+
+@guru_app.command("build-index")
+def guru_build_index(
+    root: Path | None = typer.Option(None, "--root", help="Long-lived guru data root."),
+    index_dir: Path | None = typer.Option(
+        None,
+        "--index-dir",
+        help="Optional index output directory. Defaults to <root>/indexes.",
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Print machine-readable JSON."),
+) -> None:
+    """Build author-sharded read indexes from reviewed guru ontology JSONL."""
+    payload = build_guru_shard_index(root, index_dir=index_dir)
+    if json_output:
+        typer.echo(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+        return
+    typer.echo("Guru shard index built")
+    typer.echo(f"manifest: {payload['manifest_path']}")
+    typer.echo(f"authors: {', '.join(payload['authors'].keys()) or '(none)'}")
+    for author_key, author_payload in payload["authors"].items():
+        counts = author_payload["counts"]
+        typer.echo(
+            f"- {author_key}: "
+            f"{counts['guru_objects']} lenses, "
+            f"{counts['consultation_objects']} moves, "
+            f"{counts['data_needs']} data needs, "
+            f"{counts['relationships']} relationships"
+        )
 
 
 @guru_app.command("select-lenses")

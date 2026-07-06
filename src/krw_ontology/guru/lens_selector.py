@@ -31,8 +31,8 @@ def select_guru_lenses(
     would need.
     """
     root_path = mcp_tools._resolve_root(root)
-    bundle = mcp_tools._load_reviewed_bundle(root_path)
     selected_authors = mcp_tools._selected_author_keys(question, author_keys)
+    bundle = mcp_tools._load_reviewed_bundle(root_path, author_keys=selected_authors)
     intent_families = _intent_families(question, intent_family)
     inferred_intent = intent_families[0] if intent_families else None
     lens_limit = mcp_tools._limit(limit, maximum=20)
@@ -106,6 +106,7 @@ def select_guru_lenses(
         "question": question,
         "ticker": mcp_tools._clean_optional(ticker),
         "root": str(root_path),
+        "runtime": mcp_tools._bundle_runtime(bundle),
         "selected_author_keys": selected_authors,
         "selected_authors": [
             {"author_key": key, "display_name": mcp_tools.AUTHOR_DISPLAY_NAMES.get(key, key)}

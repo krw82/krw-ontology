@@ -36,6 +36,11 @@ def test_guru_advisor_plugin_is_separate_and_has_dedicated_mcp_server() -> None:
     assert mcp_config["mcpServers"]["krw-guru-advisor"]["command"] == "uv"
     assert "krw-guru-advisor-mcp" in mcp_config["mcpServers"]["krw-guru-advisor"]["args"]
     assert "KRW_GURU_ROOT" in mcp_config["mcpServers"]["krw-guru-advisor"]["env"]
+    assert mcp_config["mcpServers"]["krw-guru-advisor"]["env"]["KRW_GURU_RUNNING_ROOT"].endswith(
+        "krw-ontology-guru-running-20260706-212951"
+    )
+    assert "brief-first consultation skills" in codex_plugin["interface"]["longDescription"]
+    assert "shard-aware read-only Guru MCP" in codex_plugin["interface"]["longDescription"]
     assert "not added to the KRW Ontology router" in codex_plugin["interface"]["longDescription"]
 
 
@@ -45,29 +50,69 @@ def test_guru_advisor_skill_is_explicit_and_read_only() -> None:
     mcp_policy = (REFERENCE_DIR / "mcp-tool-policy.md").read_text()
     research_pack_contract = (REFERENCE_DIR / "research-pack-contract.md").read_text()
     skill_contract = (REFERENCE_DIR / "guru-skill-contract.md").read_text()
+    answer_style_contract = (REFERENCE_DIR / "answer-style-adapters.md").read_text()
+    guru_brief_policy = (REFERENCE_DIR / "guru-brief-policy.md").read_text()
 
     assert "Do not give personalized buy, sell, hold" in output_contract
+    assert "internal guru consultation brief" in output_contract
+    assert "Do not add footer disclaimers" in output_contract
+    assert "AI 렌즈 해석" in output_contract
+    assert "generic safety template" in output_contract
     assert "must not modify the existing KRW company ontology schema" in company_contract
+    assert "Bridge Workflow" in company_contract
     assert "krw_guru_query_context" in mcp_policy
+    assert "krw_guru_index_context" in mcp_policy
+    assert "author SQLite shards" in mcp_policy
     assert "krw_guru_context" not in mcp_policy
     assert "Skills must not hard-code guru principles" in research_pack_contract
+    assert "private internal guru consultation brief" in research_pack_contract
     assert "The application code owns guru selection" in skill_contract
+    assert "guru-brief-policy.md" in skill_contract
+    assert "Mandatory Composition" in answer_style_contract
+    assert "private internal guru consultation brief" in answer_style_contract
+    assert "footer disclaimers" in answer_style_contract
+    assert "Author-Specific Style" in answer_style_contract
+    assert "primary_intent" in guru_brief_policy
+    assert "secondary_intents" in guru_brief_policy
+    assert "Use `krw_guru_index_context` only for debug" in guru_brief_policy
 
     assert not (SKILLS_DIR / "krw-guru-advisor" / "SKILL.md").exists()
     assert GURU_SKILL_MAP == GURU_SKILLS
     for author_key, skill_name in GURU_SKILLS.items():
         skill_text = (SKILLS_DIR / skill_name / "SKILL.md").read_text()
         agent_text = (SKILLS_DIR / skill_name / "agents" / "openai.yaml").read_text()
+        local_style_text = (SKILLS_DIR / skill_name / "references" / "answer-style.md").read_text()
 
         assert guru_skill_name(author_key) == skill_name
         assert f"name: {skill_name}" in skill_text
         assert f'Fixed `author_key`: `{author_key}`.' in skill_text
         assert "This is not a router" in skill_text
         assert "must not hard-code" in skill_text
+        assert "private internal guru consultation brief" in skill_text
+        assert "guru-brief-policy.md" in skill_text
+        assert "references/answer-style.md" in skill_text
+        assert "answer-style-adapters.md" in skill_text
         assert "krw_guru_query_context" in skill_text
         assert f'author_keys=["{author_key}"]' in skill_text
         assert "ResearchPack" in skill_text
+        assert "private internal guru consultation brief" in agent_text
+        assert "brief-optimized question" in agent_text
+        assert "skill-local references/answer-style.md" in agent_text
+        assert "voice, texture, and analogy rendering" in agent_text
         assert "krw_guru_query_context" in agent_text
+        assert f"Fixed `author_key`: `{author_key}`." in local_style_text
+        assert "This file controls rendering only" in local_style_text
+        assert "## Rendering Boundary" in local_style_text
+        assert "## Voice" in local_style_text
+        assert "## Texture" in local_style_text
+        assert "## Allowed Analogies" in local_style_text
+        assert "## Identity Boundary" in local_style_text
+        assert "## Style Transformations" in local_style_text
+        assert "ResearchPack decides what to say" in local_style_text
+        assert "렌즈로 보면" not in local_style_text
+        assert "렌즈로 본다면" not in local_style_text
+        assert "말투로 바꾸면" not in local_style_text
+        assert "현재 온톨로지" not in local_style_text
 
     with pytest.raises(ValueError, match="Unknown guru author_key"):
         guru_skill_name("unknown")

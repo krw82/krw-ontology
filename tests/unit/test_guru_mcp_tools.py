@@ -8,6 +8,7 @@ from pathlib import Path
 from krw_ontology.guru import mcp_server
 from krw_ontology.guru import mcp_tools
 from krw_ontology.guru import lens_selector
+from krw_ontology.guru.index import build_guru_shard_index
 from krw_ontology.guru.lens_selector import guru_select_lenses_tool, select_guru_lenses
 from krw_ontology.guru.mcp_tools import (
     guru_chain_tool,
@@ -15,6 +16,7 @@ from krw_ontology.guru.mcp_tools import (
     guru_data_needs_tool,
     guru_eval_questions_tool,
     guru_evidence_tool,
+    guru_index_context_tool,
     guru_query_context_tool,
     guru_search_tool,
     guru_status_tool,
@@ -36,7 +38,70 @@ def test_guru_mcp_server_registers_read_only_tool_names() -> None:
         "krw_guru_evidence",
         "krw_guru_data_needs",
         "krw_guru_eval_questions",
+        "krw_guru_index_context",
     } <= tool_names
+
+
+def test_guru_shard_index_is_used_for_query_context(tmp_path: Path, monkeypatch) -> None:
+    root = _write_reviewed_fixture(tmp_path)
+    manifest = build_guru_shard_index(root)
+
+    assert manifest["schema_version"] == "krw-guru-shard-index/v1"
+    assert (root / "indexes" / "guru_shard_manifest.json").is_file()
+    assert (root / "indexes" / "shards" / "buffett.sqlite").is_file()
+    assert manifest["authors"]["buffett"]["counts"]["guru_objects"] == 1
+
+    original_read_jsonl = mcp_tools._read_jsonl
+
+    def fail_reviewed_jsonl(path: Path):
+        if "reviewed" in path.parts:
+            raise AssertionError(f"reviewed JSONL fallback was used: {path}")
+        return original_read_jsonl(path)
+
+    monkeypatch.setattr(mcp_tools, "_read_jsonl", fail_reviewed_jsonl)
+
+    index_context = json.loads(guru_index_context_tool(root=root))
+    assert index_context["status"]["usable"] is True
+    assert index_context["status"]["runtime_mode"] == "author_shard"
+
+    status = json.loads(guru_status_tool(root=root))
+    assert status["runtime"]["mode"] == "author_shard"
+    assert status["runtime"]["index_usable"] is True
+
+    query_context = json.loads(
+        guru_query_context_tool(
+            root=root,
+            question="내가 AAPL을 샀는데 버핏 관점에서 장기 보유해도 되는지 봐줘",
+            ticker="AAPL",
+            author_keys=["buffett"],
+        )
+    )
+    assert query_context["runtime"]["mode"] == "author_shard"
+    assert query_context["runtime"]["author_keys"] == ["buffett"]
+    assert query_context["research_pack"]["pack_meta"]["guru_keys"] == ["buffett"]
+    assert query_context["research_pack"]["selected_lenses"][0]["reviewed_id"] == (
+        "guru:buffett:principle:cash-owner-earnings:test"
+    )
+
+    search = json.loads(
+        guru_search_tool(
+            root=root,
+            query="버핏 현금흐름",
+            author_keys=["buffett"],
+        )
+    )
+    assert search["runtime"]["mode"] == "author_shard"
+    assert search["results"][0]["author_key"] == "buffett"
+
+    selection = json.loads(
+        guru_select_lenses_tool(
+            root=root,
+            question="AAPL을 버핏 관점에서 봐줘",
+            ticker="AAPL",
+            author_keys=["buffett"],
+        )
+    )
+    assert selection["runtime"]["mode"] == "author_shard"
 
 
 def test_guru_status_search_context_evidence_and_data_needs(tmp_path: Path) -> None:

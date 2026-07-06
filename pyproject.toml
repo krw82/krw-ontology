@@ -8,8 +8,10 @@ dependencies = [
     "pydantic>=2.0,<2.13",
     "httpx>=0.27",
     "beautifulsoup4>=4.12",
+    "brotli>=1.1",
     "markdownify>=0.12",
     "lxml>=5.0",
+    "pypdf>=5.0",
     "claude-agent-sdk==0.2.85",
     "pyyaml>=6.0",
     "rich>=13.0",
@@ -28,6 +30,7 @@ dev = [
 krw-ontology = "krw_ontology.cli.main:app"
 krw-ontology-mcp = "krw_ontology.mcp_server.http_server:main"
 krw-ontology-mcp-stdio = "krw_ontology.mcp_server.server:main"
+krw-guru-advisor-mcp = "krw_ontology.guru.mcp_server:main"
 
 [build-system]
 requires = ["hatchling"]

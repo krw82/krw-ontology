@@ -62,6 +62,8 @@ class ExtractionWorker:
         user_prompt = prompt_template.format(**input_data)
         metadata = {**self.call_log_context, **(call_metadata or {})}
         data = await self._call_with_retry(user_prompt, output_schema, stage_name, metadata)
+        if isinstance(data, str):
+            return parse_structured_output(data, output_schema, stage_name)
         return parse_structured_data(data, stage_name)
 
     async def _call_with_retry(
@@ -120,7 +122,7 @@ class ExtractionWorker:
         stage_name: str,
         *,
         call_metadata: dict[str, Any] | None = None,
-        attempt: int,
+        attempt: int = 1,
     ) -> Any:
         """Run one Claude Code structured-output request with a hard subprocess timeout."""
         started_monotonic = time.monotonic()
@@ -161,6 +163,7 @@ class ExtractionWorker:
             stderr=asyncio.subprocess.PIPE,
             cwd=str(self.cwd),
         )
+        proc_pid = getattr(proc, "pid", None)
         self._write_agent_call_log(
             log_path,
             {
@@ -169,7 +172,7 @@ class ExtractionWorker:
                 "model": self.model,
                 "attempt": attempt,
                 "max_retries": self.max_retries,
-                "pid": proc.pid,
+                "pid": proc_pid,
                 "timeout_seconds": self.call_timeout_s,
                 "max_turns": self.max_turns,
                 **metadata,
@@ -190,7 +193,7 @@ class ExtractionWorker:
                     metadata,
                     started_monotonic=started_monotonic,
                     attempt=attempt,
-                    pid=proc.pid,
+                    pid=proc_pid,
                     status="timeout",
                     error_preview=f"Claude call timed out after {self.call_timeout_s}s",
                     returncode=proc.returncode,
@@ -212,7 +215,7 @@ class ExtractionWorker:
                     metadata,
                     started_monotonic=started_monotonic,
                     attempt=attempt,
-                    pid=proc.pid,
+                    pid=proc_pid,
                     status=status,
                     error_preview=message,
                     returncode=proc.returncode,
@@ -234,7 +237,7 @@ class ExtractionWorker:
                     metadata,
                     started_monotonic=started_monotonic,
                     attempt=attempt,
-                    pid=proc.pid,
+                    pid=proc_pid,
                     status="error",
                     error_preview="empty response from Claude CLI",
                     returncode=proc.returncode,
@@ -252,7 +255,7 @@ class ExtractionWorker:
                     metadata,
                     started_monotonic=started_monotonic,
                     attempt=attempt,
-                    pid=proc.pid,
+                    pid=proc_pid,
                     status="error",
                     error_preview=f"failed to parse Claude CLI JSON: {e}; {stdout_text[:500]}",
                     returncode=proc.returncode,
@@ -273,7 +276,7 @@ class ExtractionWorker:
                     metadata,
                     started_monotonic=started_monotonic,
                     attempt=attempt,
-                    pid=proc.pid,
+                    pid=proc_pid,
                     status=status,
                     error_preview=message,
                     returncode=proc.returncode,
@@ -289,7 +292,7 @@ class ExtractionWorker:
                 metadata,
                 started_monotonic=started_monotonic,
                 attempt=attempt,
-                pid=proc.pid,
+                pid=proc_pid,
                 status="success",
                 returncode=proc.returncode,
                 output_preview=_safe_preview(stdout_text),
@@ -466,11 +469,28 @@ def _extract_json(raw: str) -> str:
     match = _JSON_BLOCK_RE.search(raw)
     if match:
         return match.group(1).strip()
-    return raw.strip()
+    text = raw.strip()
+    start_positions = [
+        position for position in (text.find("{"), text.find("[")) if position >= 0
+    ]
+    if not start_positions:
+        return text
+    start = min(start_positions)
+    end = max(text.rfind("}"), text.rfind("]"))
+    if end > start:
+        return text[start : end + 1].strip()
+    return text
 
 
 def _repair_common_json_issues(json_str: str) -> str:
     """Repair small JSON mistakes common in model output."""
     # Trailing commas before object/array close are invalid JSON but common in
     # long model-generated arrays.
-    return re.sub(r",\s*([}\]])", r"\1", json_str)
+    repaired = re.sub(r",\s*([}\]])", r"\1", json_str)
+    # Long object outputs sometimes drop the comma between a completed value and
+    # the next object key. Only apply this after normal parsing failed.
+    return re.sub(
+        r'(?<=[}\]"])\s*\n\s*("[-A-Za-z0-9_]+"(?:\s*):)',
+        r",\n\1",
+        repaired,
+    )

@@ -1,0 +1,5 @@
+interface:
+  display_name: "KRW Guru Buffett Advisor"
+  short_description: "Buffett lens adapter backed by Guru ResearchPack"
+  default_prompt: "Use $krw-guru-buffett-advisor only when Buffett is already selected. Call krw_guru_query_context with author_keys=[\"buffett\"]. Do not hard-code Buffett principles; use only the returned ResearchPack."
+

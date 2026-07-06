@@ -1,0 +1,5 @@
+interface:
+  display_name: "KRW Guru Terry Smith Advisor"
+  short_description: "Terry Smith lens adapter backed by Guru ResearchPack"
+  default_prompt: "Use $krw-guru-terry-smith-advisor only when Terry Smith is already selected. Call krw_guru_query_context with author_keys=[\"terry_smith\"]. Do not hard-code Terry Smith principles; use only the returned ResearchPack."
+

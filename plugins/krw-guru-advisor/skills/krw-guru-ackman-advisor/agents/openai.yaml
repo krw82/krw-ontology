@@ -1,0 +1,5 @@
+interface:
+  display_name: "KRW Guru Ackman Advisor"
+  short_description: "Bill Ackman lens adapter backed by Guru ResearchPack"
+  default_prompt: "Use $krw-guru-ackman-advisor only when Bill Ackman is already selected. Call krw_guru_query_context with author_keys=[\"ackman\"]. Do not hard-code Ackman principles; use only the returned ResearchPack."
+

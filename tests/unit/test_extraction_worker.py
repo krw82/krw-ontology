@@ -93,6 +93,50 @@ def test_trailing_commas_are_repaired():
     assert items[0]["id"] == "claim:1"
 
 
+def test_prose_wrapped_json_is_extracted():
+    raw = """
+    Here is the JSON:
+    {
+      "items": [
+        {
+          "id": "claim:1",
+          "claim_text": "Revenue increased.",
+          "claim_type": "financial_performance",
+          "supported_by_quotes": ["quote:1"],
+          "confidence": "high"
+        }
+      ]
+    }
+    Done.
+    """
+
+    items = parse_structured_output(raw, {}, "extract_research_claims")
+
+    assert len(items) == 1
+    assert items[0]["id"] == "claim:1"
+
+
+def test_missing_comma_between_json_fields_is_repaired():
+    raw = """
+    {
+      "items": [
+        {
+          "id": "claim:1"
+          "claim_text": "Revenue increased.",
+          "claim_type": "financial_performance",
+          "supported_by_quotes": ["quote:1"],
+          "confidence": "high"
+        }
+      ]
+    }
+    """
+
+    items = parse_structured_output(raw, {}, "extract_research_claims")
+
+    assert len(items) == 1
+    assert items[0]["id"] == "claim:1"
+
+
 def test_extract_uses_claude_cli_structured_output(monkeypatch, tmp_path):
     captured = {}
 
@@ -195,6 +239,81 @@ def test_extract_uses_claude_cli_structured_output(monkeypatch, tmp_path):
     ]
 
 
+def test_extract_parses_claude_cli_result_markdown_json(monkeypatch, tmp_path):
+    captured = {}
+
+    class FakeProcess:
+        returncode = 0
+
+        async def communicate(self, stdin):
+            captured["stdin"] = stdin.decode()
+            return (
+                json.dumps(
+                    {
+                        "type": "result",
+                        "result": """```json
+{
+  "items": [
+    {
+      "id": "claim:1",
+      "claim_text": "Revenue increased.",
+      "claim_type": "financial_performance",
+      "supported_by_quotes": ["quote:1"],
+      "confidence": "high"
+    }
+  ]
+}
+```""",
+                    }
+                ).encode(),
+                b"",
+            )
+
+        def kill(self):
+            captured["killed"] = True
+
+        async def wait(self):
+            return self.returncode
+
+    async def fake_create_subprocess_exec(*cmd, **kwargs):
+        return FakeProcess()
+
+    monkeypatch.setattr(
+        worker_module.SubprocessCLITransport,
+        "_find_cli",
+        lambda self: "/bin/claude",
+    )
+    monkeypatch.setattr(
+        worker_module.asyncio,
+        "create_subprocess_exec",
+        fake_create_subprocess_exec,
+    )
+
+    extraction_worker = ExtractionWorker(model="claude-test", cwd=tmp_path)
+
+    items = asyncio.run(
+        extraction_worker.extract(
+            "Analyze.",
+            {},
+            {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "claim_text": {"type": "string"},
+                    "claim_type": {"type": "string"},
+                    "supported_by_quotes": {"type": "array", "items": {"type": "string"}},
+                    "confidence": {"type": "string"},
+                },
+                "required": ["id", "claim_text", "claim_type", "supported_by_quotes", "confidence"],
+            },
+            "extract_research_claims",
+        )
+    )
+
+    assert items[0]["id"] == "claim:1"
+    assert items[0]["confidence"] == "high"
+
+
 def test_extract_retries_rate_limit_same_request(monkeypatch, tmp_path):
     calls = {"count": 0}
     sleeps = []
@@ -202,7 +321,7 @@ def test_extract_retries_rate_limit_same_request(monkeypatch, tmp_path):
     async def fake_sleep(delay):
         sleeps.append(delay)
 
-    async def fake_call_once(prompt_text, sdk_schema, stage_name):
+    async def fake_call_once(prompt_text, sdk_schema, stage_name, **kwargs):
         calls["count"] += 1
         if calls["count"] == 1:
             raise RateLimitError("HTTP 429 too many requests")

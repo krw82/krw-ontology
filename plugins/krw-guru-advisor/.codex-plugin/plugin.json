@@ -1,0 +1,37 @@
+{
+  "name": "krw-guru-advisor",
+  "version": "0.1.0",
+  "description": "Explicit investor-guru consultation skill that uses guru ontology as an investing lens and KRW Ontology filing research as company-fact evidence.",
+  "author": {
+    "name": "Jeong Woncheol",
+    "email": "local@example.com"
+  },
+  "homepage": "file://~/krw-ontology",
+  "repository": "file://~/krw-ontology",
+  "license": "UNLICENSED",
+  "keywords": [
+    "investing",
+    "guru-ontology",
+    "equity-research",
+    "consultation"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "KRW Guru Advisor",
+    "shortDescription": "Explicit guru-style investor consultation using separate guru ontology plus filing evidence.",
+    "longDescription": "Provides a separately installed, explicitly invoked consultation skill and read-only Guru MCP. Guru ontology supplies investor lenses, questions, and risk frames; KRW Ontology filing research remains the source for company facts. This plugin is not added to the KRW Ontology router.",
+    "developerName": "Jeong Woncheol",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "Read"
+    ],
+    "defaultPrompt": [
+      "Use $krw-guru-buffett-advisor: 내가 AAPL을 샀는데 이 렌즈로 점검해줘.",
+      "Use $krw-guru-marks-advisor: 이 기업을 리스크 중심으로 봐줘.",
+      "Use $krw-guru-terry-smith-advisor: 이 회사를 왜 거절할 수 있을지 봐줘."
+    ],
+    "brandColor": "#0F766E"
+  }
+}

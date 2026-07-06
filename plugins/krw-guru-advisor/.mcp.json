@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "krw-guru-advisor": {
+      "command": "uv",
+      "args": [
+        "--directory",
+        "~/krw-ontology",
+        "run",
+        "krw-guru-advisor-mcp"
+      ],
+      "env": {
+        "KRW_GURU_ROOT": "~/krw-ontology-guru",
+        "KRW_GURU_RUNNING_ROOT": "~/krw-ontology-guru-running-v2-3docs-20260705-224618"
+      }
+    }
+  }
+}

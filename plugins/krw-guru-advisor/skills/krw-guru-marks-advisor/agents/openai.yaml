@@ -1,0 +1,5 @@
+interface:
+  display_name: "KRW Guru Marks Advisor"
+  short_description: "Howard Marks lens adapter backed by Guru ResearchPack"
+  default_prompt: "Use $krw-guru-marks-advisor only when Howard Marks is already selected. Call krw_guru_query_context with author_keys=[\"marks\"]. Do not hard-code Marks principles; use only the returned ResearchPack."
+

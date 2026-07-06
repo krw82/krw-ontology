@@ -34,6 +34,7 @@ from krw_ontology.cli.config import (
     set_config_value,
     unset_config_value,
 )
+from krw_ontology.guru.cli import guru_app
 from krw_ontology.cli.init_workspace import init_workspace
 from krw_ontology.config.paths import ONTOLOGY_ROOT_ENV, resolve_ontology_root
 from krw_ontology.observability import (
@@ -286,6 +287,7 @@ app.add_typer(source_manifest_app, name="source-manifest")
 release_app.add_typer(release_cache_app, name="cache")
 app.add_typer(release_app, name="release")
 app.add_typer(observability_app, name="observability")
+app.add_typer(guru_app, name="guru")
 quality_app.add_typer(quality_repair_app, name="repair")
 app.add_typer(quality_app, name="quality")
 

@@ -22,16 +22,21 @@ from krw_ontology.guru.extractor import DEFAULT_AGENT_SDK_CONCURRENCY, extract_g
 from krw_ontology.guru.fetcher import fetch_guru_sources
 from krw_ontology.guru.index import build_guru_shard_index, guru_index_status
 from krw_ontology.guru.lens_selector import select_guru_lenses
+from krw_ontology.guru.mcp_tools import guru_company_brief_tool, guru_company_pack_tool
 from krw_ontology.guru.parser import parse_guru_sources
 from krw_ontology.guru.pipeline import run_guru_pipeline
 from krw_ontology.guru.planner import build_collection_plan
 from krw_ontology.guru.sources import parse_author_keys
 from krw_ontology.guru.verifier import verify_guru_workspace
 from krw_ontology.guru.workspace import (
+    default_guru_data_root,
+    guru_release_status,
     guru_root,
     guru_running_root,
     guru_workspace_status,
     initialize_guru_workspace,
+    promote_guru_release,
+    rollback_guru_release,
 )
 
 
@@ -43,6 +48,18 @@ guru_app = typer.Typer(
     ),
     no_args_is_help=True,
 )
+
+
+def _json_text_from_inline_or_path(inline_json: str | None, path: Path | None) -> str | None:
+    if path is not None:
+        return path.read_text(encoding="utf-8")
+    return inline_json
+
+
+def _mutable_guru_root(root: Path | None) -> Path:
+    if root is not None:
+        return guru_root(root)
+    return default_guru_data_root() / "workspaces" / "default"
 
 
 @guru_app.command(
@@ -62,12 +79,12 @@ def guru_run(
     root: Path | None = typer.Option(
         None,
         "--root",
-        help="Long-lived guru data root. Defaults to ~/krw-ontology-guru.",
+        help="Mutable guru workspace root. Defaults to ~/krw-ontology-guru-data/workspaces/default.",
     ),
     running_root: Path | None = typer.Option(
         None,
         "--running-root",
-        help="Mutable raw/parsed/Agent workspace. Defaults to ~/krw-ontology-guru-running.",
+        help="Mutable raw/parsed/Agent workspace. Defaults to ~/krw-ontology-guru-data/runs/default.",
     ),
     authors: str | None = typer.Option(
         None,
@@ -122,10 +139,11 @@ def guru_run(
     json_output: bool = typer.Option(False, "--json", help="Print machine-readable JSON."),
 ) -> None:
     """Run the standalone guru pipeline in the foreground."""
+    root_path = _mutable_guru_root(root)
     if background:
         try:
             payload = start_background_guru_run(
-                root,
+                root_path,
                 running_root=running_root,
                 authors=authors,
                 limit_per_author=limit_per_author,
@@ -151,7 +169,7 @@ def guru_run(
         return
 
     payload = run_guru_pipeline(
-        root,
+        root_path,
         running_root=running_root,
         author_keys=parse_author_keys(authors),
         force=force,
@@ -181,7 +199,7 @@ def guru_run(
 
 @guru_app.command("run-worker", hidden=True)
 def guru_run_worker(
-    root: Path | None = typer.Option(None, "--root", help="Long-lived guru data root."),
+    root: Path | None = typer.Option(None, "--root", help="Mutable guru workspace root."),
     running_root: Path | None = typer.Option(None, "--running-root", help="Mutable workspace root."),
     authors: str | None = typer.Option(None, "--authors", help="Comma-separated author keys."),
     limit_per_author: int | None = typer.Option(None, "--limit-per-author", min=1),
@@ -198,8 +216,9 @@ def guru_run_worker(
     max_span_chars: int = typer.Option(2400, "--max-span-chars", min=200),
 ) -> None:
     """Hidden worker command for detached guru runs."""
+    root_path = _mutable_guru_root(root)
     payload = run_background_worker(
-        root,
+        root_path,
         running_root=running_root,
         author_keys=parse_author_keys(authors),
         force=force,
@@ -219,12 +238,12 @@ def guru_start(
     root: Path | None = typer.Option(
         None,
         "--root",
-        help="Long-lived guru data root. Defaults to ~/krw-ontology-guru.",
+        help="Mutable guru workspace root. Defaults to ~/krw-ontology-guru-data/workspaces/default.",
     ),
     running_root: Path | None = typer.Option(
         None,
         "--running-root",
-        help="Mutable raw/parsed/Agent workspace. Defaults to ~/krw-ontology-guru-running.",
+        help="Mutable raw/parsed/Agent workspace. Defaults to ~/krw-ontology-guru-data/runs/default.",
     ),
     authors: str | None = typer.Option(
         None,
@@ -248,7 +267,7 @@ def guru_start(
     ),
 ) -> None:
     """Create a planned guru ontology workspace without collecting documents."""
-    root_path = guru_root(root)
+    root_path = _mutable_guru_root(root)
     running_path = guru_running_root(running_root)
     author_keys = parse_author_keys(authors)
     if dry_run:
@@ -286,13 +305,14 @@ def guru_start(
 
 @guru_app.command("plan")
 def guru_plan(
-    root: Path | None = typer.Option(None, "--root", help="Long-lived guru data root."),
+    root: Path | None = typer.Option(None, "--root", help="Mutable guru workspace root."),
     running_root: Path | None = typer.Option(None, "--running-root", help="Mutable workspace root."),
     authors: str | None = typer.Option(None, "--authors", help="Comma-separated author keys."),
 ) -> None:
     """Print the planned guru ontology DAG without writing files."""
+    root_path = _mutable_guru_root(root)
     plan = build_collection_plan(
-        guru_root(root),
+        root_path,
         parse_author_keys(authors),
         running_root=guru_running_root(running_root),
     )
@@ -301,12 +321,13 @@ def guru_plan(
 
 @guru_app.command("verify")
 def guru_verify(
-    root: Path | None = typer.Option(None, "--root", help="Long-lived guru data root."),
+    root: Path | None = typer.Option(None, "--root", help="Mutable guru workspace root."),
     running_root: Path | None = typer.Option(None, "--running-root", help="Mutable workspace root."),
 ) -> None:
     """Verify planned guru ontology artifacts."""
+    root_path = _mutable_guru_root(root)
     result = verify_guru_workspace(
-        root,
+        root_path,
         running_root=running_root,
     )
     typer.echo(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
@@ -316,11 +337,16 @@ def guru_verify(
 
 @guru_app.command("status")
 def guru_status(
-    root: Path | None = typer.Option(None, "--root", help="Long-lived guru data root."),
+    root: Path | None = typer.Option(None, "--root", help="Long-lived guru release root."),
     running_root: Path | None = typer.Option(None, "--running-root", help="Mutable workspace root."),
 ) -> None:
     """Show whether a guru planning workspace exists."""
-    payload = guru_workspace_status(root, running_root=running_root)
+    status_root = _mutable_guru_root(root) if root is None else guru_root(root)
+    payload = guru_workspace_status(status_root, running_root=running_root)
+    if root is None:
+        payload["workspace_root"] = payload["root"]
+        payload["serving_root"] = str(guru_root(None))
+        payload["release"] = guru_release_status()
     payload["background"] = guru_background_status(running_root)
     payload["index"] = guru_index_status(root)
     typer.echo(
@@ -333,9 +359,131 @@ def guru_status(
     )
 
 
+@guru_app.command("release-status")
+def guru_release_status_command(
+    env: str | None = typer.Option(
+        None,
+        "--env",
+        help="Guru release environment. Defaults to KRW_GURU_ENV or prod.",
+    ),
+    data_root: Path | None = typer.Option(
+        None,
+        "--data-root",
+        help="Guru operational data root. Defaults to ~/krw-ontology-guru-data.",
+    ),
+    release_id: str = typer.Option(
+        "current",
+        "--release-id",
+        help="Release id to inspect. Defaults to current.",
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Print machine-readable JSON."),
+) -> None:
+    """Show guru release/current operational status."""
+    payload = guru_release_status(env=env, data_root=data_root, release_id=release_id)
+    if json_output:
+        typer.echo(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+        return
+    typer.echo(f"env: {payload['env']}")
+    typer.echo(f"data_root: {payload['data_root']}")
+    typer.echo(f"release_root: {payload['release_root']}")
+    typer.echo(f"manifest_exists: {str(payload['manifest_exists']).lower()}")
+    typer.echo(f"current_symlink: {str(payload['current_symlink']).lower()}")
+    typer.echo(f"current_release_id: {payload['current_release_id'] or '(none)'}")
+
+
+@guru_app.command("promote")
+def guru_promote(
+    source_root: Path = typer.Option(
+        ...,
+        "--source-root",
+        help="Reviewed guru root to copy into releases/<env>/<release-id>.",
+    ),
+    env: str | None = typer.Option(
+        None,
+        "--env",
+        help="Guru release environment. Defaults to KRW_GURU_ENV or prod.",
+    ),
+    data_root: Path | None = typer.Option(
+        None,
+        "--data-root",
+        help="Guru operational data root. Defaults to ~/krw-ontology-guru-data.",
+    ),
+    release_id: str | None = typer.Option(
+        None,
+        "--release-id",
+        help="Release id. Defaults to current UTC timestamp.",
+    ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Replace an existing release id or non-symlink current path.",
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Print machine-readable JSON."),
+) -> None:
+    """Promote a reviewed guru root to releases/<env>/<release-id> and update current."""
+    try:
+        payload = promote_guru_release(
+            source_root,
+            env=env,
+            data_root=data_root,
+            release_id=release_id,
+            force=force,
+        )
+    except (FileExistsError, FileNotFoundError, ValueError) as exc:
+        typer.echo(str(exc))
+        raise typer.Exit(1) from exc
+    if json_output:
+        typer.echo(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+        return
+    typer.echo("Guru release promoted")
+    typer.echo(f"data_root: {payload['data_root']}")
+    typer.echo(f"env: {payload['env']}")
+    typer.echo(f"release_id: {payload['promoted_release_id']}")
+    typer.echo(f"current: {payload['current_symlink_path']} -> {payload['current_symlink_target']}")
+
+
+@guru_app.command("rollback")
+def guru_rollback(
+    release_id: str = typer.Option(..., "--release-id", help="Existing release id to point current at."),
+    env: str | None = typer.Option(
+        None,
+        "--env",
+        help="Guru release environment. Defaults to KRW_GURU_ENV or prod.",
+    ),
+    data_root: Path | None = typer.Option(
+        None,
+        "--data-root",
+        help="Guru operational data root. Defaults to ~/krw-ontology-guru-data.",
+    ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Replace a non-symlink current path.",
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Print machine-readable JSON."),
+) -> None:
+    """Move releases/<env>/current back to an existing guru release."""
+    try:
+        payload = rollback_guru_release(
+            env=env,
+            data_root=data_root,
+            release_id=release_id,
+            force=force,
+        )
+    except (FileExistsError, FileNotFoundError, ValueError) as exc:
+        typer.echo(str(exc))
+        raise typer.Exit(1) from exc
+    if json_output:
+        typer.echo(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+        return
+    typer.echo("Guru release current pointer updated")
+    typer.echo(f"env: {payload['env']}")
+    typer.echo(f"current: {payload['current_symlink_path']} -> {payload['current_symlink_target']}")
+
+
 @guru_app.command("build-index")
 def guru_build_index(
-    root: Path | None = typer.Option(None, "--root", help="Long-lived guru data root."),
+    root: Path | None = typer.Option(None, "--root", help="Long-lived guru release root."),
     index_dir: Path | None = typer.Option(
         None,
         "--index-dir",
@@ -370,7 +518,7 @@ def guru_select_lenses(
         "-q",
         help="Investor consultation question to route through the guru ontology.",
     ),
-    root: Path | None = typer.Option(None, "--root", help="Long-lived guru data root."),
+    root: Path | None = typer.Option(None, "--root", help="Long-lived guru release root."),
     authors: str | None = typer.Option(
         None,
         "--authors",
@@ -380,6 +528,16 @@ def guru_select_lenses(
         None,
         "--ticker",
         help="Optional company ticker when the question is company-specific.",
+    ),
+    company_context_json: str | None = typer.Option(
+        None,
+        "--company-context-json",
+        help="Optional inline JSON object from company ontology topic_map/profile.",
+    ),
+    company_context: Path | None = typer.Option(
+        None,
+        "--company-context",
+        help="Optional JSON file from company ontology topic_map/profile.",
     ),
     intent_family: str | None = typer.Option(
         None,
@@ -401,11 +559,13 @@ def guru_select_lenses(
     json_output: bool = typer.Option(False, "--json", help="Print machine-readable JSON."),
 ) -> None:
     """Select relevant guru ontology lenses for one investor question."""
+    context_json = _json_text_from_inline_or_path(company_context_json, company_context)
     payload = select_guru_lenses(
         question=question,
         root=root,
         author_keys=parse_author_keys(authors) if authors else None,
         ticker=ticker,
+        company_context=json.loads(context_json) if context_json else None,
         intent_family=intent_family,
         limit=limit,
         data_need_limit=data_need_limit,
@@ -428,9 +588,154 @@ def guru_select_lenses(
         )
 
 
+@guru_app.command("company-brief")
+def guru_company_brief(
+    question: str = typer.Option(
+        ...,
+        "--question",
+        "-q",
+        help="Investor question to translate into a company filing research brief.",
+    ),
+    root: Path | None = typer.Option(None, "--root", help="Long-lived guru release root."),
+    authors: str | None = typer.Option(
+        None,
+        "--authors",
+        help="Optional comma-separated author keys. Omit to infer from the question.",
+    ),
+    ticker: str | None = typer.Option(
+        None,
+        "--ticker",
+        help="Optional company ticker when the question is company-specific.",
+    ),
+    company_name: str | None = typer.Option(
+        None,
+        "--company-name",
+        help="Optional company name when a ticker is unavailable or ambiguous.",
+    ),
+    company_context_json: str | None = typer.Option(
+        None,
+        "--company-context-json",
+        help="Optional inline JSON object from company ontology topic_map/profile.",
+    ),
+    company_context: Path | None = typer.Option(
+        None,
+        "--company-context",
+        help="Optional JSON file from company ontology topic_map/profile.",
+    ),
+    intent_family: str | None = typer.Option(
+        None,
+        "--intent-family",
+        help="Optional explicit guru consultation intent family.",
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Print machine-readable JSON."),
+) -> None:
+    """Build a company filing brief from guru ontology lenses."""
+    context_json = _json_text_from_inline_or_path(company_context_json, company_context)
+    payload_text = guru_company_brief_tool(
+        question=question,
+        root=root,
+        author_keys=parse_author_keys(authors) if authors else None,
+        ticker=ticker,
+        company_name=company_name,
+        company_context_json=context_json,
+        intent_family=intent_family,
+    )
+    payload = json.loads(payload_text)
+    if json_output:
+        typer.echo(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+        return
+    brief = payload["company_filing_brief"]
+    identity = brief["company_identity"]
+    typer.echo(f"research_status: {payload['research_status']}")
+    typer.echo(f"subject: {identity['subject']}")
+    typer.echo(f"requires_company_evidence: {str(payload['requires_company_evidence']).lower()}")
+    typer.echo(f"next_step: {payload['next_step']}")
+    typer.echo("company_research_question_ko:")
+    typer.echo(brief["company_research_question_ko"])
+    if brief.get("required_filing_topics"):
+        typer.echo("required_filing_topics: " + ", ".join(brief["required_filing_topics"]))
+
+
+@guru_app.command("company-pack")
+def guru_company_pack(
+    question: str = typer.Option(
+        ...,
+        "--question",
+        "-q",
+        help="Investor question that produced the guru/company pack.",
+    ),
+    root: Path | None = typer.Option(None, "--root", help="Mutable guru workspace root."),
+    authors: str | None = typer.Option(
+        None,
+        "--authors",
+        help="Optional comma-separated author keys. Omit to infer from the question.",
+    ),
+    ticker: str | None = typer.Option(None, "--ticker", help="Optional company ticker."),
+    company_name: str | None = typer.Option(None, "--company-name", help="Optional company name."),
+    company_payload: Path | None = typer.Option(
+        None,
+        "--company-payload",
+        help="Optional JSON file returned by KRW Ontology company filing research.",
+    ),
+    company_payload_json: str | None = typer.Option(
+        None,
+        "--company-payload-json",
+        help="Optional inline JSON object returned by KRW Ontology company filing research.",
+    ),
+    company_context: Path | None = typer.Option(
+        None,
+        "--company-context",
+        help="Optional JSON file from company ontology topic_map/profile.",
+    ),
+    company_context_json: str | None = typer.Option(
+        None,
+        "--company-context-json",
+        help="Optional inline JSON object from company ontology topic_map/profile.",
+    ),
+    intent_family: str | None = typer.Option(
+        None,
+        "--intent-family",
+        help="Optional explicit guru consultation intent family.",
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Print machine-readable JSON."),
+) -> None:
+    """Build GuruCompanyResearchPack and answer render plan."""
+    payload_json = company_payload_json
+    if company_payload is not None:
+        payload_json = company_payload.read_text(encoding="utf-8")
+    context_json = _json_text_from_inline_or_path(company_context_json, company_context)
+    try:
+        payload_text = guru_company_pack_tool(
+            question=question,
+            root=root,
+            author_keys=parse_author_keys(authors) if authors else None,
+            ticker=ticker,
+            company_name=company_name,
+            company_payload_json=payload_json,
+            company_context_json=context_json,
+            intent_family=intent_family,
+        )
+    except ValueError as exc:
+        typer.echo(str(exc))
+        raise typer.Exit(1) from exc
+    payload = json.loads(payload_text)
+    if json_output:
+        typer.echo(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+        return
+    company_pack = payload["company_pack"]
+    render_plan = payload["render_plan"]
+    identity = company_pack["company_identity"]
+    typer.echo(f"research_status: {payload['research_status']}")
+    typer.echo(f"subject: {identity['subject']}")
+    typer.echo(f"opening_style: {render_plan['opening_style']}")
+    typer.echo(f"first_question: {render_plan['first_question']}")
+    if company_pack.get("missing_evidence"):
+        typer.echo("missing_evidence: " + ", ".join(company_pack["missing_evidence"]))
+
+
 @guru_app.command("fetch")
 def guru_fetch(
-    root: Path | None = typer.Option(None, "--root", help="Long-lived guru data root."),
+    root: Path | None = typer.Option(None, "--root", help="Mutable guru workspace root."),
     running_root: Path | None = typer.Option(None, "--running-root", help="Mutable workspace root."),
     limit_per_author: int | None = typer.Option(
         None,
@@ -447,8 +752,9 @@ def guru_fetch(
     json_output: bool = typer.Option(False, "--json", help="Print machine-readable JSON."),
 ) -> None:
     """Fetch official indexes and discovered PDF/HTML source documents."""
+    root_path = _mutable_guru_root(root)
     manifest = fetch_guru_sources(
-        root,
+        root_path,
         running_root=running_root,
         limit_per_author=limit_per_author,
         overwrite=overwrite,
@@ -466,7 +772,7 @@ def guru_fetch(
 
 @guru_app.command("parse")
 def guru_parse(
-    root: Path | None = typer.Option(None, "--root", help="Long-lived guru data root."),
+    root: Path | None = typer.Option(None, "--root", help="Mutable guru workspace root."),
     running_root: Path | None = typer.Option(None, "--running-root", help="Mutable workspace root."),
     source_ids: str | None = typer.Option(
         None,
@@ -484,8 +790,9 @@ def guru_parse(
 ) -> None:
     """Parse fetched raw PDF/HTML/text files into private spans."""
     selected_source_ids = _parse_csv_set(source_ids)
+    root_path = _mutable_guru_root(root)
     manifest = parse_guru_sources(
-        root,
+        root_path,
         running_root=running_root,
         source_ids=selected_source_ids,
         overwrite=overwrite,
@@ -504,7 +811,7 @@ def guru_parse(
 
 @guru_app.command("extract")
 def guru_extract(
-    root: Path | None = typer.Option(None, "--root", help="Long-lived guru data root."),
+    root: Path | None = typer.Option(None, "--root", help="Mutable guru workspace root."),
     running_root: Path | None = typer.Option(None, "--running-root", help="Mutable workspace root."),
     execute_agent_sdk: bool = typer.Option(
         False,
@@ -527,8 +834,9 @@ def guru_extract(
     json_output: bool = typer.Option(False, "--json", help="Print machine-readable JSON."),
 ) -> None:
     """Build Agent SDK extraction batches; dry-run unless explicitly executed."""
+    root_path = _mutable_guru_root(root)
     manifest = extract_guru_ontology(
-        root,
+        root_path,
         running_root=running_root,
         execute_agent_sdk=execute_agent_sdk,
         model=model,
@@ -548,7 +856,7 @@ def guru_extract(
 
 @guru_app.command("curate")
 def guru_curate(
-    root: Path | None = typer.Option(None, "--root", help="Long-lived guru data root."),
+    root: Path | None = typer.Option(None, "--root", help="Long-lived guru release root."),
     running_root: Path | None = typer.Option(None, "--running-root", help="Mutable workspace root."),
     candidates_path: Path | None = typer.Option(
         None,
@@ -563,8 +871,9 @@ def guru_curate(
     json_output: bool = typer.Option(False, "--json", help="Print machine-readable JSON."),
 ) -> None:
     """Curate raw guru extraction candidates into reviewed ontology artifacts."""
+    root_path = _mutable_guru_root(root)
     report = curate_guru_candidates(
-        root,
+        root_path,
         running_root=running_root,
         candidates_path=candidates_path,
         reviewed_dir=reviewed_dir,
@@ -586,7 +895,7 @@ def guru_curate(
 
 @guru_app.command("eval-quality")
 def guru_eval_quality(
-    root: Path | None = typer.Option(None, "--root", help="Long-lived guru data root."),
+    root: Path | None = typer.Option(None, "--root", help="Long-lived guru release root."),
     eval_path: Path | None = typer.Option(
         None,
         "--eval-path",
@@ -642,7 +951,7 @@ def guru_eval_answer(
         "--answer-file",
         help="Path to a generated answer Markdown/text file.",
     ),
-    root: Path | None = typer.Option(None, "--root", help="Long-lived guru data root."),
+    root: Path | None = typer.Option(None, "--root", help="Long-lived guru release root."),
     research_payload_path: Path | None = typer.Option(
         None,
         "--research-payload",
@@ -692,7 +1001,7 @@ def guru_eval_answer_batch(
         "--cases-path",
         help="JSONL cases with question plus answer/answer_path and optional research payload.",
     ),
-    root: Path | None = typer.Option(None, "--root", help="Long-lived guru data root."),
+    root: Path | None = typer.Option(None, "--root", help="Long-lived guru release root."),
     output_path: Path | None = typer.Option(
         None,
         "--output-path",

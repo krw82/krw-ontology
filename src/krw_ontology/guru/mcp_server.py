@@ -11,6 +11,8 @@ from krw_ontology.guru.lens_selector import guru_select_lenses_tool
 from krw_ontology.guru.mcp_tools import (
     GuruResponseFormat,
     guru_chain_tool,
+    guru_company_brief_tool,
+    guru_company_pack_tool,
     guru_context_tool,
     guru_data_needs_tool,
     guru_eval_questions_tool,
@@ -116,6 +118,7 @@ async def krw_guru_query_context(
     root: str | None = None,
     author_keys: list[str] | None = None,
     ticker: str | None = None,
+    company_context_json: str | None = None,
     intent_family: str | None = None,
     limit_lens: int = 4,
     limit_consultation: int = 3,
@@ -129,10 +132,77 @@ async def krw_guru_query_context(
         root=Path(root).expanduser() if root else None,
         author_keys=author_keys,
         ticker=ticker,
+        company_context_json=company_context_json,
         intent_family=intent_family,
         limit_lens=limit_lens,
         limit_consultation=limit_consultation,
         limit_data_needs=limit_data_needs,
+        response_format=response_format,
+    )
+
+
+@mcp.tool(
+    name="krw_guru_company_brief",
+    title="Build KRW company filing brief from guru lenses",
+    annotations=READ_ONLY,
+)
+async def krw_guru_company_brief(
+    question: str,
+    root: str | None = None,
+    author_keys: list[str] | None = None,
+    ticker: str | None = None,
+    company_name: str | None = None,
+    company_context_json: str | None = None,
+    intent_family: str | None = None,
+    limit_lens: int = 4,
+    limit_consultation: int = 3,
+    limit_data_needs: int = 5,
+    response_format: GuruResponseFormat = GuruResponseFormat.JSON,
+) -> str:
+    """Return a company filing research brief derived from guru ontology needs."""
+    return await _run_tool(
+        guru_company_brief_tool,
+        question=question,
+        root=Path(root).expanduser() if root else None,
+        author_keys=author_keys,
+        ticker=ticker,
+        company_name=company_name,
+        company_context_json=company_context_json,
+        intent_family=intent_family,
+        limit_lens=limit_lens,
+        limit_consultation=limit_consultation,
+        limit_data_needs=limit_data_needs,
+        response_format=response_format,
+    )
+
+
+@mcp.tool(
+    name="krw_guru_company_pack",
+    title="Build GuruCompanyResearchPack from guru lenses and company evidence",
+    annotations=READ_ONLY,
+)
+async def krw_guru_company_pack(
+    question: str,
+    root: str | None = None,
+    author_keys: list[str] | None = None,
+    ticker: str | None = None,
+    company_name: str | None = None,
+    company_payload_json: str | None = None,
+    company_context_json: str | None = None,
+    intent_family: str | None = None,
+    response_format: GuruResponseFormat = GuruResponseFormat.JSON,
+) -> str:
+    """Return internal company-aware guru answer pack plus render plan."""
+    return await _run_tool(
+        guru_company_pack_tool,
+        question=question,
+        root=Path(root).expanduser() if root else None,
+        author_keys=author_keys,
+        ticker=ticker,
+        company_name=company_name,
+        company_payload_json=company_payload_json,
+        company_context_json=company_context_json,
+        intent_family=intent_family,
         response_format=response_format,
     )
 
@@ -147,6 +217,7 @@ async def krw_guru_select_lenses(
     root: str | None = None,
     author_keys: list[str] | None = None,
     ticker: str | None = None,
+    company_context_json: str | None = None,
     intent_family: str | None = None,
     limit: int = 5,
     data_need_limit: int = 6,
@@ -159,6 +230,7 @@ async def krw_guru_select_lenses(
         root=Path(root).expanduser() if root else None,
         author_keys=author_keys,
         ticker=ticker,
+        company_context_json=company_context_json,
         intent_family=intent_family,
         limit=limit,
         data_need_limit=data_need_limit,

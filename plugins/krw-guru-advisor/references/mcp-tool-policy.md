@@ -6,8 +6,13 @@ Use the dedicated Guru MCP as a read-only ontology lens layer. It is separate fr
 
 ```text
 private internal guru consultation brief
--> krw_guru_query_context
+-> if company-specific: krw_ontology_topic_map or compact company context read
+-> normalize company_context_json without ticker hard-coding
+-> krw_guru_query_context with company_context_json when available
 -> optional krw_guru_trace or krw_guru_chain on selected reviewed_ids
+-> if company-specific: krw_guru_company_brief with the same company_context_json
+-> application/orchestrator calls KRW Ontology company filing research
+-> if company evidence is available: krw_guru_company_pack with the same company_context_json
 -> answer
 ```
 
@@ -15,11 +20,19 @@ Use `krw_guru_search` only for fallback discovery or debugging. Do not use broad
 
 The brief is private. Do not expose it to the user.
 
+All MCP usage is silent. Do not tell the user that you are calling tools, reading files, checking `research_status`, retrying JSON parameters, or waiting for a bridge. Tool outputs are internal materials for the final answer only.
+
 ## Tool Roles
 
 ```text
 krw_guru_query_context
-- Default first MCP call after the internal guru consultation brief. Returns ResearchPack, answerability, allowed next tools, selected lenses, source anchors, runtime mode, and company bridge needs.
+- Default first Guru MCP call after the internal guru consultation brief. For company-specific questions, pass company_context_json from `krw_ontology_topic_map` or an equivalent company ontology orientation read when available. Returns ResearchPack, answerability, allowed next tools, selected lenses, source anchors, runtime mode, and company bridge needs.
+
+krw_guru_company_brief
+- Company-specific bridge. Converts selected guru lenses, data_needs, company_context_json, and company_bridge requirements into a KRW Ontology company filing research question. It does not retrieve company facts.
+
+krw_guru_company_pack
+- Optional post-company-evidence bridge. Combines the Guru ResearchPack, company_context_json, opaque company filing evidence supplied by the application/orchestrator, missing evidence, judgment conditions, and render_plan. It does not call the company MCP itself.
 
 krw_guru_trace
 - Source support and bounded related objects for one selected ontology object.
@@ -65,7 +78,7 @@ needs_clarification:
 ask the returned clarifying question before strong advice
 
 needs_company_evidence:
-keep the guru lens, but use KRW Ontology filing evidence before a company-specific judgment
+call krw_guru_company_brief with company_context_json when available, let the application/orchestrator obtain KRW Ontology filing evidence, then use krw_guru_company_pack when evidence is available
 
 ontology_gap:
 state that the current guru ontology did not return enough support
@@ -75,4 +88,4 @@ Trace or chain only selected reviewed_ids from the ResearchPack. Do not trace ev
 
 ## Hard Boundary
 
-The Guru MCP does not answer company facts, current financials, valuation, market prices, or latest filings. If the ResearchPack says company evidence is required, use KRW Ontology filing research later as a separate read-only evidence source.
+The Guru MCP does not answer company facts, current financials, valuation, market prices, or latest filings. `company_context_json` is orientation only, not evidence. `krw_guru_company_brief` only prepares the company filing research brief. `krw_guru_company_pack` only combines already-supplied company evidence with guru lenses. Application/orchestrator code owns the actual KRW Ontology company filing MCP call.

@@ -26,12 +26,37 @@ persona_profile
 selected_lenses
 consultation_moves
 data_needs
+company_context
 source_anchors
 clarifying_questions
 company_bridge
 trace_recommendations
 warnings
 ```
+
+## Company-Aware Serving Contracts
+
+For company-specific questions, the Guru ResearchPack is not the final answer payload. Use the serving-layer bridge objects:
+
+```text
+company ontology orientation from krw_ontology_topic_map or equivalent
+-> company_context_json
+-> GuruResearchPack
+-> GuruCompanyFilingBrief
+-> KRW Ontology company filing evidence from application/orchestrator
+-> GuruCompanyResearchPack
+-> GuruAnswerRenderPlan
+```
+
+`company_context_json` is bounded runtime context from existing company ontology reads. It improves retrieval and filing-brief construction, but it is not final company evidence and must not be created from ticker hard-coding.
+
+`GuruCompanyFilingBrief` converts guru lens/data needs and company_context_json into a company filing research question. It does not contain company facts.
+
+`GuruCompanyResearchPack` combines the Guru ResearchPack, company_context_json, and opaque company filing evidence supplied by the application/orchestrator. It is not a database schema and must not expand the KRW company ontology.
+
+`GuruAnswerRenderPlan` provides answer structure and author voice posture. It must not introduce new guru principles that were absent from the ResearchPack.
+
+`missing_evidence` is an internal completeness signal. It helps the answer agent know where the company-specific judgment is still thin. It is not a required final-answer section. In normal user answers, mention it only as one concise next check when it changes the practical judgment. Do not turn it into a report-style "data limitation" block or invent a long metric checklist from general finance memory.
 
 ## Answer Style Inputs
 
@@ -65,7 +90,7 @@ needs_clarification
 - Ask the returned clarifying question before giving a strong consultation.
 
 needs_company_evidence
-- Guru lens is available, but company-specific judgment needs filing evidence from KRW Ontology company research.
+- Guru lens is available, but company-specific judgment needs filing evidence from KRW Ontology company research. Call krw_guru_company_brief with company_context_json when available; use krw_guru_company_pack after company evidence is supplied.
 ```
 
 ## Evidence Boundary

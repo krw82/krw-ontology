@@ -22,6 +22,10 @@ GURU_PARSED_MANIFEST_FORMAT = "krw-guru-parsed-manifest/v1"
 GURU_EXTRACTION_MANIFEST_FORMAT = "krw-guru-extraction-manifest/v1"
 GURU_CURATION_REPORT_FORMAT = "krw-guru-curation-report/v1"
 GURU_RESEARCH_PACK_FORMAT = "krw-guru-research-pack/v1"
+GURU_COMPANY_ONTOLOGY_CONTEXT_FORMAT = "krw-guru-company-ontology-context/v1"
+GURU_COMPANY_FILING_BRIEF_FORMAT = "krw-guru-company-filing-brief/v1"
+GURU_COMPANY_RESEARCH_PACK_FORMAT = "krw-guru-company-research-pack/v1"
+GURU_ANSWER_RENDER_PLAN_FORMAT = "krw-guru-answer-render-plan/v1"
 
 AUTHOR_KEYS = ("buffett", "marks", "ackman", "flatt", "terry_smith")
 SOURCE_TYPES = ("shareholder_letter", "memo")
@@ -924,6 +928,7 @@ class GuruResearchPack(GuruBaseModel):
     selected_lenses: list[dict[str, Any]] = Field(default_factory=list)
     consultation_moves: list[dict[str, Any]] = Field(default_factory=list)
     data_needs: list[dict[str, Any]] = Field(default_factory=list)
+    company_context: dict[str, Any] = Field(default_factory=dict)
     source_anchors: list[dict[str, Any]] = Field(default_factory=list)
     clarifying_questions: list[str] = Field(default_factory=list)
     company_bridge: dict[str, Any] = Field(default_factory=dict)
@@ -931,6 +936,113 @@ class GuruResearchPack(GuruBaseModel):
     agent_autonomy: dict[str, Any] = Field(default_factory=dict)
     do_not_call: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
+
+
+class GuruCompanyIdentity(GuruBaseModel):
+    ticker: str | None = None
+    company_name: str | None = None
+    subject: str
+    unresolved: bool = False
+
+
+class GuruCompanyOntologyContext(GuruBaseModel):
+    """Bounded runtime summary produced from company ontology reads.
+
+    This object is not persisted into, and does not extend, the company filing
+    ontology schema. It lets guru lens selection use company vocabulary without
+    hard-coding ticker-to-industry mappings.
+    """
+
+    format: str = GURU_COMPANY_ONTOLOGY_CONTEXT_FORMAT
+    ticker: str | None = None
+    company_name: str | None = None
+    source: str = "company_ontology_runtime"
+    context_terms: list[str] = Field(default_factory=list)
+    business_context_terms: list[str] = Field(default_factory=list)
+    risk_context_terms: list[str] = Field(default_factory=list)
+    available_company_topics: list[str] = Field(default_factory=list)
+    context_tags: list[str] = Field(default_factory=list)
+    confidence: Literal["low", "medium", "high"] | None = None
+    source_payload_keys: list[str] = Field(default_factory=list)
+
+
+class GuruCompanyFilingBrief(GuruBaseModel):
+    """Serving-layer bridge from guru lenses to company filing research."""
+
+    format: str = GURU_COMPANY_FILING_BRIEF_FORMAT
+    author_key: Literal["buffett", "marks", "ackman", "flatt", "terry_smith"]
+    original_question: str
+    company_identity: GuruCompanyIdentity
+    requires_company_evidence: bool
+    requires_identifier_clarification: bool = False
+    company_context: dict[str, Any] = Field(default_factory=dict)
+    company_research_question_ko: str
+    company_research_question_en: str
+    query_terms: list[str] = Field(default_factory=list)
+    required_filing_topics: list[str] = Field(default_factory=list)
+    candidate_filing_topics: list[str] = Field(default_factory=list)
+    filtered_out_topics: list[dict[str, str]] = Field(default_factory=list)
+    lens_specific_evidence_requests: list[str] = Field(default_factory=list)
+    generic_filing_requirements: list[str] = Field(default_factory=list)
+    data_need_keys: list[str] = Field(default_factory=list)
+    missing_inputs: list[str] = Field(default_factory=list)
+    recommended_company_mcp_call: dict[str, Any] = Field(default_factory=dict)
+    boundary: str = (
+        "Guru filing brief translates selected guru ontology needs into company filing "
+        "research inputs. It does not supply company facts."
+    )
+
+
+class GuruCompanyEvidenceAlignment(GuruBaseModel):
+    lens_id: str | None = None
+    lens_label_ko: str | None = None
+    required_company_evidence: list[str] = Field(default_factory=list)
+    status: Literal["supported", "partial", "missing", "pending_company_research", "not_required"]
+    company_fact_refs: list[dict[str, Any]] = Field(default_factory=list)
+    reason_ko: str
+
+
+class GuruCompanyResearchPack(GuruBaseModel):
+    """Internal answer-prep pack joining guru lenses with optional company facts.
+
+    This is a serving-layer object. Company evidence stays opaque so the Guru
+    module does not expand the KRW company ontology schema.
+    """
+
+    format: str = GURU_COMPANY_RESEARCH_PACK_FORMAT
+    user_question: str
+    author_key: Literal["buffett", "marks", "ackman", "flatt", "terry_smith"]
+    company_identity: GuruCompanyIdentity
+    guru_pack: dict[str, Any]
+    company_context: dict[str, Any] = Field(default_factory=dict)
+    company_filing_brief: dict[str, Any]
+    company_evidence_pack: dict[str, Any] = Field(default_factory=dict)
+    evidence_alignment: list[GuruCompanyEvidenceAlignment] = Field(default_factory=list)
+    missing_evidence: list[str] = Field(default_factory=list)
+    judgment_conditions: dict[str, Any] = Field(default_factory=dict)
+    render_hints: dict[str, Any] = Field(default_factory=dict)
+    answer_contract: dict[str, Any] = Field(default_factory=dict)
+    boundaries: list[str] = Field(default_factory=list)
+
+
+class GuruAnswerRenderPlan(GuruBaseModel):
+    """Stable rendering plan for final advisor prose.
+
+    The plan gives structure and voice hints, not new investment principles.
+    """
+
+    format: str = GURU_ANSWER_RENDER_PLAN_FORMAT
+    author_key: Literal["buffett", "marks", "ackman", "flatt", "terry_smith"]
+    opening_style: str
+    first_question: str
+    reframe: str
+    supported_points: list[str] = Field(default_factory=list)
+    concerns: list[str] = Field(default_factory=list)
+    missing_evidence: list[str] = Field(default_factory=list)
+    judgment_conditions: dict[str, Any] = Field(default_factory=dict)
+    next_question: str | None = None
+    forbidden_output_patterns: list[str] = Field(default_factory=list)
+    source_fields: list[str] = Field(default_factory=list)
 
 
 class GuruRejectedCandidate(GuruBaseModel):

@@ -11,6 +11,23 @@ import re
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
+from krw_ontology.guru.company_bridge import (
+    build_guru_company_research_pack,
+    company_filing_brief_from_guru_lens,
+)
+from krw_ontology.guru.company_context import (
+    coerce_company_context,
+    company_context_search_text,
+    company_context_topics,
+)
+from krw_ontology.guru.context_taxonomy import (
+    contains_context_term,
+    context_match_bonus,
+    context_mismatch_penalty,
+    context_tags_for_text,
+    overfit_penalty_rules,
+    sector_context_tags,
+)
 from krw_ontology.guru.index import (
     guru_index_status,
     load_guru_index_bundle,
@@ -21,6 +38,7 @@ from krw_ontology.guru.models import (
     GuruResearchPack,
     GuruResearchPackMeta,
 )
+from krw_ontology.guru.renderer import build_guru_answer_render_plan
 from krw_ontology.guru.workspace import GURU_RUNNING_ROOT_ENV, guru_root
 
 
@@ -365,6 +383,7 @@ def guru_query_context_tool(
     root: str | Path | None = None,
     author_keys: Sequence[str] | None = None,
     ticker: str | None = None,
+    company_context_json: str | None = None,
     intent_family: str | None = None,
     limit_lens: int = 4,
     limit_consultation: int = 3,
@@ -377,6 +396,7 @@ def guru_query_context_tool(
         root=root,
         author_keys=author_keys,
         ticker=ticker,
+        company_context=_json_arg(company_context_json, field_name="company_context_json"),
         intent_family=intent_family,
         limit_lens=limit_lens,
         limit_consultation=limit_consultation,
@@ -384,6 +404,113 @@ def guru_query_context_tool(
     )
     if response_format == GuruResponseFormat.MARKDOWN:
         return _query_context_markdown(payload)
+    return _json(payload)
+
+
+def guru_company_brief_tool(
+    *,
+    question: str,
+    root: str | Path | None = None,
+    author_keys: Sequence[str] | None = None,
+    ticker: str | None = None,
+    company_name: str | None = None,
+    company_context_json: str | None = None,
+    intent_family: str | None = None,
+    limit_lens: int = 4,
+    limit_consultation: int = 3,
+    limit_data_needs: int = 5,
+    response_format: GuruResponseFormat = GuruResponseFormat.JSON,
+) -> str:
+    """Build a company filing brief from selected guru ontology lenses."""
+    query_payload = json.loads(
+        guru_query_context_tool(
+            question=question,
+            root=root,
+            author_keys=author_keys,
+            ticker=ticker,
+            company_context_json=company_context_json,
+            intent_family=intent_family,
+            limit_lens=limit_lens,
+            limit_consultation=limit_consultation,
+            limit_data_needs=limit_data_needs,
+            response_format=GuruResponseFormat.JSON,
+        )
+    )
+    brief = company_filing_brief_from_guru_lens(
+        query_payload,
+        ticker=ticker,
+        company_name=company_name,
+        company_context=_json_arg(company_context_json, field_name="company_context_json"),
+        author_key=(author_keys[0] if author_keys else None),
+        question=question,
+    )
+    brief_payload = brief.model_dump(mode="json", exclude_none=True)
+    payload = {
+        "company_brief_context_version": "krw-guru-company-brief-context/v1",
+        "research_status": query_payload.get("research_status"),
+        "answerability": query_payload.get("answerability"),
+        "runtime": query_payload.get("runtime"),
+        "selected_author_keys": query_payload.get("selected_author_keys"),
+        "requires_company_evidence": brief.requires_company_evidence,
+        "company_filing_brief": brief_payload,
+        "next_step": _company_brief_next_step(brief_payload),
+        "do_not_call": [
+            "Do not call broad guru search after this brief unless query_context returned ontology_gap.",
+            "Do not let Guru MCP call the company MCP directly; application/orchestrator owns that step.",
+        ],
+    }
+    if response_format == GuruResponseFormat.MARKDOWN:
+        return _company_brief_markdown(payload)
+    return _json(payload)
+
+
+def guru_company_pack_tool(
+    *,
+    question: str,
+    root: str | Path | None = None,
+    author_keys: Sequence[str] | None = None,
+    ticker: str | None = None,
+    company_name: str | None = None,
+    company_payload_json: str | None = None,
+    company_context_json: str | None = None,
+    intent_family: str | None = None,
+    response_format: GuruResponseFormat = GuruResponseFormat.JSON,
+) -> str:
+    """Build the internal GuruCompanyResearchPack and answer render plan."""
+    query_payload = json.loads(
+        guru_query_context_tool(
+            question=question,
+            root=root,
+            author_keys=author_keys,
+            ticker=ticker,
+            company_context_json=company_context_json,
+            intent_family=intent_family,
+            response_format=GuruResponseFormat.JSON,
+        )
+    )
+    company_payload = _json_arg(company_payload_json, field_name="company_payload_json")
+    company_pack = build_guru_company_research_pack(
+        query_payload,
+        company_evidence_payload=company_payload,
+        ticker=ticker,
+        company_name=company_name,
+        company_context=_json_arg(company_context_json, field_name="company_context_json"),
+        author_key=(author_keys[0] if author_keys else None),
+        question=question,
+    )
+    render_plan = build_guru_answer_render_plan(company_pack)
+    payload = {
+        "company_pack_context_version": "krw-guru-company-pack-context/v1",
+        "research_status": query_payload.get("research_status"),
+        "company_pack": company_pack.model_dump(mode="json", exclude_none=True),
+        "render_plan": render_plan.model_dump(mode="json", exclude_none=True),
+        "usage": {
+            "company_mcp_called_by": "application_orchestrator",
+            "answer_agent_input": "Use company_pack plus render_plan; do not expose internal payload names.",
+        },
+    }
+    if response_format == GuruResponseFormat.MARKDOWN:
+        return _company_pack_markdown(payload)
     return _json(payload)
 
 
@@ -563,6 +690,7 @@ def guru_context_tool(
         root=root_path,
         author_keys=selected_authors,
         ticker=ticker,
+        company_context=None,
         intent_family=inferred_intent,
         limit_lens=limit_lens,
         limit_consultation=limit_consultation,
@@ -853,6 +981,7 @@ def _build_guru_research_context(
     root: str | Path | None,
     author_keys: Sequence[str] | None,
     ticker: str | None,
+    company_context: Mapping[str, Any] | None,
     intent_family: str | None,
     limit_lens: int,
     limit_consultation: int,
@@ -862,14 +991,19 @@ def _build_guru_research_context(
     selected_authors = _selected_author_keys(question, author_keys)
     bundle = _load_reviewed_bundle(root_path, author_keys=selected_authors)
     inferred_intent = _clean_optional(intent_family) or _infer_intent_family(question)
+    company_context_model = coerce_company_context(
+        company_context or None,
+        ticker=ticker,
+    )
     lens_limit = _limit(limit_lens, maximum=10)
     if len(selected_authors) > 1:
         lens_limit = max(lens_limit, min(len(selected_authors), 5))
     consultation_limit = _limit(limit_consultation, maximum=8)
     data_need_limit = _limit(limit_data_needs, maximum=12)
+    scoring_query = _scoring_query(question, ticker, company_context_model)
 
     lens_rows = _rank_context_rows(
-        query=question,
+        query=scoring_query,
         rows=bundle["guru_objects"],
         author_keys=selected_authors,
         intent_family=inferred_intent,
@@ -877,7 +1011,7 @@ def _build_guru_research_context(
         limit=lens_limit,
     )
     consultation_rows = _rank_context_rows(
-        query=question,
+        query=scoring_query,
         rows=bundle["consultation_objects"],
         author_keys=selected_authors,
         intent_family=inferred_intent,
@@ -902,7 +1036,7 @@ def _build_guru_research_context(
         needs_company_data = True
 
     data_needs = _rank_context_rows(
-        query=question,
+        query=scoring_query,
         rows=bundle["data_needs"],
         author_keys=selected_authors,
         intent_family=inferred_intent,
@@ -941,7 +1075,7 @@ def _build_guru_research_context(
         _compact_result(
             row,
             score=_context_score(
-                question,
+                scoring_query,
                 row,
                 intent_family=inferred_intent,
                 row_family="guru_object",
@@ -955,7 +1089,7 @@ def _build_guru_research_context(
         _compact_result(
             row,
             score=_context_score(
-                question,
+                scoring_query,
                 row,
                 intent_family=inferred_intent,
                 row_family="consultation_object",
@@ -969,7 +1103,7 @@ def _build_guru_research_context(
         _compact_result(
             row,
             score=_context_score(
-                question,
+                scoring_query,
                 row,
                 intent_family=inferred_intent,
                 row_family="data_need",
@@ -979,11 +1113,22 @@ def _build_guru_research_context(
         )
         for row in data_needs
     ]
-    filing_bridge = _filing_bridge_payload(question, data_needs, intent_family=inferred_intent)
+    filing_bridge = _filing_bridge_payload(
+        question,
+        data_needs,
+        intent_family=inferred_intent,
+        company_context=company_context_model,
+    )
+    company_context_payload = (
+        company_context_model.model_dump(mode="json", exclude_none=True)
+        if company_context_model is not None
+        else {}
+    )
     company_bridge = {
         **filing_bridge,
         "requires_company_evidence": needs_company_data,
         "company_facts_source": "KRW Ontology filing research",
+        "company_context": company_context_payload,
         "boundary": "Guru MCP supplies lens context only; company facts require filing evidence.",
     }
     pack = GuruResearchPack(
@@ -1004,6 +1149,7 @@ def _build_guru_research_context(
         selected_lenses=selected_lenses,
         consultation_moves=consultation_moves,
         data_needs=compact_data_needs,
+        company_context=company_context_payload,
         source_anchors=_source_anchors_for_rows(root_path, selected_rows, limit=8),
         clarifying_questions=clarifying_questions,
         company_bridge=company_bridge,
@@ -1025,8 +1171,15 @@ def _build_guru_research_context(
             for key in selected_authors
         ],
         "requires_company_evidence": needs_company_data,
+        "company_context": company_context_payload,
         "filing_evidence_requirements": (
-            _generic_filing_requirements(question, inferred_intent) if needs_company_data else []
+            _filing_requirements_with_company_context(
+                question,
+                inferred_intent,
+                company_context_model,
+            )
+            if needs_company_data
+            else []
         ),
         "agent_autonomy": pack_dict["agent_autonomy"],
         "do_not_call": pack_dict["do_not_call"],
@@ -1279,6 +1432,7 @@ def _clarifying_questions_for_question(
         questions.append("원자재 자체, ETF/선물, 생산 기업, 로열티/인프라 중 무엇에 투자한 건가요?")
     if (
         needs_company_data
+        and not _clean_optional(ticker)
         and not _has_ticker_like_token(question)
     ):
         if _question_has_named_company_phrase(question):
@@ -1638,6 +1792,7 @@ def _context_score(
     score += _soft_metadata_score(query, row, intent_family=intent_family, row_family=row_family)
     score += _data_need_intent_bonus(query, row, intent_family=intent_family, row_family=row_family)
     score += _semantic_relevance_bonus(query, row)
+    score += _context_domain_adjustment(query, row, intent_family=intent_family, row_family=row_family)
     score -= _theme_overfit_penalty(query, row)
     if intent_family and row.get("intent_family") == intent_family:
         score += 7
@@ -1646,6 +1801,51 @@ def _context_score(
             score += 3
         if row.get("supporting_span_ids"):
             score += 2
+    return score
+
+
+def _context_domain_adjustment(
+    query: str,
+    row: Mapping[str, Any],
+    *,
+    intent_family: str | None,
+    row_family: str,
+) -> int:
+    if row_family not in {"guru_object", "data_need"}:
+        return 0
+    query_tags = _query_domain_tags(query)
+    row_tags = _row_domain_tags(row)
+    specificity = _mapping_value(row.get("specificity"))
+    specificity_level = str(specificity.get("level") or "")
+    score = 0
+
+    if query_tags and row_tags:
+        if query_tags & row_tags:
+            score += 10 if row_family == "guru_object" else 6
+        elif row_tags & sector_context_tags():
+            score -= 10
+
+    company_context = bool(query_tags) or _has_ticker_like_token(query) or _question_mentions_company_need(query)
+    if company_context and row_family == "guru_object":
+        if specificity_level == "general_principle":
+            score += 4
+        elif specificity_level == "company_case_specific" and not (query_tags & row_tags):
+            score -= 10
+
+    if _question_is_generic_lens_framework(query):
+        if specificity_level == "general_principle":
+            score += 4
+        elif specificity_level in {"sector_specific", "asset_class_specific", "company_case_specific"}:
+            score -= 8
+
+    for tag in row_tags:
+        score -= context_mismatch_penalty(
+            tag,
+            query_tags=query_tags,
+            intent_family=intent_family,
+        )
+    for tag in query_tags & row_tags:
+        score += context_match_bonus(tag)
     return score
 
 
@@ -1884,89 +2084,48 @@ def _theme_overfit_penalty(query: str, row: Mapping[str, Any]) -> int:
     normalized_query = query.lower()
     haystack = _row_text(row)
     penalty = 0
-    theme_rules = (
-        (
-            ("ai", "인공지능", "데이터센터", "data center", "nvidia", "nvda", "소프트웨어 부채"),
-            ("ai", "인공지능", "데이터센터", "data center", "nvidia", "nvda"),
-            24,
-        ),
-        (
-            (
-                "프라이빗 크레딧",
-                "private credit",
-                "신용시장",
-                "신용 리스크",
-                "사적 대출",
-                "하이일드",
-                "pik",
-                "재융자",
-                "대출자",
-                "차입자",
-                "레버리지",
-                "크레딧 =",
-            ),
-            ("신용", "credit", "레버리지", "부채", "대출", "차입"),
-            16,
-        ),
-        (
-            ("sotp", "nav", "peer", "동종", "bn ", "브룩필드", "할인거래"),
-            ("sotp", "nav", "peer", "밸류", "가치평가", "할인", "브룩필드", "bn", "bam"),
-            12,
-        ),
-        (
-            ("american tailwind", "미국의 순풍", "미국의 경제적", "미국 경제"),
-            ("미국", "america", "american", "경제", "거시"),
-            10,
-        ),
-        (
-            ("인덱스 비중", "펀드 매니저", "뇌외과", "수수료만으로"),
-            ("인덱스", "펀드", "매니저", "수수료"),
-            10,
-        ),
-        (
-            ("사회·정치", "포퓰리즘", "일자리 상실", "ubi", "정치적 분열"),
-            ("정치", "사회", "실업", "일자리", "ubi", "포퓰리즘"),
-            12,
-        ),
-        (
-            ("sparc", "상장 인수", "인수 회사", "창업자주식", "워런트"),
-            ("sparc", "상장 인수", "인수 회사", "워런트"),
-            16,
-        ),
-        (
-            ("현금보다 주식", "cash equivalents", "cash"),
-            ("현금", "cash", "채권", "단기자금"),
-            12,
-        ),
-        (
-            ("차량 리프레시", "nike", "우버", "uber", "chipotle", "umg", "qsr"),
-            ("차량", "자동차", "nike", "우버", "uber", "chipotle", "umg", "qsr"),
-            12,
-        ),
-        (
-            ("자율주행", "av ", "autonomous", "미국 상장", "상장 전환"),
-            ("자율주행", "av", "autonomous", "상장"),
-            12,
-        ),
-    )
-    for row_terms, query_terms, amount in theme_rules:
-        if _contains_any(haystack, row_terms) and not _contains_any(normalized_query, query_terms):
-            penalty += amount
-    if _contains_any(
-        normalized_query,
-        ("비중", "몰려", "집중", "포트폴리오", "현금 비중", "position", "sizing"),
-    ) and _contains_any(
-        haystack,
-        ("보험 손실", "감가상각", "depreciation", "자본 집약", "capital intensive"),
-    ):
-        penalty += 18
-    if (
-        str(row.get("author_key") or "") != "flatt"
-        and _contains_any(haystack, ("브루크필드", "brookfield", "bn ", "bam"))
-        and not _contains_any(normalized_query, ("브루크필드", "brookfield", "bn", "bam"))
-    ):
-        penalty += 16
+    author_key = str(row.get("author_key") or "")
+    for rule in overfit_penalty_rules():
+        author_allowlist = {str(value) for value in _list_value(rule.get("author_allowlist"))}
+        if author_allowlist and author_key in author_allowlist:
+            continue
+        row_terms = [str(value) for value in _list_value(rule.get("row_terms"))]
+        query_terms = [str(value) for value in _list_value(rule.get("query_terms"))]
+        row_matches = _contains_any(haystack, row_terms)
+        query_matches = _contains_any(normalized_query, query_terms)
+        if bool(rule.get("applies_when_query_matches")):
+            if row_matches and query_matches:
+                penalty += int(rule.get("penalty") or 0)
+        elif row_matches and not query_matches:
+            penalty += int(rule.get("penalty") or 0)
     return penalty
+
+
+def _scoring_query(
+    question: str,
+    ticker: str | None,
+    company_context: Mapping[str, Any] | None = None,
+) -> str:
+    clean_ticker = _clean_optional(ticker)
+    parts = [question]
+    if clean_ticker and not contains_context_term(question, clean_ticker):
+        parts.append(clean_ticker)
+    context_text = company_context_search_text(company_context)
+    if context_text:
+        parts.append(context_text)
+    return " ".join(parts)
+
+
+def _query_domain_tags(query: str) -> set[str]:
+    return context_tags_for_text(query)
+
+
+def _row_domain_tags(row: Mapping[str, Any]) -> set[str]:
+    text = _row_text(row)
+    specificity = _mapping_value(row.get("specificity"))
+    source_tags = " ".join(str(value).lower() for value in _list_value(specificity.get("source_case_tags")))
+    haystack = f"{text} {source_tags}"
+    return context_tags_for_text(haystack)
 
 
 def _contains_any(value: str, terms: Sequence[str]) -> bool:
@@ -2485,6 +2644,10 @@ def _question_is_generic_lens_framework(question: str) -> bool:
         "매수 전 질문",
         "포트폴리오",
         "평균단가",
+        "현금 비중",
+        "현금 보유",
+        "cash position",
+        "cash allocation",
         "손실 중",
         "안전마진",
         "사이클 리스크",
@@ -2552,11 +2715,17 @@ def _generic_filing_requirements(question: str, intent_family: str | None = None
                 "risk_factors",
             ]
         )
-    if _has_ticker_like_token(question, ticker="TSLA"):
-        requirements.extend(["demand_cycle_exposure", "margin_pressure", "capital_intensity"])
-    if _has_ticker_like_token(question, ticker="AAPL"):
-        requirements.extend(["share_repurchases", "services_mix", "customer_demand"])
     return list(dict.fromkeys(requirements))
+
+
+def _filing_requirements_with_company_context(
+    question: str,
+    intent_family: str | None,
+    company_context: Mapping[str, Any] | None,
+) -> list[str]:
+    requirements = _generic_filing_requirements(question, intent_family)
+    requirements.extend(company_context_topics(company_context))
+    return list(dict.fromkeys(value for value in requirements if value))
 
 
 def _has_ticker_like_token(question: str, *, ticker: str | None = None) -> bool:
@@ -2589,7 +2758,7 @@ def _question_mentions_non_company_instrument(question: str) -> bool:
 def _filing_bridge_brief(question: str, rows: Sequence[Mapping[str, Any]]) -> str:
     hooks = _generic_filing_requirements(question)
     for row in rows:
-        hooks.extend(str(item) for item in row.get("company_data_hooks") or [])
+        hooks.extend(_normalized_company_hooks(row.get("company_data_hooks") or []))
         data_key = row.get("data_need_key")
         if data_key:
             hooks.append(str(data_key))
@@ -2606,19 +2775,49 @@ def _filing_bridge_brief(question: str, rows: Sequence[Mapping[str, Any]]) -> st
     )
 
 
+def _normalized_company_hooks(values: Any) -> list[str]:
+    if isinstance(values, str):
+        return [values.strip()] if values.strip() else []
+    if not isinstance(values, Iterable):
+        return []
+    hooks: list[str] = []
+    for value in values:
+        if isinstance(value, Mapping):
+            for key in ("key", "metric", "section", "topic", "field", "table", "data_key"):
+                nested = value.get(key)
+                if isinstance(nested, str) and nested.strip():
+                    hooks.append(nested.strip())
+                    break
+            continue
+        if isinstance(value, str) and value.strip():
+            hooks.append(value.strip())
+    return list(dict.fromkeys(hooks))
+
+
 def _filing_bridge_payload(
     question: str,
     rows: Sequence[Mapping[str, Any]],
     *,
     intent_family: str | None,
+    company_context: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    requirements = _generic_filing_requirements(question, intent_family)
+    requirements = _filing_requirements_with_company_context(
+        question,
+        intent_family,
+        company_context,
+    )
+    company_context_payload = (
+        company_context.model_dump(mode="json", exclude_none=True)
+        if hasattr(company_context, "model_dump")
+        else dict(company_context or {})
+    )
     requires_company = _question_mentions_company_need(question)
     if not requires_company:
         return {
             "use_existing_krw_ontology_mcp": False,
             "filing_evidence_requirements": [],
             "conditional_filing_evidence_requirements": requirements,
+            "company_context": company_context_payload,
             "next_step": "Select a company or ticker before calling KRW Ontology filing research.",
             "brief_en": (
                 "No company or ticker is selected. Treat these as conditional filing checks "
@@ -2630,6 +2829,7 @@ def _filing_bridge_payload(
         "use_existing_krw_ontology_mcp": True,
         "filing_evidence_requirements": requirements,
         "conditional_filing_evidence_requirements": [],
+        "company_context": company_context_payload,
         "brief_en": _filing_bridge_brief(question, rows),
         "boundary": "This tool identifies evidence needs only; it does not answer company facts.",
     }
@@ -2657,6 +2857,26 @@ def _limit(value: int, *, maximum: int) -> int:
 def _limited_words(value: str, *, max_words: int) -> str:
     words = value.split()
     return " ".join(words[:max_words])
+
+
+def _json_arg(value: str | None, *, field_name: str) -> dict[str, Any]:
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{field_name} must be valid JSON") from exc
+    if not isinstance(parsed, Mapping):
+        raise ValueError(f"{field_name} must decode to a JSON object")
+    return dict(parsed)
+
+
+def _company_brief_next_step(brief: Mapping[str, Any]) -> str:
+    if brief.get("requires_identifier_clarification") or brief.get("missing_inputs"):
+        return "Resolve company identifier before calling KRW Ontology company filing research."
+    if brief.get("requires_company_evidence"):
+        return "Pass company_research_question_ko or company_research_question_en to KRW Ontology company filing research."
+    return "No company evidence is required yet; keep the answer guru-only unless a company is selected."
 
 
 def _json(payload: Mapping[str, Any]) -> str:
@@ -2708,6 +2928,57 @@ def _query_context_markdown(payload: Mapping[str, Any]) -> str:
     lines.append("- selected_lenses:")
     for result in research_pack.get("selected_lenses") or []:
         lines.append(f"  - {result.get('label_ko')} ({result.get('author_name')})")
+    return "\n".join(lines)
+
+
+def _company_brief_markdown(payload: Mapping[str, Any]) -> str:
+    brief = payload.get("company_filing_brief") if isinstance(payload.get("company_filing_brief"), Mapping) else {}
+    lines = [
+        "# Guru Company Filing Brief",
+        "",
+        f"- research_status: {payload.get('research_status')}",
+        f"- requires_company_evidence: {payload.get('requires_company_evidence')}",
+        f"- subject: {((brief.get('company_identity') or {}) if isinstance(brief.get('company_identity'), Mapping) else {}).get('subject')}",
+        f"- next_step: {payload.get('next_step')}",
+        "",
+        "## Company Research Question",
+        "",
+        str(brief.get("company_research_question_ko") or ""),
+    ]
+    topics = brief.get("required_filing_topics") or []
+    if topics:
+        lines.extend(["", "## Required Filing Topics"])
+        lines.extend(f"- {topic}" for topic in topics[:12])
+    return "\n".join(lines)
+
+
+def _company_pack_markdown(payload: Mapping[str, Any]) -> str:
+    company_pack = payload.get("company_pack") if isinstance(payload.get("company_pack"), Mapping) else {}
+    render_plan = payload.get("render_plan") if isinstance(payload.get("render_plan"), Mapping) else {}
+    identity = (
+        company_pack.get("company_identity")
+        if isinstance(company_pack.get("company_identity"), Mapping)
+        else {}
+    )
+    lines = [
+        "# Guru Company Research Pack",
+        "",
+        f"- research_status: {payload.get('research_status')}",
+        f"- author_key: {company_pack.get('author_key')}",
+        f"- subject: {identity.get('subject')}",
+        f"- opening_style: {render_plan.get('opening_style')}",
+        f"- first_question: {render_plan.get('first_question')}",
+    ]
+    missing = company_pack.get("missing_evidence") or []
+    if missing:
+        lines.extend(
+            [
+                "",
+                "## Internal Follow-Up Checks",
+                "Use these silently as concise next checks; do not print a data-limitation section.",
+            ]
+        )
+        lines.extend(f"- {item}" for item in missing[:12])
     return "\n".join(lines)
 
 

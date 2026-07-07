@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from krw_ontology.guru import mcp_tools
+from krw_ontology.guru.company_context import coerce_company_context, company_context_topics
 
 
 DEFAULT_LENS_LIMIT = 5
@@ -19,6 +20,7 @@ def select_guru_lenses(
     root: str | Path | None = None,
     author_keys: Sequence[str] | None = None,
     ticker: str | None = None,
+    company_context: Mapping[str, Any] | None = None,
     intent_family: str | None = None,
     limit: int = DEFAULT_LENS_LIMIT,
     data_need_limit: int = DEFAULT_DATA_NEED_LIMIT,
@@ -35,18 +37,25 @@ def select_guru_lenses(
     bundle = mcp_tools._load_reviewed_bundle(root_path, author_keys=selected_authors)
     intent_families = _intent_families(question, intent_family)
     inferred_intent = intent_families[0] if intent_families else None
+    company_context_model = coerce_company_context(company_context or None, ticker=ticker)
     lens_limit = mcp_tools._limit(limit, maximum=20)
     need_limit = mcp_tools._limit(data_need_limit, maximum=30)
+    scoring_question = mcp_tools._scoring_query(question, ticker, company_context_model)
+    company_context_payload = (
+        company_context_model.model_dump(mode="json", exclude_none=True)
+        if company_context_model is not None
+        else {}
+    )
 
     lens_rows = _select_lens_portfolio(
-        query=question,
+        query=scoring_question,
         bundle=bundle,
         author_keys=selected_authors,
         intent_families=intent_families,
         limit=lens_limit,
     )
     data_need_rows = _select_related_data_needs(
-        question=question,
+        question=scoring_question,
         bundle=bundle,
         lens_rows=lens_rows,
         author_keys=selected_authors,
@@ -71,16 +80,17 @@ def select_guru_lenses(
         question=question,
         intent_family=inferred_intent,
         data_need_rows=data_need_rows,
+        company_context=company_context_model,
     )
     lens_payloads = [
         _lens_payload(
-            question=question,
+            question=scoring_question,
             row=row,
             bundle=bundle,
             intent_family=inferred_intent,
             related_data_needs=_data_needs_for_lens(row, data_need_rows, bundle),
             requires_company_evidence=requires_company_evidence,
-            lens_role=_lens_role(row, question, inferred_intent),
+            lens_role=_lens_role(row, scoring_question, inferred_intent),
             intent_families=intent_families,
         )
         for row in lens_rows
@@ -118,6 +128,7 @@ def select_guru_lenses(
         "intent_families": intent_families,
         "requires_company_evidence": requires_company_evidence,
         "requires_identifier_clarification": requires_identifier_clarification,
+        "company_context": company_context_payload,
         "clarifying_questions": clarifying_questions,
         "count": len(lens_payloads),
         "selected_lenses": lens_payloads,
@@ -126,7 +137,7 @@ def select_guru_lenses(
             mcp_tools._compact_result(
                 row,
                 score=mcp_tools._context_score(
-                    question,
+                    scoring_question,
                     row,
                     intent_family=inferred_intent,
                     row_family="data_need",
@@ -143,6 +154,7 @@ def select_guru_lenses(
             requires_identifier_clarification=requires_identifier_clarification,
             evidence_requirements=evidence_requirements,
             data_need_rows=data_need_rows,
+            company_context=company_context_payload,
         ),
         "answer_evidence_plan": answer_evidence_plan,
         "usage": {
@@ -168,6 +180,7 @@ def guru_select_lenses_tool(
     root: str | Path | None = None,
     author_keys: Sequence[str] | None = None,
     ticker: str | None = None,
+    company_context_json: str | None = None,
     intent_family: str | None = None,
     limit: int = DEFAULT_LENS_LIMIT,
     data_need_limit: int = DEFAULT_DATA_NEED_LIMIT,
@@ -179,6 +192,10 @@ def guru_select_lenses_tool(
         root=root,
         author_keys=author_keys,
         ticker=ticker,
+        company_context=mcp_tools._json_arg(
+            company_context_json,
+            field_name="company_context_json",
+        ),
         intent_family=intent_family,
         limit=limit,
         data_need_limit=data_need_limit,
@@ -554,12 +571,14 @@ def _evidence_requirements(
     question: str,
     intent_family: str | None,
     data_need_rows: Sequence[Mapping[str, Any]],
+    company_context: Mapping[str, Any] | None = None,
 ) -> list[str]:
     requirements = mcp_tools._generic_filing_requirements(question, intent_family)
     for row in data_need_rows:
         requirements.extend(_normalized_company_hook(value) for value in row.get("company_data_hooks") or [])
         if row.get("data_need_key"):
             requirements.append(str(row["data_need_key"]))
+    requirements.extend(company_context_topics(company_context))
     return list(dict.fromkeys(value for value in requirements if value))
 
 
@@ -605,10 +624,12 @@ def _company_bridge(
     requires_identifier_clarification: bool,
     evidence_requirements: Sequence[str],
     data_need_rows: Sequence[Mapping[str, Any]],
+    company_context: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     clean_ticker = mcp_tools._clean_optional(ticker)
     hook_text = ", ".join(evidence_requirements[:12])
     subject = clean_ticker or "the selected company"
+    company_context_payload = dict(company_context or {})
     if requires_identifier_clarification:
         return {
             "use_existing_krw_ontology_mcp": False,
@@ -617,6 +638,7 @@ def _company_bridge(
             "filing_evidence_requirements": [],
             "conditional_filing_evidence_requirements": list(evidence_requirements),
             "data_need_keys": _data_need_keys(data_need_rows),
+            "company_context": company_context_payload,
             "next_step": (
                 "Resolve the exact company identifier, ticker, exchange, and share class before "
                 "calling KRW Ontology filing research."
@@ -636,6 +658,7 @@ def _company_bridge(
             "filing_evidence_requirements": list(evidence_requirements),
             "conditional_filing_evidence_requirements": [],
             "data_need_keys": _data_need_keys(data_need_rows),
+            "company_context": company_context_payload,
             "brief_en": (
                 f"For {subject}, retrieve filing evidence for: {hook_text}. "
                 f"User question: {question}"
@@ -651,6 +674,7 @@ def _company_bridge(
         "filing_evidence_requirements": [],
         "conditional_filing_evidence_requirements": list(evidence_requirements),
         "data_need_keys": _data_need_keys(data_need_rows),
+        "company_context": company_context_payload,
         "next_step": "Select a company or ticker before calling KRW Ontology filing research.",
         "brief_en": (
             "No company or ticker is selected. Treat these as conditional filing checks "

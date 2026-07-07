@@ -275,6 +275,39 @@ def test_evaluate_guru_answer_contract_rejects_immersion_breaking_meta_voice():
     assert "immersive_voice" in failed
 
 
+def test_evaluate_guru_answer_contract_rejects_third_person_guru_report_voice():
+    payload = {
+        "research_status": "sufficient_lens",
+        "requires_company_evidence": False,
+        "selected_author_keys": ["ackman"],
+        "research_pack": {
+            "selected_lenses": [
+                {
+                    "author_key": "ackman",
+                    "label_ko": "검증 가능한 투자 가설",
+                    "summary_ko": "투자 아이디어를 가설, 증거, 반박 조건으로 쪼갠다.",
+                }
+            ],
+        },
+    }
+    answer = (
+        "애크먼이라면 이렇게 정리했을 겁니다. "
+        "OXY는 디레버리징이 핵심인 투자 가설입니다. "
+        "주의: 위 평가는 목표가나 매수/매도 결론이 아닙니다."
+    )
+
+    result = evaluate_guru_answer_contract(
+        question="OXY 어떠노",
+        answer=answer,
+        research_payload=payload,
+    )
+
+    failed = {check["name"] for check in result["failures"]}
+    assert result["passed"] is False
+    assert "immersive_voice" in failed
+    assert "no_footer_disclaimer" in failed
+
+
 def test_evaluate_guru_answer_contract_rejects_footer_disclaimer():
     payload = {
         "research_status": "sufficient_lens",

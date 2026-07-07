@@ -8,10 +8,13 @@ from pathlib import Path
 from krw_ontology.guru import mcp_server
 from krw_ontology.guru import mcp_tools
 from krw_ontology.guru import lens_selector
+from krw_ontology.guru.company_bridge import company_filing_brief_from_guru_lens
 from krw_ontology.guru.index import build_guru_shard_index
 from krw_ontology.guru.lens_selector import guru_select_lenses_tool, select_guru_lenses
 from krw_ontology.guru.mcp_tools import (
     guru_chain_tool,
+    guru_company_brief_tool,
+    guru_company_pack_tool,
     guru_context_tool,
     guru_data_needs_tool,
     guru_eval_questions_tool,
@@ -22,6 +25,7 @@ from krw_ontology.guru.mcp_tools import (
     guru_status_tool,
     guru_trace_tool,
 )
+from krw_ontology.guru.renderer import build_guru_answer_render_plan
 
 
 def test_guru_mcp_server_registers_read_only_tool_names() -> None:
@@ -31,6 +35,8 @@ def test_guru_mcp_server_registers_read_only_tool_names() -> None:
         "krw_guru_status",
         "krw_guru_search",
         "krw_guru_query_context",
+        "krw_guru_company_brief",
+        "krw_guru_company_pack",
         "krw_guru_select_lenses",
         "krw_guru_context",
         "krw_guru_trace",
@@ -40,6 +46,352 @@ def test_guru_mcp_server_registers_read_only_tool_names() -> None:
         "krw_guru_eval_questions",
         "krw_guru_index_context",
     } <= tool_names
+
+
+def test_guru_company_brief_tool_translates_lenses_to_filing_research(
+    tmp_path: Path,
+) -> None:
+    root = _write_reviewed_fixture(tmp_path)
+
+    payload = json.loads(
+        guru_company_brief_tool(
+            root=root,
+            question="옥시덴탈을 버핏 관점에서 장기 보유해도 되는지 봐줘",
+            ticker="OXY",
+            author_keys=["buffett"],
+        )
+    )
+
+    brief = payload["company_filing_brief"]
+    assert payload["company_brief_context_version"] == "krw-guru-company-brief-context/v1"
+    assert payload["requires_company_evidence"] is True
+    assert brief["format"] == "krw-guru-company-filing-brief/v1"
+    assert brief["author_key"] == "buffett"
+    assert brief["company_identity"]["ticker"] == "OXY"
+    assert brief["company_identity"]["unresolved"] is False
+    assert "cash_flow" in brief["required_filing_topics"]
+    assert "capital_allocation" in brief["required_filing_topics"]
+    assert "share_repurchases" in brief["required_filing_topics"]
+    assert "operating cash flow" in brief["query_terms"]
+    assert "OXY" in brief["company_research_question_en"]
+    assert brief["recommended_company_mcp_call"]["tool"] == "krw_ontology_query_context"
+    assert "application/orchestrator" in payload["do_not_call"][1]
+
+
+def test_company_brief_filters_credit_hooks_from_general_monopoly_risk() -> None:
+    guru_payload = _synthetic_marks_credit_noise_payload(
+        question="ASML은 독점력이 강하다고들 하는데 막스 관점에서 반대로 봐야 할 위험은 뭐야?"
+    )
+
+    brief = company_filing_brief_from_guru_lens(
+        guru_payload,
+        ticker="ASML",
+        author_key="marks",
+        question="ASML은 독점력이 강하다고들 하는데 막스 관점에서 반대로 봐야 할 위험은 뭐야?",
+    ).model_dump(mode="json")
+
+    assert "risk_factors" in brief["required_filing_topics"]
+    assert "demand_cycle_exposure" in brief["required_filing_topics"]
+    assert "전환사채 전환가격 및 만기" not in brief["required_filing_topics"]
+    assert "쿠폰 금리 및 풋/콜 옵션 조건" not in brief["required_filing_topics"]
+    assert "전환사채 전환가격 및 만기" not in brief["query_terms"]
+    assert {
+        item["topic"]
+        for item in brief["filtered_out_topics"]
+    } >= {
+        "전환사채 전환가격 및 만기",
+        "쿠폰 금리 및 풋/콜 옵션 조건",
+        "발행 목적(자사주 매입, 부채 재편, 신규 투자)",
+        "희석 가능 주식수 및 희석 비율",
+    }
+
+
+def test_company_brief_allows_credit_hooks_for_credit_instrument_questions() -> None:
+    question = "막스 관점에서 이 회사 전환사채와 쿠폰, 만기 리파이낸싱 리스크를 봐줘"
+    guru_payload = _synthetic_marks_credit_noise_payload(question=question)
+
+    brief = company_filing_brief_from_guru_lens(
+        guru_payload,
+        ticker="XYZ",
+        author_key="marks",
+        question=question,
+    ).model_dump(mode="json")
+
+    assert "전환사채 전환가격 및 만기" in brief["required_filing_topics"]
+    assert "쿠폰 금리 및 풋/콜 옵션 조건" in brief["required_filing_topics"]
+    assert brief["filtered_out_topics"] == []
+
+
+def test_company_brief_filters_insurance_float_hooks_for_non_insurance_company() -> None:
+    question = "KO를 버핏 관점에서 장기 보유해도 되는지 봐줘"
+    guru_payload = _synthetic_buffett_insurance_noise_payload(question=question)
+
+    brief = company_filing_brief_from_guru_lens(
+        guru_payload,
+        ticker="KO",
+        author_key="buffett",
+        question=question,
+    ).model_dump(mode="json")
+
+    assert "cash_flow" in brief["required_filing_topics"]
+    assert "pricing_power" in brief["required_filing_topics"]
+    assert "사업별 플로트 규모 및 증감" not in brief["required_filing_topics"]
+    assert "평균 플로트 비용(연간 인수손익/평균 플로트)" not in brief["required_filing_topics"]
+    assert {
+        item["topic"]
+        for item in brief["filtered_out_topics"]
+    } >= {
+        "사업별 플로트 규모 및 증감",
+        "평균 플로트 비용(연간 인수손익/평균 플로트)",
+    }
+
+
+def test_company_brief_allows_insurance_float_hooks_for_insurance_questions() -> None:
+    question = "BRK 보험 플로트와 언더라이팅 수익성을 버핏 관점에서 봐줘"
+    guru_payload = _synthetic_buffett_insurance_noise_payload(question=question)
+
+    brief = company_filing_brief_from_guru_lens(
+        guru_payload,
+        ticker="BRK.B",
+        author_key="buffett",
+        question=question,
+    ).model_dump(mode="json")
+
+    assert "사업별 플로트 규모 및 증감" in brief["required_filing_topics"]
+    assert "평균 플로트 비용(연간 인수손익/평균 플로트)" in brief["required_filing_topics"]
+    assert brief["filtered_out_topics"] == []
+
+
+def test_company_brief_filters_sector_specific_hooks_without_matching_context() -> None:
+    question = "ADBE를 애크먼 관점에서 보면 가격 인상, 비용 구조, 자본배분 중 어디가 핵심이야?"
+    guru_payload = _synthetic_sector_specific_noise_payload(question=question)
+
+    brief = company_filing_brief_from_guru_lens(
+        guru_payload,
+        ticker="ADBE",
+        author_key="ackman",
+        question=question,
+    ).model_dump(mode="json")
+
+    assert "average_contract_renewal_price_increase" in brief["required_filing_topics"]
+    assert "fuel_surcharge_mechanism" not in brief["required_filing_topics"]
+    assert "carry_realization_track_record" not in brief["required_filing_topics"]
+    assert "quarterly_gross_carried_interest" not in brief["required_filing_topics"]
+    assert "fee_related_revenue_share" not in brief["required_filing_topics"]
+    assert "target_return_assumptions_per_fund" not in brief["required_filing_topics"]
+    assert {
+        item["topic"]
+        for item in brief["filtered_out_topics"]
+    } >= {
+        "fuel_surcharge_mechanism",
+        "carry_realization_track_record",
+        "quarterly_gross_carried_interest",
+        "fee_related_revenue_share",
+        "target_return_assumptions_per_fund",
+    }
+
+
+def test_company_brief_allows_asset_manager_hooks_for_asset_manager_questions() -> None:
+    question = "BAM 같은 자산운용사를 브루스 플랫 관점에서 보면 AUM과 carried interest를 봐줘"
+    guru_payload = _synthetic_sector_specific_noise_payload(question=question)
+
+    brief = company_filing_brief_from_guru_lens(
+        guru_payload,
+        ticker="BAM",
+        author_key="flatt",
+        question=question,
+    ).model_dump(mode="json")
+
+    assert "carry_realization_track_record" in brief["required_filing_topics"]
+    assert "quarterly_gross_carried_interest" in brief["required_filing_topics"]
+
+
+def test_guru_company_pack_tool_returns_company_pack_and_render_plan(
+    tmp_path: Path,
+) -> None:
+    root = _write_reviewed_fixture(tmp_path)
+    company_payload = {
+        "facts": [
+            {
+                "topic": "cash_flow",
+                "text": (
+                    "OXY operating cash flow, free cash flow, capital allocation, "
+                    "share repurchases, business model, balance sheet, risk factors, "
+                    "valuation context, commodity price exposure"
+                ),
+            }
+        ]
+    }
+    company_context = {
+        "source": "company_mcp_topic_map",
+        "business_context_terms": ["oil and gas producer"],
+        "risk_context_terms": ["commodity price exposure"],
+        "available_company_topics": ["commodity_price_exposure", "cash_flow"],
+    }
+
+    payload = json.loads(
+        guru_company_pack_tool(
+            root=root,
+            question="옥시덴탈을 버핏 관점에서 장기 보유해도 되는지 봐줘",
+            ticker="OXY",
+            author_keys=["buffett"],
+            company_payload_json=json.dumps(company_payload),
+            company_context_json=json.dumps(company_context),
+        )
+    )
+
+    company_pack = payload["company_pack"]
+    render_plan = payload["render_plan"]
+    assert payload["company_pack_context_version"] == "krw-guru-company-pack-context/v1"
+    assert company_pack["format"] == "krw-guru-company-research-pack/v1"
+    assert company_pack["company_identity"]["subject"] == "OXY"
+    assert company_pack["company_context"]["source"] == "company_mcp_topic_map"
+    assert "commodity_price_exposure" in company_pack["company_filing_brief"]["required_filing_topics"]
+    assert company_pack["company_evidence_pack"] == company_payload
+    assert company_pack["evidence_alignment"]
+    assert company_pack["answer_contract"]["must_not_include"] == [
+        "footer_disclaimer",
+        "internal_tool_names",
+        "ResearchPack_or_MCP_terms",
+        "company_facts_not_present_in_company_evidence_pack",
+    ]
+    assert render_plan["format"] == "krw-guru-answer-render-plan/v1"
+    assert render_plan["author_key"] == "buffett"
+    assert render_plan["opening_style"] == "자, 내가 먼저 묻고 싶은 건 하나입니다."
+    assert "ResearchPack" in render_plan["forbidden_output_patterns"]
+    assert "데이터 한계" in render_plan["forbidden_output_patterns"]
+    assert "주의:" in render_plan["forbidden_output_patterns"]
+    assert "관점에서 보면" in render_plan["forbidden_output_patterns"]
+    assert "애크먼이라면" in render_plan["forbidden_output_patterns"]
+
+
+def test_guru_answer_render_plan_keeps_missing_evidence_concise() -> None:
+    plan = build_guru_answer_render_plan(
+        {
+            "author_key": "buffett",
+            "company_identity": {"subject": "OXY"},
+            "guru_pack": {
+                "selected_lenses": [
+                    {
+                        "label_ko": "현금창출력",
+                        "summary_ko": "현금이 오래 남는 사업인지 확인한다.",
+                    }
+                ]
+            },
+            "company_filing_brief": {},
+            "evidence_alignment": [],
+            "missing_evidence": [
+                "cash_flow",
+                "balance_sheet",
+                "valuation_context",
+                "risk_factors",
+            ],
+        }
+    ).model_dump(mode="json")
+
+    assert len(plan["concerns"]) == 1
+    assert "영업현금흐름과 자유현금흐름" in plan["concerns"][0]
+    assert "balance_sheet" not in plan["concerns"][0]
+    assert "데이터 한계" in plan["forbidden_output_patterns"]
+    assert "내가 더 확인할 건" in plan["next_question"]
+    assert "cash_flow" not in plan["next_question"]
+
+
+def test_guru_answer_render_plan_uses_first_person_advisor_posture() -> None:
+    plan = build_guru_answer_render_plan(
+        {
+            "author_key": "ackman",
+            "company_identity": {"subject": "OXY"},
+            "guru_pack": {
+                "selected_lenses": [
+                    {
+                        "label_ko": "디레버리징 가설",
+                        "summary_ko": "부채 감축이 주주가치 전환의 핵심이다.",
+                    }
+                ]
+            },
+            "company_filing_brief": {},
+            "evidence_alignment": [],
+            "missing_evidence": [],
+        }
+    ).model_dump(mode="json")
+
+    assert plan["opening_style"] == "좋습니다. 이건 감정이 아니라 논리로 쪼개야 합니다."
+    assert plan["first_question"].startswith("내가 먼저 쓸 가설은")
+    assert "좋습니다." in plan["reframe"]
+    assert "애크먼이라면" in plan["forbidden_output_patterns"]
+    assert "관점에서 분석하면" in plan["forbidden_output_patterns"]
+    assert "렌즈로 보면" in plan["forbidden_output_patterns"]
+
+
+def test_company_context_guides_lens_selection_without_ticker_hardcoding(
+    tmp_path: Path,
+) -> None:
+    root = _write_company_context_ranking_fixture(tmp_path)
+    company_context = {
+        "source": "company_mcp_topic_map",
+        "context_terms": [
+            "oil and gas",
+            "commodity price exposure",
+            "capital expenditures",
+            "cash flow cyclicality",
+        ],
+        "available_company_topics": [
+            "commodity_price_exposure",
+            "capital_intensity",
+            "cash_flow",
+        ],
+    }
+
+    payload = json.loads(
+        guru_query_context_tool(
+            root=root,
+            question="OXY 어떠노. 버핏 관점에서 장기 보유할 만한지 봐줘",
+            ticker="OXY",
+            author_keys=["buffett"],
+            company_context_json=json.dumps(company_context),
+        )
+    )
+
+    assert payload["company_context"]["source"] == "company_mcp_topic_map"
+    assert "commodity_price_exposure" in payload["filing_evidence_requirements"]
+    assert "rate_case_filings" not in payload["filing_evidence_requirements"]
+    assert "rate_case_filings" not in (
+        payload["research_pack"]["company_bridge"]["filing_evidence_requirements"]
+    )
+    assert payload["research_pack"]["selected_lenses"][0]["label_ko"] == (
+        "원자재 가격 의존도가 만드는 잔존가치 소멸 리스크"
+    )
+    selected_labels = [
+        item["label_ko"] for item in payload["research_pack"]["selected_lenses"]
+    ]
+    assert "고객과 규제기관의 상호 호혜 원칙" not in selected_labels
+
+
+def test_company_context_flows_into_company_brief_topics(tmp_path: Path) -> None:
+    root = _write_company_context_ranking_fixture(tmp_path)
+    company_context = {
+        "source": "company_mcp_topic_map",
+        "business_context_terms": ["oil and gas producer", "capital intensive upstream assets"],
+        "risk_context_terms": ["commodity price exposure", "reserve replacement"],
+        "available_company_topics": ["commodity_price_exposure", "capital_intensity"],
+    }
+
+    payload = json.loads(
+        guru_company_brief_tool(
+            root=root,
+            question="OXY 어떠노. 버핏 관점에서 장기 보유할 만한지 봐줘",
+            ticker="OXY",
+            author_keys=["buffett"],
+            company_context_json=json.dumps(company_context),
+        )
+    )
+    brief = payload["company_filing_brief"]
+
+    assert brief["company_context"]["source"] == "company_mcp_topic_map"
+    assert "commodity_price_exposure" in brief["required_filing_topics"]
+    assert "capital_intensity" in brief["required_filing_topics"]
+    assert "oil price" in brief["query_terms"]
 
 
 def test_guru_shard_index_is_used_for_query_context(tmp_path: Path, monkeypatch) -> None:
@@ -304,6 +656,29 @@ def test_select_guru_lenses_normalizes_structured_company_hooks() -> None:
     )
 
 
+def test_guru_filing_bridge_brief_normalizes_structured_company_hooks() -> None:
+    brief = mcp_tools._filing_bridge_brief(
+        "OXY를 버핏 관점에서 봐줘",
+        [
+            {
+                "company_data_hooks": [
+                    {"description": "연간 영업현금흐름", "metric": "operating_cash_flow"},
+                    {"description": "위험요인", "section": "risk_factors"},
+                    "capital_allocation",
+                ],
+                "data_need_key": "cash_flow_quality",
+            }
+        ],
+    )
+
+    assert "operating_cash_flow" in brief
+    assert "risk_factors" in brief
+    assert "capital_allocation" in brief
+    assert "cash_flow_quality" in brief
+    assert "{'description'" not in brief
+    assert '"description"' not in brief
+
+
 def test_guru_question_parser_does_not_treat_metrics_or_etfs_as_company_tickers() -> None:
     assert not mcp_tools._has_ticker_like_token("높은 ROIC가 유지 가능한지 보려면?")
     assert not mcp_tools._question_mentions_company_need(
@@ -322,6 +697,11 @@ def test_guru_clarifying_questions_respect_resolved_company_context() -> None:
         "XOM 같은 원유 생산회사를 막스 관점에서 사이클 리스크로 봐줘",
         needs_company_data=True,
         ticker="XOM",
+    ) == []
+    assert mcp_tools._clarifying_questions_for_question(
+        "옥시덴탈을 버핏 관점에서 장기 보유해도 되는지 봐줘",
+        needs_company_data=True,
+        ticker="OXY",
     ) == []
     assert mcp_tools._clarifying_questions_for_question(
         "삼성전자라는 종목을 버핏 렌즈로 보면 장기 보유할 수 있는지 어떤 공시 근거가 필요해?",
@@ -424,6 +804,156 @@ def test_context_score_prioritizes_portfolio_context_data_need_for_position_sizi
     )
 
 
+def test_context_score_downranks_case_specific_noise_for_company_questions() -> None:
+    question = "옥시덴탈을 버핏 관점에서 장기 보유해도 되는지 봐줘 OXY"
+    owner_earnings_lens = {
+        "author_key": "buffett",
+        "object_type": "decision_criterion",
+        "object_origin": "source_grounded",
+        "label_ko": "소유주 이익과 자본배분 점검",
+        "summary_ko": "원유와 에너지 사업은 현금흐름, 부채, 자본배분, 원자재 가격 민감도를 봐야 한다.",
+        "intent_family": "holding_review",
+        "specificity": {"level": "general_principle", "source_case_tags": []},
+        "answer_role": {"default": "core_lens", "possible_roles": ["checklist"]},
+    }
+    wooden_lens = {
+        "author_key": "buffett",
+        "object_type": "principle",
+        "object_origin": "source_grounded",
+        "label_ko": "우든 효과: 최고 인재에 시간과 권한을 집중하라",
+        "summary_ko": "우든 코치 사례처럼 CEO와 인재에게 권한과 시간을 집중한다.",
+        "intent_family": "holding_review",
+        "specificity": {
+            "level": "company_case_specific",
+            "source_case_tags": ["wooden", "talent", "management"],
+        },
+        "answer_role": {"default": "supporting_lens", "possible_roles": []},
+    }
+    insurance_lens = {
+        "author_key": "buffett",
+        "object_type": "decision_criterion",
+        "object_origin": "source_grounded",
+        "label_ko": "보험 플로트 비용은 자본 비용이다",
+        "summary_ko": "보험 플로트, 언더라이팅, 재보험 손실을 투자 자금 원천으로 평가한다.",
+        "intent_family": "holding_review",
+        "specificity": {"level": "sector_specific", "source_case_tags": ["insurance"]},
+        "answer_role": {"default": "core_lens", "possible_roles": []},
+    }
+
+    owner_score = mcp_tools._context_score(
+        question,
+        owner_earnings_lens,
+        intent_family="holding_review",
+        row_family="guru_object",
+    )
+
+    assert owner_score > mcp_tools._context_score(
+        question,
+        wooden_lens,
+        intent_family="holding_review",
+        row_family="guru_object",
+    )
+    assert owner_score > mcp_tools._context_score(
+        question,
+        insurance_lens,
+        intent_family="holding_review",
+        row_family="guru_object",
+    )
+
+
+def test_context_score_downranks_sector_cases_for_generic_risk_questions() -> None:
+    question = "막스식으로 지금 내가 놓치기 쉬운 리스크 질문 목록을 만들어줘. 특정 종목은 없어."
+    general_risk_lens = {
+        "author_key": "marks",
+        "object_type": "risk_frame",
+        "object_origin": "source_grounded",
+        "label_ko": "좋은 이야기보다 하방 경로를 먼저 보라",
+        "summary_ko": "리스크, 손실 경로, 사이클, 불확실성, 가격에 반영된 낙관을 점검한다.",
+        "intent_family": "risk_check",
+        "specificity": {"level": "general_principle", "source_case_tags": []},
+        "answer_role": {"default": "core_lens", "possible_roles": ["caution"]},
+    }
+    cre_bank_lens = {
+        "author_key": "marks",
+        "object_type": "risk_frame",
+        "object_origin": "source_grounded",
+        "label_ko": "은행의 CRE 대출 집중 리스크",
+        "summary_ko": "은행, CRE, 상업용 부동산 대출, 신용스프레드와 차환 리스크를 본다.",
+        "intent_family": "risk_check",
+        "specificity": {
+            "level": "sector_specific",
+            "source_case_tags": ["bank", "CRE", "credit"],
+        },
+        "answer_role": {"default": "core_lens", "possible_roles": ["caution"]},
+    }
+
+    assert mcp_tools._context_score(
+        question,
+        general_risk_lens,
+        intent_family="risk_check",
+        row_family="guru_object",
+    ) > mcp_tools._context_score(
+        question,
+        cre_bank_lens,
+        intent_family="risk_check",
+        row_family="guru_object",
+    )
+
+
+def test_context_score_downranks_derivative_lens_for_non_derivative_company_risk() -> None:
+    question = "AI 반도체 인프라 회사의 성장 리스크를 버핏과 막스 관점으로 보면 어디가 가장 불편해?"
+    innovation_risk = {
+        "author_key": "marks",
+        "object_type": "risk_frame",
+        "object_origin": "source_grounded",
+        "label_ko": "새로운 기술 투자 붐의 자본 파괴 위험",
+        "summary_ko": "AI, 데이터센터, 반도체 인프라 붐은 기대가 과하면 자본 파괴와 수요 사이클 위험을 만든다.",
+        "intent_family": "risk_check",
+        "specificity": {"level": "general_principle", "source_case_tags": ["AI", "semiconductor"]},
+        "answer_role": {"default": "core_lens", "possible_roles": ["caution"]},
+    }
+    derivative_disclosure = {
+        "author_key": "buffett",
+        "object_type": "risk_frame",
+        "object_origin": "source_grounded",
+        "label_ko": "파생상품 공시의 불투명성",
+        "summary_ko": "파생상품, 스왑, 옵션, 헤지 계약은 공시를 읽어도 위험이 불투명할 수 있다.",
+        "intent_family": "risk_check",
+        "specificity": {"level": "general_principle", "source_case_tags": ["derivatives"]},
+        "answer_role": {"default": "core_lens", "possible_roles": ["caution"]},
+    }
+    governance_lens = {
+        "author_key": "buffett",
+        "object_type": "risk_frame",
+        "object_origin": "source_grounded",
+        "label_ko": "보수 의존적 이사의 독립성 역설",
+        "summary_ko": "이사회, 이사 보수, 독립성, 거버넌스 구조가 주주 관점과 어긋날 수 있다.",
+        "intent_family": "risk_check",
+        "specificity": {"level": "general_principle", "source_case_tags": ["governance"]},
+        "answer_role": {"default": "core_lens", "possible_roles": ["caution"]},
+    }
+
+    innovation_score = mcp_tools._context_score(
+        question,
+        innovation_risk,
+        intent_family="risk_check",
+        row_family="guru_object",
+    )
+
+    assert innovation_score > mcp_tools._context_score(
+        question,
+        derivative_disclosure,
+        intent_family="risk_check",
+        row_family="guru_object",
+    )
+    assert innovation_score > mcp_tools._context_score(
+        question,
+        governance_lens,
+        intent_family="risk_check",
+        row_family="guru_object",
+    )
+
+
 def test_guru_context_respects_explicit_no_ticker_question(tmp_path: Path) -> None:
     root = _write_reviewed_fixture(tmp_path)
 
@@ -514,6 +1044,10 @@ def test_guru_query_context_respects_no_ticker_and_no_company_name_phrasing(
         (
             ["buffett"],
             "가격 인상, 비용 구조, 자본배분 중 어떤 순서로 확인해야 해? 회사명 없이.",
+        ),
+        (
+            ["buffett", "marks"],
+            "현금 비중을 높게 들고 있는 게 버핏과 막스 관점에서 언제 말이 돼?",
         ),
     ]
 
@@ -613,6 +1147,166 @@ def test_guru_query_context_prefers_intent_relevant_lenses_over_theme_overfit(
         assert top_lens["label_ko"] != disallowed_top_label, question
         assert query_context["requires_company_evidence"] is False, question
         assert query_context["filing_evidence_requirements"] == [], question
+
+
+def _synthetic_marks_credit_noise_payload(*, question: str) -> dict:
+    return {
+        "research_context_version": "krw-guru-query-context/v1",
+        "research_status": "needs_company_evidence",
+        "requires_company_evidence": True,
+        "filing_evidence_requirements": [
+            "risk_factors",
+            "balance_sheet",
+            "cash_flow",
+            "demand_cycle_exposure",
+            "margin_pressure",
+            "liquidity",
+        ],
+        "research_pack": {
+            "format": "krw-guru-research-pack/v1",
+            "pack_meta": {
+                "pack_id": "test-pack",
+                "guru_keys": ["marks"],
+                "question": question,
+            },
+            "company_bridge": {
+                "requires_company_evidence": True,
+                "filing_evidence_requirements": [
+                    "risk_factors",
+                    "balance_sheet",
+                    "cash_flow",
+                    "demand_cycle_exposure",
+                    "margin_pressure",
+                    "liquidity",
+                ],
+            },
+            "selected_lenses": [
+                {
+                    "reviewed_id": "guru:marks:risk:test",
+                    "label_ko": "프리미엄 밸류에이션의 이중 위험",
+                    "summary_ko": "좋은 이야기가 가격에 반영되면 하방 위험이 커진다.",
+                    "company_evidence_requirements": [
+                        "risk_factors",
+                        "demand_cycle_exposure",
+                    ],
+                }
+            ],
+            "data_needs": [
+                {
+                    "data_need_key": "convertible_debt_terms",
+                    "company_data_hooks": [
+                        "전환사채 전환가격 및 만기",
+                        "쿠폰 금리 및 풋/콜 옵션 조건",
+                        "발행 목적(자사주 매입, 부채 재편, 신규 투자)",
+                        "희석 가능 주식수 및 희석 비율",
+                    ],
+                }
+            ],
+        },
+    }
+
+
+def _synthetic_buffett_insurance_noise_payload(*, question: str) -> dict:
+    return {
+        "research_context_version": "krw-guru-query-context/v1",
+        "research_status": "needs_company_evidence",
+        "requires_company_evidence": True,
+        "filing_evidence_requirements": [
+            "business_model",
+            "cash_flow",
+            "capital_allocation",
+            "risk_factors",
+        ],
+        "research_pack": {
+            "format": "krw-guru-research-pack/v1",
+            "pack_meta": {
+                "pack_id": "test-pack",
+                "guru_keys": ["buffett"],
+                "question": question,
+            },
+            "company_bridge": {
+                "requires_company_evidence": True,
+                "filing_evidence_requirements": [
+                    "business_model",
+                    "cash_flow",
+                    "capital_allocation",
+                    "risk_factors",
+                ],
+            },
+            "selected_lenses": [
+                {
+                    "reviewed_id": "guru:buffett:quality:test",
+                    "label_ko": "브랜드와 현금창출력 점검",
+                    "summary_ko": "소비재 기업은 브랜드, 가격결정력, 반복 현금흐름을 본다.",
+                    "company_evidence_requirements": ["cash_flow", "pricing_power"],
+                }
+            ],
+            "data_needs": [
+                {
+                    "data_need_key": "insurance_float_economics",
+                    "company_data_hooks": [
+                        "사업별 플로트 규모 및 증감",
+                        "평균 플로트 비용(연간 인수손익/평균 플로트)",
+                        "pricing_power",
+                    ],
+                }
+            ],
+        },
+    }
+
+
+def _synthetic_sector_specific_noise_payload(*, question: str) -> dict:
+    return {
+        "research_context_version": "krw-guru-query-context/v1",
+        "research_status": "needs_company_evidence",
+        "requires_company_evidence": True,
+        "filing_evidence_requirements": [
+            "business_model",
+            "cash_flow",
+            "capital_allocation",
+            "risk_factors",
+        ],
+        "research_pack": {
+            "format": "krw-guru-research-pack/v1",
+            "pack_meta": {
+                "pack_id": "test-pack",
+                "guru_keys": ["ackman"],
+                "question": question,
+            },
+            "company_bridge": {
+                "requires_company_evidence": True,
+                "filing_evidence_requirements": [
+                    "business_model",
+                    "cash_flow",
+                    "capital_allocation",
+                    "risk_factors",
+                ],
+            },
+            "selected_lenses": [
+                {
+                    "reviewed_id": "guru:ackman:pricing:test",
+                    "label_ko": "가격 인상과 운영 레버 점검",
+                    "summary_ko": "계약 갱신 가격, 비용 구조, 자본배분을 본다.",
+                    "company_evidence_requirements": [
+                        "average_contract_renewal_price_increase",
+                    ],
+                }
+            ],
+            "data_needs": [
+                {
+                    "data_need_key": "sector_specific_noise",
+                    "company_data_hooks": [
+                        "average_contract_renewal_price_increase",
+                        "fuel_surcharge_mechanism",
+                        "carry_realization_track_record",
+                        "quarterly_gross_carried_interest",
+                        "fee_related_revenue_share",
+                        "target_return_assumptions_per_fund",
+                    ],
+                }
+            ],
+        },
+    }
 
 
 def _write_reviewed_fixture(tmp_path: Path) -> Path:
@@ -917,6 +1611,175 @@ def _write_quality_ranking_fixture(tmp_path: Path) -> Path:
     _write_jsonl(reviewed / "corpus_metadata.jsonl", [])
     _write_jsonl(reviewed / "rejected_candidates.jsonl", [])
     _write_jsonl(reviewed / "relationships.jsonl", [])
+    (reviewed / "curation_report.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "krw-guru-ontology/v1",
+                "generated_at": "2026-07-05T00:00:00+00:00",
+                "root": str(root),
+                "running_root": str(tmp_path / "missing-running-root"),
+                "warnings": [],
+                "rejection_reasons": {},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    return root
+
+
+def _write_company_context_ranking_fixture(tmp_path: Path) -> Path:
+    root = tmp_path / "guru-company-context"
+    reviewed = root / "reviewed"
+    reviewed.mkdir(parents=True)
+    _write_jsonl(
+        reviewed / "guru_objects.jsonl",
+        [
+            {
+                "reviewed_id": "guru:buffett:risk:commodity-residual-value:test",
+                "candidate_id": "candidate:cctx1",
+                "author_key": "buffett",
+                "object_type": "risk_frame",
+                "object_origin": "source_grounded",
+                "label_ko": "원자재 가격 의존도가 만드는 잔존가치 소멸 리스크",
+                "summary_ko": "원유와 가스 같은 원자재 사업은 상품가격, 자본지출, 잔존가치, 현금흐름 사이클을 함께 본다.",
+                "supporting_span_ids": [],
+                "intent_family": "holding_review",
+                "specificity": {
+                    "level": "sector_specific",
+                    "source_case_tags": ["commodity", "oil", "capital intensity"],
+                },
+                "answer_role": {"default": "core_lens", "possible_roles": ["caution"]},
+                "confidence": "high",
+                "status": "reviewed",
+                "related_reviewed_ids": [
+                    "guru:buffett:data_need:commodity-cash-flow:test"
+                ],
+            },
+            {
+                "reviewed_id": "guru:buffett:principle:owner-manager:test",
+                "candidate_id": "candidate:cctx2",
+                "author_key": "buffett",
+                "object_type": "principle",
+                "object_origin": "source_grounded",
+                "label_ko": "100% 소유자처럼 경영하라",
+                "summary_ko": "경영진은 주식 가격이 아니라 장기 소유자 관점에서 회사를 운영해야 한다.",
+                "supporting_span_ids": [],
+                "intent_family": "holding_review",
+                "specificity": {"level": "general_principle", "source_case_tags": []},
+                "answer_role": {"default": "supporting_lens", "possible_roles": []},
+                "confidence": "high",
+                "status": "reviewed",
+            },
+            {
+                "reviewed_id": "guru:buffett:principle:regulated-utility:test",
+                "candidate_id": "candidate:cctx4",
+                "author_key": "buffett",
+                "object_type": "principle",
+                "object_origin": "source_grounded",
+                "label_ko": "고객과 규제기관의 상호 호혜 원칙",
+                "summary_ko": (
+                    "규제 유틸리티에서는 고객, 규제기관, 대규모 재투자, "
+                    "rate case, allowed return이 장기 경제성을 좌우한다."
+                ),
+                "supporting_span_ids": [],
+                "intent_family": "holding_review",
+                "specificity": {
+                    "level": "sector_specific",
+                    "source_case_tags": ["regulated utility", "rate case", "allowed return"],
+                },
+                "answer_role": {"default": "core_lens", "possible_roles": ["checklist"]},
+                "confidence": "high",
+                "status": "reviewed",
+                "related_reviewed_ids": [
+                    "guru:buffett:data_need:regulated-utility:test"
+                ],
+            },
+        ],
+    )
+    _write_jsonl(reviewed / "consultation_objects.jsonl", [])
+    _write_jsonl(
+        reviewed / "data_needs.jsonl",
+        [
+            {
+                "reviewed_id": "guru:buffett:data_need:commodity-cash-flow:test",
+                "candidate_id": "candidate:cctx3",
+                "author_key": "buffett",
+                "label_ko": "원자재 민감도와 자본지출 근거",
+                "summary_ko": "회사 공시에서 commodity_price_exposure, capital_intensity, cash_flow를 확인한다.",
+                "object_origin": "data_need",
+                "data_need_family": "future_company_metric",
+                "data_need_key": "commodity_cash_flow_context",
+                "requires_company_data": True,
+                "company_data_hooks": [
+                    "commodity_price_exposure",
+                    "capital_intensity",
+                    "cash_flow",
+                ],
+                "supporting_span_ids": [],
+                "intent_family": "holding_review",
+                "specificity": {
+                    "level": "sector_specific",
+                    "source_case_tags": ["commodity", "oil"],
+                },
+                "answer_role": {"default": "data_need", "possible_roles": ["checklist"]},
+                "confidence": "high",
+                "status": "reviewed",
+                "related_reviewed_ids": [
+                    "guru:buffett:risk:commodity-residual-value:test"
+                ],
+            },
+            {
+                "reviewed_id": "guru:buffett:data_need:regulated-utility:test",
+                "candidate_id": "candidate:cctx5",
+                "author_key": "buffett",
+                "label_ko": "요금 규제와 허용수익률 근거",
+                "summary_ko": "회사 공시에서 rate_case_filings, allowed_return, regulator_decisions를 확인한다.",
+                "object_origin": "data_need",
+                "data_need_family": "future_company_text",
+                "data_need_key": "rate_case_filings",
+                "requires_company_data": True,
+                "company_data_hooks": [
+                    "rate_case_filings",
+                    "allowed_return",
+                    "regulator_decisions",
+                ],
+                "supporting_span_ids": [],
+                "intent_family": "holding_review",
+                "specificity": {
+                    "level": "sector_specific",
+                    "source_case_tags": ["regulated utility", "rate case", "allowed return"],
+                },
+                "answer_role": {"default": "data_need", "possible_roles": ["checklist"]},
+                "confidence": "high",
+                "status": "reviewed",
+                "related_reviewed_ids": [
+                    "guru:buffett:principle:regulated-utility:test"
+                ],
+            }
+        ],
+    )
+    _write_jsonl(reviewed / "corpus_metadata.jsonl", [])
+    _write_jsonl(reviewed / "rejected_candidates.jsonl", [])
+    _write_jsonl(
+        reviewed / "relationships.jsonl",
+        [
+            {
+                "relationship_id": "guru:relationship:cctx:test",
+                "from_id": "guru:buffett:risk:commodity-residual-value:test",
+                "to_id": "guru:buffett:data_need:commodity-cash-flow:test",
+                "relation_type": "requires_evidence",
+                "explanation_ko": "원자재 사업 렌즈는 원자재 민감도와 자본지출 근거를 요구한다.",
+            },
+            {
+                "relationship_id": "guru:relationship:cctx-utility:test",
+                "from_id": "guru:buffett:principle:regulated-utility:test",
+                "to_id": "guru:buffett:data_need:regulated-utility:test",
+                "relation_type": "requires_evidence",
+                "explanation_ko": "규제 유틸리티 렌즈는 요금 규제와 허용수익률 근거를 요구한다.",
+            }
+        ],
+    )
     (reviewed / "curation_report.json").write_text(
         json.dumps(
             {

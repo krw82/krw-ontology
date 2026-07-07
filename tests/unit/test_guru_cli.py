@@ -77,6 +77,41 @@ def test_guru_run_invokes_pipeline_without_agent_sdk_by_default(
     assert captured["execute_agent_sdk"] is False
 
 
+def test_guru_run_without_root_defaults_to_mutable_workspace(tmp_path: Path, monkeypatch):
+    captured = {}
+
+    def fake_run_guru_pipeline(root=None, **kwargs):
+        captured["root"] = root
+        captured.update(kwargs)
+        return {
+            "root": str(root),
+            "running_root": str(tmp_path / "guru-data" / "runs" / "default"),
+            "initialized": True,
+            "collection_started": True,
+            "extraction_started": False,
+            "execution_mode": "dry_run",
+            "agent_sdk_called": False,
+            "raw_documents": 0,
+            "raw_errors": 0,
+            "parsed_documents": 0,
+            "parsed_errors": 0,
+            "extraction_batches": 0,
+            "files": {},
+        }
+
+    import krw_ontology.guru.cli as guru_cli
+
+    monkeypatch.setenv("KRW_GURU_DATA_ROOT", str(tmp_path / "guru-data"))
+    monkeypatch.setattr(guru_cli, "run_guru_pipeline", fake_run_guru_pipeline)
+
+    result = runner.invoke(app, ["guru", "run", "--json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["root"].endswith("guru-data/workspaces/default")
+    assert captured["root"] == tmp_path / "guru-data" / "workspaces" / "default"
+
+
 def test_guru_run_background_starts_detached_worker(tmp_path: Path, monkeypatch):
     captured = {}
 
@@ -294,6 +329,55 @@ def test_guru_build_index_command_outputs_json(tmp_path: Path, monkeypatch):
     }
 
 
+def test_guru_promote_and_release_status_commands(tmp_path: Path):
+    source = tmp_path / "guru-source"
+    (source / "reviewed").mkdir(parents=True)
+    (source / "reviewed" / "guru_objects.jsonl").write_text(
+        '{"reviewed_id":"guru:buffett:1","author_key":"buffett"}\n',
+        encoding="utf-8",
+    )
+
+    promote = runner.invoke(
+        app,
+        [
+            "guru",
+            "promote",
+            "--source-root",
+            str(source),
+            "--data-root",
+            str(tmp_path / "guru-data"),
+            "--env",
+            "prod",
+            "--release-id",
+            "rel-cli",
+            "--json",
+        ],
+    )
+
+    assert promote.exit_code == 0
+    promoted_payload = json.loads(promote.output)
+    assert promoted_payload["promoted_release_id"] == "rel-cli"
+    assert promoted_payload["current_release_id"] == "rel-cli"
+
+    status = runner.invoke(
+        app,
+        [
+            "guru",
+            "release-status",
+            "--data-root",
+            str(tmp_path / "guru-data"),
+            "--env",
+            "prod",
+            "--json",
+        ],
+    )
+
+    assert status.exit_code == 0
+    status_payload = json.loads(status.output)
+    assert status_payload["current_release_id"] == "rel-cli"
+    assert status_payload["manifest_exists"] is True
+
+
 def test_guru_select_lenses_command_outputs_json(tmp_path: Path, monkeypatch):
     captured = {}
 
@@ -355,10 +439,178 @@ def test_guru_select_lenses_command_outputs_json(tmp_path: Path, monkeypatch):
         "root": tmp_path / "guru",
         "author_keys": ["buffett"],
         "ticker": "AAPL",
+        "company_context": None,
         "intent_family": "holding_review",
         "limit": 3,
         "data_need_limit": 4,
     }
+
+
+def test_guru_select_lenses_command_accepts_company_context_json(tmp_path: Path, monkeypatch):
+    captured = {}
+
+    def fake_select_guru_lenses(**kwargs):
+        captured.update(kwargs)
+        return {
+            "lens_selection_version": "krw-guru-lens-selection/v1",
+            "selection_status": "ready_for_company_bridge",
+            "selected_author_keys": kwargs["author_keys"],
+            "requires_company_evidence": True,
+            "count": 0,
+            "selected_lenses": [],
+            "company_bridge": {"filing_evidence_requirements": []},
+        }
+
+    import krw_ontology.guru.cli as guru_cli
+
+    monkeypatch.setattr(guru_cli, "select_guru_lenses", fake_select_guru_lenses)
+
+    context_json = json.dumps({"context_terms": ["oil and gas", "commodity price exposure"]})
+    result = runner.invoke(
+        app,
+        [
+            "guru",
+            "select-lenses",
+            "--root",
+            str(tmp_path / "guru"),
+            "--question",
+            "OXY 어떠노",
+            "--authors",
+            "buffett",
+            "--ticker",
+            "OXY",
+            "--company-context-json",
+            context_json,
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert captured["company_context"] == {
+        "context_terms": ["oil and gas", "commodity price exposure"]
+    }
+
+
+def test_guru_company_brief_command_outputs_bridge_payload(tmp_path: Path, monkeypatch):
+    captured = {}
+
+    def fake_company_brief_tool(**kwargs):
+        captured.update(kwargs)
+        return json.dumps(
+            {
+                "company_brief_context_version": "krw-guru-company-brief-context/v1",
+                "research_status": "needs_company_evidence",
+                "requires_company_evidence": True,
+                "next_step": "Pass company_research_question_ko to KRW Ontology.",
+                "company_filing_brief": {
+                    "format": "krw-guru-company-filing-brief/v1",
+                    "company_identity": {"subject": "OXY", "ticker": "OXY", "unresolved": False},
+                    "company_research_question_ko": "OXY 공시에서 현금흐름을 확인하라.",
+                    "required_filing_topics": ["cash_flow"],
+                },
+            },
+            ensure_ascii=False,
+        )
+
+    import krw_ontology.guru.cli as guru_cli
+
+    monkeypatch.setattr(guru_cli, "guru_company_brief_tool", fake_company_brief_tool)
+
+    context_json = json.dumps({"available_company_topics": ["commodity_price_exposure"]})
+    result = runner.invoke(
+        app,
+        [
+            "guru",
+            "company-brief",
+            "--root",
+            str(tmp_path / "guru"),
+            "--question",
+            "옥시덴탈 어떠노",
+            "--authors",
+            "buffett",
+            "--ticker",
+            "OXY",
+            "--company-name",
+            "Occidental Petroleum",
+            "--company-context-json",
+            context_json,
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["company_brief_context_version"] == "krw-guru-company-brief-context/v1"
+    assert captured["root"] == tmp_path / "guru"
+    assert captured["author_keys"] == ["buffett"]
+    assert captured["ticker"] == "OXY"
+    assert captured["company_name"] == "Occidental Petroleum"
+    assert captured["company_context_json"] == context_json
+
+
+def test_guru_company_pack_command_outputs_render_plan(tmp_path: Path, monkeypatch):
+    captured = {}
+    company_payload = tmp_path / "company_payload.json"
+    company_payload.write_text('{"facts":[{"topic":"cash_flow"}]}', encoding="utf-8")
+    company_context = tmp_path / "company_context.json"
+    company_context.write_text(
+        '{"available_company_topics":["commodity_price_exposure"]}',
+        encoding="utf-8",
+    )
+
+    def fake_company_pack_tool(**kwargs):
+        captured.update(kwargs)
+        return json.dumps(
+            {
+                "company_pack_context_version": "krw-guru-company-pack-context/v1",
+                "research_status": "needs_company_evidence",
+                "company_pack": {
+                    "format": "krw-guru-company-research-pack/v1",
+                    "company_identity": {"subject": "OXY", "ticker": "OXY", "unresolved": False},
+                    "missing_evidence": ["balance_sheet"],
+                },
+                "render_plan": {
+                    "format": "krw-guru-answer-render-plan/v1",
+                    "opening_style": "자, 내가 먼저 묻고 싶은 건 하나입니다.",
+                    "first_question": "OXY를 사업 일부로 가진다면 먼저 현금흐름을 봐야 합니다.",
+                },
+            },
+            ensure_ascii=False,
+        )
+
+    import krw_ontology.guru.cli as guru_cli
+
+    monkeypatch.setattr(guru_cli, "guru_company_pack_tool", fake_company_pack_tool)
+
+    result = runner.invoke(
+        app,
+        [
+            "guru",
+            "company-pack",
+            "--root",
+            str(tmp_path / "guru"),
+            "--question",
+            "옥시덴탈 어떠노",
+            "--authors",
+            "buffett",
+            "--ticker",
+            "OXY",
+            "--company-payload",
+            str(company_payload),
+            "--company-context",
+            str(company_context),
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["company_pack_context_version"] == "krw-guru-company-pack-context/v1"
+    assert captured["company_payload_json"] == '{"facts":[{"topic":"cash_flow"}]}'
+    assert captured["company_context_json"] == (
+        '{"available_company_topics":["commodity_price_exposure"]}'
+    )
+    assert captured["author_keys"] == ["buffett"]
 
 
 def test_guru_eval_quality_command_outputs_report(tmp_path: Path, monkeypatch):

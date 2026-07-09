@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from typing import Any
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
@@ -19,6 +20,7 @@ from krw_ontology.guru.mcp_tools import (
     guru_evidence_tool,
     guru_index_context_tool,
     guru_query_context_tool,
+    guru_review_company_evidence_tool,
     guru_search_tool,
     guru_status_tool,
     guru_trace_tool,
@@ -118,7 +120,7 @@ async def krw_guru_query_context(
     root: str | None = None,
     author_keys: list[str] | None = None,
     ticker: str | None = None,
-    company_context_json: str | None = None,
+    company_context: dict[str, Any] | None = None,
     intent_family: str | None = None,
     limit_lens: int = 4,
     limit_consultation: int = 3,
@@ -132,7 +134,7 @@ async def krw_guru_query_context(
         root=Path(root).expanduser() if root else None,
         author_keys=author_keys,
         ticker=ticker,
-        company_context_json=company_context_json,
+        company_context=company_context,
         intent_family=intent_family,
         limit_lens=limit_lens,
         limit_consultation=limit_consultation,
@@ -152,7 +154,7 @@ async def krw_guru_company_brief(
     author_keys: list[str] | None = None,
     ticker: str | None = None,
     company_name: str | None = None,
-    company_context_json: str | None = None,
+    company_context: dict[str, Any] | None = None,
     intent_family: str | None = None,
     limit_lens: int = 4,
     limit_consultation: int = 3,
@@ -167,7 +169,7 @@ async def krw_guru_company_brief(
         author_keys=author_keys,
         ticker=ticker,
         company_name=company_name,
-        company_context_json=company_context_json,
+        company_context=company_context,
         intent_family=intent_family,
         limit_lens=limit_lens,
         limit_consultation=limit_consultation,
@@ -187,8 +189,8 @@ async def krw_guru_company_pack(
     author_keys: list[str] | None = None,
     ticker: str | None = None,
     company_name: str | None = None,
-    company_payload_json: str | None = None,
-    company_context_json: str | None = None,
+    company_payload: dict[str, Any] | None = None,
+    company_context: dict[str, Any] | None = None,
     intent_family: str | None = None,
     response_format: GuruResponseFormat = GuruResponseFormat.JSON,
 ) -> str:
@@ -200,8 +202,39 @@ async def krw_guru_company_pack(
         author_keys=author_keys,
         ticker=ticker,
         company_name=company_name,
-        company_payload_json=company_payload_json,
-        company_context_json=company_context_json,
+        company_payload=company_payload,
+        company_context=company_context,
+        intent_family=intent_family,
+        response_format=response_format,
+    )
+
+
+@mcp.tool(
+    name="krw_guru_review_company_evidence",
+    title="Review company evidence through guru lenses",
+    annotations=READ_ONLY,
+)
+async def krw_guru_review_company_evidence(
+    question: str,
+    root: str | None = None,
+    author_keys: list[str] | None = None,
+    ticker: str | None = None,
+    company_name: str | None = None,
+    company_payload: dict[str, Any] | None = None,
+    company_context: dict[str, Any] | None = None,
+    intent_family: str | None = None,
+    response_format: GuruResponseFormat = GuruResponseFormat.JSON,
+) -> str:
+    """Return internal guru interpretation guidance after company evidence."""
+    return await _run_tool(
+        guru_review_company_evidence_tool,
+        question=question,
+        root=Path(root).expanduser() if root else None,
+        author_keys=author_keys,
+        ticker=ticker,
+        company_name=company_name,
+        company_payload=company_payload,
+        company_context=company_context,
         intent_family=intent_family,
         response_format=response_format,
     )
@@ -217,7 +250,7 @@ async def krw_guru_select_lenses(
     root: str | None = None,
     author_keys: list[str] | None = None,
     ticker: str | None = None,
-    company_context_json: str | None = None,
+    company_context: dict[str, Any] | None = None,
     intent_family: str | None = None,
     limit: int = 5,
     data_need_limit: int = 6,
@@ -230,7 +263,7 @@ async def krw_guru_select_lenses(
         root=Path(root).expanduser() if root else None,
         author_keys=author_keys,
         ticker=ticker,
-        company_context_json=company_context_json,
+        company_context=company_context,
         intent_family=intent_family,
         limit=limit,
         data_need_limit=data_need_limit,

@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 from krw_ontology.guru.company_bridge import (
+    build_guru_company_evidence_review,
     build_guru_company_research_pack,
     company_filing_brief_from_guru_lens,
 )
@@ -37,6 +38,10 @@ from krw_ontology.guru.models import (
     GuruResearchIntent,
     GuruResearchPack,
     GuruResearchPackMeta,
+)
+from krw_ontology.mcp_server.evidence_pack import (
+    VERIFIED_COMPANY_EVIDENCE_FORMAT,
+    is_verified_company_evidence_pack,
 )
 from krw_ontology.guru.renderer import build_guru_answer_render_plan
 from krw_ontology.guru.workspace import GURU_RUNNING_ROOT_ENV, guru_root
@@ -383,7 +388,8 @@ def guru_query_context_tool(
     root: str | Path | None = None,
     author_keys: Sequence[str] | None = None,
     ticker: str | None = None,
-    company_context_json: str | None = None,
+    company_context: dict[str, Any] | None = None,
+    company_context_json: Any = None,
     intent_family: str | None = None,
     limit_lens: int = 4,
     limit_consultation: int = 3,
@@ -396,7 +402,10 @@ def guru_query_context_tool(
         root=root,
         author_keys=author_keys,
         ticker=ticker,
-        company_context=_json_arg(company_context_json, field_name="company_context_json"),
+        company_context=_json_arg(
+            company_context if company_context is not None else company_context_json,
+            field_name="company_context",
+        ),
         intent_family=intent_family,
         limit_lens=limit_lens,
         limit_consultation=limit_consultation,
@@ -414,7 +423,8 @@ def guru_company_brief_tool(
     author_keys: Sequence[str] | None = None,
     ticker: str | None = None,
     company_name: str | None = None,
-    company_context_json: str | None = None,
+    company_context: dict[str, Any] | None = None,
+    company_context_json: Any = None,
     intent_family: str | None = None,
     limit_lens: int = 4,
     limit_consultation: int = 3,
@@ -428,7 +438,9 @@ def guru_company_brief_tool(
             root=root,
             author_keys=author_keys,
             ticker=ticker,
-            company_context_json=company_context_json,
+            company_context_json=(
+                company_context if company_context is not None else company_context_json
+            ),
             intent_family=intent_family,
             limit_lens=limit_lens,
             limit_consultation=limit_consultation,
@@ -440,7 +452,10 @@ def guru_company_brief_tool(
         query_payload,
         ticker=ticker,
         company_name=company_name,
-        company_context=_json_arg(company_context_json, field_name="company_context_json"),
+        company_context=_json_arg(
+            company_context if company_context is not None else company_context_json,
+            field_name="company_context",
+        ),
         author_key=(author_keys[0] if author_keys else None),
         question=question,
     )
@@ -471,8 +486,10 @@ def guru_company_pack_tool(
     author_keys: Sequence[str] | None = None,
     ticker: str | None = None,
     company_name: str | None = None,
-    company_payload_json: str | None = None,
-    company_context_json: str | None = None,
+    company_payload: dict[str, Any] | None = None,
+    company_payload_json: Any = None,
+    company_context: dict[str, Any] | None = None,
+    company_context_json: Any = None,
     intent_family: str | None = None,
     response_format: GuruResponseFormat = GuruResponseFormat.JSON,
 ) -> str:
@@ -483,18 +500,26 @@ def guru_company_pack_tool(
             root=root,
             author_keys=author_keys,
             ticker=ticker,
-            company_context_json=company_context_json,
+            company_context_json=(
+                company_context if company_context is not None else company_context_json
+            ),
             intent_family=intent_family,
             response_format=GuruResponseFormat.JSON,
         )
     )
-    company_payload = _json_arg(company_payload_json, field_name="company_payload_json")
+    company_payload_data = _json_arg(
+        company_payload if company_payload is not None else company_payload_json,
+        field_name="company_payload",
+    )
     company_pack = build_guru_company_research_pack(
         query_payload,
-        company_evidence_payload=company_payload,
+        company_evidence_payload=company_payload_data,
         ticker=ticker,
         company_name=company_name,
-        company_context=_json_arg(company_context_json, field_name="company_context_json"),
+        company_context=_json_arg(
+            company_context if company_context is not None else company_context_json,
+            field_name="company_context",
+        ),
         author_key=(author_keys[0] if author_keys else None),
         question=question,
     )
@@ -511,6 +536,77 @@ def guru_company_pack_tool(
     }
     if response_format == GuruResponseFormat.MARKDOWN:
         return _company_pack_markdown(payload)
+    return _json(payload)
+
+
+def guru_review_company_evidence_tool(
+    *,
+    question: str,
+    root: str | Path | None = None,
+    author_keys: Sequence[str] | None = None,
+    ticker: str | None = None,
+    company_name: str | None = None,
+    company_payload: dict[str, Any] | None = None,
+    company_payload_json: Any = None,
+    company_context: dict[str, Any] | None = None,
+    company_context_json: Any = None,
+    intent_family: str | None = None,
+    response_format: GuruResponseFormat = GuruResponseFormat.JSON,
+) -> str:
+    """Review company evidence through selected guru lenses for final prose."""
+    query_payload = json.loads(
+        guru_query_context_tool(
+            question=question,
+            root=root,
+            author_keys=author_keys,
+            ticker=ticker,
+            company_context_json=(
+                company_context if company_context is not None else company_context_json
+            ),
+            intent_family=intent_family,
+            response_format=GuruResponseFormat.JSON,
+        )
+    )
+    company_payload_data = _json_arg(
+        company_payload if company_payload is not None else company_payload_json,
+        field_name="company_payload",
+    )
+    if not is_verified_company_evidence_pack(company_payload_data):
+        raise ValueError(
+            "company_payload must be an unmodified "
+            f"{VERIFIED_COMPANY_EVIDENCE_FORMAT} payload returned by "
+            "krw_ontology_verify_evidence"
+        )
+    normalized_ticker = str(ticker or "").strip().upper()
+    payload_ticker = str(company_payload_data.get("ticker") or "").strip().upper()
+    if normalized_ticker and payload_ticker != normalized_ticker:
+        raise ValueError("company_payload ticker does not match the requested ticker")
+    review = build_guru_company_evidence_review(
+        query_payload,
+        company_evidence_payload=company_payload_data,
+        ticker=ticker,
+        company_name=company_name,
+        company_context=_json_arg(
+            company_context if company_context is not None else company_context_json,
+            field_name="company_context",
+        ),
+        author_key=(author_keys[0] if author_keys else None),
+        question=question,
+    )
+    payload = {
+        "company_evidence_review_context_version": "krw-guru-company-evidence-review-context/v1",
+        "research_status": query_payload.get("research_status"),
+        "company_evidence_review": review.model_dump(mode="json", exclude_none=True),
+        "usage": {
+            "company_mcp_called_by": "application_orchestrator",
+            "answer_agent_input": (
+                "Use this review as interpretation guidance with Guru ResearchPack and "
+                "CompanyEvidencePack; do not expose internal payload names or fixed sections."
+            ),
+        },
+    }
+    if response_format == GuruResponseFormat.MARKDOWN:
+        return _company_evidence_review_markdown(payload)
     return _json(payload)
 
 
@@ -1155,7 +1251,10 @@ def _build_guru_research_context(
         company_bridge=company_bridge,
         trace_recommendations=_trace_recommendations(question, lens_rows, consultation_rows),
         agent_autonomy=_guru_agent_autonomy(research_status, needs_company_data),
-        do_not_call=_guru_do_not_call(research_status),
+        do_not_call=_guru_do_not_call(
+            research_status,
+            needs_company_data=needs_company_data,
+        ),
         warnings=_research_pack_warnings(context_quality, selected_rows),
     )
     pack_dict = pack.model_dump(mode="json", exclude_none=True)
@@ -1186,7 +1285,15 @@ def _build_guru_research_context(
         "research_pack": pack_dict,
         "usage": {
             "default_first_tool": "krw_guru_query_context",
-            "normal_follow_up": "Use krw_guru_trace or krw_guru_chain on selected reviewed_ids only.",
+            "normal_follow_up": (
+                "For company-specific questions, call krw_guru_company_brief, "
+                "then the app-provided company_evidence_researcher Agent, then "
+                "krw_guru_review_company_evidence before final writing. Use "
+                "krw_guru_trace or krw_guru_chain only for extra guru-source "
+                "support after the company evidence path is satisfied."
+                if needs_company_data
+                else "Use krw_guru_trace or krw_guru_chain on selected reviewed_ids only."
+            ),
             "search_policy": "Use krw_guru_search only for fallback discovery or debugging.",
         },
     }
@@ -1586,23 +1693,54 @@ def _trace_recommendations(
 
 
 def _guru_agent_autonomy(research_status: str, needs_company_data: bool) -> dict[str, Any]:
+    if needs_company_data:
+        return {
+            "mode": "company_bridge_required",
+            "allowed_next_tools": [
+                "krw_guru_company_brief",
+                "company_evidence_researcher Agent",
+                "krw_guru_review_company_evidence",
+            ],
+            "optional_after_company_evidence": [
+                "krw_guru_trace",
+                "krw_guru_chain",
+            ],
+            "max_additional_tool_calls": 5,
+            "stop_after": (
+                "Do not answer a named-company judgment from Guru-only tools. "
+                "First obtain company filing evidence through the app-provided "
+                "company_evidence_researcher Agent, then review that evidence "
+                "through krw_guru_review_company_evidence."
+            ),
+        }
+
     allowed = ["krw_guru_trace", "krw_guru_chain"]
     if research_status == "ontology_gap":
         allowed.append("krw_guru_search")
-    if needs_company_data:
-        allowed.append("KRW Ontology filing research bridge")
     return {
         "mode": "bounded",
         "allowed_next_tools": allowed,
-        "max_additional_tool_calls": 3 if needs_company_data else 2,
+        "max_additional_tool_calls": 2,
         "stop_after": (
             "Answer after query_context plus at most selected trace/chain calls; do not perform broad search loops."
         ),
     }
 
 
-def _guru_do_not_call(research_status: str) -> list[str]:
+def _guru_do_not_call(
+    research_status: str,
+    *,
+    needs_company_data: bool = False,
+) -> list[str]:
     blocked = ["krw_guru_evidence as broad retrieval", "full raw JSONL reads"]
+    if needs_company_data:
+        blocked.extend(
+            [
+                "final company-specific answer before company_evidence_researcher",
+                "krw_guru_trace or krw_guru_chain as a substitute for company filing evidence",
+                "krw_guru_review_company_evidence with empty payload, retrieval plan, or company_filing_brief",
+            ]
+        )
     if research_status != "ontology_gap":
         blocked.append("krw_guru_search for broad re-ranking")
     return blocked
@@ -2859,9 +2997,11 @@ def _limited_words(value: str, *, max_words: int) -> str:
     return " ".join(words[:max_words])
 
 
-def _json_arg(value: str | None, *, field_name: str) -> dict[str, Any]:
+def _json_arg(value: Any, *, field_name: str) -> dict[str, Any]:
     if not value:
         return {}
+    if isinstance(value, Mapping):
+        return dict(value)
     try:
         parsed = json.loads(value)
     except json.JSONDecodeError as exc:
@@ -2979,6 +3119,40 @@ def _company_pack_markdown(payload: Mapping[str, Any]) -> str:
             ]
         )
         lines.extend(f"- {item}" for item in missing[:12])
+    return "\n".join(lines)
+
+
+def _company_evidence_review_markdown(payload: Mapping[str, Any]) -> str:
+    review = (
+        payload.get("company_evidence_review")
+        if isinstance(payload.get("company_evidence_review"), Mapping)
+        else {}
+    )
+    identity = (
+        review.get("company_identity")
+        if isinstance(review.get("company_identity"), Mapping)
+        else {}
+    )
+    lines = [
+        "# Guru Company Evidence Review",
+        "",
+        f"- research_status: {payload.get('research_status')}",
+        f"- author_key: {review.get('author_key')}",
+        f"- subject: {identity.get('subject')}",
+        f"- lens_alignment: {review.get('lens_alignment')}",
+        "",
+        "## Internal Interpretation",
+        "",
+        str(review.get("primary_interpretation_ko") or ""),
+    ]
+    emphasize = review.get("what_to_emphasize") or []
+    if emphasize:
+        lines.extend(["", "## Emphasize"])
+        lines.extend(f"- {item}" for item in emphasize[:8])
+    avoid = review.get("what_not_to_overstate") or []
+    if avoid:
+        lines.extend(["", "## Do Not Overstate"])
+        lines.extend(f"- {item}" for item in avoid[:8])
     return "\n".join(lines)
 
 

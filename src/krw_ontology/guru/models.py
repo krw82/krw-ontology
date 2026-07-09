@@ -24,7 +24,9 @@ GURU_CURATION_REPORT_FORMAT = "krw-guru-curation-report/v1"
 GURU_RESEARCH_PACK_FORMAT = "krw-guru-research-pack/v1"
 GURU_COMPANY_ONTOLOGY_CONTEXT_FORMAT = "krw-guru-company-ontology-context/v1"
 GURU_COMPANY_FILING_BRIEF_FORMAT = "krw-guru-company-filing-brief/v1"
+GURU_DYNAMIC_QUESTION_PLAN_FORMAT = "krw-guru-dynamic-question-plan/v1"
 GURU_COMPANY_RESEARCH_PACK_FORMAT = "krw-guru-company-research-pack/v1"
+GURU_COMPANY_EVIDENCE_REVIEW_FORMAT = "krw-guru-company-evidence-review/v1"
 GURU_ANSWER_RENDER_PLAN_FORMAT = "krw-guru-answer-render-plan/v1"
 
 AUTHOR_KEYS = ("buffett", "marks", "ackman", "flatt", "terry_smith")
@@ -966,6 +968,42 @@ class GuruCompanyOntologyContext(GuruBaseModel):
     source_payload_keys: list[str] = Field(default_factory=list)
 
 
+class GuruDynamicQuestionPlanItem(GuruBaseModel):
+    """One guru-specific, company-specific question for filing evidence retrieval."""
+
+    question_id: str
+    question_en: str
+    question_ko_label: str
+    why_guru_relevant: str
+    why_company_specific: str
+    evidence_needed: list[str] = Field(default_factory=list)
+    priority: Literal["highest", "high", "medium"] = "medium"
+    answer_role: Literal[
+        "main_tension",
+        "supporting_evidence",
+        "counterweight",
+        "change_condition",
+        "do_not_overstate",
+    ] = "supporting_evidence"
+    retrieval_query_en: str
+    stop_condition: str
+    do_not_overstate: str
+
+
+class GuruDynamicQuestionPlan(GuruBaseModel):
+    """Question plan produced by the guru lens before company evidence retrieval."""
+
+    format: str = GURU_DYNAMIC_QUESTION_PLAN_FORMAT
+    author_key: Literal["buffett", "marks", "ackman", "flatt", "terry_smith"]
+    ticker: str | None = None
+    company_name: str | None = None
+    subject: str
+    user_intent: str | None = None
+    company_context_terms: list[str] = Field(default_factory=list)
+    questions: list[GuruDynamicQuestionPlanItem] = Field(default_factory=list)
+    construction_rules: list[str] = Field(default_factory=list)
+
+
 class GuruCompanyFilingBrief(GuruBaseModel):
     """Serving-layer bridge from guru lenses to company filing research."""
 
@@ -985,6 +1023,7 @@ class GuruCompanyFilingBrief(GuruBaseModel):
     lens_specific_evidence_requests: list[str] = Field(default_factory=list)
     generic_filing_requirements: list[str] = Field(default_factory=list)
     data_need_keys: list[str] = Field(default_factory=list)
+    dynamic_question_plan: GuruDynamicQuestionPlan | None = None
     missing_inputs: list[str] = Field(default_factory=list)
     recommended_company_mcp_call: dict[str, Any] = Field(default_factory=dict)
     boundary: str = (
@@ -1021,6 +1060,32 @@ class GuruCompanyResearchPack(GuruBaseModel):
     missing_evidence: list[str] = Field(default_factory=list)
     judgment_conditions: dict[str, Any] = Field(default_factory=dict)
     render_hints: dict[str, Any] = Field(default_factory=dict)
+    answer_contract: dict[str, Any] = Field(default_factory=dict)
+    boundaries: list[str] = Field(default_factory=list)
+
+
+class GuruCompanyEvidenceReview(GuruBaseModel):
+    """Internal interpretation guide after company evidence is available.
+
+    This object keeps final prose flexible. It reviews how filing evidence
+    supports, weakens, or limits the selected guru lenses, but it does not
+    write the user-facing answer or impose a fixed report structure.
+    """
+
+    format: str = GURU_COMPANY_EVIDENCE_REVIEW_FORMAT
+    user_question: str
+    author_key: Literal["buffett", "marks", "ackman", "flatt", "terry_smith"]
+    company_identity: GuruCompanyIdentity
+    lens_alignment: Literal["strengthens", "mixed", "weakens", "unresolved"] = "unresolved"
+    primary_interpretation_ko: str
+    advisor_question_ko: str | None = None
+    strengthened_by: list[str] = Field(default_factory=list)
+    weakened_by: list[str] = Field(default_factory=list)
+    what_to_emphasize: list[str] = Field(default_factory=list)
+    what_not_to_overstate: list[str] = Field(default_factory=list)
+    change_conditions: list[str] = Field(default_factory=list)
+    missing_evidence: list[str] = Field(default_factory=list)
+    evidence_alignment: list[GuruCompanyEvidenceAlignment] = Field(default_factory=list)
     answer_contract: dict[str, Any] = Field(default_factory=dict)
     boundaries: list[str] = Field(default_factory=list)
 

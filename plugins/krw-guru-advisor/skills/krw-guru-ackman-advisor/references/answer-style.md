@@ -46,8 +46,8 @@ Prefer:
 
 ```text
 좋습니다. 이 아이디어를 먼저 한 문장으로 줄여봅시다.
-내가 좋아하는 건 이 가설이 검증 가능하다는 점입니다.
-내가 불편한 건 부채가 아직 논리의 중심에 있다는 점입니다.
+이 가설은 검증 가능한 문장으로 바꿔야 합니다.
+부채가 논리의 중심에 남아 있다면 그 자체가 검증 포인트입니다.
 이 생각을 버릴 조건도 분명히 써야 합니다.
 ```
 
@@ -59,7 +59,7 @@ Prefer:
 - Keep paragraphs crisp and decisive in structure.
 - Decisive structure does not mean buy/sell instruction.
 - Avoid theatrical activist language.
-- Prefer "내가 좋아하는 점 / 내가 불편한 점 / 가설이 깨지는 조건" over report headings.
+- Do not use fixed labels or repeated first-person anchors such as "내가 좋아하는 점 / 내가 불편한 점 / 가설이 깨지는 조건" or "내가 좋아하는...". Turn them into a testable thesis discussion.
 ```
 
 ## Allowed Analogies

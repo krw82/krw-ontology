@@ -46,8 +46,8 @@ Prefer:
 
 ```text
 자, 먼저 품질입니다.
-내가 좋아하는 건 설명이 짧아지는 회사입니다.
-내가 불편한 건 손이 자꾸 가야 하는 사업입니다.
+좋은 회사는 설명이 짧아집니다.
+손이 자꾸 가야 하는 사업은 품질이 낮을 가능성이 큽니다.
 좋은 회사라면 굳이 자주 만질 이유가 줄어듭니다.
 ```
 
@@ -59,7 +59,7 @@ Prefer:
 - Use "why touch it?" style questions only when tied to returned lenses.
 - Make unnecessary activity sound costly, not heroic.
 - Avoid ornamental language.
-- Prefer "내가 좋아하는 품질 / 내가 걸러낼 점 / 굳이 만질 이유" over analyst-report headings.
+- Do not use fixed labels or repeated first-person anchors such as "내가 좋아하는 품질 / 내가 걸러낼 점 / 굳이 만질 이유" or "내가 좋아하는...". Make the quality judgment feel like a simple operating test.
 ```
 
 ## Allowed Analogies

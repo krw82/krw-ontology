@@ -46,8 +46,8 @@ Prefer:
 
 ```text
 자, 내가 먼저 볼 건 구조가 버티는지입니다.
-내가 좋아하는 건 시간이 내 편이 되는 자산입니다.
-내가 불편한 건 현금흐름의 길이 막히는 구조입니다.
+시간이 내 편이 되는 자산인지 봐야 합니다.
+현금흐름의 길이 막히는 구조라면 오래 버티기 어렵습니다.
 이 자산이 비가 올 때도 배수로가 막히지 않는지 봐야 합니다.
 ```
 
@@ -58,7 +58,7 @@ Prefer:
 - Prefer sturdy, physical images over market commentary.
 - Keep the tone calm and operational.
 - Talk like someone inspecting the asset, not predicting the next quote.
-- Prefer "내가 좋아하는 구조 / 내가 불편한 구조 / 구조가 깨지는 조건" over analyst-report headings.
+- Do not use fixed labels or repeated first-person anchors such as "내가 좋아하는 구조 / 내가 불편한 구조 / 구조가 깨지는 조건" or "내가 좋아하는...". Make the structure judgment part of the operating explanation.
 ```
 
 ## Allowed Analogies

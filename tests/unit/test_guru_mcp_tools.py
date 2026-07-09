@@ -5,10 +5,15 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from krw_ontology.guru import mcp_server
 from krw_ontology.guru import mcp_tools
 from krw_ontology.guru import lens_selector
-from krw_ontology.guru.company_bridge import company_filing_brief_from_guru_lens
+from krw_ontology.guru.company_bridge import (
+    build_guru_company_evidence_review,
+    company_filing_brief_from_guru_lens,
+)
 from krw_ontology.guru.index import build_guru_shard_index
 from krw_ontology.guru.lens_selector import guru_select_lenses_tool, select_guru_lenses
 from krw_ontology.guru.mcp_tools import (
@@ -21,11 +26,97 @@ from krw_ontology.guru.mcp_tools import (
     guru_evidence_tool,
     guru_index_context_tool,
     guru_query_context_tool,
+    guru_review_company_evidence_tool,
     guru_search_tool,
     guru_status_tool,
     guru_trace_tool,
 )
 from krw_ontology.guru.renderer import build_guru_answer_render_plan
+from krw_ontology.mcp_server.evidence_pack import evidence_pack_hash
+
+
+def _verified_company_payload(
+    *,
+    root: Path,
+    question: str,
+    ticker: str,
+    author_key: str,
+    excerpt: str,
+    company_context: dict | None = None,
+) -> dict:
+    brief_payload = json.loads(
+        guru_company_brief_tool(
+            root=root,
+            question=question,
+            ticker=ticker,
+            author_keys=[author_key],
+            company_context_json=company_context,
+        )
+    )
+    plan_questions = (
+        brief_payload["company_filing_brief"]["dynamic_question_plan"]["questions"]
+    )
+    payload = {
+        "format": "krw-verified-company-evidence/v1",
+        "release_id": "guru-unit-test",
+        "ticker": ticker,
+        "current_driver": {
+            "ticker": ticker,
+            "period": "CY2026Q1",
+            "document_type": "10-Q",
+            "role": "current_driver",
+        },
+        "annual_baseline": {
+            "ticker": ticker,
+            "period": "CY2025",
+            "document_type": "10-K",
+            "role": "annual_baseline",
+        },
+        "evidence_by_question": [
+            {
+                "question_id": item["question_id"],
+                "evidence": [
+                    {
+                        "source_object_id": f"claim:{ticker}:{item['question_id']}",
+                        "object_type": "ResearchClaim",
+                        "trace_status": "traceable_direct",
+                        "evidence_grade": "direct",
+                        "usable_for_strong_claim": True,
+                        "usable_for_interpretation": True,
+                        "document": {
+                            "ticker": ticker,
+                            "document_type": "10-Q",
+                            "period": "CY2026Q1",
+                            "section": "MD&A",
+                            "anchor_roles": ["current_driver"],
+                        },
+                        "claim_ids": [f"claim:{ticker}:{item['question_id']}"],
+                        "quote_ids": [f"quote:{ticker}:{item['question_id']}"],
+                        "span_ids": [f"span:{ticker}:{item['question_id']}"],
+                        "verified_excerpt": excerpt,
+                        "metric_lineage": None,
+                    }
+                ],
+                "verified_count": 1,
+                "answerability": "verified",
+            }
+            for item in plan_questions
+        ],
+        "rejected_refs": [],
+        "verification_summary": {
+            "question_count": len(plan_questions),
+            "requested_object_count": len(plan_questions),
+            "verified_object_count": len(plan_questions),
+            "strong_claim_evidence_count": len(plan_questions),
+            "interpretation_evidence_count": len(plan_questions),
+            "all_questions_have_verified_evidence": True,
+        },
+        "usage_policy": {
+            "strong_company_claims": "Use only verified entries.",
+        },
+    }
+    payload["pack_hash"] = evidence_pack_hash(payload)
+    return payload
 
 
 def test_guru_mcp_server_registers_read_only_tool_names() -> None:
@@ -37,6 +128,7 @@ def test_guru_mcp_server_registers_read_only_tool_names() -> None:
         "krw_guru_query_context",
         "krw_guru_company_brief",
         "krw_guru_company_pack",
+        "krw_guru_review_company_evidence",
         "krw_guru_select_lenses",
         "krw_guru_context",
         "krw_guru_trace",
@@ -76,6 +168,35 @@ def test_guru_company_brief_tool_translates_lenses_to_filing_research(
     assert "OXY" in brief["company_research_question_en"]
     assert brief["recommended_company_mcp_call"]["tool"] == "krw_ontology_query_context"
     assert "application/orchestrator" in payload["do_not_call"][1]
+
+
+def test_guru_company_brief_tool_returns_dynamic_question_plan(
+    tmp_path: Path,
+) -> None:
+    root = _write_reviewed_fixture(tmp_path)
+
+    payload = json.loads(
+        guru_company_brief_tool(
+            root=root,
+            question="옥시덴탈을 버핏 관점에서 장기 보유해도 되는지 봐줘",
+            ticker="OXY",
+            author_keys=["buffett"],
+        )
+    )
+
+    plan = payload["company_filing_brief"]["dynamic_question_plan"]
+    assert plan["format"] == "krw-guru-dynamic-question-plan/v1"
+    assert plan["author_key"] == "buffett"
+    assert plan["ticker"] == "OXY"
+    assert len(plan["questions"]) >= 3
+    first_question = plan["questions"][0]
+    assert first_question["priority"] == "highest"
+    assert first_question["answer_role"] == "main_tension"
+    assert "OXY" in first_question["question_en"]
+    assert "latest 10-Q" in first_question["retrieval_query_en"]
+    assert first_question["do_not_overstate"]
+    assert first_question["evidence_needed"]
+    assert "회사별" not in first_question["question_ko_label"]
 
 
 def test_company_brief_filters_credit_hooks_from_general_monopoly_risk() -> None:
@@ -265,6 +386,277 @@ def test_guru_company_pack_tool_returns_company_pack_and_render_plan(
     assert "애크먼이라면" in render_plan["forbidden_output_patterns"]
 
 
+def test_guru_review_company_evidence_tool_returns_interpretation_guidance(
+    tmp_path: Path,
+) -> None:
+    root = _write_reviewed_fixture(tmp_path)
+    question = "옥시덴탈을 버핏 관점에서 장기 보유해도 되는지 봐줘"
+    company_payload = _verified_company_payload(
+        root=root,
+        question=question,
+        ticker="OXY",
+        author_key="buffett",
+        excerpt=(
+            "OXY operating cash flow and capital allocation remain exposed to "
+            "commodity prices and reinvestment needs."
+        ),
+    )
+
+    payload = json.loads(
+        guru_review_company_evidence_tool(
+            root=root,
+            question=question,
+            ticker="OXY",
+            author_keys=["buffett"],
+            company_payload_json=json.dumps(company_payload),
+        )
+    )
+
+    review = payload["company_evidence_review"]
+    assert (
+        payload["company_evidence_review_context_version"]
+        == "krw-guru-company-evidence-review-context/v1"
+    )
+    assert review["format"] == "krw-guru-company-evidence-review/v1"
+    assert review["author_key"] == "buffett"
+    assert review["company_identity"]["subject"] == "OXY"
+    assert review["lens_alignment"] in {"strengthens", "mixed"}
+    assert review["primary_interpretation_ko"]
+    assert review["what_to_emphasize"]
+    assert review["what_not_to_overstate"]
+    assert review["answer_contract"]["purpose"] == "final_answer_guidance_only"
+    assert "fixed_report_template" in review["answer_contract"]["must_not_include"]
+    assert "ResearchPack_or_CompanyEvidencePack_terms" in review["answer_contract"]["must_not_include"]
+
+
+def test_guru_review_company_evidence_tool_accepts_dict_payloads(
+    tmp_path: Path,
+) -> None:
+    root = _write_reviewed_fixture(tmp_path)
+    question = "옥시덴탈을 버핏 관점에서 장기 보유해도 되는지 봐줘"
+    company_context = {
+        "source": "company_mcp_topic_map",
+        "available_company_topics": ["cash_flow", "capital_allocation"],
+    }
+    company_payload = _verified_company_payload(
+        root=root,
+        question=question,
+        ticker="OXY",
+        author_key="buffett",
+        excerpt="OXY operating cash flow and free cash flow support capital allocation.",
+        company_context=company_context,
+    )
+
+    payload = json.loads(
+        guru_review_company_evidence_tool(
+            root=root,
+            question=question,
+            ticker="OXY",
+            author_keys=["buffett"],
+            company_payload_json=company_payload,
+            company_context_json=company_context,
+        )
+    )
+
+    review = payload["company_evidence_review"]
+    assert review["company_identity"]["subject"] == "OXY"
+    assert review["what_not_to_overstate"]
+
+
+def test_guru_review_rejects_unverified_or_modified_company_payload(
+    tmp_path: Path,
+) -> None:
+    root = _write_reviewed_fixture(tmp_path)
+    question = "옥시덴탈을 버핏 관점에서 장기 보유해도 되는지 봐줘"
+
+    with pytest.raises(ValueError, match="krw-verified-company-evidence/v1"):
+        guru_review_company_evidence_tool(
+            root=root,
+            question=question,
+            ticker="OXY",
+            author_keys=["buffett"],
+            company_payload={"evidence_by_question": [{"finding": "invented"}]},
+        )
+
+    verified = _verified_company_payload(
+        root=root,
+        question=question,
+        ticker="OXY",
+        author_key="buffett",
+        excerpt="Cash generation remains exposed to commodity prices.",
+    )
+    verified["evidence_by_question"][0]["evidence"][0]["verified_excerpt"] = (
+        "A modified finding that was not in the verifier output."
+    )
+    with pytest.raises(ValueError, match="krw-verified-company-evidence/v1"):
+        guru_review_company_evidence_tool(
+            root=root,
+            question=question,
+            ticker="OXY",
+            author_keys=["buffett"],
+            company_payload=verified,
+        )
+
+
+def test_guru_review_rejects_verified_pack_for_different_question_plan(
+    tmp_path: Path,
+) -> None:
+    root = _write_reviewed_fixture(tmp_path)
+    question = "옥시덴탈을 버핏 관점에서 장기 보유해도 되는지 봐줘"
+    verified = _verified_company_payload(
+        root=root,
+        question=question,
+        ticker="OXY",
+        author_key="buffett",
+        excerpt="Cash generation remains exposed to commodity prices.",
+    )
+    verified["evidence_by_question"][0]["question_id"] = "q_wrong_plan"
+    verified["pack_hash"] = evidence_pack_hash(verified)
+
+    with pytest.raises(ValueError, match="question ids do not match"):
+        guru_review_company_evidence_tool(
+            root=root,
+            question=question,
+            ticker="OXY",
+            author_keys=["buffett"],
+            company_payload=verified,
+        )
+
+
+def test_guru_review_company_evidence_uses_question_driven_memo(
+    tmp_path: Path,
+) -> None:
+    root = _write_reviewed_fixture(tmp_path)
+    question = "옥시덴탈을 버핏 관점에서 장기 보유해도 되는지 봐줘"
+    company_payload = _verified_company_payload(
+        root=root,
+        question=question,
+        ticker="OXY",
+        author_key="buffett",
+        excerpt=(
+            "Cash generation is meaningful but still tied to commodity prices "
+            "and reinvestment needs."
+        ),
+    )
+
+    payload = json.loads(
+        guru_review_company_evidence_tool(
+            root=root,
+            question=question,
+            ticker="OXY",
+            author_keys=["buffett"],
+            company_payload_json=json.dumps(company_payload),
+        )
+    )
+
+    review = payload["company_evidence_review"]
+    assert any(
+        "commodity prices" in item
+        for item in review["what_to_emphasize"]
+    )
+    assert review["what_not_to_overstate"]
+    assert "dynamic question answers when available" in review["answer_contract"]["must_use"]
+
+
+def test_guru_review_company_evidence_accepts_question_evidence_object(
+    tmp_path: Path,
+) -> None:
+    root = _write_reviewed_fixture(tmp_path)
+    question = "SLB를 버핏 관점에서 장기 보유해도 되는지 봐줘"
+    company_payload = _verified_company_payload(
+        root=root,
+        question=question,
+        ticker="SLB",
+        author_key="buffett",
+        excerpt=(
+            "Data Center Solutions is directionally diversifying, but the core "
+            "business remains tied to upstream capital spending."
+        ),
+    )
+
+    payload = json.loads(
+        guru_review_company_evidence_tool(
+            root=root,
+            question=question,
+            ticker="SLB",
+            author_keys=["buffett"],
+            company_payload_json=json.dumps(company_payload),
+        )
+    )
+
+    review = payload["company_evidence_review"]
+    assert any(
+        "upstream capital spending" in item
+        for item in review["what_to_emphasize"]
+    )
+    assert review["what_not_to_overstate"]
+
+
+def test_guru_review_filters_question_irrelevant_lenses() -> None:
+    guru_payload = {
+        "research_pack": {
+            "format": "krw-guru-research-pack/v1",
+            "pack_meta": {
+                "guru_keys": ["buffett"],
+                "question": "AAPL 서비스 매출과 아이폰 의존성을 버핏 관점에서 봐줘.",
+            },
+            "company_bridge": {
+                "requires_company_evidence": True,
+                "filing_evidence_requirements": [
+                    "business_model",
+                    "cash_flow",
+                    "capital_allocation",
+                    "risk_factors",
+                ],
+            },
+            "selected_lenses": [
+                {
+                    "reviewed_id": "guru:buffett:concept:architect:test",
+                    "label_ko": "설계자와 시공자 파트너십 모델",
+                    "summary_ko": "멍거는 버크셔의 설계자였고 버핏은 시공자였다.",
+                    "company_evidence_requirements": ["business_model"],
+                },
+                {
+                    "reviewed_id": "guru:buffett:concept:moat:test",
+                    "label_ko": "반복 수익과 해자의 질",
+                    "summary_en": (
+                        "Recurring services revenue can strengthen a moat "
+                        "when it is not fully dependent on iPhone unit cycles."
+                    ),
+                    "company_evidence_requirements": ["business_model", "cash_flow"],
+                },
+            ],
+        }
+    }
+    company_payload = {
+        "ticker": "AAPL",
+        "company_name": "Apple Inc.",
+        "filing_supported_facts": [
+            "Apple's business model and cash flow are supported by recurring services revenue tied to the iPhone installed base.",
+            "Services revenue mix has expanded to roughly a quarter of total revenue.",
+            "iPhone remains the central product gateway for the installed base.",
+            "Services revenue is recurring but still tied to the device ecosystem.",
+        ],
+        "still_open_risks": [
+            "iPhone concentration and App Store regulatory risk remain open.",
+        ],
+    }
+
+    review = build_guru_company_evidence_review(
+        guru_payload,
+        company_evidence_payload=company_payload,
+        ticker="AAPL",
+        company_name="Apple Inc.",
+        author_key="buffett",
+        question="AAPL 서비스 매출과 아이폰 의존성을 버핏 관점에서 봐줘.",
+    ).model_dump(mode="json", exclude_none=True)
+
+    emphasized = " ".join(review["what_to_emphasize"])
+    assert "반복 수익과 해자의 질" in emphasized
+    assert "설계자와 시공자" not in emphasized
+    assert "설계자와 시공자" not in (review.get("advisor_question_ko") or "")
+
+
 def test_guru_answer_render_plan_keeps_missing_evidence_concise() -> None:
     plan = build_guru_answer_render_plan(
         {
@@ -366,6 +758,44 @@ def test_company_context_guides_lens_selection_without_ticker_hardcoding(
         item["label_ko"] for item in payload["research_pack"]["selected_lenses"]
     ]
     assert "고객과 규제기관의 상호 호혜 원칙" not in selected_labels
+
+
+def test_company_context_flows_into_dynamic_question_plan(tmp_path: Path) -> None:
+    root = _write_company_context_ranking_fixture(tmp_path)
+    company_context = {
+        "source": "company_mcp_topic_map",
+        "context_terms": [
+            "oil and gas",
+            "commodity price exposure",
+            "capital expenditures",
+            "cash flow cyclicality",
+        ],
+        "available_company_topics": [
+            "commodity_price_exposure",
+            "capital_intensity",
+            "cash_flow",
+        ],
+    }
+
+    payload = json.loads(
+        guru_company_brief_tool(
+            root=root,
+            question="OXY 어떠노. 버핏 관점에서 장기 보유할 만한지 봐줘",
+            ticker="OXY",
+            author_keys=["buffett"],
+            company_context_json=json.dumps(company_context),
+        )
+    )
+
+    plan = payload["company_filing_brief"]["dynamic_question_plan"]
+    question_text = " ".join(
+        item["question_en"] + " " + item["retrieval_query_en"]
+        for item in plan["questions"]
+    )
+    assert "commodity_price_exposure" in payload["company_filing_brief"]["required_filing_topics"]
+    assert "commodity price exposure" in question_text
+    assert "cash flow cyclicality" in question_text
+    assert "rate_case_filings" not in question_text
 
 
 def test_company_context_flows_into_company_brief_topics(tmp_path: Path) -> None:

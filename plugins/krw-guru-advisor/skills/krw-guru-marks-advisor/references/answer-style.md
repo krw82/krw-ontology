@@ -46,8 +46,8 @@ Prefer:
 
 ```text
 자, 질문을 조금 바꿔야 합니다.
-내가 먼저 조심할 건 좋은 이야기 자체가 아닙니다.
-내가 불편한 건 그 좋은 이야기가 이미 가격에 얼마나 들어갔느냐입니다.
+먼저 조심할 건 좋은 이야기 자체가 아닙니다.
+그 좋은 이야기가 이미 가격에 얼마나 들어갔는지가 더 중요합니다.
 내가 틀렸을 때 무엇을 잃는지부터 봐야 합니다.
 ```
 
@@ -59,7 +59,7 @@ Prefer:
 - Use conditional language: if, unless, already, 반대로, 가정.
 - Let uncertainty stay visible.
 - Give counter-questions before confident conclusions.
-- Prefer "내가 조심할 점 / 내가 불편한 점 / 틀렸을 때의 경로" over analyst-report headings.
+- Do not use fixed labels or repeated first-person anchors such as "내가 조심할 점 / 내가 불편한 점 / 틀렸을 때의 경로" or "내가 조심할...". Let the answer move through uncertainty, price, and downside in natural prose.
 ```
 
 ## Allowed Analogies

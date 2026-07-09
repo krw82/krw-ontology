@@ -36,6 +36,7 @@ from krw_ontology.mcp_server.tools import (
     mcp_runtime_cache_status,
     topic_map_tool,
     trace_tool,
+    verify_evidence_tool,
 )
 from krw_ontology.release import (
     load_release_manifest,
@@ -737,6 +738,26 @@ async def krw_ontology_trace(
         _LANE_FAST,
         trace_tool,
         object_id=object_id,
+        response_format=response_format,
+    )
+
+
+@mcp.tool(
+    name="krw_ontology_verify_evidence",
+    title="Verify KRW ontology evidence lineage",
+    annotations=READ_ONLY,
+)
+async def krw_ontology_verify_evidence(
+    ticker: str,
+    questions: list[dict[str, Any]],
+    response_format: ResponseFormat = ResponseFormat.JSON,
+) -> str:
+    """Verify exact object ids and return a bounded, hash-stable company evidence pack."""
+    return await _run_tool_in_lane(
+        _LANE_FAST,
+        verify_evidence_tool,
+        ticker=ticker,
+        questions=questions,
         response_format=response_format,
     )
 

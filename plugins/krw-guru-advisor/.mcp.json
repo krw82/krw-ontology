@@ -13,10 +13,6 @@
         "KRW_GURU_DATA_ROOT": "~/krw-ontology-guru-data",
         "KRW_GURU_RELEASE_ROOT": "~/krw-ontology-guru-data/releases/prod/current"
       }
-    },
-    "krw-ontology-company": {
-      "type": "http",
-      "url": "http://127.0.0.1:8765/mcp"
     }
   }
 }

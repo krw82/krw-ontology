@@ -28,6 +28,9 @@ from krw_ontology.config.paths import (
     ONTOLOGY_GLOBAL_SPINE_PATH_ENV,
     resolve_ontology_root,
 )
+from krw_ontology.mcp_server.evidence_pack import (
+    build_verified_company_evidence_pack,
+)
 
 
 class ResponseFormat(str, Enum):
@@ -1344,6 +1347,25 @@ def trace_tool(
                 while len(_TRACE_TOOL_CACHE) > _TRACE_TOOL_CACHE_MAX:
                     _TRACE_TOOL_CACHE.popitem(last=False)
     return _format_response(payload, response_format, _markdown_trace)
+
+
+def verify_evidence_tool(
+    *,
+    ticker: str,
+    questions: Sequence[Mapping[str, Any]],
+    response_format: ResponseFormat = ResponseFormat.JSON,
+) -> str:
+    """Verify exact ontology object ids and return a hash-stable evidence pack."""
+    index = _runtime_global_spine_path()
+    signature = _index_signature(index)
+    with _store(index) as store:
+        payload = build_verified_company_evidence_pack(
+            store=store,
+            ticker=ticker,
+            questions=questions,
+            release_id=signature.release_id,
+        )
+    return _format_response(payload, response_format, _markdown_verify_evidence)
 
 
 def chain_tool(
@@ -3209,6 +3231,34 @@ def _markdown_trace(payload: dict[str, Any]) -> str:
             lines.append(f"- Calculation: `{metric_lineage['calculation'].get('id')}`")
         for fact in (metric_lineage.get("xbrl_facts") or [])[:3]:
             lines.append(f"- XBRLFact `{fact.get('id')}`: {_short_text(fact.get('text'))}")
+    return "\n".join(lines)
+
+
+def _markdown_verify_evidence(payload: dict[str, Any]) -> str:
+    summary = payload.get("verification_summary") or {}
+    lines = [
+        "# Verified Company Evidence",
+        f"- Ticker: `{payload.get('ticker')}`",
+        f"- Release: `{payload.get('release_id') or 'unknown'}`",
+        f"- Pack hash: `{payload.get('pack_hash')}`",
+        f"- Verified objects: {summary.get('verified_object_count', 0)}",
+        f"- Strong-claim evidence: {summary.get('strong_claim_evidence_count', 0)}",
+    ]
+    for question in payload.get("evidence_by_question") or []:
+        lines.append(
+            f"## {question.get('question_id')} ({question.get('answerability')})"
+        )
+        for item in question.get("evidence") or []:
+            document = item.get("document") or {}
+            lines.append(
+                f"- `{item.get('source_object_id')}` "
+                f"{document.get('period')} {document.get('document_type')} "
+                f"[{item.get('evidence_grade')}]: {_short_text(item.get('verified_excerpt'))}"
+            )
+    for rejected in payload.get("rejected_refs") or []:
+        lines.append(
+            f"- Rejected `{rejected.get('object_id')}`: {rejected.get('reason')}"
+        )
     return "\n".join(lines)
 
 

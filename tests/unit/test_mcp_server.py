@@ -46,6 +46,7 @@ from krw_ontology.mcp_server.tools import (
     ResponseDetail,
     trace_tool,
     topic_map_tool,
+    verify_evidence_tool,
     ResponseFormat,
 )
 from krw_ontology.release import write_release_manifest_v3
@@ -175,6 +176,84 @@ def test_mcp_tools_query_trace_quality_and_compare(tmp_path: Path, monkeypatch):
     plan = json.loads(plan_query_tool(question="VG 최근 10-K revenue growth 근거 찾아줘"))
     assert plan["plan"]["tickers"] == ["VG"]
     assert plan["plan"]["document_types"] == ["10-K"]
+
+
+def test_mcp_verify_evidence_returns_hash_stable_source_lineage(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _write_fixture(tmp_path)
+    _build_v3_runtime(tmp_path, release_id="verified-evidence-release")
+    monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
+
+    questions = [
+        {
+            "question_id": "q_business_quality",
+            "object_ids": [
+                "claim:VG:FY2025:10K:revenue-growth",
+                "business_factor:VG:FY2025:10K:revenue-growth",
+                "business_factor:VG:FY2025:10K:unsupported-risk",
+            ],
+        }
+    ]
+    first = json.loads(verify_evidence_tool(ticker="VG", questions=questions))
+    second = json.loads(verify_evidence_tool(ticker="VG", questions=questions))
+
+    assert first == second
+    assert first["format"] == "krw-verified-company-evidence/v1"
+    assert first["release_id"] == "verified-evidence-release"
+    assert len(first["pack_hash"]) == 64
+    assert first["current_driver"]["period"] == "FY2025"
+    assert first["annual_baseline"]["period"] == "FY2025"
+    evidence = first["evidence_by_question"][0]["evidence"]
+    assert evidence[0]["trace_status"] == "traceable_direct"
+    assert evidence[0]["usable_for_strong_claim"] is True
+    assert evidence[0]["quote_ids"] == ["quote:VG:FY2025:10K:0001"]
+    assert evidence[0]["span_ids"] == ["span:VG:FY2025:10K:0001"]
+    assert evidence[1]["trace_status"] == "traceable_related"
+    assert evidence[1]["usable_for_strong_claim"] is False
+    assert first["rejected_refs"] == [
+        {
+            "question_id": "q_business_quality",
+            "object_id": "business_factor:VG:FY2025:10K:unsupported-risk",
+            "reason": "missing_source_lineage",
+        }
+    ]
+
+
+def test_mcp_verify_evidence_rejects_wrong_ticker_and_limits_ids(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _write_fixture(tmp_path)
+    _build_v3_runtime(tmp_path)
+    monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
+
+    wrong_ticker = json.loads(
+        verify_evidence_tool(
+            ticker="XOM",
+            questions=[
+                {
+                    "question_id": "q_wrong_ticker",
+                    "object_ids": ["claim:VG:FY2025:10K:revenue-growth"],
+                }
+            ],
+        )
+    )
+    assert wrong_ticker["verification_summary"]["verified_object_count"] == 0
+    assert wrong_ticker["rejected_refs"][0]["reason"] == "ticker_mismatch"
+
+    with pytest.raises(ValueError, match="at most 8 unique object ids"):
+        verify_evidence_tool(
+            ticker="VG",
+            questions=[
+                {
+                    "question_id": f"q_{index}",
+                    "object_ids": [f"object:{index}", f"object:{index + 10}"],
+                }
+                for index in range(5)
+            ],
+        )
 
 
 def test_mcp_health_reports_release_manifest(tmp_path: Path, monkeypatch):
@@ -1045,6 +1124,7 @@ def test_mcp_server_registers_expected_tools():
         "krw_ontology_topic_map",
         "krw_ontology_retrieve",
         "krw_ontology_trace",
+        "krw_ontology_verify_evidence",
         "krw_ontology_chain",
         "krw_ontology_quality",
         "krw_ontology_compare",

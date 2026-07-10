@@ -115,13 +115,14 @@ Use when the user provides a ticker/company or the chat session has default tick
 Flow:
 
 ```text
-1. Build a concise internal English investment brief that preserves the user's ticker/tickers, period, metric, and comparison intent.
-2. Call query_context with the ticker/tickers and the internal English investment brief.
-3. Read research_status, research_pack, answerability, agent_autonomy, and kernel when present.
-4. If sufficient_for_default_answer or equivalent, answer immediately.
-5. If trace is recommended for a strong claim, trace/chain only selected roots.
-6. If a specific material gap remains, use one targeted query/compare for that gap.
-7. Write analyst synthesis in Korean.
+1. Before the first filing call, the model authors one complete SearchPlan v2 from the user's full question.
+2. Split the plan into independently verifiable clauses. Keep qualitative relations together with required_concepts + required_predicates; put exact metric needs in separate metric clauses.
+3. Call query_context with exactly {search_plan}. Never send question, ticker, tickers, limit, response_detail, or response_format beside search_plan.
+4. Read ResearchState v2: answerability, clause_coverage, evidence_units, computed_values, calculation_coverage, missing_parts, recommended_actions, continuation, and warnings.
+5. If every required clause is covered at the requested directness and every requested calculation is valid, answer immediately.
+6. Trace/chain only selected evidence roots when a strong claim still needs lineage verification.
+7. If a material required clause remains open, follow the narrowest relevant recommended action or author a narrower follow-up plan; do not repeat the same plan.
+8. Write analyst synthesis in Korean.
 ```
 
 Use ontology objects by purpose:
@@ -151,14 +152,14 @@ broad ontology discovery. First turn it into a narrow user-facing choice set.
 
 Concrete tickerless question:
 if the user gives a specific factor, channel, product, business model, metric, event type, or company type but no ticker,
-you may use query_context with tickers=[] and limit_tickers <= 5 so the v3 global spine can rank candidate covered tickers.
+author SearchPlan v2 with universe="covered" so the sidecar can rank covered tickers. Set limit_tickers and limit_results from the number of companies and required clauses needed to answer; do not use a universal cap.
 ```
 
 Do not start with:
 
 ```text
 broad raw Korean topic text
-broad sector/global query_context with tickers=[]
+broad sector/global query_context using legacy tickerless arguments
 broad catalog(limit > 5)
 catalog as a sector discovery substitute
 unbounded retrieve
@@ -181,58 +182,57 @@ Flow for too broad sector/global/macro questions:
 
 ```text
 1. Build an ontology/MCP-aware internal English investment brief.
-2. Identify a bounded covered ticker basket before the main research call.
+2. Identify a covered ticker basket large enough to represent the requested scope before the main research call.
 3. Use only indexed/catalog/company metadata to confirm coverage.
-4. Select 4-6 representative indexed tickers.
+4. Select representative indexed tickers across the relevant sub-industries; size the basket to the question rather than a fixed count.
 5. Prefer recent 10-K/10-Q coverage, relevant business/sector/topic evidence, and sub-industry diversity.
 6. Exclude unavailable tickers silently.
-7. Call query_context with selected tickers, limit_tickers <= 5, limit_results <= 3, and compact/markdown output when available.
-8. If multi-company query_context overflows, do not retry the same broad call. Split into per-ticker or per-channel compact query calls.
-9. Synthesize common signals -> company signals -> financial channels -> interpretation.
+7. Author one SearchPlan v2 whose explicit tickers and required clauses cover that basket, then call query_context with exactly {search_plan}.
+8. Set limit_results at least to required-clause coverage and increase it when multiple tickers, dimensions, or comparison pairs require more evidence.
+9. If ResearchState reports missing coverage or continuation, split only the open clauses by ticker/channel; do not repeat the same plan.
+10. Synthesize common signals -> company signals -> financial channels -> interpretation.
 ```
 
 Flow for concrete tickerless questions:
 
 ```text
 1. Build an ontology/MCP-aware internal English investment brief.
-2. Make one bounded global-spine candidate route call through query_context with tickers=[], limit_tickers <= 5, limit_results <= 3, and compact/markdown output when available.
-3. Treat ticker candidates as a ranked covered universe, not as a final answer.
-4. Continue with selected candidate tickers only when the first pass gives enough signal or a specific gap remains.
-5. If the first pass is too broad or overflows, split into per-channel or selected-ticker compact calls; do not repeat the same broad call.
+2. Author SearchPlan v2 with universe="covered", atomic clauses, and adaptive limit_tickers/limit_results, then call query_context with exactly {search_plan}.
+3. Treat resolved_scope.resolved_tickers as a ranked covered universe, not as final evidence.
+4. Continue with selected candidate tickers only when evidence_units support the screen or a specific required clause remains open.
+5. If the first state is partial, split only missing_parts or use continuation/recommended_actions; do not repeat the same broad plan.
 6. Do not promote a candidate from route score, hit count, or generic theme language alone.
 ```
 
 Overflow continuation rule:
 
 ```text
-Overflow is not terminal failure.
-Do not read huge saved tool-result files in normal web chat.
-Do not mention overflow to the user.
-Fallback to one compact query per selected ticker or one compact query per top channel.
-Use short English topics, response_detail="compact", response_format="markdown" when available, and limit <= 3.
-Stop when covered signals are enough for a directional synthesis.
+ResearchState is bounded model-visible state; partial coverage is not terminal failure.
+Do not read huge saved tool-result files in normal web chat or mention internal size handling to the user.
+Use missing_parts, recommended_actions, and continuation to split only open clauses by ticker, channel, metric, or period.
+Keep follow-up retrieval queries concise and evidence-specific.
+Stop when all required clauses and requested calculations are covered, or explain the remaining evidence boundary.
 ```
 
 Bad flow:
 
 ```text
-query_context(question="consumer macro...", tickers=[], limit_tickers=20)
+send legacy top-level question/tickers arguments to query_context
 catalog(limit=50)
 catalog(limit=200)
-query_context(question="...", limit_results=10, limit_tickers=20)
+repeat the same broad query_context with different wording
 ```
 
 Good flow:
 
 ```text
-brief="consumer sector macro read-through: pricing power, volume trends, trade-down, consumer demand, inflation, input cost pressure, margin impact"
-covered_tickers=[4-6 indexed relevant tickers]
-query_context(question=brief, tickers=covered_tickers, limit_results=3, limit_tickers=5)
-if overflow: query(ticker=one covered ticker, topic=one short channel, limit=3, response_detail="compact")
+search_plan={question, intent, explicit covered tickers, atomic clauses for pricing/volume/margin, adaptive limits}
+query_context(search_plan=search_plan)
+if partial: follow only missing_parts or recommended_actions
 
-brief="AI infrastructure capex pressure, cloud backlog, free cash flow, share repurchase trade-off"
-query_context(question=brief, tickers=[], limit_results=3, limit_tickers=5)
-continue with selected covered candidates only
+search_plan={question, intent, universe:"covered", atomic AI infrastructure clauses, adaptive limits}
+query_context(search_plan=search_plan)
+continue only with candidates backed by evidence_units
 ```
 
 If a broad question cannot be bounded and the v3 global spine first pass is not appropriate, ask one concise clarification question instead of running broad catalog/query loops.
@@ -244,12 +244,12 @@ Use for revenue, segment/product mix, share of total, YoY growth, margin, cost r
 Flow:
 
 ```text
-1. Prefer query_context and use metric_series_pack when present.
-2. Use MetricObservation + Calculation + XBRLFact lineage for values.
-3. Verify unit, scale, period alignment, dimensions, denominator role, and annual/quarterly labels.
-4. Use targeted query only for a specific missing metric/dimension/period.
-5. Trace metric lineage only for strong numeric claims or suspicious values.
-6. Render table only when values are supported and aligned.
+1. Put each exact metric need in its own SearchPlan clause, using canonical metrics, metric_scope, metric_dimensions, comparison_axes, and calculation_window.
+2. Read computed_values and calculation_coverage together with the metric-lineage evidence_units.
+3. Verify unit, currency, basis, duration, period alignment, dimensions, scope, denominator role, and annual/quarterly labels.
+4. Use targeted follow-up only for a metric/dimension/period named in missing_parts or recommended_actions.
+5. Trace metric lineage only for strong numeric claims, conflicts, or suspicious values.
+6. Render a table only when requested calculations are valid and aligned; never calculate across a reported conflict.
 ```
 
 Do not:
@@ -258,7 +258,7 @@ Do not:
 invent numeric tables
 use total-company metric as segment/product metric
 mix annual and quarterly values without clear labels
-re-query each metric repeatedly after metric_series_pack is sufficient
+re-query each metric repeatedly after calculation_coverage is complete
 ```
 
 ### 2.5 Path D: business model/company overview question
@@ -268,9 +268,9 @@ Use for "how does the company make money", business structure, revenue drivers, 
 Flow:
 
 ```text
-1. query_context first.
-2. Prefer business_profile_pack when present.
-3. Use CompanyBusinessProfile, BusinessActivity, ResearchClaim, EvidenceQuote, and selected MetricObservation.
+1. Author the complete SearchPlan v2, then call query_context with exactly {search_plan}.
+2. Read business-model evidence from evidence_units and clause_coverage.
+3. Prefer traceable CompanyBusinessProfile, BusinessActivity, ResearchClaim, EvidenceQuote, and selected MetricObservation evidence.
 4. If the user asks recent/latest, lead with the most recent 10-Q/current filing drivers, then annual baseline.
 5. Use chain only for selected business mechanisms that clarify revenue/cost/margin paths.
 6. Do not declare not_answerable merely because exact segment metrics are missing.
@@ -293,9 +293,9 @@ Use for growth thesis, margin pressure, risk factors, cost pressure, supply chai
 Flow:
 
 ```text
-1. query_context first.
-2. Prefer risk_mechanism_pack when present.
-3. Use BusinessFactor, ExternalFactorExposure, ResearchClaim, EvidenceQuote, and selected representative MetricObservation.
+1. Author the complete SearchPlan v2, then call query_context with exactly {search_plan}.
+2. Read risk/mechanism support from evidence_units, directness, and clause_coverage.
+3. Use traceable BusinessFactor, ExternalFactorExposure, ResearchClaim, EvidenceQuote, and selected representative MetricObservation evidence.
 4. Organize evidence as risk/premise -> financial path -> affected metric/channel -> implication -> caveat.
 5. Use representative metrics only; do not perform exhaustive all-metric searches unless explicitly required by the question.
 6. Use chain for selected risk-to-financial-path mechanisms.
@@ -316,9 +316,9 @@ Use when the user asks whether a company is directly exposed to a specific facto
 Flow:
 
 ```text
-1. query_context first with the company and exact factor.
-2. Prefer direct_exposure_pack when present.
-3. Use ExternalFactorExposure only when the requested factor is explicitly connected to the company/channel.
+1. Author a direct-exposure SearchPlan clause with the company, exact factor, all required concepts, required predicate, and directness requirement.
+2. Read direct versus related support from evidence_units and clause_coverage.
+3. Use ExternalFactorExposure only when the requested factor is explicitly connected to the company/channel in one traceable evidence span.
 4. Separate direct evidence, related context, and no direct evidence.
 5. Negative direct-exposure answers can be sufficient when the ontology supports no direct evidence but related context exists.
 6. Trace selected direct candidates before strong direct wording.
@@ -339,8 +339,8 @@ Flow:
 
 ```text
 1. Determine comparison type: metric, risk, direct exposure, business model, contract/event, or mixed.
-2. query_context first if it can frame comparison.
-3. Use compare only when explicit comparison state is missing or the user asks for a comparison table.
+2. Put the complete comparison universe, axes, metric scope, and atomic propositions in SearchPlan v2, then call query_context with exactly {search_plan}.
+3. Use compare only when ResearchState identifies a material comparison gap or the user asks for an additional non-plan comparison view.
 4. For metric comparison, require same basis/period/unit.
 5. For risk/direct comparison, compare channels and evidence strength, not hit counts.
 6. Final judgment is written by the analyst; MCP hints are not automatic conclusions.
@@ -353,7 +353,7 @@ Use for agreement terms, maturities, commitments, pricing mechanisms, named even
 Flow:
 
 ```text
-1. Use query_context unless the user gives fully structured arguments.
+1. Author SearchPlan v2 even when the user gives structured arguments, then call query_context with exactly {search_plan}.
 2. Use targeted query for AgreementTerm, BusinessEvent, ChangeEvent, ResearchClaim, EvidenceQuote, or MetricObservation as needed.
 3. Trace exact dates, amounts, counterparties, terms, and event claims before strong wording.
 4. Answer narrowly and avoid broader thesis if not asked.
@@ -384,12 +384,12 @@ Flow:
 Use tools by role:
 
 ```text
-query_context = default research workbench
-query = one targeted structured follow-up
-compare = explicit comparison only when query_context is insufficient
+query_context = execute one complete model-authored SearchPlan v2 and return ResearchState v2
+query = targeted structured follow-up for a named missing clause only
+compare = additional explicit comparison only when ResearchState leaves a comparison gap
 trace = selected evidence lineage
 chain = selected business mechanism expansion
-retrieve = legacy fallback only
+retrieve = object-filtered recall extension only for a named missing clause; never the broad default
 company_context = orientation only when needed
 index_context/catalog/quality = debug, audit, or coverage only
 ```
@@ -424,9 +424,9 @@ Before writing a substantive final answer, check whether you have real filing ev
 Real evidence includes:
 
 ```text
-successful query_context evidence rows or research packs
+ResearchState evidence_units with covered required clause IDs
 successful targeted query results
-metric_series_pack or calculation lineage
+valid computed_values plus calculation_coverage and metric lineage
 company filing commentary from MD&A, business discussion, notes, or specific risk-factor channels
 trace result for a selected evidence root
 chain result for a selected mechanism root
@@ -448,7 +448,7 @@ open or missing tool results
 
 Do not write a substantive answer from catalog, diagnostic, overflow-only, or status-only evidence.
 
-If the evidence floor is not met, perform one narrower recovery path before answering:
+If the evidence floor is not met, follow the smallest evidence-specific recovery path before answering:
 
 ```text
 reduce ticker basket
@@ -481,23 +481,24 @@ Broad consumer macro query_context overflows -> query KO/PEP/PG for latest MD&A 
 
 Catalog/index/quality outputs may orient research, but they must not become user-facing evidence.
 
-## 5. Research pack policy
+## 5. ResearchState v2 policy
 
-Packs are runtime research state, not DB tables and not user-facing concepts.
+ResearchState is bounded runtime research state, not a DB table and not a user-facing concept.
 
-Use packs when present:
+Use its fields by purpose:
 
 ```text
-metric_series_pack -> numeric table, share, growth, period/unit checks
-business_profile_pack -> business segments, drivers, annual mix, caveats
-risk_mechanism_pack -> support summary, financial path, affected metrics, implication
-comparison_view -> same-basis rows and conclusion hints
-direct_exposure_pack -> direct vs related candidates and negative-answer policy
-scope_guard_pack -> target price/fair value/investment opinion stop
-evidence_index / chain_pack -> selected trace/chain roots only
+resolved_scope -> actual ticker/document/period boundary
+source_anchors -> current filing and annual-baseline anchors
+answerability + clause_coverage -> whether every required proposition is supported
+evidence_units -> deduplicated, traceable filing evidence and supported clause IDs
+computed_values + calculation_coverage -> validated arithmetic and refused/conflicted calculations
+missing_parts + recommended_actions -> only the material gaps worth following
+continuation -> bounded cursor/state for an unfinished required scope
+warnings -> internal caveats that may constrain wording
 ```
 
-Never mention pack names in normal answers.
+Never mention contract or field names in normal answers.
 
 Reference: `references/research-pack-rendering.md`.
 
@@ -623,7 +624,7 @@ sector signal convergence
 offsetting factors or caveats
 ```
 
-Trace is not broad search. Chain is not broad search. Use them only after selecting a small number of candidate roots from query_context, query, compare, or retrieve.
+Trace is not broad search. Chain is not broad search. Use them only after selecting evidence roots from ResearchState or a targeted follow-up.
 
 Good trace use:
 

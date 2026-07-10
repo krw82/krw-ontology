@@ -51,7 +51,7 @@ These rules govern:
 
 ```text
 internal English investment briefs
-query_context-first research
+model-authored SearchPlan v2 before query_context
 MCP `filing_document_roles` for current_driver / annual_baseline
 latest 10-Q as current driver
 latest 10-K as annual business baseline
@@ -164,19 +164,21 @@ company-defined FCF vs simple OCF minus capex
 Follow this order:
 
 ```text
-1. Build the internal English earnings brief.
-2. Start with query_context for the latest reported quarter and the user's focus.
-3. Confirm the newest available 10-Q or latest 10-K when no newer quarter exists.
-4. Define the operating thesis being updated. If the user supplied a thesis, use it; otherwise derive the narrow filing-supported operating thesis from the latest quarter evidence.
-5. Read management discussion, explanatory notes, segment commentary, and business descriptions before expanding metric searches.
-6. Identify three to five material quarterly changes, not every reported line.
-7. Use representative metrics to verify direction, magnitude, and period alignment.
-8. Reconcile company commentary with reported numbers and notes.
-9. Decide whether each change is timing noise, accounting effect, operating proof, or thesis-relevant deterioration.
-10. Check earnings quality, cash-flow conversion, capex, acquisitions, buybacks, debt, and dilution only when material to the quarter update.
-11. Classify the thesis effect: strengthened, intact, mixed, weakened, or requires re-underwriting.
-12. Use one targeted query for a material missing axis and selected trace/chain for load-bearing claims.
-13. Write the Korean earnings update report.
+1. Build the internal English earnings brief, then author one complete SearchPlan v2 before any filing call.
+2. Split headline metrics, guidance/expectations, operating drivers, margin/cash-flow paths, and risks into independently verifiable clauses. Keep qualitative relations in required_concepts + required_predicates and exact metrics in separate metric clauses.
+3. Call query_context with exactly {search_plan}; never send legacy top-level question/ticker/limit arguments.
+4. Read ResearchState v2 source_anchors, clause_coverage, evidence_units, computed_values, calculation_coverage, missing_parts, recommended_actions, continuation, and warnings.
+5. Confirm the newest available 10-Q or latest 10-K when no newer quarter exists.
+6. Define the operating thesis being updated. If the user supplied a thesis, use it; otherwise derive the narrow filing-supported operating thesis from the latest quarter evidence.
+7. Read management discussion, explanatory notes, segment commentary, and business descriptions before following any missing metric clause.
+8. Identify the material quarterly changes needed to update the thesis, not every reported line and not a fixed count.
+9. Use representative metrics to verify direction, magnitude, and period alignment.
+10. Reconcile company commentary with reported numbers and notes.
+11. Decide whether each change is timing noise, accounting effect, operating proof, or thesis-relevant deterioration.
+12. Check earnings quality, cash-flow conversion, capex, acquisitions, buybacks, debt, and dilution only when material to the quarter update.
+13. Classify the thesis effect: strengthened, intact, mixed, weakened, or requires re-underwriting.
+14. Follow only material missing_parts/recommended_actions and use selected trace/chain for load-bearing claims; do not impose a fixed follow-up count.
+15. Write the Korean earnings update report.
 ```
 
 Do not request `response_detail="full"` in normal web chat.

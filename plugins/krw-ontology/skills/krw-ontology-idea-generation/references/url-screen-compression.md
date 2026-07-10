@@ -106,24 +106,30 @@ filings show pricing, supply constraint, customer commitment, or margin linkage
 to hardware cost pressure
 ```
 
-## Query Budget
+## Evidence-Driven Continuation
 
-URL-based idea generation may use at most 3 tickerless `query_context` calls.
+URL-based idea generation has no fixed tickerless call count. Before the first
+filing call, compress the URL into one dominant screen and author a complete
+SearchPlan v2 with `universe="covered"`, atomic qualification/rejection clauses,
+and adaptive result limits. Call `query_context` with exactly `{search_plan}`.
 
-The calls must be sequential and stay inside the same screen:
+Continue only when ResearchState shows a material required gap:
 
 ```text
-1. primary wording of the compressed screen
-2. narrower direct-exposure wording inside the same screen
-3. one adjacent wording only if the first two produce no usable covered candidates
+missing direct-exposure proposition -> narrow that proposition
+missing financial-path proposition -> add only the named channel/metric clause
+unfinished candidate scope -> use continuation or a contract-sized ticker batch
+covered clauses -> never repeat them with a wording variant
 ```
 
-Do not run multiple tickerless URL searches in parallel.
+Independent open clauses may be researched concurrently when the runtime
+supports it; dependent clauses must wait for the prior state. Every follow-up
+must stay inside the same compressed screen. A new economic screen requires a
+new user choice or a clearly dominant path from the source, not an arbitrary
+extra search.
 
-Do not use the third call to open a new screen. It is only for a close wording
-variant of the same screen.
-
-After 3 tickerless calls, stop.
+Stop when material candidates have comparable evidence coverage, when remaining
+gaps cannot change classification, or when the evidence floor cannot be met.
 
 ## Stop And Ask
 

@@ -3,14 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import os
 import sqlite3
+import sys
 from contextlib import closing
+from functools import lru_cache
+from importlib.metadata import PackageNotFoundError, version as package_version
 from pathlib import Path
 from typing import Any, Callable, TypeVar
 
 from mcp.server.fastmcp import FastMCP
-from mcp.types import ToolAnnotations
+from mcp.types import CallToolResult, TextContent, ToolAnnotations
 from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse
 
@@ -38,6 +43,12 @@ from krw_ontology.mcp_server.tools import (
     trace_tool,
     verify_evidence_tool,
 )
+from krw_ontology.mcp_server.contracts import (
+    MCP_CONTRACT_VERSION,
+    ResearchState,
+    SearchPlan,
+)
+from krw_ontology.mcp_server.runtime import configured_mcp_root, prepare_mcp_runtime
 from krw_ontology.release import (
     load_release_manifest,
     normalize_ontology_env,
@@ -68,6 +79,30 @@ _LANE_CONCURRENCY_ENVS = {
     _LANE_DIAGNOSTIC: "KRW_MCP_DIAGNOSTIC_LANE_CONCURRENCY",
 }
 _LANE_SEMAPHORES: dict[tuple[int, str], asyncio.Semaphore] = {}
+EXPECTED_TOOL_NAMES = (
+    "krw_ontology_catalog",
+    "krw_ontology_chain",
+    "krw_ontology_company_context",
+    "krw_ontology_compare",
+    "krw_ontology_index_context",
+    "krw_ontology_plan_query",
+    "krw_ontology_quality",
+    "krw_ontology_query",
+    "krw_ontology_query_context",
+    "krw_ontology_retrieve",
+    "krw_ontology_topic_map",
+    "krw_ontology_trace",
+    "krw_ontology_verify_evidence",
+)
+_EXPECTED_FINGERPRINT_ENVS = {
+    "mcp_contract_version": "KRW_MCP_EXPECTED_CONTRACT_VERSION",
+    "tool_schema_sha256": "KRW_MCP_EXPECTED_TOOL_SCHEMA_SHA256",
+    "build_id": "KRW_MCP_EXPECTED_BUILD_ID",
+    "backend_git_sha": "KRW_MCP_EXPECTED_BACKEND_GIT_SHA",
+    "build_fingerprint_sha256": "KRW_MCP_EXPECTED_BUILD_FINGERPRINT_SHA256",
+    "release_manifest_sha256": "KRW_MCP_EXPECTED_RELEASE_MANIFEST_SHA256",
+    "service_fingerprint_sha256": "KRW_MCP_EXPECTED_SERVICE_FINGERPRINT_SHA256",
+}
 
 
 def health_payload(
@@ -84,6 +119,18 @@ def ready_payload(
 ) -> tuple[dict, int]:
     """Return lightweight worker-admission readiness metadata."""
     return _release_payload(root=root, include_runtime_cache=False)
+
+
+def require_mcp_runtime_ready(*, root: Path | str) -> dict[str, Any]:
+    """Fail before serving when release, artifact, tool, or build bindings mismatch."""
+    payload, status_code = ready_payload(root=str(root))
+    if status_code != 200 or not payload.get("ok"):
+        startup = payload.get("startup") if isinstance(payload.get("startup"), dict) else {}
+        errors = list(startup.get("errors") or [])
+        mismatches = payload.get("fingerprint_mismatches") or []
+        details = ", ".join(str(value) for value in [*errors, *mismatches])
+        raise RuntimeError(details or str(payload.get("error") or "runtime_not_ready"))
+    return payload
 
 
 def live_payload() -> tuple[dict, int]:
@@ -181,6 +228,7 @@ def _release_payload(
         if isinstance(chart_series_verification, dict)
         else None
     )
+    fingerprints = _runtime_fingerprints(release_manifest_path)
     payload = {
         "ok": False,
         "root": str(root_path),
@@ -213,7 +261,8 @@ def _release_payload(
         "documents": document_count,
         "objects": object_count,
         "sqlite_checked": False,
-        "tools": sorted(tool.name for tool in mcp._tool_manager.list_tools()),
+        "tools": fingerprints["tool_names"],
+        **fingerprints,
     }
     if include_runtime_cache:
         cache_status = mcp_runtime_cache_status()
@@ -240,9 +289,216 @@ def _release_payload(
     if not startup_verification["ok"]:
         payload["error"] = "release_startup_verification_failed"
         return payload, 503
+    if not payload["fingerprint_match"]:
+        payload["error"] = "mcp_fingerprint_mismatch"
+        return payload, 503
 
     payload["ok"] = True
     return payload, 200
+
+
+def _runtime_fingerprints(manifest_path: Path | None) -> dict[str, Any]:
+    tool_contract = _tool_contract_fingerprint()
+    source_sha256 = _source_build_sha256()
+    git_sha = _backend_git_sha()
+    try:
+        distribution_version = package_version("krw-ontology")
+    except PackageNotFoundError:
+        distribution_version = "0+unknown"
+    build_id = os.environ.get("KRW_MCP_BUILD_ID") or (
+        f"krw-ontology-{distribution_version}+source.{source_sha256[:12]}"
+    )
+    build_fingerprint_sha256 = _sha256_json(
+        {
+            "mcp_contract_version": MCP_CONTRACT_VERSION,
+            "build_id": build_id,
+            "backend_git_sha": git_sha,
+            "distribution_version": distribution_version,
+            "source_sha256": source_sha256,
+            "runtime_versions": {
+                "python": sys.version.split()[0],
+                "sqlite": sqlite3.sqlite_version,
+                "mcp": _distribution_version("mcp"),
+                "pydantic": _distribution_version("pydantic"),
+            },
+        }
+    )
+    release_manifest_sha256 = _file_sha256(manifest_path)
+    service_fingerprint_sha256 = _sha256_json(
+        {
+            "mcp_contract_version": MCP_CONTRACT_VERSION,
+            "tool_schema_sha256": tool_contract["tool_schema_sha256"],
+            "build_fingerprint_sha256": build_fingerprint_sha256,
+            "release_manifest_sha256": release_manifest_sha256,
+        }
+    )
+    payload: dict[str, Any] = {
+        "mcp_contract_version": MCP_CONTRACT_VERSION,
+        "tool_count": tool_contract["tool_count"],
+        "tool_names": tool_contract["tool_names"],
+        "tool_names_match": tool_contract["tool_names_match"],
+        "tool_schema_sha256": tool_contract["tool_schema_sha256"],
+        "build_id": build_id,
+        "backend_git_sha": git_sha,
+        "build_fingerprint_sha256": build_fingerprint_sha256,
+        "release_manifest_sha256": release_manifest_sha256,
+        "service_fingerprint_sha256": service_fingerprint_sha256,
+    }
+    mismatches: list[dict[str, str | None]] = []
+    if not tool_contract["tool_names_match"]:
+        mismatches.append(
+            {
+                "field": "tool_names",
+                "expected": ",".join(EXPECTED_TOOL_NAMES),
+                "actual": ",".join(tool_contract["tool_names"]),
+            }
+        )
+    for field, env_name in _EXPECTED_FINGERPRINT_ENVS.items():
+        expected = os.environ.get(env_name)
+        if expected is not None and expected.strip() and str(payload.get(field) or "") != expected.strip():
+            mismatches.append(
+                {
+                    "field": field,
+                    "expected": expected.strip(),
+                    "actual": str(payload.get(field)) if payload.get(field) is not None else None,
+                }
+            )
+    payload["fingerprint_match"] = not mismatches
+    payload["fingerprint_mismatches"] = mismatches
+    return payload
+
+
+def runtime_fingerprint_payload(*, root: str | Path | None = None) -> dict[str, Any]:
+    """Return deploy-time MCP/build/release fingerprints without opening SQLite."""
+    root_path = _supplied_root_path(str(root) if root is not None else None).resolve()
+    _manifest, manifest_path = load_release_manifest(
+        root_path,
+        manifest_path=root_path / "manifest.json",
+    )
+    return _runtime_fingerprints(manifest_path or (root_path / "manifest.json"))
+
+
+@lru_cache(maxsize=1)
+def _tool_contract_fingerprint() -> dict[str, Any]:
+    tools = sorted(mcp._tool_manager.list_tools(), key=lambda tool: tool.name)
+    names = [tool.name for tool in tools]
+    schemas = []
+    for tool in tools:
+        annotations = tool.annotations
+        if hasattr(annotations, "model_dump"):
+            annotations_payload = annotations.model_dump(mode="json")
+        elif isinstance(annotations, dict):
+            annotations_payload = dict(annotations)
+        else:
+            annotations_payload = None
+        fn_metadata = getattr(tool, "fn_metadata", None)
+        schemas.append(
+            {
+                "name": tool.name,
+                "title": tool.title,
+                "description": tool.description,
+                "input_schema": tool.parameters,
+                "output_schema": getattr(fn_metadata, "output_schema", None),
+                "annotations": annotations_payload,
+            }
+        )
+    return {
+        "tool_count": len(names),
+        "tool_names": names,
+        "tool_names_match": tuple(names) == EXPECTED_TOOL_NAMES,
+        "tool_schema_sha256": _sha256_json(schemas),
+    }
+
+
+@lru_cache(maxsize=1)
+def _source_build_sha256() -> str:
+    package_dir = Path(__file__).resolve().parent.parent
+    repository_root = package_dir.parent.parent
+    files = sorted(
+        path
+        for path in package_dir.rglob("*")
+        if path.is_file()
+        and "__pycache__" not in path.parts
+        and path.suffix in {".json", ".py", ".yaml", ".yml"}
+    )
+    for relative_path in (
+        "pyproject.toml",
+        "uv.lock",
+        "plugins/krw-ontology/.mcp.json",
+        "plugins/krw-ontology/plugin.json",
+        "Dockerfile",
+        "docker-compose.yml",
+    ):
+        candidate = repository_root / relative_path
+        if candidate.is_file():
+            files.append(candidate)
+    files = sorted(set(files))
+    digest = hashlib.sha256()
+    for path in files:
+        try:
+            relative = path.relative_to(repository_root)
+        except ValueError:
+            relative = path.relative_to(package_dir)
+        digest.update(relative.as_posix().encode("utf-8"))
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+def _distribution_version(name: str) -> str:
+    try:
+        return package_version(name)
+    except PackageNotFoundError:
+        return "0+unknown"
+
+
+@lru_cache(maxsize=1)
+def _backend_git_sha() -> str | None:
+    configured = os.environ.get("KRW_MCP_BACKEND_GIT_SHA")
+    if configured and configured.strip():
+        return configured.strip()
+    repo_root = Path(__file__).resolve().parents[3]
+    git_dir = repo_root / ".git"
+    if git_dir.is_file():
+        pointer = git_dir.read_text(encoding="utf-8").strip()
+        if pointer.startswith("gitdir:"):
+            candidate = Path(pointer.split(":", 1)[1].strip())
+            git_dir = candidate if candidate.is_absolute() else (repo_root / candidate).resolve()
+    head_path = git_dir / "HEAD"
+    if not head_path.exists():
+        return None
+    head = head_path.read_text(encoding="utf-8").strip()
+    if not head.startswith("ref:"):
+        return head or None
+    ref_path = git_dir / head.split(":", 1)[1].strip()
+    if ref_path.exists():
+        return ref_path.read_text(encoding="utf-8").strip() or None
+    packed_refs = git_dir / "packed-refs"
+    if packed_refs.exists():
+        ref_name = head.split(":", 1)[1].strip()
+        for line in packed_refs.read_text(encoding="utf-8").splitlines():
+            if not line or line.startswith(("#", "^")):
+                continue
+            sha, _, name = line.partition(" ")
+            if name == ref_name:
+                return sha or None
+    return None
+
+
+def _file_sha256(path: Path | None) -> str | None:
+    if path is None or not path.exists():
+        return None
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _sha256_json(value: Any) -> str:
+    serialized = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(serialized).hexdigest()
 
 
 def _supplied_root_path(root: str | None) -> Path:
@@ -577,32 +833,26 @@ async def krw_ontology_company_context(
     annotations=READ_ONLY,
 )
 async def krw_ontology_query_context(
-    question: str,
-    ticker: str | None = None,
-    tickers: list[str] | None = None,
-    document_types: list[str] | None = None,
-    periods: list[str] | None = None,
-    universe: str | None = None,
-    limit_results: int = 10,
-    limit_tickers: int = 20,
-    include_internal_ids: bool = True,
-    response_format: ResponseFormat = ResponseFormat.JSON,
-) -> str:
-    """Return a compact query-specific context pack with answerability guidance."""
-    lane = _LANE_FAST if _has_ticker_scope(ticker=ticker, tickers=tickers) else _LANE_BROAD
-    return await _run_tool_in_lane(
+    search_plan: SearchPlan,
+) -> ResearchState:
+    """Execute one explicit agent search plan and return compact ResearchState v2.
+
+    The search plan is mandatory. The server never infers or replaces its intent,
+    clauses, ticker scope, document filters, or period filters from keywords.
+    Invalid plans fail input validation with an actionable `invalid_plan` error.
+    """
+    lane = _LANE_FAST if bool(search_plan.tickers) else _LANE_BROAD
+    state = await _run_tool_in_lane(
         lane,
         query_context_tool,
-        question=question,
-        ticker=ticker,
-        tickers=tickers,
-        document_types=document_types,
-        periods=periods,
-        universe=universe,
-        limit_results=limit_results,
-        limit_tickers=limit_tickers,
-        include_internal_ids=include_internal_ids,
-        response_format=response_format,
+        search_plan=search_plan,
+    )
+    compact_json = state.model_dump_json()
+    # Returning CallToolResult bypasses FastMCP's indented compatibility
+    # serializer while retaining the declared ResearchState output schema.
+    return CallToolResult(  # type: ignore[return-value]
+        content=[TextContent(type="text", text=compact_json)],
+        structuredContent=state.model_dump(mode="json", by_alias=True),
     )
 
 
@@ -850,24 +1100,39 @@ async def krw_ontology_compare(
 
 @mcp.tool(
     name="krw_ontology_plan_query",
-    title="Plan KRW ontology query",
+    title="Validate KRW ontology SearchPlan v2",
     annotations=READ_ONLY,
 )
 async def krw_ontology_plan_query(
-    question: str,
+    search_plan: SearchPlan,
     response_format: ResponseFormat = ResponseFormat.JSON,
 ) -> str:
-    """Return the deterministic QueryPlan without executing a search."""
+    """Validate and normalize an agent-authored SearchPlan without retrieval."""
     return await _run_tool_in_lane(
         _LANE_FAST,
         plan_query_tool,
-        question=question,
+        search_plan=search_plan,
         response_format=response_format,
     )
 
 
 def main() -> None:
     """Run the local stdio MCP server."""
+    root = configured_mcp_root()
+    try:
+        prepare_mcp_runtime(
+            root=root,
+            env=os.getenv(ONTOLOGY_ENV_ENV),
+            expected_release_id=(
+                os.getenv("KRW_MCP_EXPECTED_RELEASE_ID")
+                or os.getenv("EXPECTED_RELEASE_ID")
+                or os.getenv("KRW_ONTOLOGY_RELEASE_ID")
+            ),
+            store_mode=os.getenv("KRW_MCP_STORE_MODE", "persistent"),
+        )
+        require_mcp_runtime_ready(root=root)
+    except RuntimeError as exc:
+        raise SystemExit(f"KRW ontology MCP startup refused: {exc}") from exc
     mcp.run("stdio")
 
 

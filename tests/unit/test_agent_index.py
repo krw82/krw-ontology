@@ -30,6 +30,10 @@ from krw_ontology.agent_index import (
     write_source_artifact_manifest,
 )
 from krw_ontology.agent_index.store import OntologyStore
+from krw_ontology.agent_index.metric_dictionary import (
+    metric_dictionary_binding,
+    metric_dictionary_catalog,
+)
 from krw_ontology.cli.main import app
 from krw_ontology.pipeline.stages.build_indexes import build_indexes
 from krw_ontology.utils.io import atomic_write_json, write_jsonl
@@ -836,7 +840,8 @@ def test_index_cache_status_reports_referenced_v3_entries(tmp_path: Path):
 
     assert result.exit_code == 0, result.output
     assert "V3 index cache: ok" in result.output
-    assert "Entries: total=2 referenced=2 missing_referenced=0 unreferenced=0" in result.output
+    assert "Entries: total=3 referenced=3 missing_referenced=0 unreferenced=0" in result.output
+    assert "Artifact fragment cache: referenced=1" in result.output
     assert "Company cache: referenced=1" in result.output
     assert "Spine cache: referenced=1" in result.output
     assert "Tickers: VG" in result.output
@@ -859,12 +864,16 @@ def test_index_cache_gc_removes_unreferenced_v3_entries_only_with_yes(tmp_path: 
     assert build.exit_code == 0, build.output
     referenced_company = next((cache_root / "v3" / "company_shards").rglob("*.sqlite"))
     referenced_fragment = next((cache_root / "v3" / "spine_fragments").rglob("*.sqlite"))
+    referenced_artifact = next((cache_root / "fragments").rglob("*.sqlite"))
     stale_company = cache_root / "v3" / "company_shards" / "ff" / "stale-company.sqlite"
     stale_company.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(referenced_company, stale_company)
     stale_fragment = cache_root / "v3" / "spine_fragments" / "ee" / "stale-fragment.sqlite"
     stale_fragment.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(referenced_fragment, stale_fragment)
+    stale_artifact = cache_root / "fragments" / "dd" / "stale-artifact.sqlite"
+    stale_artifact.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(referenced_artifact, stale_artifact)
 
     dry_run = runner.invoke(
         app,
@@ -881,9 +890,10 @@ def test_index_cache_gc_removes_unreferenced_v3_entries_only_with_yes(tmp_path: 
 
     assert dry_run.exit_code == 0, dry_run.output
     assert "V3 index cache GC: dry-run" in dry_run.output
-    assert "Candidates: 2" in dry_run.output
+    assert "Candidates: 3" in dry_run.output
     assert stale_company.exists()
     assert stale_fragment.exists()
+    assert stale_artifact.exists()
     assert referenced_company.exists()
     assert referenced_fragment.exists()
 
@@ -903,9 +913,11 @@ def test_index_cache_gc_removes_unreferenced_v3_entries_only_with_yes(tmp_path: 
 
     assert deleted.exit_code == 0, deleted.output
     assert "V3 index cache GC: deleted" in deleted.output
-    assert "Deleted: 2" in deleted.output
+    assert "Deleted: 3" in deleted.output
     assert not stale_company.exists()
     assert not stale_fragment.exists()
+    assert not stale_artifact.exists()
+    assert referenced_artifact.exists()
     assert referenced_company.exists()
     assert referenced_fragment.exists()
 
@@ -1451,6 +1463,582 @@ def test_agent_retriever_plans_and_retrieves_latest_10q(tmp_path: Path):
     assert {bundle["period"] for bundle in bundles} == {"FY2025Q3"}
     assert any(bundle["evidence"]["quotes"] for bundle in bundles)
     assert result["audit"]["executed_queries"][0]["topic"] == "margin pressure"
+
+
+def test_planned_compact_query_executes_agent_terms_without_domain_expansion(
+    tmp_path: Path,
+):
+    _write_document_fixture(
+        tmp_path,
+        ticker="VG",
+        document_type="10-Q",
+        doc_type_key="10Q",
+        period="FY2025Q3",
+        section_quality={"status": "pass", "missing_core_sections": [], "fail_reasons": []},
+        topic_text=(
+            "Cloud infrastructure requires capital spending for new capacity. "
+            "클라우드 인프라 투자가 신규 용량을 확대합니다."
+        ),
+        metric_name="capex",
+        metric_value=125.0,
+    )
+    index = build_agent_index(tmp_path)
+
+    with OntologyStore(index["index_path"]) as store:
+        strict, strict_diagnostics = store.query_planned_compact_with_diagnostics(
+            retrieval_query="cloud capital",
+            retrieval_terms=["cloud infrastructure", "capital spending"],
+            tickers=["VG"],
+            object_types=["ResearchClaim"],
+            limit=5,
+        )
+        relaxed, relaxed_diagnostics = store.query_planned_compact_with_diagnostics(
+            retrieval_query="cloud absenttoken",
+            tickers=["VG"],
+            object_types=["ResearchClaim"],
+            allow_relaxed=True,
+            limit=5,
+        )
+        verbose, verbose_diagnostics = store.query_planned_compact_with_diagnostics(
+            retrieval_query=(
+                "Could you please explain whether cloud infrastructure capital spending "
+                "supports new capacity?"
+            ),
+            retrieval_terms=["cloud infrastructure", "capital spending"],
+            tickers=["VG"],
+            object_types=["ResearchClaim"],
+            limit=5,
+        )
+        korean, korean_diagnostics = store.query_planned_compact_with_diagnostics(
+            retrieval_query="클라우드 인프라 투자가 용량을 늘리는지 확인",
+            retrieval_terms=["클라우드", "인프라"],
+            tickers=["VG"],
+            object_types=["ResearchClaim"],
+            limit=5,
+        )
+        metric_rows, metric_diagnostics = store.query_planned_compact_with_diagnostics(
+            retrieval_query="VG capex trend",
+            retrieval_terms=["capex"],
+            metrics=["capex"],
+            tickers=["VG"],
+            object_types=["ResearchClaim"],
+            limit=5,
+        )
+
+    assert strict
+    assert {row["planned_match_mode"] for row in strict} == {"strict"}
+    assert {tuple(row["planned_evidence_terms"]) for row in strict} == {
+        ("cloud", "infrastructure", "capital", "spending")
+    }
+    assert strict_diagnostics["lexical_terms"] == [
+        "cloud",
+        "infrastructure",
+        "capital",
+        "spending",
+    ]
+    assert strict_diagnostics["keyword_expansion_used"] is False
+    assert strict_diagnostics["intent_reclassification_used"] is False
+    assert relaxed
+    assert {row["planned_match_mode"] for row in relaxed} == {"relaxed"}
+    assert relaxed_diagnostics["strict_result_count"] == 0
+    assert relaxed_diagnostics["relaxed_result_count"] > 0
+    assert verbose
+    assert verbose_diagnostics["lexical_terms"] == [
+        "cloud",
+        "infrastructure",
+        "capital",
+        "spending",
+    ]
+    assert korean
+    assert korean_diagnostics["lexical_terms"] == ["클라우드", "인프라"]
+    assert any(row["type"] == "MetricObservation" for row in metric_rows)
+    assert metric_diagnostics["metric_lookup_used"] is True
+    assert metric_diagnostics["metric_result_count"] > 0
+
+
+def test_planned_metric_lookup_balances_multiple_metrics_and_periods(tmp_path: Path):
+    fixtures = (
+        ("10-K", "10K", "FY2024", "revenue", 100.0),
+        ("10-K", "10K", "FY2025", "revenue", 125.0),
+        ("10-Q", "10Q", "FY2024Q4", "capex", 40.0),
+        ("10-Q", "10Q", "FY2025Q4", "capex", 50.0),
+    )
+    for document_type, doc_type_key, period, metric, value in fixtures:
+        _write_document_fixture(
+            tmp_path,
+            ticker="VG",
+            document_type=document_type,
+            doc_type_key=doc_type_key,
+            period=period,
+            section_quality={
+                "status": "pass",
+                "missing_core_sections": [],
+                "fail_reasons": [],
+            },
+            topic_text=f"VG reported {metric} for {period}.",
+            metric_name=metric,
+            metric_value=value,
+        )
+    index = build_agent_index(tmp_path)
+
+    with OntologyStore(index["index_path"]) as store:
+        rows, diagnostics = store.query_planned_compact_with_diagnostics(
+            retrieval_query="VG revenue capex trend",
+            retrieval_terms=["revenue", "capex"],
+            metrics=["revenue", "capex"],
+            metric_scope="any",
+            tickers=["VG"],
+            limit=8,
+        )
+
+    metric_rows = [row for row in rows if row["type"] == "MetricObservation"]
+    by_metric: dict[str, list[str]] = {}
+    for row in metric_rows:
+        metric = row["object"]["metric_name"]
+        by_metric.setdefault(metric, []).append(row["period"])
+    assert set(by_metric) == {"revenue", "capex"}
+    assert all(len(periods) >= 2 for periods in by_metric.values())
+    assert diagnostics["metric_result_count"] == 4
+
+
+def test_metric_lookup_separates_filing_and_observation_periods_and_preserves_pair(
+    tmp_path: Path,
+) -> None:
+    _write_document_fixture(
+        tmp_path,
+        ticker="MSFT",
+        document_type="10-K",
+        doc_type_key="10K",
+        period="CY2025",
+        section_quality={
+            "status": "pass",
+            "missing_core_sections": [],
+            "fail_reasons": [],
+        },
+        topic_text="MSFT reported annual revenue.",
+        metric_name="revenue",
+        metric_value=281_724.0,
+    )
+    ontology_dir = tmp_path / "companies" / "MSFT" / "ontology" / "10K" / "CY2025"
+    sources_dir = tmp_path / "companies" / "MSFT" / "sources" / "10K" / "CY2025"
+    metrics = [
+        {
+            "id": f"metric_observation:MSFT:CY2025:10K:revenue:{year}",
+            "type": "MetricObservation",
+            "ticker": "MSFT",
+            "source_document_id": "source:MSFT:CY2025:10K",
+            "document_type": "10-K",
+            "period": "CY2025",
+            "metric_name": "revenue",
+            "value": value,
+            "unit": "USD",
+            "fiscal_year": year,
+            "fiscal_period": "CY2025",
+            "period_type": "annual",
+            "period_start": f"{year - 1}-07-01",
+            "period_end": f"{year}-06-30",
+            "source_type": "reported",
+            "schema_version": "0.1.0",
+        }
+        for year, value in ((2023, 211_915.0), (2024, 245_122.0), (2025, 281_724.0))
+    ]
+    write_jsonl(ontology_dir / "metric_observations.jsonl", metrics)
+    build_indexes(
+        ticker="MSFT",
+        period="CY2025",
+        doc_type_key="10K",
+        ontology_dir=ontology_dir,
+        sources_dir=sources_dir,
+        output_dir=tmp_path,
+        document_type="10-K",
+    )
+    index = build_agent_index(tmp_path)
+
+    with sqlite3.connect(index["index_path"]) as conn:
+        period_rows = conn.execute(
+            """
+            SELECT filing_period, observation_period, period, fiscal_year,
+                   observation_period_type, observation_start_date,
+                   observation_end_date, observation_context_key
+            FROM metric_lookup
+            WHERE canonical_metric = 'revenue'
+            ORDER BY fiscal_year
+            """
+        ).fetchall()
+    assert [row[0] for row in period_rows] == ["CY2025", "CY2025", "CY2025"]
+    assert [row[1] for row in period_rows] == ["FY2023", "FY2024", "FY2025"]
+    assert [row[2] for row in period_rows] == ["CY2025", "CY2025", "CY2025"]
+    assert all(row[4] == "annual" and row[7] for row in period_rows)
+
+    with OntologyStore(index["index_path"]) as store:
+        rows, _diagnostics = store.query_planned_compact_with_diagnostics(
+            retrieval_query="MSFT annual revenue growth",
+            retrieval_terms=["revenue"],
+            metrics=["revenue"],
+            metric_scope="company_total",
+            calculation_window="period_over_period",
+            comparison_axes=["growth_rate"],
+            tickers=["MSFT"],
+            document_types=["10-K"],
+            limit=2,
+        )
+    assert [row["type"] for row in rows] == ["MetricObservation", "MetricObservation"]
+    assert {row["period"] for row in rows} == {"FY2024", "FY2025"}
+    assert {row["filing_period"] for row in rows} == {"CY2025"}
+    assert all(row["object"]["observation_context_key"] for row in rows)
+
+    with sqlite3.connect(index["index_path"]) as conn:
+        conn.execute(
+            """
+            UPDATE metric_lookup
+            SET observation_context_key = ''
+            WHERE object_id = ?
+            """,
+            (metrics[0]["id"],),
+        )
+    invalid = agent_index_builder.verify_agent_index(index["index_path"])
+    assert invalid["ok"] is False
+    assert any(
+        error.startswith("metric_lookup_observation_context_invalid:")
+        for error in invalid["errors"]
+    )
+
+
+def test_planned_metric_temporal_selection_preserves_series_fairness_and_conflicts(
+    tmp_path: Path,
+) -> None:
+    _write_document_fixture(
+        tmp_path,
+        ticker="VG",
+        document_type="10-K",
+        doc_type_key="10K",
+        period="FY2025",
+        section_quality={
+            "status": "pass",
+            "missing_core_sections": [],
+            "fail_reasons": [],
+        },
+        topic_text="VG reported regional revenue.",
+        metric_name="revenue",
+        metric_value=300.0,
+    )
+    ontology_dir = tmp_path / "companies" / "VG" / "ontology" / "10K" / "FY2025"
+    sources_dir = tmp_path / "companies" / "VG" / "sources" / "10K" / "FY2025"
+
+    def metric(
+        region: str,
+        year: int,
+        value: float,
+        suffix: str,
+    ) -> dict[str, object]:
+        return {
+            "id": f"metric_observation:VG:FY2025:10K:{region}:{year}:{suffix}",
+            "type": "MetricObservation",
+            "ticker": "VG",
+            "source_document_id": "source:VG:FY2025:10K",
+            "document_type": "10-K",
+            "period": "FY2025",
+            "metric_name": "revenue",
+            "value": value,
+            "unit": "USD",
+            "fiscal_year": year,
+            "period_type": "annual",
+            "period_start": f"{year}-01-01",
+            "period_end": f"{year}-12-31",
+            "dimensions": {"region": region},
+            "source_type": "reported",
+            "schema_version": "0.1.0",
+        }
+
+    write_jsonl(
+        ontology_dir / "metric_observations.jsonl",
+        [
+            metric("Europe", 2024, 100.0, "a"),
+            metric("Europe", 2025, 125.0, "a"),
+            metric("Asia", 2024, 200.0, "a"),
+            metric("Asia", 2025, 220.0, "a"),
+            metric("Asia", 2025, 221.0, "b"),
+        ],
+    )
+    build_indexes(
+        ticker="VG",
+        period="FY2025",
+        doc_type_key="10K",
+        ontology_dir=ontology_dir,
+        sources_dir=sources_dir,
+        output_dir=tmp_path,
+        document_type="10-K",
+    )
+    index = build_agent_index(tmp_path)
+
+    with OntologyStore(index["index_path"]) as store:
+        rows, _diagnostics = store.query_planned_compact_with_diagnostics(
+            retrieval_query="VG regional revenue growth",
+            retrieval_terms=["revenue"],
+            metrics=["revenue"],
+            metric_scope="dimensioned",
+            calculation_window="period_over_period",
+            comparison_axes=["growth_rate"],
+            tickers=["VG"],
+            limit=4,
+        )
+    metric_rows = [row for row in rows if row["type"] == "MetricObservation"]
+    assert len(metric_rows) == 4
+    by_region: dict[str, list[dict[str, object]]] = {}
+    for row in metric_rows:
+        region = str(row["object"]["dimensions"]["region"])
+        by_region.setdefault(region, []).append(row)
+    assert {key: len(value) for key, value in by_region.items()} == {
+        "Asia": 2,
+        "Europe": 2,
+    }
+    assert {row["period"] for row in by_region["Europe"]} == {"CY2024", "CY2025"}
+    assert {row["object"]["value"] for row in by_region["Asia"]} == {220.0, 221.0}
+    assert all(row["object"]["metric_conflict"] is True for row in by_region["Asia"])
+
+
+def test_metric_observation_context_distinguishes_quarter_ytd_and_long_duration() -> None:
+    quarter = agent_index_builder._metric_lookup_observation_context(
+        {
+            "fiscal_year": 2026,
+            "period_type": "quarter",
+            "period_start": "2026-01-01",
+            "period_end": "2026-03-31",
+        },
+        "CY2026Q1",
+    )
+    ytd = agent_index_builder._metric_lookup_observation_context(
+        {
+            "fiscal_year": 2026,
+            "period_type": "year_to_date",
+            "period_start": "2025-07-01",
+            "period_end": "2026-03-31",
+        },
+        "CY2026Q1",
+    )
+    long_duration = agent_index_builder._metric_lookup_observation_context(
+        {
+            "fiscal_year": 2024,
+            "period_start": "2023-01-01",
+            "period_end": "2024-12-31",
+        },
+        "FY2024",
+    )
+    annual_boundary_without_duration = (
+        agent_index_builder._metric_lookup_observation_context(
+            {
+                "fiscal_year": 2024,
+                "period_end": "2024-12-31",
+            },
+            "CY2025",
+        )
+    )
+
+    assert quarter["observation_period"] == ytd["observation_period"] == "CY2026Q1"
+    assert quarter["period_type"] == "quarter"
+    assert ytd["period_type"] == "year_to_date"
+    assert quarter["context_key"] != ytd["context_key"]
+    assert long_duration["period_type"] == "unknown"
+    assert annual_boundary_without_duration["period_type"] == "unknown"
+    assert annual_boundary_without_duration["fiscal_quarter"] is None
+    assert annual_boundary_without_duration["observation_period"] == "CY2024"
+
+
+def test_metric_dictionary_round_trips_every_canonical_alias_and_xbrl_tag() -> None:
+    catalog = metric_dictionary_catalog()
+
+    for canonical, entry in catalog.entries.items():
+        assert catalog.canonicalize(canonical) == canonical
+        for alias in entry.get("aliases") or []:
+            assert catalog.canonicalize(alias) == canonical
+        for tag in entry.get("xbrl_tags") or []:
+            assert catalog.canonicalize_xbrl_tag(tag) == canonical
+            assert catalog.canonicalize_xbrl_tag(tag.replace(":", "_")) == canonical
+            assert (
+                agent_index_builder._metric_lookup_xbrl_metric_name(
+                    {"taxonomy_tag": tag}
+                )
+                == canonical
+            )
+
+
+def test_metric_lookup_materializes_dictionary_canonical_and_aliases(tmp_path: Path) -> None:
+    _write_document_fixture(
+        tmp_path,
+        ticker="VG",
+        document_type="10-K",
+        doc_type_key="10K",
+        period="FY2025",
+        section_quality={
+            "status": "pass",
+            "missing_core_sections": [],
+            "fail_reasons": [],
+        },
+        topic_text="Capital expenditures increased for new capacity.",
+        metric_name="capex",
+        metric_value=125.0,
+    )
+    index = build_agent_index(tmp_path)
+
+    with sqlite3.connect(index["index_path"]) as conn:
+        canonical, alias_text = conn.execute(
+            """
+            SELECT canonical_metric, metric_alias_text
+            FROM metric_lookup
+            WHERE object_type = 'MetricObservation'
+            """
+        ).fetchone()
+        build_metadata = json.loads(
+            conn.execute(
+                "SELECT value FROM metadata WHERE key = 'build'"
+            ).fetchone()[0]
+        )
+    with OntologyStore(index["index_path"]) as store:
+        canonical_rows = store._query_metrics(
+            ["capital_expenditures"],
+            tickers=["VG"],
+            document_types=None,
+            periods=None,
+            metric_dimensions=None,
+            metric_scope="any",
+            limit_per_metric=5,
+        )
+        alias_rows = store._query_metrics(
+            ["capex"],
+            tickers=["VG"],
+            document_types=None,
+            periods=None,
+            metric_dimensions=None,
+            metric_scope="any",
+            limit_per_metric=5,
+        )
+
+    assert canonical == "capital_expenditures"
+    assert "capex" in alias_text.split()
+    assert build_metadata["metric_dictionary"] == metric_dictionary_binding()
+    assert {row["id"] for row in canonical_rows} == {row["id"] for row in alias_rows}
+
+
+def test_agent_index_verification_rejects_metric_dictionary_mismatch(
+    tmp_path: Path,
+) -> None:
+    _write_document_fixture(
+        tmp_path,
+        ticker="VG",
+        document_type="10-K",
+        doc_type_key="10K",
+        period="FY2025",
+        section_quality={
+            "status": "pass",
+            "missing_core_sections": [],
+            "fail_reasons": [],
+        },
+        topic_text="Revenue increased.",
+        metric_name="revenue",
+        metric_value=125.0,
+    )
+    index = build_agent_index(tmp_path)
+    with sqlite3.connect(index["index_path"]) as conn:
+        metadata = json.loads(
+            conn.execute(
+                "SELECT value FROM metadata WHERE key = 'build'"
+            ).fetchone()[0]
+        )
+        metadata["metric_dictionary"]["sha256"] = "0" * 64
+        conn.execute(
+            "UPDATE metadata SET value = ? WHERE key = 'build'",
+            (json.dumps(metadata, sort_keys=True),),
+        )
+
+    verification = agent_index_builder.verify_agent_index(index["index_path"])
+
+    assert verification["ok"] is False
+    assert "metric_dictionary_sha256_mismatch" in verification["errors"]
+
+
+def test_planned_metric_dimension_filter_uses_exact_member_key(tmp_path: Path) -> None:
+    index_path = tmp_path / "dimension-exact.sqlite"
+    with sqlite3.connect(index_path) as conn:
+        agent_index_builder._create_schema(conn)
+        for index, member in enumerate(
+            [*(f"Business {number}" for number in range(12)), "Russia", "US"]
+        ):
+            object_id = f"metric:VG:FY{2000 + index}:revenue"
+            period = f"FY{2000 + index}"
+            dimensions = {"GeographyAxis": member}
+            conn.execute(
+                """
+                INSERT INTO objects(
+                    id, type, ticker, document_type, doc_type_key, period,
+                    source_document_id, section_name, metric_name, review_status,
+                    confidence, text, json, artifact_key, artifact_path
+                ) VALUES(?, 'MetricObservation', 'VG', '10-K', '10K', ?,
+                         NULL, NULL, 'revenue', 'accepted', 'high', ?, ?,
+                         'metric_observations', 'metric_observations.jsonl')
+                """,
+                (
+                    object_id,
+                    period,
+                    f"{member} revenue",
+                    json.dumps(
+                        {
+                            "id": object_id,
+                            "type": "MetricObservation",
+                            "ticker": "VG",
+                            "period": period,
+                            "metric_name": "revenue",
+                            "dimensions": dimensions,
+                        }
+                    ),
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO metric_lookup(
+                    object_id, object_type, ticker, document_type, doc_type_key,
+                    period, filing_period, observation_period,
+                    observation_period_type, observation_context_key,
+                    metric_name, canonical_metric, metric_alias_text,
+                    dimensions_json, is_company_total, text
+                ) VALUES(?, 'MetricObservation', 'VG', '10-K', '10K', ?, ?, ?,
+                         'annual', ?, 'revenue', 'revenue', 'revenue', ?, 0, ?)
+                """,
+                (
+                    object_id,
+                    period,
+                    period,
+                    period,
+                    f"ctx-{period}",
+                    json.dumps(dimensions),
+                    f"{member} revenue",
+                ),
+            )
+            member_key = agent_index_builder._metric_dimension_key(member)
+            conn.execute(
+                """
+                INSERT INTO metric_dimension_lookup(
+                    object_id, ticker, period, filing_period, observation_period,
+                    canonical_metric, dimension_kind,
+                    dimension_key, dimension_label, axis_key, member_key,
+                    is_company_total
+                ) VALUES(?, 'VG', ?, ?, ?, 'revenue', 'geography', ?, ?,
+                         'geography', ?, 0)
+                """,
+                (object_id, period, period, period, member_key, member, member_key),
+            )
+
+    with OntologyStore(index_path) as store:
+        rows = store._query_metrics(
+            ["revenue"],
+            tickers=["VG"],
+            document_types=None,
+            periods=None,
+            metric_dimensions=["US"],
+            metric_scope="dimensioned",
+            limit_per_metric=1,
+        )
+
+    assert [row["text"] for row in rows] == ["US revenue"]
 
 
 def test_agent_retriever_key_risk_question_uses_latest_10k_and_broad_risk_topic(tmp_path: Path):

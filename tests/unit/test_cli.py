@@ -16,6 +16,7 @@ from typer.testing import CliRunner
 
 import krw_ontology.agent_index as agent_index
 import krw_ontology.agent_index.builder as agent_index_builder
+import krw_ontology.agent_index.spine_builder as spine_builder
 import krw_ontology.cli.main as cli_main
 import krw_ontology.release as release_helpers
 import krw_ontology.pipeline.orchestrator as orchestrator
@@ -23,6 +24,8 @@ import krw_ontology.pipeline.queue as pipeline_queue
 import krw_ontology.pipeline.research_plan as research_plan
 import krw_ontology.pipeline.stages.build_company_context as company_context_stage
 from krw_ontology.agent_index.builder import AGENT_INDEX_SCHEMA_VERSION
+from krw_ontology.agent_index.metric_dictionary import metric_dictionary_binding
+from krw_ontology.agent_index.router_sidecar import build_router_sidecar
 from krw_ontology.agent_index.spine_builder import _company_shard_quality_summary
 from krw_ontology.agent_index.spine_schema import initialize_global_spine_database
 from krw_ontology.cli.config import load_cli_config
@@ -46,6 +49,13 @@ def _write_minimal_agent_index(index_path: Path) -> None:
                     {
                         "schema_version": AGENT_INDEX_SCHEMA_VERSION,
                         "agent_index_schema_version": AGENT_INDEX_SCHEMA_VERSION,
+                        "source_artifact_sqlite_schema_version": (
+                            agent_index.SOURCE_ARTIFACT_SQLITE_SCHEMA_VERSION
+                        ),
+                        "source_artifact_sqlite_builder_version": (
+                            agent_index.SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION
+                        ),
+                        "metric_dictionary": metric_dictionary_binding(),
                     }
                 ),
             ),
@@ -109,12 +119,21 @@ def _write_minimal_v3_release(
     (root / "companies" / ticker).mkdir(parents=True, exist_ok=True)
     (root / "companies" / ticker / "artifact.txt").write_text(artifact_text, encoding="utf-8")
     shard_path = root / "indexes" / "companies" / f"{ticker}.sqlite"
+    global_spine_path = root / "indexes" / "global_spine.sqlite"
     _write_minimal_agent_index(shard_path)
     initialize_global_spine_database(
-        root / "indexes" / "global_spine.sqlite",
+        global_spine_path,
         metadata={
             "release_id": release_id,
             "source_manifest_hash": "test-source",
+            "spine_projection_version": spine_builder.SPINE_PROJECTION_VERSION,
+            "source_artifact_sqlite_schema_version": (
+                agent_index.SOURCE_ARTIFACT_SQLITE_SCHEMA_VERSION
+            ),
+            "source_artifact_sqlite_builder_version": (
+                agent_index.SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION
+            ),
+            "company_shard_schema_version": spine_builder.COMPANY_SHARD_SCHEMA_VERSION,
         },
         replace=True,
     )
@@ -138,18 +157,33 @@ def _write_minimal_v3_release(
                 "index_layout": "global-spine-and-company-shards",
                 "release_id": release_id,
                 "source_manifest_hash": "test-source",
+                "company_shard_schema_version": spine_builder.COMPANY_SHARD_SCHEMA_VERSION,
+                "source_artifact_sqlite_schema_version": (
+                    agent_index.SOURCE_ARTIFACT_SQLITE_SCHEMA_VERSION
+                ),
+                "source_artifact_sqlite_builder_version": (
+                    agent_index.SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION
+                ),
+                "metric_dictionary": metric_dictionary_binding(),
                 "ticker_count": 1,
                 "shards": {
                     ticker: {
                         "ticker": ticker,
                         "path": f"companies/{ticker}.sqlite",
-                        "schema_version": "krw-company-shard/v1",
+                        "schema_version": spine_builder.COMPANY_SHARD_SCHEMA_VERSION,
+                        "source_artifact_sqlite_schema_version": (
+                            agent_index.SOURCE_ARTIFACT_SQLITE_SCHEMA_VERSION
+                        ),
+                        "source_artifact_sqlite_builder_version": (
+                            agent_index.SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION
+                        ),
                         "document_count": 0,
                         "object_count": 0,
                         "edge_count": 0,
                         "quality_event_count": 0,
                         "quality_summary": _company_shard_quality_summary(shard_path),
                         "sha256": _sha256(shard_path),
+                        "metric_dictionary": metric_dictionary_binding(),
                     }
                 },
             },
@@ -158,6 +192,7 @@ def _write_minimal_v3_release(
         + "\n",
         encoding="utf-8",
     )
+    build_router_sidecar(global_spine_path, release_id=release_id)
     write_release_manifest_v3(root, release_id=release_id, env=env, source_root=root)
     return root
 
@@ -178,6 +213,14 @@ def _write_minimal_v3_index_outputs(
         metadata={
             "release_id": release_id,
             "source_manifest_hash": "test-source",
+            "spine_projection_version": spine_builder.SPINE_PROJECTION_VERSION,
+            "source_artifact_sqlite_schema_version": (
+                agent_index.SOURCE_ARTIFACT_SQLITE_SCHEMA_VERSION
+            ),
+            "source_artifact_sqlite_builder_version": (
+                agent_index.SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION
+            ),
+            "company_shard_schema_version": spine_builder.COMPANY_SHARD_SCHEMA_VERSION,
         },
         replace=True,
     )
@@ -187,17 +230,37 @@ def _write_minimal_v3_index_outputs(
         "index_layout": "global-spine-and-company-shards",
         "release_id": release_id,
         "source_manifest_hash": "test-source",
+        "company_shard_schema_version": spine_builder.COMPANY_SHARD_SCHEMA_VERSION,
+        "source_artifact_sqlite_schema_version": (
+            agent_index.SOURCE_ARTIFACT_SQLITE_SCHEMA_VERSION
+        ),
+        "source_artifact_sqlite_builder_version": (
+            agent_index.SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION
+        ),
+        "metric_dictionary": metric_dictionary_binding(),
         "ticker_count": 1,
         "shards": {
             ticker: {
                 "ticker": ticker,
                 "path": f"indexes/companies/{ticker}.sqlite",
+                "schema_version": spine_builder.COMPANY_SHARD_SCHEMA_VERSION,
+                "source_artifact_sqlite_schema_version": (
+                    agent_index.SOURCE_ARTIFACT_SQLITE_SCHEMA_VERSION
+                ),
+                "source_artifact_sqlite_builder_version": (
+                    agent_index.SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION
+                ),
                 "sha256": _sha256(shard_path),
                 "quality_summary": _company_shard_quality_summary(shard_path),
+                "metric_dictionary": metric_dictionary_binding(),
             }
         },
     }
     shard_manifest_path.write_text(json.dumps(shard_manifest, sort_keys=True), encoding="utf-8")
+    router_sidecar_result = build_router_sidecar(
+        global_spine_path,
+        release_id=release_id,
+    )
     build_summary = {
         "format": "krw-ontology-v3-build-summary/v1",
         "release_id": release_id,
@@ -221,6 +284,7 @@ def _write_minimal_v3_index_outputs(
         release_root=root,
         release_id=release_id,
         global_spine_path=global_spine_path,
+        router_sidecar_path=router_sidecar_result.path,
         shard_manifest_path=shard_manifest_path,
         build_summary_path=build_summary_path,
         build_summary=build_summary,
@@ -684,17 +748,13 @@ class TestUpdateTickerCommand:
                 "counts": {"company_business_profiles": 1},
             }
 
-        def fake_build_agent_index(root, *, index_path=None, force=True, source_manifest_path=None):
-            events.append(("index", root, index_path, force))
-            _write_minimal_agent_index(index_path or root / "indexes" / "agent_index.sqlite")
-            return {
-                "index_path": index_path or root / "indexes" / "agent_index.sqlite",
-                "totals": {"documents": 1, "objects": 2, "edges": 0, "quality_events": 0},
-            }
+        def fake_build_spine(root, *, release_id, **kwargs):
+            events.append(("index", root, release_id, kwargs))
+            return _write_minimal_v3_index_outputs(root, release_id=release_id, ticker="CVX")
 
         monkeypatch.setattr(orchestrator, "run_pipeline", fake_run_pipeline)
         monkeypatch.setattr(company_context_stage, "build_company_context", fake_build_company_context)
-        monkeypatch.setattr(agent_index_builder, "build_agent_index", fake_build_agent_index)
+        monkeypatch.setattr(agent_index, "build_spine_shard_release_outputs", fake_build_spine)
 
         result = runner.invoke(
             app,
@@ -1258,6 +1318,85 @@ class TestProdCommand:
         assert os.readlink(remote_root / "current") == "releases/old-release"
         assert not (remote_root / "releases" / release_id).exists()
         assert (remote_root / "failed" / release_id / "indexes" / "shard_manifest.json").exists()
+
+    @pytest.mark.parametrize(
+        ("stale_binding", "expected_error"),
+        [
+            (
+                "global_schema",
+                "remote manifest global_spine binding mismatch: schema_version",
+            ),
+            (
+                "projection",
+                "remote manifest builder binding mismatch: spine_projection_version",
+            ),
+            (
+                "source_builder",
+                "remote global_spine metadata binding mismatch: "
+                "source_artifact_sqlite_builder_version",
+            ),
+        ],
+    )
+    def test_prod_activation_rejects_stale_serving_bindings_before_current_switch(
+        self,
+        tmp_path: Path,
+        stale_binding: str,
+        expected_error: str,
+    ):
+        remote_root = tmp_path / "remote"
+        release_id = f"stale-{stale_binding}"
+        incoming = remote_root / "incoming"
+        old_release = remote_root / "releases" / "old-release"
+        incoming.mkdir(parents=True)
+        old_release.mkdir(parents=True)
+        (remote_root / "current").symlink_to("releases/old-release")
+
+        stable = tmp_path / "stable"
+        _write_minimal_v3_release(stable, release_id="stable-dev", env="dev", ticker="AAPL")
+        bundle_source = tmp_path / "bundle-source"
+        cli_main._materialize_verified_prod_release(stable, bundle_source, release_id)
+        manifest_path = bundle_source / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if stale_binding == "global_schema":
+            manifest["indexes"]["global_spine"]["schema_version"] = (
+                "krw-ontology-global-spine/v1"
+            )
+        elif stale_binding == "projection":
+            manifest["builder"]["spine_projection_version"] = "spine-projection/v1"
+        else:
+            global_spine_path = bundle_source / "indexes" / "global_spine.sqlite"
+            with sqlite3.connect(global_spine_path) as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO metadata(key, value_json) VALUES(?, ?)",
+                    (
+                        "source_artifact_sqlite_builder_version",
+                        json.dumps("source-artifact-sqlite-builder/v1"),
+                    ),
+                )
+            manifest["indexes"]["global_spine"]["sha256"] = _sha256(global_spine_path)
+        manifest_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+        with tarfile.open(incoming / f"{release_id}.tar.gz", "w:gz") as archive:
+            for child in sorted(bundle_source.iterdir()):
+                archive.add(child, arcname=child.name, recursive=True)
+
+        completed = cli_main.subprocess.run(
+            ["sh"],
+            input=cli_main._prod_activation_script(
+                remote_root=str(remote_root),
+                release_id=release_id,
+                reload_command=None,
+                health_url=None,
+                keep_releases=5,
+            ),
+            text=True,
+            capture_output=True,
+        )
+
+        assert completed.returncode != 0
+        assert expected_error in completed.stderr
+        assert os.readlink(remote_root / "current") == "releases/old-release"
+        assert not (remote_root / "releases" / release_id).exists()
+        assert (remote_root / "failed" / release_id / "manifest.json").exists()
 
     def test_prod_publish_uploads_bundle_and_activates_release(
         self,
@@ -1961,6 +2100,7 @@ class TestReleaseCommand:
             "spine_fragment:VG",
             "global_spine_merge",
             "cross_company_links",
+            "router_sidecar",
             "shard_manifest",
             "chart_series",
             "release_manifest",
@@ -2372,6 +2512,33 @@ class TestReleaseCommand:
             release_helpers.promote_local_release(releases_root, env="prod", release_id=target.name)
 
         assert os.readlink(current) == old.name
+
+    def test_release_promote_rejects_tampered_shard_and_preserves_current(
+        self,
+        tmp_path: Path,
+    ):
+        releases_root = tmp_path / "releases"
+        env_root = releases_root / "prod"
+        old = env_root / "old-release"
+        target = env_root / "new-release"
+        _write_minimal_v3_release(old, release_id=old.name, env="prod")
+        _write_minimal_v3_release(target, release_id=target.name, env="prod")
+        current = env_root / "current"
+        current.symlink_to(old.name)
+
+        shard_path = target / "indexes" / "companies" / "AAPL.sqlite"
+        with shard_path.open("ab") as handle:
+            handle.write(b"tampered-after-manifest")
+
+        with pytest.raises(ValueError, match="sha256_mismatch"):
+            release_helpers.promote_local_release(
+                releases_root,
+                env="prod",
+                release_id=target.name,
+            )
+
+        assert os.readlink(current) == old.name
+        assert not (env_root / "release_events.jsonl").exists()
 
     def test_release_promote_event_log_append_failure_is_reported_after_switch(
         self,
@@ -3090,6 +3257,50 @@ class TestReleaseCommand:
         assert "krw-ontology release promote 20260528_090000" in result.output
         assert "Prod release promoted:" not in result.output
 
+    def test_release_materialize_prod_rebinds_sidecar_for_new_target_id(
+        self,
+        tmp_path: Path,
+    ):
+        releases_root = tmp_path / "releases"
+        source_id = "20260528_091000"
+        target_id = "20260528_091000-prod"
+        source = releases_root / "dev" / source_id
+        _write_minimal_v3_release(source, release_id=source_id, env="dev", ticker="VG")
+
+        result = runner.invoke(
+            app,
+            [
+                "release",
+                "materialize-prod",
+                source_id,
+                "--releases-root",
+                str(releases_root),
+                "--prod-release-id",
+                target_id,
+                "--no-promote",
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        prod = releases_root / "prod" / target_id
+        with sqlite3.connect(prod / "indexes" / "router_sidecar.sqlite") as conn:
+            sidecar_release_id = json.loads(
+                conn.execute(
+                    "SELECT value_json FROM metadata WHERE key = 'release_id'"
+                ).fetchone()[0]
+            )
+        with sqlite3.connect(source / "indexes" / "router_sidecar.sqlite") as conn:
+            source_sidecar_release_id = json.loads(
+                conn.execute(
+                    "SELECT value_json FROM metadata WHERE key = 'release_id'"
+                ).fetchone()[0]
+            )
+        manifest = json.loads((prod / "manifest.json").read_text(encoding="utf-8"))
+        assert sidecar_release_id == target_id
+        assert source_sidecar_release_id == source_id
+        assert manifest["release_id"] == target_id
+        assert manifest["indexes"]["router_sidecar"]["verification_ok"] is True
+
     def test_release_materialize_prod_current_uses_source_current(self, tmp_path: Path):
         releases_root = tmp_path / "releases"
         source = releases_root / "dev" / "20260528_100000"
@@ -3345,7 +3556,7 @@ class TestQueueCommands:
         assert result.exit_code == 1
         assert "Use either --latest or --period" in result.output
 
-    def test_queue_run_processes_job_and_publishes_once(
+    def test_queue_run_processes_job_and_defers_release_publish(
         self,
         tmp_path: Path,
         monkeypatch,
@@ -3386,18 +3597,9 @@ class TestQueueCommands:
                 "counts": {"company_business_profiles": 1},
             }
 
-        def fake_build_agent_index(root, *, index_path=None, force=True, source_manifest_path=None):
-            events.append(("index", root, index_path, force))
-            _write_minimal_agent_index(index_path or root / "indexes" / "agent_index.sqlite")
-            return {
-                "index_path": index_path or root / "indexes" / "agent_index.sqlite",
-                "totals": {"documents": 1, "objects": 2, "edges": 0, "quality_events": 0},
-            }
-
         monkeypatch.setattr(research_plan, "discover_research_filing_targets", fake_discover)
         monkeypatch.setattr(orchestrator, "run_pipeline", fake_run_pipeline)
         monkeypatch.setattr(company_context_stage, "build_company_context", fake_build_company_context)
-        monkeypatch.setattr(agent_index_builder, "build_agent_index", fake_build_agent_index)
 
         result = runner.invoke(
             app,
@@ -3406,19 +3608,16 @@ class TestQueueCommands:
 
         assert result.exit_code == 0
         assert store.load_job(job.job_id).status == pipeline_queue.SUCCEEDED
-        current = stable.resolve() / "dev" / "current"
-        release_root = current.resolve()
-        assert (release_root / "companies" / "CVX" / "artifact.txt").read_text() == "FY2025"
-        assert events[:3] == [
+        assert (tmp_path / "companies" / "CVX" / "artifact.txt").read_text() == "FY2025"
+        assert events == [
             ("plan", "CVX", 1),
             ("pipeline", "CVX", "FY2025"),
             ("context", "CVX"),
         ]
-        assert (release_root / "indexes" / "global_spine.sqlite").exists()
-        assert (release_root / "indexes" / "companies" / "CVX.sqlite").exists()
-        assert not (release_root / "indexes" / "agent_index.sqlite").exists()
+        assert not (stable.resolve() / "dev" / "current").exists()
         assert "SUCCEEDED" in result.output
-        assert "Queue release promoted" in result.output
+        assert "Skipping automatic queue release publish" in result.output
+        assert "release publish-dev" in result.output
 
     def test_queue_run_refreshes_v3_index_when_explicit(
         self,
@@ -3529,7 +3728,7 @@ class TestQueueCommands:
         assert index_calls == []
         assert "FAILED" in result.output
 
-    def test_queue_run_publish_prod_after_stable_publish(
+    def test_queue_run_publish_prod_defers_until_manual_release_publish(
         self,
         tmp_path: Path,
         monkeypatch,
@@ -3567,13 +3766,6 @@ class TestQueueCommands:
                 "counts": {"company_business_profiles": 1},
             }
 
-        def fake_build_agent_index(root, *, index_path=None, force=True, source_manifest_path=None):
-            _write_minimal_agent_index(index_path or root / "indexes" / "agent_index.sqlite")
-            return {
-                "index_path": index_path or root / "indexes" / "agent_index.sqlite",
-                "totals": {"documents": 1, "objects": 2, "edges": 0, "quality_events": 0},
-            }
-
         def fake_publish_prod_root(*, stable_root, **kwargs):
             prod_calls.append(stable_root)
             return {
@@ -3585,7 +3777,6 @@ class TestQueueCommands:
         monkeypatch.setattr(research_plan, "discover_research_filing_targets", fake_discover)
         monkeypatch.setattr(orchestrator, "run_pipeline", fake_run_pipeline)
         monkeypatch.setattr(company_context_stage, "build_company_context", fake_build_company_context)
-        monkeypatch.setattr(agent_index_builder, "build_agent_index", fake_build_agent_index)
         monkeypatch.setattr(cli_main, "_publish_prod_root", fake_publish_prod_root)
 
         result = runner.invoke(
@@ -3595,8 +3786,10 @@ class TestQueueCommands:
 
         assert result.exit_code == 0
         assert store.load_job(job.job_id).status == pipeline_queue.SUCCEEDED
-        assert prod_calls == [(stable.resolve() / "dev" / "current").resolve()]
-        assert "Prod release activated: release=release-1" in result.output
+        assert prod_calls == []
+        assert not (stable.resolve() / "dev" / "current").exists()
+        assert "Skipping automatic queue release publish" in result.output
+        assert "release publish-dev" in result.output
 
     def test_queue_run_publish_prod_requires_publish_root(
         self,
@@ -3628,7 +3821,7 @@ class TestQueueCommands:
         assert "--publish-prod requires jobs with a release publish root" in failed_job.error
         assert pipeline_calls == []
 
-    def test_queue_run_processes_filing_update_job_and_publishes_once(
+    def test_queue_run_processes_filing_update_and_defers_release_publish(
         self,
         tmp_path: Path,
         monkeypatch,
@@ -3670,18 +3863,9 @@ class TestQueueCommands:
                 "counts": {"company_business_profiles": 1},
             }
 
-        def fake_build_agent_index(root, *, index_path=None, force=True, source_manifest_path=None):
-            events.append(("index", root, index_path, force))
-            _write_minimal_agent_index(index_path or root / "indexes" / "agent_index.sqlite")
-            return {
-                "index_path": index_path or root / "indexes" / "agent_index.sqlite",
-                "totals": {"documents": 1, "objects": 2, "edges": 0, "quality_events": 0},
-            }
-
         monkeypatch.setattr(research_plan, "discover_research_filing_targets", fake_discover)
         monkeypatch.setattr(orchestrator, "run_pipeline", fake_run_pipeline)
         monkeypatch.setattr(company_context_stage, "build_company_context", fake_build_company_context)
-        monkeypatch.setattr(agent_index_builder, "build_agent_index", fake_build_agent_index)
 
         result = runner.invoke(
             app,
@@ -3690,19 +3874,16 @@ class TestQueueCommands:
 
         assert result.exit_code == 0
         assert store.load_job(job.job_id).status == pipeline_queue.SUCCEEDED
-        current = stable.resolve() / "dev" / "current"
-        release_root = current.resolve()
-        assert (release_root / "companies" / "VG" / "artifact.txt").read_text() == "FY2026Q1"
-        assert events[:2] == [
+        assert (tmp_path / "companies" / "VG" / "artifact.txt").read_text() == "FY2026Q1"
+        assert events == [
             ("pipeline", "VG", "10-Q", "FY2026Q1", False, True),
             ("context", "VG"),
         ]
-        assert (release_root / "indexes" / "global_spine.sqlite").exists()
-        assert (release_root / "indexes" / "companies" / "VG.sqlite").exists()
-        assert not (release_root / "indexes" / "agent_index.sqlite").exists()
+        assert not (stable.resolve() / "dev" / "current").exists()
         assert "START update VG 10-Q FY2026Q1" in result.output
         assert "SUCCEEDED" in result.output
-        assert "Queue release promoted" in result.output
+        assert "Skipping automatic queue release publish" in result.output
+        assert "release publish-dev" in result.output
 
     def test_queue_start_launches_detached_worker(self, tmp_path: Path, monkeypatch):
         calls = []
@@ -4350,6 +4531,7 @@ def test_release_finalize_dev_refuses_to_mutate_current_when_publish_root_unset(
     release_root = releases_root / "dev" / release_id
     (release_root / "companies" / "CVX" / "ontology").mkdir(parents=True)
     (release_root / "companies" / "CVX" / "ontology" / "artifact.jsonl").write_text("{}\n")
+    _write_minimal_v3_index_outputs(release_root, release_id=release_id, ticker="CVX")
     write_release_manifest_v3(release_root, release_id=release_id, env="dev")
     (releases_root / "dev" / "current").symlink_to(release_id)
     calls = []
@@ -4386,6 +4568,7 @@ def test_release_finalize_dev_refuses_empty_release_root_before_index_build(tmp_
     release_id = "20260528_100000"
     release_root = releases_root / "dev" / release_id
     release_root.mkdir(parents=True)
+    _write_minimal_v3_index_outputs(release_root, release_id=release_id, ticker="EMPTY")
     write_release_manifest_v3(release_root, release_id=release_id, env="dev")
     calls = []
 

@@ -1,51 +1,68 @@
 # MCP Tool Policy
 
-Use KRW ontology MCP tools as read-only evidence tools. Do not use raw JSONL or memory when indexed ontology evidence can answer or constrain the answer.
+Use KRW ontology MCP tools as read-only evidence tools. Do not use raw JSONL or
+memory when indexed ontology evidence can answer or constrain the answer.
 
 ## Tool roles
 
 ```text
 krw_ontology_query_context
-Default first call for natural-language research. Returns research state, packs, answerability, and allowed next tools.
+  Default first ontology call. Accepts only {search_plan}; returns ResearchState v2.
+
+krw_ontology_plan_query
+  Optional SearchPlan validation/debug. Performs no retrieval and is not a
+  required normal preflight.
 
 krw_ontology_query
-Targeted structured follow-up for a specific metric, fact, object type, ticker, period, or explicit missing part.
+  Targeted structured follow-up for a specific missing clause, metric, object
+  type, ticker, period, or dimension.
 
 krw_ontology_compare
-Explicit comparison only when query_context does not provide enough comparison state or the user asks for a comparison table.
+  Explicit comparison follow-up when the first ResearchState lacks a required
+  aligned comparison.
 
 krw_ontology_trace
-Evidence lineage for one selected object.
+  Evidence lineage for one selected evidence object.
 
 krw_ontology_chain
-Business/semantic/temporal mechanism around one selected object.
+  Business, semantic, or temporal mechanism around one selected object.
 
 krw_ontology_retrieve
-Legacy fallback only. Do not use after sufficient query_context.
+  Rare bounded evidence expansion for a specific gap. It is not a substitute
+  for an explicit SearchPlan and is not the default after query_context.
 
 krw_ontology_company_context
-Company orientation only when query_context lacks company-specific vocabulary or the user asks broad company profile context.
+  Company orientation when planning needs company-specific vocabulary.
 
-krw_ontology_index_context
-Debug/capability/coverage only. Not for normal research.
-
-krw_ontology_catalog
-Inventory/coverage only.
-
-krw_ontology_quality
-Audit/validation/coverage only.
+krw_ontology_index_context / krw_ontology_catalog / krw_ontology_quality
+  Debug, audit, capability, or coverage work only; not normal research.
 ```
 
 ## Normal workflow
 
 ```text
-query_context -> optional targeted query/compare -> selected trace/chain -> answer
+DeepSeek-authored SearchPlan
+-> query_context({search_plan})
+-> inspect ResearchState v2
+-> targeted actions for missing_parts/recommended_actions when material
+-> selected trace/chain when a load-bearing claim needs it
+-> answer
 ```
 
-Do not issue repeated equivalent queries. Do not use `full` response detail for broad first-pass exploration.
+Write the complete plan before the first ontology call. For tickerless
+discovery, use `universe="covered"`; for explicit companies, use `tickers`.
+Never combine both.
 
-Never request `response_detail="full"` in normal web chat. Use compact or ticker-summary query output, then selected trace/chain when stronger verification is needed.
+Do not issue equivalent plans with cosmetic wording changes. Do not impose
+fixed top-5, limit-3, one-follow-up, or hard tool-call caps. Choose adaptive
+`limit_results` and `limit_tickers` large enough for the required clauses,
+tickers, metric periods/pairs, and conflict detection; reduce them only after
+logs and quality evaluation justify it.
 
 ## Strong claim rule
 
-Strong final claims require traceable direct evidence or metric lineage. Projection or topic candidates are routes, not final proof.
+A strong qualitative claim requires
+`answerability.strong_claim_allowed=true` and sufficient coverage/directness
+for every load-bearing required clause. A strong numeric or comparison claim
+also requires covered `calculation_coverage` and aligned `computed_values`.
+Projection, topic routing, and related context are candidate paths, not proof.

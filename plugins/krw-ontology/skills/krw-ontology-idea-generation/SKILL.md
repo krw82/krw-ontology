@@ -52,7 +52,7 @@ These shared rules govern:
 
 ```text
 internal English investment briefs
-query_context-first research
+model-authored SearchPlan v2 before query_context
 v3 global-spine candidate routing
 MCP `filing_document_roles` for candidate validation current_driver / annual_baseline
 latest 10-Q as current driver
@@ -194,7 +194,7 @@ Use a three-phase workflow:
    Translate the user's broad question into qualification, evidence, financial path, rejection, and why-now criteria.
 
 2. Candidate discovery:
-   Use v3 global-spine routing or the user's ticker list to find at most 5 covered candidates.
+   Use a model-authored SearchPlan v2 with universe="covered" or the user's ticker list to find enough covered candidates for the requested screen.
    Do not finalize ranking in this phase.
 
 3. Candidate validation:
@@ -206,24 +206,27 @@ Use a three-phase workflow:
 Only use this path when the user has provided a concrete theme, driver,
 financial condition, risk condition, company type, event type, or exclusion.
 
-Start with one bounded v3 global-spine discovery call:
+Start with one complete model-authored v3 global-spine discovery plan:
 
 ```text
-query_context(
-  question=internal idea-screen brief,
-  tickers=[],
-  limit_tickers<=5,
-  limit_results<=3
-)
+search_plan={
+  question: original user screen,
+  intent: idea_screen,
+  universe: "covered",
+  clauses: atomic qualification, direct-exposure, financial-path, rejection, and why-now propositions,
+  limit_tickers: sized to the requested candidate breadth,
+  limit_results: sized to cover every required clause across the candidate pool
+}
+query_context(search_plan=search_plan)
 ```
 
-Treat returned ticker candidates as routes to verify, not as final ranked ideas.
+Treat `resolved_scope.resolved_tickers` as routes to verify, not as final ranked ideas. Use `clause_coverage` and `evidence_units` to determine which candidates actually satisfy the screen.
 
 Do not:
 
 ```text
 run whole-catalog scans
-rank more than 5 companies in a normal answer
+rank more companies than the available evidence can compare consistently
 repeat the same broad query_context with slightly different wording
 advance a candidate from keyword relevance alone
 ```
@@ -241,35 +244,34 @@ references/url-screen-compression.md
 ```
 
 This reference owns URL screen compression, the boundary between discover URL
-and company/news URL behavior, and the tickerless query budget. Do not duplicate
-or improvise a different URL compression policy.
+and company/news URL behavior, and evidence-driven continuation. Do not duplicate
+or improvise a fixed call-count policy.
 
 ### 5.3 User-provided ticker list
 
 Use only the named, covered tickers.
 
 ```text
-up to 5 tickers:
-one bounded multi-ticker query_context
+up to the SearchPlan ticker-scope contract:
+one multi-ticker SearchPlan with identical evaluation clauses for every candidate
 
-more than 5 tickers:
-split into bounded batches, then reconcile on the same evaluation axes
+larger lists:
+split into contract-sized batches, then reconcile on the same evaluation axes and evidence floor
 ```
 
 Exclude unavailable tickers silently unless their absence materially changes the requested screen.
 
 ### 5.4 Candidate validation
 
-Validate the top candidates with the smallest useful evidence path:
+Validate material candidates with a complete but focused evidence path:
 
 ```text
-1. Use compact query_context evidence by selected ticker.
-2. Verify direct exposure against the screen definition.
-3. Verify financial pathway and why-now evidence.
-4. Identify the strongest burden and first rejection risk.
-5. Use one targeted query only for a material missing axis.
-6. Use selected trace/chain only when a top-candidate claim needs stronger support.
-7. Stop when the candidate can be classified reliably.
+1. Author a validation SearchPlan whose explicit ticker scope and atomic clauses apply the same screen to every selected candidate.
+2. Call query_context with exactly {search_plan}; never send legacy top-level question/ticker/limit arguments.
+3. Verify direct exposure, financial pathway, why-now evidence, strongest burden, and first rejection risk from ResearchState clause_coverage/evidence_units.
+4. Follow missing_parts/recommended_actions only for a material required axis; do not repeat covered clauses.
+5. Use selected trace/chain only when a material candidate claim needs stronger lineage support.
+6. Stop when every material candidate can be classified consistently or disclose the remaining evidence boundary.
 ```
 
 Never request `response_detail="full"` in normal web chat.

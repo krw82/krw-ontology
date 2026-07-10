@@ -8,6 +8,8 @@ import pytest
 
 import krw_ontology.agent_index.builder as agent_index_builder
 import krw_ontology.agent_index.spine_builder as spine_builder
+from krw_ontology.agent_index.router_sidecar import build_router_sidecar
+from krw_ontology.agent_index.metric_dictionary import metric_dictionary_binding
 from krw_ontology.agent_index.source_artifact_sqlite import (
     SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION,
     SOURCE_ARTIFACT_SQLITE_SCHEMA_VERSION,
@@ -17,6 +19,7 @@ from krw_ontology.agent_index.spine_builder import (
     build_company_shard_direct,
     emit_spine_fragment_from_company_shard,
     merge_spine_fragments,
+    plan_spine_shard_release_outputs,
     _company_shard_quality_summary,
 )
 from krw_ontology.agent_index.spine_schema import (
@@ -35,10 +38,13 @@ def _write_synthetic_company_shard(path: Path) -> None:
             "INSERT INTO metadata(key, value) VALUES('build', ?)",
             (
                 json.dumps(
-                    {
-                        "schema_version": agent_index_builder.AGENT_INDEX_SCHEMA_VERSION,
-                        "agent_index_schema_version": agent_index_builder.AGENT_INDEX_SCHEMA_VERSION,
-                    },
+                        {
+                            "schema_version": agent_index_builder.AGENT_INDEX_SCHEMA_VERSION,
+                            "agent_index_schema_version": agent_index_builder.AGENT_INDEX_SCHEMA_VERSION,
+                            "source_artifact_sqlite_schema_version": agent_index_builder.AGENT_INDEX_SCHEMA_VERSION,
+                            "source_artifact_sqlite_builder_version": agent_index_builder.SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION,
+                            "metric_dictionary": metric_dictionary_binding(),
+                        },
                     sort_keys=True,
                 ),
             ),
@@ -113,11 +119,14 @@ def _write_synthetic_company_shard(path: Path) -> None:
             """
             INSERT INTO metric_lookup(
                 object_id, object_type, ticker, document_type, doc_type_key, period,
-                metric_name, canonical_metric, value_text, unit, dimensions_json,
+                filing_period, observation_period, observation_period_type,
+                observation_start_date, observation_end_date, observation_context_key,
+                metric_name, canonical_metric, value_text, value_numeric, unit, dimensions_json,
                 is_company_total, trace_status, metric_lineage_status, text
             )
             VALUES('obj:AAPL:metric', 'MetricObservation', 'AAPL', '10-K', '10K', 'FY2025',
-                   'Revenue', 'revenue', '100', 'USD', '{}', 1,
+                   'FY2025', 'FY2025', 'annual', '2025-01-01', '2025-12-31',
+                   'ctx-aapl-fy2025', 'Revenue', 'revenue', '100', 100.0, 'USD', '{}', 1,
                    'traceable', 'ok', 'Revenue was 100')
             """
         )
@@ -174,6 +183,86 @@ def _write_minimal_context_artifact(root: Path, ticker: str) -> None:
     )
 
 
+def test_plan_spine_shard_release_outputs_is_read_only(tmp_path: Path) -> None:
+    release_root = tmp_path / "release"
+    _write_minimal_context_artifact(release_root, "AAPL")
+    source_manifest_path = release_root / "source_manifest.json"
+    source_manifest_path.write_text('{"sentinel": true}\n', encoding="utf-8")
+    original_bytes = source_manifest_path.read_bytes()
+
+    plan = plan_spine_shard_release_outputs(
+        release_root,
+        release_id="preview-only",
+        workers=1,
+        source_manifest_path=source_manifest_path,
+        no_cache=True,
+    )
+
+    assert source_manifest_path.read_bytes() == original_bytes
+    assert plan["source_manifest"]["artifact_count"] == 1
+    assert plan["source_manifest"]["manifest_hash"] == plan["source_manifest_hash"]
+    assert plan["plan"]["discovery_mode"] == "in-memory-source-manifest"
+    assert not (release_root / "indexes").exists()
+
+
+def test_clone_or_copy_file_falls_back_to_isolated_full_copy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_path = tmp_path / "source.sqlite"
+    target_path = tmp_path / "target.sqlite"
+    source_path.write_bytes(b"immutable-sqlite-bytes")
+    monkeypatch.setenv("KRW_INDEX_COPY_MODE", "copy")
+
+    copy_mode = spine_builder._clone_or_copy_file(source_path, target_path)
+
+    assert copy_mode == "copy"
+    assert target_path.read_bytes() == source_path.read_bytes()
+    target_path.write_bytes(b"changed-target")
+    assert source_path.read_bytes() == b"immutable-sqlite-bytes"
+
+
+def test_clone_or_copy_file_can_require_reflink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_path = tmp_path / "source.sqlite"
+    target_path = tmp_path / "target.sqlite"
+    source_path.write_bytes(b"immutable-sqlite-bytes")
+    monkeypatch.setenv("KRW_INDEX_COPY_MODE", "reflink-required")
+    monkeypatch.setattr(spine_builder, "_try_reflink_copy", lambda *_args: False)
+
+    with pytest.raises(RuntimeError, match="reflink_required_but_unavailable"):
+        spine_builder._clone_or_copy_file(source_path, target_path)
+
+    assert not target_path.exists()
+
+
+def test_clone_or_copy_immutable_tree_fallback_preserves_ignore_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_path = tmp_path / "source"
+    target_path = tmp_path / "target"
+    (source_path / "nested" / ".krw_pipeline").mkdir(parents=True)
+    (source_path / "nested" / "keep.json").write_text("keep", encoding="utf-8")
+    (source_path / "nested" / ".krw_pipeline" / "ignore.json").write_text(
+        "ignore",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("KRW_INDEX_COPY_MODE", "copy")
+
+    copy_mode = spine_builder.clone_or_copy_immutable_tree(
+        source_path,
+        target_path,
+        ignored_names=(".krw_pipeline",),
+    )
+
+    assert copy_mode == "copy"
+    assert (target_path / "nested" / "keep.json").read_text(encoding="utf-8") == "keep"
+    assert not (target_path / "nested" / ".krw_pipeline").exists()
+
+
 def test_emit_spine_fragment_from_company_shard_projects_global_rows(tmp_path: Path) -> None:
     shard_path = tmp_path / "indexes" / "companies" / "AAPL.sqlite"
     fragment_path = tmp_path / "indexes" / "fragments" / "spine" / "AAPL.sqlite"
@@ -203,7 +292,16 @@ def test_emit_spine_fragment_from_company_shard_projects_global_rows(tmp_path: P
         route = conn.execute(
             "SELECT shard_path FROM global_object_locator WHERE object_id = 'obj:AAPL:factor'"
         ).fetchone()[0]
+        metric_period, metric_document_id = conn.execute(
+            """
+            SELECT period, document_id
+            FROM global_metric_spine
+            WHERE object_id = 'obj:AAPL:metric'
+            """
+        ).fetchone()
     assert route == "indexes/companies/AAPL.sqlite"
+    assert metric_period == "FY2025"
+    assert metric_document_id == "AAPL:10K:FY2025"
 
 
 def test_emit_spine_fragment_skips_edges_with_missing_endpoints(tmp_path: Path) -> None:
@@ -311,6 +409,7 @@ def test_build_spine_shard_release_outputs_builds_v3_without_monolith(tmp_path: 
     )
 
     assert result.global_spine_path.exists()
+    assert result.router_sidecar_path.exists()
     assert result.shard_manifest_path.exists()
     assert result.build_plan_path.exists()
     assert result.build_summary_path.exists()
@@ -323,13 +422,17 @@ def test_build_spine_shard_release_outputs_builds_v3_without_monolith(tmp_path: 
     assert not (release_root / "indexes" / "fragments" / "spine").exists()
     assert not (release_root / "indexes" / "fragments").exists()
     assert sorted(result.shard_manifest["shards"]) == ["AAPL"]
+    assert result.shard_manifest["metric_dictionary"] == metric_dictionary_binding()
     shard_entry = result.shard_manifest["shards"]["AAPL"]
+    assert shard_entry["metric_dictionary"] == metric_dictionary_binding()
     assert shard_entry["quality_summary"]["format"] == "krw-ontology-shard-quality-summary/v1"
     assert shard_entry["quality_summary"]["totals"]["documents"] == 1
     assert shard_entry["quality_summary"]["ticker_quality"][0]["ticker"] == "AAPL"
     assert result.build_summary["company_count"] == 1
     assert result.build_summary["progress_path"] == "indexes/build_progress.jsonl"
     assert result.build_summary["chart_series"]["status"] == "complete"
+    assert result.build_summary["router_sidecar"]["verification"]["ok"] is True
+    assert result.build_summary["router_sidecar"]["ranking_profile_sha256"]
     assert result.build_summary["chart_series"]["path"] == "indexes/chart_series.sqlite"
     assert result.build_summary["chart_series"]["verification"]["ok"] is True
     assert result.build_summary["artifact_cleanup"]["spine_fragments"]["removed"] is True
@@ -359,10 +462,19 @@ def test_build_spine_shard_release_outputs_builds_v3_without_monolith(tmp_path: 
     assert company_event["output"] == "indexes/companies/AAPL.sqlite"
     from krw_ontology.release import verify_release_root, write_release_manifest_v3
 
-    write_release_manifest_v3(release_root, release_id="test-release", env="dev")
+    build_router_sidecar(
+        release_root / "indexes" / "global_spine.sqlite",
+        release_id="test-release",
+    )
+    release_manifest = write_release_manifest_v3(
+        release_root,
+        release_id="test-release",
+        env="dev",
+    )
     verification = verify_release_root(release_root, env="dev")
 
     assert verification["ok"] is True, verification["errors"]
+    assert release_manifest["metric_dictionary"] == metric_dictionary_binding()
     assert verification["verification_mode"] == "release-root-v3-light"
     assert verification["chart_series_verification"]["ok"] is True
 
@@ -730,10 +842,18 @@ def test_verify_spine_shard_release_checks_global_and_shard_consistency(tmp_path
         json.dumps(
             {
                 "format": "krw-ontology-shard-manifest/v3",
+                "company_shard_schema_version": spine_builder.COMPANY_SHARD_SCHEMA_VERSION,
+                "source_artifact_sqlite_schema_version": SOURCE_ARTIFACT_SQLITE_SCHEMA_VERSION,
+                "source_artifact_sqlite_builder_version": SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION,
+                "metric_dictionary": metric_dictionary_binding(),
                 "shards": {
                     "AAPL": {
                         "path": "companies/AAPL.sqlite",
+                        "schema_version": spine_builder.COMPANY_SHARD_SCHEMA_VERSION,
+                        "source_artifact_sqlite_schema_version": SOURCE_ARTIFACT_SQLITE_SCHEMA_VERSION,
+                        "source_artifact_sqlite_builder_version": SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION,
                         "quality_summary": _company_shard_quality_summary(shard_path),
+                        "metric_dictionary": metric_dictionary_binding(),
                     }
                 },
             },
@@ -743,6 +863,10 @@ def test_verify_spine_shard_release_checks_global_and_shard_consistency(tmp_path
     )
     from krw_ontology.release import verify_release_root, write_release_manifest_v3
 
+    build_router_sidecar(
+        release_root / "indexes" / "global_spine.sqlite",
+        release_id="test-release",
+    )
     write_release_manifest_v3(release_root, release_id="test-release", env="dev")
 
     result = verify_spine_shard_release(release_root)
@@ -753,6 +877,52 @@ def test_verify_spine_shard_release_checks_global_and_shard_consistency(tmp_path
     assert release_result["verification_mode"] == "release-root-v3-light"
     assert result["counts"]["global_object_locator"] == 2
     assert set(result["shards"]) == {"AAPL"}
+
+    with sqlite3.connect(shard_path) as conn:
+        build_metadata = json.loads(
+            conn.execute(
+                "SELECT value FROM metadata WHERE key = 'build'"
+            ).fetchone()[0]
+        )
+        build_metadata["schema_version"] = "1.0.0-alpha.3"
+        build_metadata["agent_index_schema_version"] = "1.0.0-alpha.3"
+        conn.execute(
+            "UPDATE metadata SET value = ? WHERE key = 'build'",
+            (json.dumps(build_metadata, sort_keys=True),),
+        )
+
+    stale = verify_spine_shard_release(release_root)
+
+    assert stale["ok"] is False
+    assert any(
+        "source_artifact_sqlite:agent_index_schema_version_mismatch" in error
+        for error in stale["errors"]
+    )
+
+    build_metadata["schema_version"] = agent_index_builder.AGENT_INDEX_SCHEMA_VERSION
+    build_metadata["agent_index_schema_version"] = (
+        agent_index_builder.AGENT_INDEX_SCHEMA_VERSION
+    )
+    build_metadata["source_artifact_sqlite_schema_version"] = (
+        agent_index_builder.AGENT_INDEX_SCHEMA_VERSION
+    )
+    build_metadata["source_artifact_sqlite_builder_version"] = (
+        "source-artifact-sqlite-builder/v1"
+    )
+    with sqlite3.connect(shard_path) as conn:
+        conn.execute(
+            "UPDATE metadata SET value = ? WHERE key = 'build'",
+            (json.dumps(build_metadata, sort_keys=True),),
+        )
+
+    stale_builder = verify_spine_shard_release(release_root)
+
+    assert stale_builder["ok"] is False
+    assert any(
+        "source_artifact_sqlite:source_artifact_sqlite_builder_version_mismatch"
+        in error
+        for error in stale_builder["errors"]
+    )
 
 
 def test_verify_release_root_light_skips_endpoint_deep_scan(tmp_path: Path) -> None:
@@ -794,10 +964,18 @@ def test_verify_release_root_light_skips_endpoint_deep_scan(tmp_path: Path) -> N
         json.dumps(
             {
                 "format": "krw-ontology-shard-manifest/v3",
+                "company_shard_schema_version": spine_builder.COMPANY_SHARD_SCHEMA_VERSION,
+                "source_artifact_sqlite_schema_version": SOURCE_ARTIFACT_SQLITE_SCHEMA_VERSION,
+                "source_artifact_sqlite_builder_version": SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION,
+                "metric_dictionary": metric_dictionary_binding(),
                 "shards": {
                     "AAPL": {
                         "path": "companies/AAPL.sqlite",
+                        "schema_version": spine_builder.COMPANY_SHARD_SCHEMA_VERSION,
+                        "source_artifact_sqlite_schema_version": SOURCE_ARTIFACT_SQLITE_SCHEMA_VERSION,
+                        "source_artifact_sqlite_builder_version": SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION,
                         "quality_summary": _company_shard_quality_summary(shard_path),
+                        "metric_dictionary": metric_dictionary_binding(),
                     }
                 },
             },
@@ -807,6 +985,7 @@ def test_verify_release_root_light_skips_endpoint_deep_scan(tmp_path: Path) -> N
     )
     from krw_ontology.release import verify_release_root, write_release_manifest_v3
 
+    build_router_sidecar(global_spine_path, release_id="test-release")
     write_release_manifest_v3(release_root, release_id="test-release", env="dev")
 
     light_result = verify_release_root(release_root, env="dev")
@@ -843,10 +1022,18 @@ def test_verify_spine_shard_release_rejects_stale_quality_summary(tmp_path: Path
         json.dumps(
             {
                 "format": "krw-ontology-shard-manifest/v3",
+                "company_shard_schema_version": spine_builder.COMPANY_SHARD_SCHEMA_VERSION,
+                "source_artifact_sqlite_schema_version": SOURCE_ARTIFACT_SQLITE_SCHEMA_VERSION,
+                "source_artifact_sqlite_builder_version": SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION,
+                "metric_dictionary": metric_dictionary_binding(),
                 "shards": {
                     "AAPL": {
                         "path": "companies/AAPL.sqlite",
+                        "schema_version": spine_builder.COMPANY_SHARD_SCHEMA_VERSION,
+                        "source_artifact_sqlite_schema_version": SOURCE_ARTIFACT_SQLITE_SCHEMA_VERSION,
+                        "source_artifact_sqlite_builder_version": SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION,
                         "quality_summary": quality_summary,
+                        "metric_dictionary": metric_dictionary_binding(),
                     }
                 },
             },
@@ -856,6 +1043,10 @@ def test_verify_spine_shard_release_rejects_stale_quality_summary(tmp_path: Path
     )
     from krw_ontology.release import write_release_manifest_v3
 
+    build_router_sidecar(
+        release_root / "indexes" / "global_spine.sqlite",
+        release_id="test-release",
+    )
     write_release_manifest_v3(release_root, release_id="test-release", env="dev")
 
     result = verify_spine_shard_release(release_root)

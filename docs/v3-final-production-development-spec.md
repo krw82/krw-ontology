@@ -194,8 +194,8 @@ v3 release는 아래 layout을 따른다.
   "monolith_required": false,
   "builder": {
     "release_builder_version": "v3",
-    "spine_schema_version": "krw-ontology-global-spine/v1",
-    "company_shard_schema_version": "krw-ontology-company-shard/v1",
+    "spine_schema_version": "krw-ontology-global-spine/v2",
+    "company_shard_schema_version": "krw-ontology-company-shard/v2",
     "chain_index_version": "krw-ontology-chain-index/v1"
   },
   "indexes": {
@@ -203,7 +203,7 @@ v3 release는 아래 layout을 따른다.
       "path": "indexes/global_spine.sqlite",
       "required": true,
       "sha256": "<sha256>",
-      "schema_version": "krw-ontology-global-spine/v1",
+      "schema_version": "krw-ontology-global-spine/v2",
       "counts": {}
     },
     "company_shards": {
@@ -317,8 +317,8 @@ Node record 예시:
   "reason": "company_source_hash_changed",
   "input_hash": "<hash>",
   "output_hash": "<hash>",
-  "builder_version": "global-spine-builder/v1",
-  "schema_version": "krw-ontology-company-shard/v1",
+  "builder_version": "global-spine-builder/v2",
+  "schema_version": "krw-ontology-company-shard/v2",
   "started_at": "<iso8601>",
   "finished_at": "<iso8601>",
   "duration_ms": 0

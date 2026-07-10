@@ -74,28 +74,32 @@ filings show demand, orders, backlog, capacity, pricing, or cash-flow linkage
 
 ## 2. Candidate Route
 
-For tickerless theme or condition questions, start with one bounded global-spine
-route through `query_context`:
+For tickerless theme or condition questions, start with one complete
+model-authored global-spine SearchPlan v2:
 
 ```text
-query_context(
-  question=internal idea-screen brief,
-  tickers=[],
-  limit_tickers<=5,
-  limit_results<=3
-)
+search_plan={
+  question: original user screen,
+  intent: idea_screen,
+  universe: "covered",
+  clauses: atomic qualification, direct-exposure, financial-path, rejection, and why-now propositions,
+  limit_tickers: adaptive candidate breadth,
+  limit_results: enough to cover all required clauses and candidate comparisons
+}
+query_context(search_plan=search_plan)
 ```
 
-Use this result only to identify candidate routes.
+Call `query_context` with exactly `{search_plan}`. Use the result to identify
+candidate routes and their evidence coverage, not to finalize ranking.
 
 Inspect:
 
 ```text
-ticker_candidates
-top_objects
-matched_object_counts
-top_reasons
-tier
+resolved_scope.resolved_tickers
+answerability
+clause_coverage
+evidence_units and supported clause IDs
+missing_parts / recommended_actions / continuation
 ```
 
 Do not infer:
@@ -113,7 +117,7 @@ When the discovery input is a user-provided URL, follow
 `url-screen-compression.md` before using this search order.
 
 That reference owns URL screen compression, multi-surface URL boundaries, and
-the tickerless `query_context` budget. This search-order document only defines
+evidence-driven continuation. This search-order document only defines
 which ontology layers to inspect after a URL screen has been selected.
 
 ## 4. Semantic Exposure Layer

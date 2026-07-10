@@ -8,12 +8,14 @@ import os
 import re
 import shutil
 import sqlite3
+import subprocess
+import sys
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from concurrent.futures.process import BrokenProcessPool
 from collections import defaultdict
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -27,14 +29,25 @@ from krw_ontology.agent_index.chart_series import (
     ChartSeriesBuildResult,
     build_chart_series_index,
 )
+from krw_ontology.agent_index.router_sidecar import (
+    ROUTER_SIDECAR_RELATIVE_PATH,
+    RouterSidecarBuildResult,
+    build_router_sidecar,
+)
+from krw_ontology.agent_index.metric_dictionary import (
+    metric_dictionary_binding,
+    metric_dictionary_binding_errors,
+)
 from krw_ontology.agent_index.source_artifact_sqlite import (
     SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION,
     SOURCE_ARTIFACT_SQLITE_SCHEMA_VERSION,
     SourceArtifactSqlitePlan,
     SourceCompanyShardPlanItem,
     build_source_artifact_sqlite,
+    build_source_artifact_manifest_payload,
     cleanup_sqlite_database_files,
     plan_source_artifact_sqlite_inputs,
+    precompile_source_artifact_fragments,
     replace_sqlite_database,
     temporary_sqlite_path,
     verify_source_artifact_sqlite,
@@ -51,16 +64,18 @@ from krw_ontology.agent_index.spine_schema import (
     write_global_spine_metadata,
 )
 
-COMPANY_SHARD_SCHEMA_VERSION = "krw-ontology-company-shard/v1"
-COMPANY_SHARD_CACHE_FORMAT_VERSION = "krw-ontology-company-shard-cache/v3"
-SPINE_FRAGMENT_CACHE_FORMAT_VERSION = "krw-ontology-spine-fragment-cache/v3"
+COMPANY_SHARD_SCHEMA_VERSION = "krw-ontology-company-shard/v2"
+COMPANY_SHARD_CACHE_FORMAT_VERSION = "krw-ontology-company-shard-cache/v4"
+SPINE_FRAGMENT_CACHE_FORMAT_VERSION = "krw-ontology-spine-fragment-cache/v4"
 SPINE_FRAGMENT_FORMAT_VERSION = "krw-ontology-spine-fragment/v1"
-SPINE_PROJECTION_VERSION = "spine-projection/v1"
+SPINE_PROJECTION_VERSION = "spine-projection/v3"
 V3_BUILD_SUMMARY_FORMAT_VERSION = "krw-ontology-v3-build-summary/v1"
 V3_BUILD_PLAN_FORMAT_VERSION = "krw-ontology-v3-build-plan/v1"
 V3_BUILD_PROGRESS_FORMAT_VERSION = "krw-ontology-v3-build-progress/v1"
 V3_SHARD_MANIFEST_FORMAT_VERSION = "krw-ontology-shard-manifest/v3"
 SHARD_QUALITY_SUMMARY_FORMAT_VERSION = "krw-ontology-shard-quality-summary/v1"
+DEFAULT_COMPANY_WORKER_MEMORY_OVERHEAD_MIB = 2_048
+DEFAULT_BUILD_MEMORY_RESERVE_MIB = 8_192
 
 
 @dataclass(frozen=True)
@@ -94,6 +109,35 @@ class GlobalSpineMergeResult:
 
 
 @dataclass(frozen=True)
+class BuildParallelism:
+    """One global CPU/memory budget split across non-overlapping build stages."""
+
+    requested_workers: int
+    cpu_count: int
+    physical_memory_mib: int | None
+    artifact_compile_workers: int
+    company_workers: int
+    company_inner_artifact_workers: int
+    spine_fragment_workers: int
+    estimated_company_worker_mib: int
+    memory_limited_company_workers: int | None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "requested_workers": self.requested_workers,
+            "cpu_count": self.cpu_count,
+            "physical_memory_mib": self.physical_memory_mib,
+            "artifact_compile_workers": self.artifact_compile_workers,
+            "company_workers": self.company_workers,
+            "company_inner_artifact_workers": self.company_inner_artifact_workers,
+            "spine_fragment_workers": self.spine_fragment_workers,
+            "estimated_company_worker_mib": self.estimated_company_worker_mib,
+            "memory_limited_company_workers": self.memory_limited_company_workers,
+            "nested_process_pools": False,
+        }
+
+
+@dataclass(frozen=True)
 class SpineShardReleaseBuildResult:
     release_root: Path
     release_id: str
@@ -102,11 +146,13 @@ class SpineShardReleaseBuildResult:
     shard_manifest_path: Path
     build_summary_path: Path
     global_spine_path: Path
+    router_sidecar_path: Path
     shard_results: tuple[CompanyShardBuildResult, ...]
     fragment_results: tuple[SpineFragmentResult, ...]
     merge_result: GlobalSpineMergeResult
     shard_manifest: Mapping[str, Any]
     build_summary: Mapping[str, Any]
+    router_sidecar_result: RouterSidecarBuildResult
     chart_series_path: Path | None = None
     chart_series_result: ChartSeriesBuildResult | None = None
     progress_path: Path | None = None
@@ -131,6 +177,7 @@ def build_spine_shard_release_outputs(
     companies_dir = indexes_dir / "companies"
     fragments_dir = indexes_dir / "fragments" / "spine"
     global_spine_path = indexes_dir / "global_spine.sqlite"
+    router_sidecar_path = resolved_root / ROUTER_SIDECAR_RELATIVE_PATH
     shard_manifest_path = indexes_dir / "shard_manifest.json"
     chart_series_path = resolved_root / CHART_SERIES_RELATIVE_PATH
     build_plan_path = indexes_dir / "build_plan.json"
@@ -207,6 +254,12 @@ def build_spine_shard_release_outputs(
             plan,
             companies_dir=companies_dir,
             no_cache=no_cache,
+            artifact_workers=1,
+        )
+        parallelism = _resolve_build_parallelism(
+            plan,
+            artifact_count=len(plan.items),
+            company_count=len(company_specs),
         )
         build_plan = {
             "format": V3_BUILD_PLAN_FORMAT_VERSION,
@@ -214,10 +267,12 @@ def build_spine_shard_release_outputs(
             "index_layout": GLOBAL_SPINE_LAYOUT,
             "source_manifest_path": _path_label(resolved_root, resolved_source_manifest_path),
             "source_manifest_hash": plan.source_manifest_hash,
+            "metric_dictionary": metric_dictionary_binding(),
             "progress_path": _path_label(resolved_root, resolved_progress_path),
             "no_cache": no_cache,
             "company_count": len(company_specs),
-            "worker_count": min(plan.workers, len(company_specs)),
+            "worker_count": parallelism.company_workers,
+            "parallelism": parallelism.to_dict(),
             "plan": plan.to_dict(include_items=True),
             "companies": [
                 {
@@ -262,9 +317,49 @@ def build_spine_shard_release_outputs(
             output=build_plan_path,
             details={
                 "company_count": len(company_specs),
-                "worker_count": min(plan.workers, len(company_specs)),
+                "worker_count": parallelism.company_workers,
+                "parallelism": parallelism.to_dict(),
             },
             started_at=plan_started_at,
+        )
+
+        dirty_company_tickers = {
+            str(spec["ticker"])
+            for spec in company_specs
+            if no_cache or not bool(spec["company_plan"].company_items[0].cache_hit)
+        }
+        precompile_items = tuple(
+            item
+            for item in plan.items
+            if item.ticker in dirty_company_tickers and (no_cache or not item.cache_hit)
+        )
+        precompile_started_at = time.perf_counter()
+        progress.record(
+            "artifact_fragments",
+            "artifact_fragment",
+            "started",
+            details={
+                "total": len(precompile_items),
+                "workers": min(parallelism.artifact_compile_workers, max(1, len(precompile_items))),
+                "force": no_cache,
+            },
+        )
+        precompile_summary = precompile_source_artifact_fragments(
+            plan,
+            items=precompile_items,
+            workers=parallelism.artifact_compile_workers,
+            force=no_cache,
+        )
+        progress.record(
+            "artifact_fragments",
+            "artifact_fragment",
+            "complete",
+            details={
+                **precompile_summary,
+                "workers": min(parallelism.artifact_compile_workers, max(1, len(precompile_items))),
+                "force": no_cache,
+            },
+            started_at=precompile_started_at,
         )
 
         shard_stage_started_at = time.perf_counter()
@@ -272,13 +367,14 @@ def build_spine_shard_release_outputs(
             "company_shards",
             "company_shard",
             "started",
-            details={"total": len(company_specs), "workers": min(plan.workers, len(company_specs))},
+            details={"total": len(company_specs), "workers": parallelism.company_workers},
         )
         shard_results = _build_company_shards_for_release(
             resolved_root,
             company_specs=company_specs,
-            workers=plan.workers,
+            workers=parallelism.company_workers,
             no_cache=no_cache,
+            fragments_prepared=True,
             progress=progress,
         )
         progress.record(
@@ -298,7 +394,7 @@ def build_spine_shard_release_outputs(
             "spine_fragments",
             "spine_fragment",
             "started",
-            details={"total": len(shard_results), "workers": min(plan.workers, len(shard_results))},
+            details={"total": len(shard_results), "workers": parallelism.spine_fragment_workers},
         )
         fragment_results = _emit_spine_fragments_for_release(
             shard_results,
@@ -306,7 +402,7 @@ def build_spine_shard_release_outputs(
             release_id=release_id,
             source_manifest_hash=plan.source_manifest_hash,
             cache_root=plan.cache_root,
-            workers=plan.workers,
+            workers=parallelism.spine_fragment_workers,
             no_cache=no_cache,
             progress=progress,
         )
@@ -358,6 +454,39 @@ def build_spine_shard_release_outputs(
                 "chain_links_inserted": merge_result.chain_links.inserted,
             },
             started_at=merge_started_at,
+        )
+
+        router_sidecar_started_at = time.perf_counter()
+        progress.record(
+            "router_sidecar",
+            "router_sidecar",
+            "started",
+            output=router_sidecar_path,
+            details={
+                "source": _path_label(resolved_root, global_spine_path),
+            },
+        )
+        router_sidecar_result = build_router_sidecar(
+            global_spine_path,
+            router_sidecar_path,
+            release_id=release_id,
+        )
+        progress.record(
+            "router_sidecar",
+            "router_sidecar",
+            "complete",
+            output=router_sidecar_path,
+            details={
+                "counts": dict(router_sidecar_result.counts),
+                "ranking_profile_sha256": router_sidecar_result.metadata.get(
+                    "ranking_profile_sha256"
+                ),
+                "build_fingerprint_sha256": router_sidecar_result.metadata.get(
+                    "build_fingerprint_sha256"
+                ),
+                "ok": bool(router_sidecar_result.verification.get("ok")),
+            },
+            started_at=router_sidecar_started_at,
         )
 
         manifest_started_at = time.perf_counter()
@@ -447,6 +576,8 @@ def build_spine_shard_release_outputs(
             "progress_path": _path_label(resolved_root, resolved_progress_path),
             "artifact_count": len(plan.items),
             "company_count": len(shard_results),
+            "parallelism": parallelism.to_dict(),
+            "artifact_fragment_precompile": precompile_summary,
             "company_shard_cache": {
                 "hits": sum(1 for result in shard_results if result.cache_hit),
                 "misses": sum(1 for result in shard_results if not result.cache_hit),
@@ -465,6 +596,26 @@ def build_spine_shard_release_outputs(
                     "key_count": merge_result.chain_links.key_count,
                     "skipped_generic_keys": merge_result.chain_links.skipped_generic_keys,
                 },
+            },
+            "router_sidecar": {
+                "path": _path_label(resolved_root, router_sidecar_result.path),
+                "schema_version": router_sidecar_result.metadata.get("schema_version"),
+                "counts": dict(router_sidecar_result.counts),
+                "source_global_spine_sha256": router_sidecar_result.metadata.get(
+                    "source_global_spine_sha256"
+                ),
+                "ranking_profile_id": router_sidecar_result.metadata.get(
+                    "ranking_profile_id"
+                ),
+                "ranking_profile_sha256": router_sidecar_result.metadata.get(
+                    "ranking_profile_sha256"
+                ),
+                "content_sha256": router_sidecar_result.metadata.get("content_sha256"),
+                "build_fingerprint_sha256": router_sidecar_result.metadata.get(
+                    "build_fingerprint_sha256"
+                ),
+                "verification": dict(router_sidecar_result.verification),
+                "elapsed_ms": router_sidecar_result.elapsed_ms,
             },
             "chart_series": chart_series_summary,
             "artifact_cleanup": {
@@ -494,6 +645,7 @@ def build_spine_shard_release_outputs(
                 "artifact_count": len(plan.items),
                 "company_count": len(shard_results),
                 "global_spine": _path_label(resolved_root, global_spine_path),
+                "router_sidecar": _path_label(resolved_root, router_sidecar_path),
                 "chart_series": _path_label(resolved_root, chart_series_path)
                 if chart_series_path.exists()
                 else None,
@@ -508,11 +660,13 @@ def build_spine_shard_release_outputs(
             shard_manifest_path=shard_manifest_path,
             build_summary_path=build_summary_path,
             global_spine_path=global_spine_path,
+            router_sidecar_path=router_sidecar_path,
             shard_results=tuple(sorted(shard_results, key=lambda result: result.ticker)),
             fragment_results=tuple(sorted(fragment_results, key=lambda result: result.ticker)),
             merge_result=merge_result,
             shard_manifest=shard_manifest,
             build_summary=build_summary,
+            router_sidecar_result=router_sidecar_result,
             chart_series_path=chart_series_path if chart_series_path.exists() else None,
             chart_series_result=chart_series_result,
             progress_path=resolved_progress_path,
@@ -539,6 +693,7 @@ def plan_spine_shard_release_outputs(
     companies_dir = indexes_dir / "companies"
     fragments_dir = indexes_dir / "fragments" / "spine"
     global_spine_path = indexes_dir / "global_spine.sqlite"
+    router_sidecar_path = resolved_root / ROUTER_SIDECAR_RELATIVE_PATH
     shard_manifest_path = indexes_dir / "shard_manifest.json"
     chart_series_path = resolved_root / CHART_SERIES_RELATIVE_PATH
     build_plan_path = indexes_dir / "build_plan.json"
@@ -548,7 +703,7 @@ def plan_spine_shard_release_outputs(
         if source_manifest_path is not None
         else resolved_root / "source_manifest.json"
     )
-    source_manifest = write_source_artifact_manifest(
+    source_manifest = build_source_artifact_manifest_payload(
         resolved_root,
         manifest_path=resolved_source_manifest_path,
     )
@@ -557,12 +712,24 @@ def plan_spine_shard_release_outputs(
         sqlite_path=global_spine_path,
         cache_root=cache_root,
         workers=workers,
+        source_manifest_path=None,
+    )
+    plan = replace(
+        plan,
         source_manifest_path=resolved_source_manifest_path,
+        source_manifest_hash=str(source_manifest["manifest_hash"]),
+        discovery_mode="in-memory-source-manifest",
     )
     company_specs = _company_build_specs(
         plan,
         companies_dir=companies_dir,
         no_cache=no_cache,
+        artifact_workers=1,
+    )
+    parallelism = _resolve_build_parallelism(
+        plan,
+        artifact_count=len(plan.items),
+        company_count=len(company_specs),
     )
 
     companies: list[dict[str, Any]] = []
@@ -609,7 +776,7 @@ def plan_spine_shard_release_outputs(
             "id": f"company_shard:{row['ticker']}",
             "stage": "company_shard",
             "ticker": row["ticker"],
-            "depends_on": ["source_manifest"],
+            "depends_on": ["artifact_fragments"],
             "output": row["company_shard_path"],
             "cache_key": row["company_cache_key"],
             "cache_hit": row["company_cache_hit"],
@@ -644,6 +811,15 @@ def plan_spine_shard_release_outputs(
             "cache_hit": False,
             "status": "planned",
         },
+        {
+            "id": "artifact_fragments",
+            "stage": "artifact_fragment",
+            "depends_on": ["source_manifest"],
+            "output": str(plan.cache_root / "fragments"),
+            "cache_hit": False,
+            "status": "planned",
+            "workers": parallelism.artifact_compile_workers,
+        },
         *company_nodes,
         *fragment_nodes,
         {
@@ -661,6 +837,14 @@ def plan_spine_shard_release_outputs(
             "output": _path_label(resolved_root, global_spine_path),
             "cache_hit": False,
             "status": "planned",
+        },
+        {
+            "id": "router_sidecar",
+            "stage": "router_sidecar",
+            "depends_on": ["global_spine_merge", "cross_company_links"],
+            "output": _path_label(resolved_root, router_sidecar_path),
+            "cache_hit": False,
+            "status": "rebuild",
         },
         {
             "id": "shard_manifest",
@@ -681,7 +865,12 @@ def plan_spine_shard_release_outputs(
         {
             "id": "release_manifest",
             "stage": "manifest",
-            "depends_on": ["global_spine_merge", "shard_manifest", "chart_series"],
+            "depends_on": [
+                "global_spine_merge",
+                "router_sidecar",
+                "shard_manifest",
+                "chart_series",
+            ],
             "output": "manifest.json",
             "cache_hit": False,
             "status": "planned",
@@ -717,7 +906,8 @@ def plan_spine_shard_release_outputs(
         "no_cache": no_cache,
         "artifact_count": len(plan.items),
         "company_count": len(companies),
-        "worker_count": min(plan.workers, len(companies)) if companies else 0,
+        "worker_count": parallelism.company_workers if companies else 0,
+        "parallelism": parallelism.to_dict(),
         "dirty_tickers": sorted(dirty_tickers),
         "dirty_company_count": sum(1 for row in companies if not row["company_cache_hit"]),
         "cached_company_count": sum(1 for row in companies if row["company_cache_hit"]),
@@ -727,6 +917,7 @@ def plan_spine_shard_release_outputs(
             "build_plan": _path_label(resolved_root, build_plan_path),
             "build_summary": _path_label(resolved_root, build_summary_path),
             "global_spine": _path_label(resolved_root, global_spine_path),
+            "router_sidecar": _path_label(resolved_root, router_sidecar_path),
             "shard_manifest": _path_label(resolved_root, shard_manifest_path),
             "company_shards_dir": _path_label(resolved_root, companies_dir),
             "spine_fragments_dir": _path_label(resolved_root, fragments_dir),
@@ -783,6 +974,7 @@ def _build_company_shard_from_plan(
     shard_path: Path,
     company_plan: SourceArtifactSqlitePlan,
     no_cache: bool,
+    fragments_prepared: bool = False,
 ) -> CompanyShardBuildResult:
     normalized_ticker = _normalize_ticker(ticker)
     resolved_root = root.expanduser().resolve()
@@ -812,7 +1004,7 @@ def _build_company_shard_from_plan(
             _quarantine_sqlite_cache(company_item.shard_cache_path)
             cleanup_sqlite_database_files(resolved_shard_path)
 
-    if no_cache:
+    if no_cache and not fragments_prepared:
         for item in company_plan.items:
             cleanup_sqlite_database_files(item.fragment_path)
 
@@ -854,6 +1046,7 @@ def _company_build_specs(
     *,
     companies_dir: Path,
     no_cache: bool,
+    artifact_workers: int = 1,
 ) -> list[dict[str, Any]]:
     specs: list[dict[str, Any]] = []
     for company in plan.company_items:
@@ -864,6 +1057,7 @@ def _company_build_specs(
             ticker=ticker,
             shard_path=shard_path,
             no_cache=no_cache,
+            artifact_workers=artifact_workers,
         )
         specs.append(
             {
@@ -909,6 +1103,7 @@ def _build_company_shards_for_release(
     company_specs: Sequence[Mapping[str, Any]],
     workers: int,
     no_cache: bool,
+    fragments_prepared: bool = False,
     progress: _BuildProgressWriter | None = None,
 ) -> list[CompanyShardBuildResult]:
     if not company_specs:
@@ -939,6 +1134,7 @@ def _build_company_shards_for_release(
                     shard_path=shard_path,
                     company_plan=company_plan,
                     no_cache=no_cache,
+                    fragments_prepared=fragments_prepared,
                 )
             except Exception as exc:
                 if progress:
@@ -997,6 +1193,7 @@ def _build_company_shards_for_release(
                     shard_path=shard_path,
                     company_plan=company_plan,
                     no_cache=no_cache,
+                    fragments_prepared=fragments_prepared,
                 )
                 futures[future] = (ticker, shard_path, started_at)
             for future in as_completed(futures):
@@ -1034,21 +1231,34 @@ def _build_company_shards_for_release(
                         started_at=started_at,
                     )
     except BrokenProcessPool as exc:
+        completed_tickers = {result.ticker for result in results}
+        remaining_specs = [
+            spec for spec in company_specs if str(spec["ticker"]) not in completed_tickers
+        ]
+        retry_workers = max(1, worker_count // 2)
         if progress:
             progress.record(
                 "company_shards",
                 "company_shard",
-                "fallback_sequential",
+                "fallback_sequential" if retry_workers == 1 else "retry_reduced_workers",
                 error=str(exc),
-                details={"workers": worker_count, "total": total},
+                details={
+                    "workers": worker_count,
+                    "retry_workers": retry_workers,
+                    "completed": len(completed_tickers),
+                    "remaining": len(remaining_specs),
+                    "total": total,
+                },
             )
-        return _build_company_shards_for_release(
+        retried = _build_company_shards_for_release(
             root,
-            company_specs=company_specs,
-            workers=1,
+            company_specs=remaining_specs,
+            workers=retry_workers,
             no_cache=no_cache,
+            fragments_prepared=fragments_prepared,
             progress=progress,
         )
+        return sorted([*results, *retried], key=lambda result: result.ticker)
     return sorted(results, key=lambda result: result.ticker)
 
 
@@ -1077,7 +1287,10 @@ def _emit_spine_fragments_for_release(
             "cache_root": cache_root,
             "no_cache": no_cache,
         }
-        for result in sorted(shard_results, key=lambda item: item.ticker)
+        for result in sorted(
+            shard_results,
+            key=lambda item: (-_file_size_or_zero(item.shard_path), item.ticker),
+        )
     ]
     total = len(tasks)
     if worker_count <= 1:
@@ -1185,24 +1398,36 @@ def _emit_spine_fragments_for_release(
                         started_at=started_at,
                     )
     except BrokenProcessPool as exc:
+        completed_tickers = {result.ticker for result in results}
+        remaining_shards = [
+            result for result in shard_results if result.ticker not in completed_tickers
+        ]
+        retry_workers = max(1, worker_count // 2)
         if progress:
             progress.record(
                 "spine_fragments",
                 "spine_fragment",
-                "fallback_sequential",
+                "fallback_sequential" if retry_workers == 1 else "retry_reduced_workers",
                 error=str(exc),
-                details={"workers": worker_count, "total": total},
+                details={
+                    "workers": worker_count,
+                    "retry_workers": retry_workers,
+                    "completed": len(completed_tickers),
+                    "remaining": len(remaining_shards),
+                    "total": total,
+                },
             )
-        return _emit_spine_fragments_for_release(
-            shard_results,
+        retried = _emit_spine_fragments_for_release(
+            remaining_shards,
             fragments_dir=fragments_dir,
             release_id=release_id,
             source_manifest_hash=source_manifest_hash,
             cache_root=cache_root,
-            workers=1,
+            workers=retry_workers,
             no_cache=no_cache,
             progress=progress,
         )
+        return sorted([*results, *retried], key=lambda result: result.ticker)
     return sorted(results, key=lambda result: result.ticker)
 
 
@@ -1215,12 +1440,27 @@ def _write_v3_shard_manifest(
     shard_results: Sequence[CompanyShardBuildResult],
 ) -> dict[str, Any]:
     shards: dict[str, Any] = {}
+    expected_metric_dictionary = metric_dictionary_binding()
     for result in sorted(shard_results, key=lambda item: item.ticker):
         counts = _company_shard_counts(result.shard_path)
+        shard_metric_dictionary = _company_shard_metric_dictionary_binding(
+            result.shard_path
+        )
+        binding_errors = metric_dictionary_binding_errors(
+            shard_metric_dictionary,
+            expected=expected_metric_dictionary,
+        )
+        if binding_errors:
+            raise RuntimeError(
+                f"company shard metric dictionary mismatch: {result.ticker}: "
+                + ", ".join(binding_errors)
+            )
         shards[result.ticker] = {
             "ticker": result.ticker,
             "path": _path_label(release_root / "indexes", result.shard_path),
             "schema_version": COMPANY_SHARD_SCHEMA_VERSION,
+            "source_artifact_sqlite_schema_version": SOURCE_ARTIFACT_SQLITE_SCHEMA_VERSION,
+            "source_artifact_sqlite_builder_version": SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION,
             "document_count": counts.get("documents", 0),
             "object_count": counts.get("objects", 0),
             "edge_count": counts.get("edges", 0),
@@ -1230,12 +1470,17 @@ def _write_v3_shard_manifest(
             "sha256": _file_sha256(result.shard_path),
             "cache_hit": result.cache_hit,
             "cache_key": result.cache_key,
+            "metric_dictionary": shard_metric_dictionary,
         }
     payload = {
         "format": V3_SHARD_MANIFEST_FORMAT_VERSION,
         "index_layout": GLOBAL_SPINE_LAYOUT,
         "release_id": release_id,
         "source_manifest_hash": source_manifest_hash,
+        "company_shard_schema_version": COMPANY_SHARD_SCHEMA_VERSION,
+        "source_artifact_sqlite_schema_version": SOURCE_ARTIFACT_SQLITE_SCHEMA_VERSION,
+        "source_artifact_sqlite_builder_version": SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION,
+        "metric_dictionary": expected_metric_dictionary,
         "companies_dir": "companies",
         "ticker_count": len(shards),
         "shards": shards,
@@ -1243,6 +1488,24 @@ def _write_v3_shard_manifest(
     }
     _write_json(path, payload)
     return payload
+
+
+def _company_shard_metric_dictionary_binding(path: Path) -> dict[str, Any]:
+    try:
+        with sqlite3.connect(path) as conn:
+            row = conn.execute(
+                "SELECT value FROM metadata WHERE key = 'build'"
+            ).fetchone()
+    except sqlite3.Error as exc:
+        raise RuntimeError(f"cannot read company shard metadata: {path}: {exc}") from exc
+    if row is None:
+        return {}
+    try:
+        metadata = json.loads(str(row[0]))
+    except json.JSONDecodeError:
+        return {}
+    binding = metadata.get("metric_dictionary")
+    return dict(binding) if isinstance(binding, Mapping) else {}
 
 
 def merge_spine_fragments(
@@ -1269,7 +1532,11 @@ def merge_spine_fragments(
     try:
         with sqlite3.connect(tmp_path) as conn:
             conn.row_factory = sqlite3.Row
-            create_global_spine_schema(conn)
+            conn.execute("PRAGMA journal_mode=OFF")
+            conn.execute("PRAGMA synchronous=OFF")
+            conn.execute("PRAGMA temp_store=MEMORY")
+            conn.execute("PRAGMA cache_size=-1048576")
+            create_global_spine_schema(conn, include_secondary_indexes=False)
             write_global_spine_metadata(
                 conn,
                 {
@@ -1278,7 +1545,11 @@ def merge_spine_fragments(
                     "schema_version": GLOBAL_SPINE_SCHEMA_VERSION,
                     "release_id": release_id,
                     "source_manifest_hash": source_manifest_hash,
+                    "metric_dictionary": metric_dictionary_binding(),
                     "spine_projection_version": SPINE_PROJECTION_VERSION,
+                    "source_artifact_sqlite_schema_version": SOURCE_ARTIFACT_SQLITE_SCHEMA_VERSION,
+                    "source_artifact_sqlite_builder_version": SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION,
+                    "company_shard_schema_version": COMPANY_SHARD_SCHEMA_VERSION,
                     "fragment_count": len(resolved_fragments),
                     "created_at": created_at or datetime.now(timezone.utc).isoformat(),
                 },
@@ -1345,6 +1616,10 @@ def merge_spine_fragments(
                     skipped_generic_keys=0,
                 )
             )
+            # Build every regenerable B-tree once, after the bulk inserts and
+            # cross-company link generation.  Creating these indexes while 332
+            # fragments stream in multiplies maintenance work substantially.
+            create_global_spine_schema(conn, include_secondary_indexes=True)
             if progress_callback:
                 progress_callback(
                     {
@@ -1372,7 +1647,11 @@ def merge_spine_fragments(
                     "schema_version": GLOBAL_SPINE_SCHEMA_VERSION,
                     "release_id": release_id,
                     "source_manifest_hash": source_manifest_hash,
+                    "metric_dictionary": metric_dictionary_binding(),
                     "spine_projection_version": SPINE_PROJECTION_VERSION,
+                    "source_artifact_sqlite_schema_version": SOURCE_ARTIFACT_SQLITE_SCHEMA_VERSION,
+                    "source_artifact_sqlite_builder_version": SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION,
+                    "company_shard_schema_version": COMPANY_SHARD_SCHEMA_VERSION,
                     "fragment_count": len(resolved_fragments),
                     "counts": counts,
                     "chain_links": {
@@ -1387,7 +1666,6 @@ def merge_spine_fragments(
             )
             conn.commit()
             conn.execute("PRAGMA optimize")
-            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
             conn.execute("PRAGMA journal_mode=DELETE").fetchall()
         replace_sqlite_database(tmp_path, resolved_output)
         verification = verify_global_spine_schema(resolved_output)
@@ -1443,6 +1721,9 @@ def emit_spine_fragment_from_company_shard(
                     "index_layout": GLOBAL_SPINE_LAYOUT,
                     "schema_version": GLOBAL_SPINE_SCHEMA_VERSION,
                     "spine_projection_version": SPINE_PROJECTION_VERSION,
+                    "source_artifact_sqlite_schema_version": SOURCE_ARTIFACT_SQLITE_SCHEMA_VERSION,
+                    "source_artifact_sqlite_builder_version": SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION,
+                    "company_shard_schema_version": COMPANY_SHARD_SCHEMA_VERSION,
                     "release_id": release_id,
                     "ticker": normalized_ticker,
                     "source_shard_path": str(resolved_shard_path),
@@ -1451,11 +1732,13 @@ def emit_spine_fragment_from_company_shard(
                     "spine_fragment_cache_key": cache_key,
                     "company_source_hash": company_source_hash,
                     "source_manifest_hash": source_manifest_hash,
+                    "metric_dictionary": metric_dictionary_binding(),
                     "created_at": datetime.now(timezone.utc).isoformat(),
                 },
             )
             object_rows = _source_rows(source, "objects")
             object_ticker = {str(row["id"]): str(row["ticker"] or normalized_ticker).upper() for row in object_rows}
+            object_type = {str(row["id"]): str(row["type"] or "") for row in object_rows}
             search_rows = _rows_by_key(_source_rows(source, "object_search_text"), "object_id")
             document_rows = _source_rows(source, "documents")
             counts["global_document_catalog"] = _emit_document_catalog(
@@ -1475,6 +1758,7 @@ def emit_spine_fragment_from_company_shard(
                 target,
                 _source_rows(source, "edges"),
                 object_ticker=object_ticker,
+                object_type=object_type,
                 ticker=normalized_ticker,
                 shard_path=release_shard_path,
             )
@@ -1693,6 +1977,7 @@ def _filter_plan_for_company(
     ticker: str,
     shard_path: Path,
     no_cache: bool,
+    artifact_workers: int | None = None,
 ) -> SourceArtifactSqlitePlan:
     items = tuple(item for item in plan.items if item.ticker == ticker)
     dirty_items = items if no_cache else tuple(item for item in items if not item.cache_hit)
@@ -1751,7 +2036,7 @@ def _filter_plan_for_company(
         dirty_company_items=(company_item,) if not company_cache_hit else (),
         cached_company_items=(company_item,) if company_cache_hit else (),
         dirty_tickers=() if company_cache_hit else (ticker,),
-        workers=plan.workers,
+        workers=max(1, int(artifact_workers if artifact_workers is not None else plan.workers)),
         layout="shards",
         build_settings=build_settings,
         builder_code_version=plan.builder_code_version,
@@ -1841,7 +2126,137 @@ def _verify_company_shard_cache_v3(
 def _copy_sqlite_database(source_path: Path, target_path: Path) -> None:
     cleanup_sqlite_database_files(target_path)
     target_path.parent.mkdir(parents=True, exist_ok=True)
+    _clone_or_copy_file(source_path, target_path)
+
+
+def clone_or_copy_immutable_file(source_path: Path, target_path: Path) -> str:
+    """Public immutable-file copy boundary used by release materialization."""
+    return _clone_or_copy_file(source_path, target_path)
+
+
+def clone_or_copy_immutable_tree(
+    source_path: Path,
+    target_path: Path,
+    *,
+    ignored_names: Sequence[str] = (),
+) -> str:
+    """Clone an immutable directory tree when supported, with a safe copy fallback."""
+    resolved_source = source_path.expanduser().resolve()
+    resolved_target = target_path.expanduser().resolve()
+    if not resolved_source.is_dir():
+        raise NotADirectoryError(f"immutable tree source is not a directory: {resolved_source}")
+    if resolved_target.exists() or resolved_target.is_symlink():
+        raise FileExistsError(f"immutable tree target already exists: {resolved_target}")
+    resolved_target.parent.mkdir(parents=True, exist_ok=True)
+    configured_mode = os.getenv("KRW_INDEX_COPY_MODE", "auto").strip().lower()
+    if _try_reflink_tree(resolved_source, resolved_target):
+        _remove_ignored_tree_entries(resolved_target, ignored_names)
+        return "reflink"
+    if configured_mode in {"clone", "reflink", "reflink-required", "cow-required"}:
+        raise RuntimeError(
+            f"reflink_tree_required_but_unavailable:{resolved_source}:{resolved_target}"
+        )
+    ignore = shutil.ignore_patterns(*ignored_names) if ignored_names else None
+    shutil.copytree(resolved_source, resolved_target, ignore=ignore)
+    return "copy"
+
+
+def _clone_or_copy_file(source_path: Path, target_path: Path) -> str:
+    """Copy an immutable build artifact, preferring filesystem CoW clones."""
+    configured_mode = os.getenv("KRW_INDEX_COPY_MODE", "auto").strip().lower()
+    if _try_reflink_copy(source_path, target_path):
+        try:
+            shutil.copystat(source_path, target_path)
+        except OSError:
+            cleanup_sqlite_database_files(target_path)
+        else:
+            return "reflink"
+    if configured_mode in {"clone", "reflink", "reflink-required", "cow-required"}:
+        raise RuntimeError(
+            f"reflink_required_but_unavailable:{source_path}:{target_path}"
+        )
     shutil.copy2(source_path, target_path)
+    return "copy"
+
+
+def _try_reflink_tree(source_path: Path, target_path: Path) -> bool:
+    configured_mode = os.getenv("KRW_INDEX_COPY_MODE", "auto").strip().lower()
+    if configured_mode in {"copy", "full-copy", "disabled", "off"}:
+        return False
+    copy_command = shutil.which("cp")
+    if not copy_command:
+        return False
+    if sys.platform == "darwin":
+        command = [copy_command, "-cR", str(source_path), str(target_path)]
+    elif sys.platform.startswith("linux"):
+        command = [
+            copy_command,
+            "--archive",
+            "--reflink=always",
+            str(source_path),
+            str(target_path),
+        ]
+    else:
+        return False
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        return False
+    if result.returncode == 0 and target_path.is_dir():
+        return True
+    shutil.rmtree(target_path, ignore_errors=True)
+    return False
+
+
+def _remove_ignored_tree_entries(root: Path, ignored_names: Sequence[str]) -> None:
+    for ignored_name in sorted({str(value) for value in ignored_names if str(value)}):
+        matches = sorted(root.rglob(ignored_name), key=lambda path: len(path.parts), reverse=True)
+        for path in matches:
+            if path.is_dir() and not path.is_symlink():
+                shutil.rmtree(path)
+            else:
+                path.unlink(missing_ok=True)
+
+
+def _try_reflink_copy(source_path: Path, target_path: Path) -> bool:
+    configured_mode = os.getenv("KRW_INDEX_COPY_MODE", "auto").strip().lower()
+    if configured_mode in {"copy", "full-copy", "disabled", "off"}:
+        return False
+    copy_command = shutil.which("cp")
+    if not copy_command:
+        return False
+    if sys.platform == "darwin":
+        command = [copy_command, "-c", str(source_path), str(target_path)]
+    elif sys.platform.startswith("linux"):
+        command = [
+            copy_command,
+            "--reflink=always",
+            "--preserve=mode,timestamps",
+            str(source_path),
+            str(target_path),
+        ]
+    else:
+        return False
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        return False
+    if result.returncode == 0 and target_path.is_file():
+        return True
+    cleanup_sqlite_database_files(target_path)
+    return False
 
 
 def _rebase_company_shard_release_paths(sqlite_path: Path, *, release_root: Path) -> None:
@@ -2015,7 +2430,7 @@ def _store_sqlite_database_cache(source_path: Path, cache_path: Path) -> None:
     tmp_path = cache_path.parent / f".{cache_path.name}.{os.getpid()}.{time.time_ns()}.tmp"
     cleanup_sqlite_database_files(tmp_path)
     try:
-        shutil.copy2(source_path, tmp_path)
+        _clone_or_copy_file(source_path, tmp_path)
         os.replace(tmp_path, cache_path)
     finally:
         cleanup_sqlite_database_files(tmp_path)
@@ -2183,6 +2598,105 @@ def _count_distinct(conn: sqlite3.Connection, table_name: str, column_name: str)
 
 def _company_build_cost(plan: SourceArtifactSqlitePlan) -> int:
     return sum(max(int(item.estimated_bytes or 0), 1) for item in plan.items) + len(plan.items)
+
+
+def _resolve_build_parallelism(
+    plan: SourceArtifactSqlitePlan,
+    *,
+    artifact_count: int,
+    company_count: int,
+) -> BuildParallelism:
+    """Resolve stage concurrency without ever nesting process pools.
+
+    The source-artifact materializer reserves a large SQLite cache per company
+    process, so CPU count alone is not a safe concurrency limit.  This resolver
+    applies one CPU budget to every (non-overlapping) stage and additionally
+    caps the company stage by physical memory.
+    """
+    cpu_count = max(1, int(os.cpu_count() or 1))
+    requested = max(1, int(plan.workers))
+    cpu_budget = min(requested, max(1, cpu_count - 1))
+    physical_memory_mib = _physical_memory_mib()
+    sqlite_cache_mib = max(1, int(plan.build_settings.get("sqlite_cache_mib") or 0))
+    estimated_company_worker_mib = max(
+        sqlite_cache_mib + DEFAULT_COMPANY_WORKER_MEMORY_OVERHEAD_MIB,
+        DEFAULT_COMPANY_WORKER_MEMORY_OVERHEAD_MIB,
+    )
+    memory_limited_company_workers: int | None = None
+    if physical_memory_mib is not None:
+        reserve_mib = max(DEFAULT_BUILD_MEMORY_RESERVE_MIB, physical_memory_mib // 5)
+        usable_mib = max(estimated_company_worker_mib, physical_memory_mib - reserve_mib)
+        memory_limited_company_workers = max(1, usable_mib // estimated_company_worker_mib)
+
+    artifact_default = min(cpu_budget, max(1, artifact_count))
+    company_default = min(cpu_budget, max(1, company_count))
+    if memory_limited_company_workers is not None:
+        company_default = min(company_default, memory_limited_company_workers)
+    spine_default = min(cpu_budget, max(1, company_count), 8)
+    if memory_limited_company_workers is not None:
+        spine_default = min(spine_default, memory_limited_company_workers)
+
+    return BuildParallelism(
+        requested_workers=requested,
+        cpu_count=cpu_count,
+        physical_memory_mib=physical_memory_mib,
+        artifact_compile_workers=_stage_worker_override(
+            "KRW_INDEX_ARTIFACT_WORKERS",
+            artifact_default,
+            maximum=min(max(1, artifact_count), cpu_budget),
+        ),
+        company_workers=_stage_worker_override(
+            "KRW_INDEX_COMPANY_WORKERS",
+            company_default,
+            maximum=min(
+                max(1, company_count),
+                cpu_budget,
+                memory_limited_company_workers or cpu_budget,
+            ),
+        ),
+        company_inner_artifact_workers=1,
+        spine_fragment_workers=_stage_worker_override(
+            "KRW_INDEX_SPINE_WORKERS",
+            spine_default,
+            maximum=min(
+                max(1, company_count),
+                cpu_budget,
+                8,
+                memory_limited_company_workers or cpu_budget,
+            ),
+        ),
+        estimated_company_worker_mib=estimated_company_worker_mib,
+        memory_limited_company_workers=memory_limited_company_workers,
+    )
+
+
+def _stage_worker_override(name: str, default: int, *, maximum: int) -> int:
+    raw = os.getenv(name)
+    if not raw:
+        return max(1, min(int(default), int(maximum)))
+    try:
+        value = int(raw)
+    except ValueError:
+        return max(1, min(int(default), int(maximum)))
+    return max(1, min(value, int(maximum)))
+
+
+def _physical_memory_mib() -> int | None:
+    try:
+        page_size = int(os.sysconf("SC_PAGE_SIZE"))
+        page_count = int(os.sysconf("SC_PHYS_PAGES"))
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+    if page_size <= 0 or page_count <= 0:
+        return None
+    return (page_size * page_count) // (1024 * 1024)
+
+
+def _file_size_or_zero(path: Path) -> int:
+    try:
+        return int(path.stat().st_size)
+    except OSError:
+        return 0
 
 
 def _safe_ticker_filename(ticker: str) -> str:
@@ -2515,6 +3029,7 @@ def _emit_edge_spine(
     rows: Sequence[sqlite3.Row],
     *,
     object_ticker: Mapping[str, str],
+    object_type: Mapping[str, str],
     ticker: str,
     shard_path: str,
 ) -> int:
@@ -2526,6 +3041,7 @@ def _emit_edge_spine(
             continue
         from_ticker = object_ticker.get(from_id, str(row["ticker"] or ticker).upper())
         to_ticker = object_ticker.get(to_id, str(row["ticker"] or ticker).upper())
+        edge = _json_loads(row["json"])
         payload.append(
             (
                 row["id"],
@@ -2535,14 +3051,14 @@ def _emit_edge_spine(
                 to_ticker,
                 row["relation_name"] or row["relation_id"],
                 "intra_company" if from_ticker == to_ticker else "cross_company",
-                None,
-                None,
+                object_type.get(from_id) or None,
+                object_type.get(to_id) or None,
                 _confidence_score(row["confidence"]),
-                row["review_status"],
-                None,
-                None,
+                edge.get("evidence_level") or edge.get("evidence_grade"),
+                _parse_float(edge.get("materiality")),
+                _parse_float(edge.get("recency_score")),
                 shard_path,
-                row["relation_name"],
+                edge.get("rationale") or row["relation_name"],
             )
         )
     conn.executemany(
@@ -2648,7 +3164,7 @@ def _emit_metric_spine(conn: sqlite3.Connection, rows: Sequence[sqlite3.Row]) ->
                 row["ticker"],
                 row["object_id"],
                 _lookup_document_id(row),
-                row["period"],
+                row["observation_period"],
                 row["document_type"],
                 _parse_float(row["value_text"]),
                 None,
@@ -2808,7 +3324,12 @@ def _object_document_id(row: sqlite3.Row, *, ticker: str) -> str:
 
 
 def _lookup_document_id(row: sqlite3.Row) -> str:
-    return f"{str(row['ticker']).upper()}:{row['doc_type_key']}:{row['period']}"
+    filing_period = (
+        row["filing_period"]
+        if "filing_period" in row.keys()
+        else row["period"]
+    )
+    return f"{str(row['ticker']).upper()}:{row['doc_type_key']}:{filing_period}"
 
 
 def _compact_label(row: sqlite3.Row, obj: Mapping[str, Any]) -> str:

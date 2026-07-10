@@ -244,8 +244,8 @@ uv run krw-ontology prod status
       "path": "indexes/global_spine.sqlite",
       "required": true,
       "sha256": "<sha256>",
-      "schema_version": "krw-ontology-global-spine/v1",
-      "builder_version": "global-spine-builder/v1",
+      "schema_version": "krw-ontology-global-spine/v2",
+      "builder_version": "global-spine-builder/v2",
       "counts": {}
     },
     "company_shards": {
@@ -256,7 +256,7 @@ uv run krw-ontology prod status
         "MSFT": {
           "path": "indexes/companies/MSFT.sqlite",
           "sha256": "<sha256>",
-          "schema_version": "krw-ontology-company-shard/v1"
+          "schema_version": "krw-ontology-company-shard/v2"
         }
       }
     },
@@ -367,7 +367,7 @@ ReleaseEventWrite
   "reason": "source_hash_unchanged",
   "input_hash": "<hash>",
   "output_hash": "<hash>",
-  "schema_version": "krw-ontology-company-shard/v1",
+  "schema_version": "krw-ontology-company-shard/v2",
   "builder_version": "<version>",
   "cache_key": "<hash>",
   "started_at": "<iso8601>",

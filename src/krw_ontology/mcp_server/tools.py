@@ -6,10 +6,12 @@ import copy
 from collections import OrderedDict
 from dataclasses import dataclass
 from enum import Enum
+import hashlib
 import json
 import logging
 import os
 import re
+import sqlite3
 import threading
 import time
 from pathlib import Path
@@ -23,7 +25,12 @@ from krw_ontology.agent_index import (
 )
 from krw_ontology.agent_index.retrieval_text import format_metric_compact
 from krw_ontology.agent_index.research_kernel import ResearchKernel, request_from_query_context_args
-from krw_ontology.agent_index.store import DEFAULT_QUERY_TYPES, OntologyStore, agent_index_cache_status
+from krw_ontology.agent_index.store import (
+    DEFAULT_QUERY_TYPES,
+    OntologyStore,
+    agent_index_cache_status,
+    filing_document_roles_from_documents,
+)
 from krw_ontology.config.paths import (
     ONTOLOGY_GLOBAL_SPINE_PATH_ENV,
     resolve_ontology_root,
@@ -31,6 +38,17 @@ from krw_ontology.config.paths import (
 from krw_ontology.mcp_server.evidence_pack import (
     build_verified_company_evidence_pack,
 )
+from krw_ontology.mcp_server.contracts import (
+    MCP_CONTRACT_VERSION,
+    PlanUncertainty,
+    ResearchState,
+    SearchPlan,
+    compile_research_state,
+    research_state_model_bytes,
+    research_state_wire_bytes,
+    validate_search_plan,
+)
+from krw_ontology.release import verify_release_startup_v3
 
 
 class ResponseFormat(str, Enum):
@@ -52,6 +70,7 @@ class ResponseDetail(str, Enum):
 LOGGER = logging.getLogger(__name__)
 SLOW_MCP_TOOL_LOG_THRESHOLD_MS = 5_000
 _SLOW_MCP_TOOL_LOG_MARKER = "[krw-ontology:mcp-slow-path]"
+_MCP_TOOL_TELEMETRY_MARKER = "[krw-ontology:mcp-telemetry]"
 _TRACE_TOOL_CACHE_MAX = 512
 _TRACE_TOOL_CACHE_LOCK = threading.Lock()
 _MCP_STORE_MODE_ENV = "KRW_MCP_STORE_MODE"
@@ -74,6 +93,7 @@ class _IndexSignature:
     release_id: str | None
     global_spine_sha256: str | None
     shard_manifest_sha256: str | None
+    router_sidecar_sha256: str | None
 
 
 _TRACE_TOOL_CACHE: OrderedDict[tuple[_IndexSignature, str], dict[str, Any]] = OrderedDict()
@@ -100,7 +120,12 @@ def _persistent_store_enabled() -> bool:
 
 def _index_signature(index_path: Path) -> _IndexSignature:
     resolved_path = index_path.expanduser().resolve()
-    release_id, global_spine_sha256, shard_manifest_sha256 = _manifest_signature_fields(resolved_path)
+    (
+        release_id,
+        global_spine_sha256,
+        shard_manifest_sha256,
+        router_sidecar_sha256,
+    ) = _manifest_signature_fields(resolved_path)
     try:
         stat = resolved_path.stat()
     except OSError:
@@ -111,6 +136,7 @@ def _index_signature(index_path: Path) -> _IndexSignature:
             release_id,
             global_spine_sha256,
             shard_manifest_sha256,
+            router_sidecar_sha256,
         )
     return _IndexSignature(
         str(resolved_path),
@@ -119,25 +145,30 @@ def _index_signature(index_path: Path) -> _IndexSignature:
         release_id,
         global_spine_sha256,
         shard_manifest_sha256,
+        router_sidecar_sha256,
     )
 
 
-def _manifest_signature_fields(resolved_index_path: Path) -> tuple[str | None, str | None, str | None]:
+def _manifest_signature_fields(
+    resolved_index_path: Path,
+) -> tuple[str | None, str | None, str | None, str | None]:
     manifest_path = resolved_index_path.parent.parent / "manifest.json"
     try:
         payload = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return None, None, None
+        return None, None, None, None
     if not isinstance(payload, Mapping):
-        return None, None, None
+        return None, None, None, None
     indexes = payload.get("indexes") if isinstance(payload.get("indexes"), Mapping) else {}
     global_spine = indexes.get("global_spine") if isinstance(indexes.get("global_spine"), Mapping) else {}
     shard_manifest = indexes.get("shard_manifest") if isinstance(indexes.get("shard_manifest"), Mapping) else {}
+    router_sidecar = indexes.get("router_sidecar") if isinstance(indexes.get("router_sidecar"), Mapping) else {}
     release_id = payload.get("release_id")
     return (
         str(release_id) if release_id else None,
         str(global_spine.get("sha256")) if global_spine.get("sha256") else None,
         str(shard_manifest.get("sha256")) if shard_manifest.get("sha256") else None,
+        str(router_sidecar.get("sha256")) if router_sidecar.get("sha256") else None,
     )
 
 
@@ -200,6 +231,7 @@ class _PersistentStorePool:
         self._rotations = 0
         self._generation = 0
         self._last_rotation: dict[str, Any] | None = None
+        self._verified_signatures: set[_IndexSignature] = set()
 
     def acquire(self, index_path: Path) -> _PersistentStoreLease:
         logical_path = str(index_path.expanduser().absolute())
@@ -211,6 +243,8 @@ class _PersistentStorePool:
         )
         with self._lock:
             bucket = self._buckets.get(logical_path)
+            if bucket is None or bucket.signature != signature:
+                self._verify_signature(signature)
             if bucket is not None and bucket.signature != signature:
                 self._retire_bucket(
                     bucket,
@@ -232,7 +266,11 @@ class _PersistentStorePool:
                 self._hits += 1
                 reused = True
             else:
-                store = open_ontology_store(index_path, check_same_thread=False, routing="spine")
+                store = open_ontology_store(
+                    Path(signature.resolved_global_spine_path),
+                    check_same_thread=False,
+                    routing="spine",
+                )
                 self._misses += 1
                 self._opened += 1
                 reused = False
@@ -349,6 +387,28 @@ class _PersistentStorePool:
             self._rotations = 0
             self._generation = 0
             self._last_rotation = None
+            self._verified_signatures.clear()
+
+    def _verify_signature(self, signature: _IndexSignature) -> None:
+        if signature in self._verified_signatures:
+            return
+        if not signature.release_id:
+            raise RuntimeError("release admission failed: release_id missing from manifest")
+        release_root = Path(signature.resolved_global_spine_path).parent.parent
+        verification = verify_release_startup_v3(
+            release_root,
+            env=os.getenv("KRW_ONTOLOGY_ENV"),
+            manifest_path=release_root / "manifest.json",
+            require_current_symlink=False,
+        )
+        if not verification.get("ok"):
+            errors = ", ".join(str(value) for value in verification.get("errors") or [])
+            raise RuntimeError(f"release admission failed: {errors}")
+        if verification.get("release_id") != signature.release_id:
+            raise RuntimeError(
+                "release admission failed: manifest release_id changed during rotation"
+            )
+        self._verified_signatures.add(signature)
 
     def _retire_bucket(
         self,
@@ -367,12 +427,14 @@ class _PersistentStorePool:
             "previous_release_id": bucket.signature.release_id,
             "previous_global_spine_sha256": bucket.signature.global_spine_sha256,
             "previous_shard_manifest_sha256": bucket.signature.shard_manifest_sha256,
+            "previous_router_sidecar_sha256": bucket.signature.router_sidecar_sha256,
             "new_resolved_global_spine_path": replacement_signature.resolved_global_spine_path,
             "new_mtime_ns": replacement_signature.mtime_ns,
             "new_size": replacement_signature.size,
             "new_release_id": replacement_signature.release_id,
             "new_global_spine_sha256": replacement_signature.global_spine_sha256,
             "new_shard_manifest_sha256": replacement_signature.shard_manifest_sha256,
+            "new_router_sidecar_sha256": replacement_signature.router_sidecar_sha256,
             "retired_leased": bucket.leased,
             "rotated_at_unix": retired_at_unix,
         }
@@ -411,6 +473,7 @@ class _PersistentStorePool:
             "release_id": bucket.signature.release_id,
             "global_spine_sha256": bucket.signature.global_spine_sha256,
             "shard_manifest_sha256": bucket.signature.shard_manifest_sha256,
+            "router_sidecar_sha256": bucket.signature.router_sidecar_sha256,
             "idle": len(bucket.idle),
             "leased": bucket.leased,
             "generation": bucket.generation,
@@ -467,9 +530,18 @@ def _log_mcp_tool_timing(
         for key, value in fields.items()
         if value is not None
     }
-    LOGGER.warning(
+    log_method = (
+        LOGGER.warning
+        if duration_ms >= SLOW_MCP_TOOL_LOG_THRESHOLD_MS
+        else LOGGER.info
+    )
+    log_method(
         "%s %s",
-        _SLOW_MCP_TOOL_LOG_MARKER,
+        (
+            _SLOW_MCP_TOOL_LOG_MARKER
+            if duration_ms >= SLOW_MCP_TOOL_LOG_THRESHOLD_MS
+            else _MCP_TOOL_TELEMETRY_MARKER
+        ),
         json.dumps(
             {
                 "tool_name": tool_name,
@@ -1378,7 +1450,7 @@ def chain_tool(
 ) -> str:
     """Return compact evidence, semantic, and temporal chains around one object."""
     index = _runtime_global_spine_path()
-    max_depth = max(0, min(int(max_depth), 4))
+    max_depth = max(0, min(int(max_depth), 5))
     with _store(index) as store:
         chain = store.chain(
             object_id,
@@ -1586,14 +1658,33 @@ def compare_tool(
 
 def plan_query_tool(
     *,
-    question: str,
+    search_plan: SearchPlan | Mapping[str, Any],
     response_format: ResponseFormat = ResponseFormat.JSON,
 ) -> str:
-    """Return the deterministic QueryPlan for a natural-language question."""
-    index = _runtime_global_spine_path()
-    with _store(index) as store:
-        plan = AgentRetriever(store).plan(question)
-    payload = {"plan": plan.to_dict()}
+    """Validate and normalize an agent-authored SearchPlan v2 without retrieval."""
+    plan = validate_search_plan(search_plan)
+    payload = {
+        "contract_version": MCP_CONTRACT_VERSION,
+        "valid": True,
+        "plan": plan.model_dump(mode="json"),
+        "execution_preview": {
+            "clause_count": len(plan.clauses),
+            "required_clause_count": sum(
+                1 for clause in plan.clauses if clause.required
+            ),
+            "routing_clauses": [
+                {
+                    "clause_id": clause.clause_id,
+                    "query": _clause_routing_query(clause),
+                    "required": clause.required,
+                }
+                for clause in plan.clauses
+            ],
+            "allow_relaxed": plan.uncertainty != PlanUncertainty.LOW,
+            "limit_tickers": plan.limit_tickers,
+            "limit_results": plan.limit_results,
+        },
+    }
     return _format_response(payload, response_format, _markdown_plan)
 
 
@@ -1675,7 +1766,7 @@ def company_context_tool(
     return _format_response(payload, response_format, _markdown_company_context)
 
 
-def query_context_tool(
+def raw_query_context_tool(
     *,
     question: str,
     ticker: str | None = None,
@@ -1688,7 +1779,11 @@ def query_context_tool(
     include_internal_ids: bool = True,
     response_format: ResponseFormat = ResponseFormat.JSON,
 ) -> str:
-    """Return a compact answer-planning pack with answerability guidance."""
+    """Return the store's internal research pack for backend regression tests.
+
+    This function is intentionally not registered as an MCP tool.  The public
+    query_context surface is query_context_tool and emits ResearchState v2 only.
+    """
     started_at = time.perf_counter()
     index = _runtime_global_spine_path()
     with _store(index) as store:
@@ -1730,6 +1825,613 @@ def query_context_tool(
         timing_ms=_diagnostic_timing_ms(payload_dict),
     )
     return _format_response(payload, response_format, _markdown_query_context)
+
+
+def query_context_tool(
+    *,
+    search_plan: SearchPlan | Mapping[str, Any],
+) -> ResearchState:
+    """Execute an explicit agent plan and return a compact ResearchState v2.
+
+    The plan is required and validated with extra fields forbidden.  Each
+    clause's retrieval_query is sent directly to compact retrieval; neither the
+    original question nor a keyword intent router is allowed to replace it.
+    """
+    started_at = time.perf_counter()
+    plan = validate_search_plan(search_plan)
+    index = _runtime_global_spine_path()
+    signature = _index_signature(index)
+    retrieval_started_at = time.perf_counter()
+    with _store(index) as store:
+        raw_payload = _execute_search_plan(store=store, search_plan=plan)
+    retrieval_elapsed_ms = _elapsed_ms(retrieval_started_at)
+    compile_started_at = time.perf_counter()
+    state = compile_research_state(
+        search_plan=plan,
+        raw_payload=raw_payload,
+        release_id=signature.release_id,
+    )
+    compile_elapsed_ms = _elapsed_ms(compile_started_at)
+    execution_telemetry = _safe_payload_dict(
+        _safe_payload_dict(raw_payload.get("search_diagnostics")).get("telemetry")
+    )
+    _log_mcp_tool_timing(
+        "krw_ontology_query_context",
+        duration_ms=_elapsed_ms(started_at),
+        force=True,
+        question_sha256=hashlib.sha256(plan.question.encode("utf-8")).hexdigest()[:16],
+        question_chars=_safe_text_length(plan.question),
+        ticker_count=len(plan.tickers),
+        document_type_count=len(plan.document_types),
+        period_count=len(plan.periods),
+        has_universe=bool(plan.universe),
+        limit_results=plan.limit_results,
+        limit_tickers=plan.limit_tickers,
+        clause_count=len(plan.clauses),
+        intent=plan.intent,
+        evidence_unit_count=len(state.evidence_units),
+        missing_part_count=len(state.missing_parts),
+        answerability_status=state.answerability.status,
+        strong_claim_allowed=state.answerability.strong_claim_allowed,
+        covered_clause_count=sum(
+            1 for coverage in state.clause_coverage if coverage.status == "covered"
+        ),
+        partial_clause_count=sum(
+            1 for coverage in state.clause_coverage if coverage.status == "partial"
+        ),
+        missing_clause_count=sum(
+            1 for coverage in state.clause_coverage if coverage.status == "missing"
+        ),
+        evidence_directness_counts={
+            directness: sum(
+                1
+                for unit in state.evidence_units
+                if unit.directness == directness
+            )
+            for directness in ("direct", "metric_lineage", "related", "unverified")
+        },
+        evidence_grade_counts={
+            grade: sum(
+                1 for unit in state.evidence_units if unit.evidence_grade == grade
+            )
+            for grade in ("strong", "medium", "weak", "unverified")
+        },
+        calculation_coverage_statuses={
+            status: sum(
+                1
+                for coverage in state.calculation_coverage
+                if coverage.status == status
+            )
+            for status in ("covered", "partial", "missing")
+        },
+        retrieval_ms=retrieval_elapsed_ms,
+        compile_ms=compile_elapsed_ms,
+        model_text_bytes=research_state_model_bytes(state),
+        mcp_wire_bytes=research_state_wire_bytes(state),
+        execution=execution_telemetry,
+    )
+    return state
+
+
+def _execute_search_plan(*, store: Any, search_plan: SearchPlan) -> dict[str, Any]:
+    """Execute only plan-authored compact queries and assemble compiler input."""
+    started_at = time.perf_counter()
+    results_by_ticker: dict[str, list[dict[str, Any]]] = {}
+    evidence_by_object_id: dict[str, dict[str, Any]] = {}
+    diagnostics: list[Mapping[str, Any]] = []
+    unknown_tickers: list[str] = []
+    failed_tickers: list[str] = []
+    shard_errors: dict[str, str] = {}
+    filing_document_roles: dict[str, Any] = {}
+    warnings: list[str] = []
+    execution_routing: dict[str, Any] = {}
+    omitted_evidence_count = 0
+    truncation_possible = False
+    route_planned_tickers = getattr(store, "route_planned_tickers", None)
+    if callable(route_planned_tickers):
+        resolved_tickers, routing_diagnostics = route_planned_tickers(
+            clauses=[
+                {
+                    "clause_id": clause.clause_id,
+                    "query": _clause_routing_query(clause),
+                    "required": clause.required,
+                }
+                for clause in search_plan.clauses
+            ],
+            explicit_tickers=search_plan.tickers or None,
+            limit=search_plan.limit_tickers,
+        )
+    else:
+        resolved_tickers = list(search_plan.tickers)
+        routing_diagnostics = {
+            "mode": "explicit_plan_scope",
+            "resolved_tickers": resolved_tickers,
+            "fallback_used": False,
+        }
+    unknown_tickers.extend(_diagnostic_unknown_tickers(routing_diagnostics))
+    warnings.extend(_diagnostic_warnings(routing_diagnostics))
+    route_error = str(routing_diagnostics.get("error") or "").strip()
+    if route_error:
+        warnings.append(route_error)
+    if not resolved_tickers and not route_error:
+        warnings.append("planned_ticker_candidates_not_found")
+    list_documents = getattr(store, "list_documents", None)
+    if resolved_tickers and callable(list_documents):
+        try:
+            filing_document_roles.update(
+                filing_document_roles_from_documents(
+                    list_documents(
+                        document_types=search_plan.document_types or None,
+                    ),
+                    tickers=resolved_tickers,
+                )
+            )
+        except (OSError, RuntimeError, ValueError, sqlite3.Error):
+            warnings.append("filing_document_roles_unavailable")
+
+    def record_clause_rows(
+        clause: Any,
+        rows: Sequence[Mapping[str, Any]],
+        clause_diagnostics: Mapping[str, Any],
+    ) -> None:
+        diagnostics.append(clause_diagnostics)
+        unknown_tickers.extend(_diagnostic_unknown_tickers(clause_diagnostics))
+        failed_tickers.extend(_diagnostic_failed_tickers(clause_diagnostics))
+        shard_errors.update(_diagnostic_shard_errors(clause_diagnostics))
+        warnings.extend(_diagnostic_warnings(clause_diagnostics))
+        filing_document_roles.update(_diagnostic_filing_roles(clause_diagnostics))
+        for raw_row in rows:
+            row = dict(raw_row)
+            object_id = str(row.get("id") or row.get("object_id") or "").strip()
+            if not object_id:
+                continue
+            existing = evidence_by_object_id.get(object_id)
+            if existing is None:
+                existing = row
+                existing["_plan_clause_ids"] = []
+                existing["_plan_clause_matches"] = []
+                evidence_by_object_id[object_id] = existing
+            clause_ids = existing.setdefault("_plan_clause_ids", [])
+            if clause.clause_id not in clause_ids:
+                clause_ids.append(clause.clause_id)
+            clause_matches = existing.setdefault("_plan_clause_matches", [])
+            clause_matches.append(
+                {
+                    "clause_id": clause.clause_id,
+                    "planned_match_mode": row.get("planned_match_mode") or "strict",
+                    "planned_evidence_terms": list(
+                        row.get("planned_evidence_terms")
+                        or _clause_evidence_terms(clause)
+                    ),
+                    "planned_predicate_terms": list(clause.required_predicates),
+                    "planned_metric_terms": _clause_metric_terms(clause),
+                    "planned_metric_scope": clause.metric_scope,
+                }
+            )
+
+    batch_query = getattr(store, "query_planned_batch_with_diagnostics", None)
+    if callable(batch_query):
+        clauses = [
+            {
+                "clause_id": clause.clause_id,
+                "retrieval_query": clause.retrieval_query,
+                "retrieval_terms": _clause_evidence_terms(clause),
+                "predicate_terms": list(clause.required_predicates),
+                "metrics": list(clause.metrics),
+                "metric_dimensions": list(clause.metric_dimensions),
+                "metric_scope": clause.metric_scope,
+                "calculation_window": clause.calculation_window,
+                "comparison_axes": list(search_plan.comparison_axes),
+                "tickers": list(clause.tickers),
+                "object_types": clause.object_types or None,
+                "allow_relaxed": search_plan.uncertainty != PlanUncertainty.LOW,
+            }
+            for clause in search_plan.clauses
+        ]
+        batch_payload, batch_diagnostics = batch_query(
+            clauses=clauses,
+            tickers=resolved_tickers,
+            document_types=search_plan.document_types or None,
+            periods=search_plan.periods or None,
+            include_rejected=False,
+            limit=search_plan.limit_results,
+        )
+        diagnostics.append(batch_diagnostics)
+        unknown_tickers.extend(_diagnostic_unknown_tickers(batch_diagnostics))
+        failed_tickers.extend(_diagnostic_failed_tickers(batch_diagnostics))
+        shard_errors.update(_diagnostic_shard_errors(batch_diagnostics))
+        warnings.extend(_diagnostic_warnings(batch_diagnostics))
+        execution_routing = _safe_payload_dict(batch_diagnostics.get("routing"))
+        omitted_evidence_count = int(batch_diagnostics.get("omitted_count") or 0)
+        truncation_possible = bool(batch_diagnostics.get("truncation_possible"))
+        for clause in search_plan.clauses:
+            clause_payload = batch_payload.get(clause.clause_id) or {}
+            raw_rows = clause_payload.get("rows") or []
+            rows = [row for row in raw_rows if isinstance(row, Mapping)]
+            clause_diagnostics = clause_payload.get("diagnostics") or {}
+            if not isinstance(clause_diagnostics, Mapping):
+                clause_diagnostics = {}
+            record_clause_rows(clause, rows, clause_diagnostics)
+    else:
+        for clause in search_plan.clauses:
+            rows, clause_diagnostics = _query_planned_compact(
+                store=store,
+                retrieval_query=clause.retrieval_query,
+                retrieval_terms=_clause_evidence_terms(clause),
+                predicate_terms=clause.required_predicates,
+                metrics=clause.metrics,
+                metric_dimensions=clause.metric_dimensions,
+                metric_scope=clause.metric_scope,
+                calculation_window=clause.calculation_window,
+                comparison_axes=search_plan.comparison_axes,
+                tickers=clause.tickers or resolved_tickers,
+                document_types=search_plan.document_types or None,
+                periods=search_plan.periods or None,
+                object_types=clause.object_types or None,
+                include_rejected=False,
+                allow_relaxed=search_plan.uncertainty != PlanUncertainty.LOW,
+                limit=search_plan.limit_results,
+            )
+            omitted_evidence_count += int(clause_diagnostics.get("omitted_count") or 0)
+            truncation_possible = truncation_possible or bool(
+                clause_diagnostics.get("truncation_possible")
+            )
+            record_clause_rows(clause, rows, clause_diagnostics)
+
+    for row in evidence_by_object_id.values():
+        ticker = str(row.get("ticker") or "").strip().upper() or "UNKNOWN"
+        results_by_ticker.setdefault(ticker, []).append(row)
+
+    failed_tickers = _dedupe_preserving_order(failed_tickers)
+    if failed_tickers:
+        warnings.append("ticker_shard_query_failed")
+    if omitted_evidence_count or truncation_possible:
+        warnings.append("planned_evidence_truncated")
+    final_routing = dict(routing_diagnostics)
+    for key in (
+        "fanout_parallel",
+        "fanout_workers",
+        "failed_tickers",
+        "shard_errors",
+    ):
+        if key in execution_routing:
+            final_routing[key] = execution_routing[key]
+    final_routing["resolved_tickers"] = [
+        ticker for ticker in resolved_tickers if ticker not in set(failed_tickers)
+    ]
+    if failed_tickers:
+        final_routing["failed_tickers"] = failed_tickers
+        final_routing["shard_errors"] = shard_errors
+
+    relation_tools = [
+        {
+            "tool": "krw_ontology_chain",
+            "object_id": object_id,
+            "clause_id": clause.clause_id,
+            "purpose": (
+                "verify the planned directed relation with a structured ontology path; "
+                "cross-company associations and similar-topic links are not causal proof"
+            ),
+        }
+        for clause in search_plan.clauses
+        if clause.required_predicates
+        for object_id, row in evidence_by_object_id.items()
+        if clause.clause_id in list(row.get("_plan_clause_ids") or [])
+    ]
+    trace_tools = [
+        {
+            "tool": "krw_ontology_trace",
+            "object_id": object_id,
+            "purpose": "verify selected evidence lineage before a strong claim",
+        }
+        for object_id, row in evidence_by_object_id.items()
+        if str(row.get("trace_status") or "") in {"traceable", "traceable_metric_lineage"}
+    ]
+    recommended_tools = _dedupe_recommended_tools([*relation_tools, *trace_tools])[:8]
+    execution_telemetry = _planned_execution_telemetry(
+        diagnostics=diagnostics,
+        routing=final_routing,
+        omitted_evidence_count=omitted_evidence_count,
+        truncation_possible=truncation_possible,
+        total_ms=_elapsed_ms(started_at),
+    )
+    return {
+        "results_by_ticker": results_by_ticker,
+        "unknown_tickers": _dedupe_preserving_order(unknown_tickers),
+        "filing_document_roles": filing_document_roles,
+        "omitted_evidence_count": omitted_evidence_count,
+        "truncation_possible": truncation_possible,
+        "warnings": _dedupe_preserving_order(warnings),
+        "recommended_tools": recommended_tools,
+        "search_diagnostics": {
+            "mode": "explicit_search_plan_v2",
+            "clause_count": len(search_plan.clauses),
+            "diagnostic_count": len(diagnostics),
+            "routing": final_routing,
+            "telemetry": execution_telemetry,
+        },
+        "routing": final_routing,
+    }
+
+
+def _clause_evidence_terms(clause: Any) -> list[str]:
+    return _dedupe_preserving_order(
+        [
+            *list(clause.required_concepts),
+            *list(clause.metrics),
+            *list(clause.metric_dimensions),
+        ]
+    )
+
+
+def _clause_metric_terms(clause: Any) -> list[str]:
+    return _dedupe_preserving_order(
+        [*list(clause.metrics), *list(clause.metric_dimensions)]
+    )
+
+
+def _clause_routing_query(clause: Any) -> str:
+    if (
+        clause.required_concepts
+        or clause.required_predicates
+        or clause.metrics
+        or clause.metric_dimensions
+    ):
+        return " ".join(
+            _dedupe_preserving_order(
+                [*_clause_evidence_terms(clause), *list(clause.required_predicates)]
+            )
+        )
+    return clause.retrieval_query
+
+
+def _query_planned_compact(
+    *,
+    store: Any,
+    retrieval_query: str,
+    retrieval_terms: Sequence[str],
+    predicate_terms: Sequence[str],
+    metrics: Sequence[str],
+    metric_dimensions: Sequence[str],
+    metric_scope: str,
+    calculation_window: str | None,
+    comparison_axes: Sequence[str],
+    tickers: Sequence[str] | None,
+    document_types: Sequence[str] | None,
+    periods: Sequence[str] | None,
+    object_types: Sequence[str] | None,
+    include_rejected: bool,
+    allow_relaxed: bool,
+    limit: int,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Call the v2 planned primitive without falling back to keyword routing."""
+    planned_query = getattr(store, "query_planned_compact_with_diagnostics", None)
+    if callable(planned_query):
+        return planned_query(
+            retrieval_query=retrieval_query,
+            retrieval_terms=retrieval_terms,
+            predicate_terms=predicate_terms,
+            metrics=metrics,
+            metric_dimensions=metric_dimensions,
+            metric_scope=metric_scope,
+            calculation_window=calculation_window,
+            comparison_axes=comparison_axes,
+            tickers=tickers,
+            document_types=document_types,
+            periods=periods,
+            object_types=object_types,
+            include_rejected=include_rejected,
+            allow_relaxed=allow_relaxed,
+            limit=limit,
+        )
+
+    store_for_ticker = getattr(store, "_store_for_ticker", None)
+    if tickers and callable(store_for_ticker):
+        rows: list[dict[str, Any]] = []
+        unavailable_tickers: list[str] = []
+        strict_count = 0
+        relaxed_count = 0
+        for ticker in tickers:
+            try:
+                ticker_store = store_for_ticker(ticker)
+            except (KeyError, FileNotFoundError):
+                unavailable_tickers.append(str(ticker).upper())
+                continue
+            ticker_rows, ticker_diagnostics = ticker_store.query_planned_compact_with_diagnostics(
+                retrieval_query=retrieval_query,
+                retrieval_terms=retrieval_terms,
+                predicate_terms=predicate_terms,
+                metrics=metrics,
+                metric_dimensions=metric_dimensions,
+                metric_scope=metric_scope,
+                calculation_window=calculation_window,
+                comparison_axes=comparison_axes,
+                tickers=[ticker],
+                document_types=document_types,
+                periods=periods,
+                object_types=object_types,
+                include_rejected=include_rejected,
+                allow_relaxed=allow_relaxed,
+                limit=limit,
+            )
+            rows.extend(ticker_rows)
+            strict_count += int(ticker_diagnostics.get("strict_result_count") or 0)
+            relaxed_count += int(ticker_diagnostics.get("relaxed_result_count") or 0)
+        return rows[:limit], {
+            "execution_mode": "planned_fts_company_fanout",
+            "retrieval_query": retrieval_query,
+            "strict_result_count": strict_count,
+            "relaxed_result_count": relaxed_count,
+            "relaxed_enabled": allow_relaxed,
+            "result_count": min(len(rows), limit),
+            "unavailable_tickers": unavailable_tickers,
+            "warnings": ["ticker_not_available"] if unavailable_tickers else [],
+            "keyword_expansion_used": False,
+            "intent_reclassification_used": False,
+        }
+
+    return [], {
+        "execution_mode": "planned_fts_unavailable",
+        "retrieval_query": retrieval_query,
+        "strict_result_count": 0,
+        "relaxed_result_count": 0,
+        "relaxed_enabled": allow_relaxed,
+        "result_count": 0,
+        "warnings": ["planned_ticker_discovery_unavailable"],
+        "keyword_expansion_used": False,
+        "intent_reclassification_used": False,
+    }
+
+
+def _diagnostic_unknown_tickers(diagnostics: Mapping[str, Any]) -> list[str]:
+    values: list[str] = []
+    for container in (diagnostics, _safe_payload_dict(diagnostics.get("routing"))):
+        for key in ("unknown_tickers", "unavailable_tickers"):
+            raw = container.get(key)
+            if isinstance(raw, Sequence) and not isinstance(raw, (str, bytes)):
+                values.extend(str(value).strip().upper() for value in raw if str(value).strip())
+    return _dedupe_preserving_order(values)
+
+
+def _diagnostic_failed_tickers(diagnostics: Mapping[str, Any]) -> list[str]:
+    values: list[str] = []
+    for container in (diagnostics, _safe_payload_dict(diagnostics.get("routing"))):
+        raw = container.get("failed_tickers")
+        if isinstance(raw, Sequence) and not isinstance(raw, (str, bytes)):
+            values.extend(
+                str(value).strip().upper() for value in raw if str(value).strip()
+            )
+        errors = container.get("shard_errors")
+        if isinstance(errors, Mapping):
+            values.extend(str(value).strip().upper() for value in errors)
+    return _dedupe_preserving_order(values)
+
+
+def _diagnostic_shard_errors(diagnostics: Mapping[str, Any]) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for container in (diagnostics, _safe_payload_dict(diagnostics.get("routing"))):
+        errors = container.get("shard_errors")
+        if not isinstance(errors, Mapping):
+            continue
+        values.update(
+            {
+                str(ticker).strip().upper(): str(error).strip()
+                for ticker, error in errors.items()
+                if str(ticker).strip()
+            }
+        )
+    return values
+
+
+def _planned_execution_telemetry(
+    *,
+    diagnostics: Sequence[Mapping[str, Any]],
+    routing: Mapping[str, Any],
+    omitted_evidence_count: int,
+    truncation_possible: bool,
+    total_ms: int,
+) -> dict[str, Any]:
+    leaves: list[Mapping[str, Any]] = []
+    for diagnostic in diagnostics:
+        shard_diagnostics = diagnostic.get("shard_diagnostics")
+        if isinstance(shard_diagnostics, Mapping):
+            leaves.extend(
+                value
+                for value in shard_diagnostics.values()
+                if isinstance(value, Mapping)
+            )
+        else:
+            leaves.append(diagnostic)
+    route_timing = _safe_payload_dict(routing.get("timing_ms"))
+    batch_diagnostic = next(
+        (
+            diagnostic
+            for diagnostic in diagnostics
+            if diagnostic.get("execution_mode") == "planned_shard_batch"
+            and "clause_count" in diagnostic
+        ),
+        {},
+    )
+    batch_timing = _safe_payload_dict(batch_diagnostic.get("timing_ms"))
+    route_queries = routing.get("queries")
+    score_summaries = []
+    if isinstance(route_queries, Sequence) and not isinstance(
+        route_queries,
+        (str, bytes),
+    ):
+        score_summaries = [
+            dict(summary)
+            for item in route_queries
+            if isinstance(item, Mapping)
+            and isinstance((summary := item.get("score_summary")), Mapping)
+        ]
+    return {
+        "total_ms": total_ms,
+        "route_ms": int(route_timing.get("total") or 0),
+        "batch_ms": int(batch_timing.get("total") or 0),
+        "shard_open_count": int(batch_diagnostic.get("shard_open_count") or 0),
+        "fanout_workers": int(batch_diagnostic.get("fanout_workers") or 0),
+        "strict_rows": sum(int(item.get("strict_result_count") or 0) for item in leaves),
+        "relaxed_rows": sum(int(item.get("relaxed_result_count") or 0) for item in leaves),
+        "metric_rows": sum(int(item.get("metric_result_count") or 0) for item in leaves),
+        "clause_query_ms": sum(
+            int(_safe_payload_dict(item.get("timing_ms")).get("total") or 0)
+            for item in leaves
+        ),
+        "pre_truncation_count": int(
+            batch_diagnostic.get("pre_truncation_count") or 0
+        ),
+        "omitted_evidence_count": omitted_evidence_count,
+        "truncation_possible": truncation_possible,
+        "route_score_summaries": score_summaries,
+        "failed_ticker_count": len(_diagnostic_failed_tickers(routing)),
+    }
+
+
+def _diagnostic_warnings(diagnostics: Mapping[str, Any]) -> list[str]:
+    values: list[str] = []
+    raw = diagnostics.get("warnings")
+    if isinstance(raw, Sequence) and not isinstance(raw, (str, bytes)):
+        values.extend(str(value).strip() for value in raw if str(value).strip())
+    return _dedupe_preserving_order(values)
+
+
+def _diagnostic_filing_roles(diagnostics: Mapping[str, Any]) -> dict[str, Any]:
+    current_prior = _safe_payload_dict(diagnostics.get("current_document_prior"))
+    roles = current_prior.get("filing_document_roles")
+    return dict(roles) if isinstance(roles, Mapping) else {}
+
+
+def _dedupe_preserving_order(values: Sequence[str]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        normalized = str(value).strip()
+        key = normalized.casefold()
+        if not normalized or key in seen:
+            continue
+        seen.add(key)
+        result.append(normalized)
+    return result
+
+
+def _dedupe_recommended_tools(
+    values: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for value in values:
+        payload = dict(value)
+        key = (
+            str(payload.get("tool") or ""),
+            str(payload.get("object_id") or ""),
+            str(payload.get("clause_id") or ""),
+        )
+        if not key[0] or key in seen:
+            continue
+        seen.add(key)
+        result.append(payload)
+    return result
 
 
 def _markdown_index_context(payload: Mapping[str, Any]) -> str:
@@ -3268,6 +3970,7 @@ def _markdown_chain(payload: dict[str, Any]) -> str:
     obj = payload.get("object", {})
     chain = payload.get("chain") or {}
     evidence_chain = chain.get("evidence_chain") or {}
+    global_chain = payload.get("global_chain") or chain.get("global_chain") or {}
     lines = [
         "# Ontology Chain",
         f"- Object: `{obj.get('id')}` ({obj.get('type')})",
@@ -3279,6 +3982,9 @@ def _markdown_chain(payload: dict[str, Any]) -> str:
         f"spans={len(evidence_chain.get('spans') or [])}",
         f"- Semantic neighbors: {len(chain.get('semantic_neighbors') or [])}",
         f"- Temporal context: {len(chain.get('temporal_context') or [])}",
+        f"- Global paths: {global_chain.get('path_count', 0)} "
+        f"(cross-company={global_chain.get('cross_company_path_count', 0)}, "
+        f"truncated={bool(global_chain.get('truncated'))})",
     ]
     warnings = (payload.get("quality") or {}).get("warnings") or []
     if warnings:
@@ -3293,6 +3999,13 @@ def _markdown_chain(payload: dict[str, Any]) -> str:
         lines.append(
             f"- Temporal `{temporal.get('id')}` ({temporal.get('type')}): "
             f"{_short_text(temporal.get('text'))}"
+        )
+    for path in (global_chain.get("paths") or [])[:5]:
+        terminal = path.get("terminal_object") or {}
+        lines.append(
+            f"- Global path `{path.get('path_id')}` depth={path.get('depth')} "
+            f"score={path.get('score')} to `{terminal.get('object_id')}` "
+            f"({terminal.get('ticker')}; association={path.get('contains_discovery_association')})"
         )
     return "\n".join(lines)
 

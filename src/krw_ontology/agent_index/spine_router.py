@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
+import heapq
 import json
+import math
 import os
+import re
 import sqlite3
+import time
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -14,6 +19,10 @@ from krw_ontology.agent_index.chart_series import (
     CHART_SERIES_RELATIVE_PATH,
     chart_series_index_status,
     query_chart_series_pack,
+)
+from krw_ontology.agent_index.router_sidecar import (
+    ROUTER_SIDECAR_RELATIVE_PATH,
+    RouterSidecar,
 )
 from krw_ontology.agent_index.store import (
     OntologyStore,
@@ -34,6 +43,11 @@ _DEFAULT_ROUTER_FANOUT_WORKERS = 8
 _MAX_ROUTER_FANOUT_WORKERS = 16
 _DEFAULT_TICKERLESS_QUERY_CONTEXT_MAX_TICKERS = 5
 _TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
+_GLOBAL_CHAIN_MAX_DEPTH = 5
+_GLOBAL_CHAIN_MAX_PATHS = 32
+_GLOBAL_CHAIN_MAX_EXPANSIONS = 256
+_GLOBAL_CHAIN_MAX_FRONTIER = 128
+_GLOBAL_CHAIN_NEIGHBORS_PER_NODE = 12
 
 
 class OntologySpineRouter:
@@ -50,7 +64,9 @@ class OntologySpineRouter:
         self._declared_shard_paths, self._shard_paths, self._missing_shard_paths = self._load_shard_paths()
         self._chart_series_path = self.release_root / CHART_SERIES_RELATIVE_PATH
         self._chart_series_status = chart_series_index_status(self._chart_series_path)
+        self._router_sidecar_path = self.release_root / ROUTER_SIDECAR_RELATIVE_PATH
         self._spine_conn: sqlite3.Connection | None = None
+        self._router_sidecar: RouterSidecar | None = None
         self._shards: dict[str, OntologyStore] = {}
         self._closed = False
 
@@ -103,6 +119,9 @@ class OntologySpineRouter:
         if self._spine_conn is not None:
             self._spine_conn.close()
             self._spine_conn = None
+        if self._router_sidecar is not None:
+            self._router_sidecar.close()
+            self._router_sidecar = None
         self._closed = True
 
     def routing_status(self) -> dict[str, Any]:
@@ -121,6 +140,8 @@ class OntologySpineRouter:
             "open_shards": sorted(self._shards),
             "chart_series_available": bool(self._chart_series_status.get("available")),
             "chart_series_path": str(self._chart_series_path),
+            "router_sidecar_available": self._router_sidecar_path.is_file(),
+            "router_sidecar_path": str(self._router_sidecar_path),
             "fallback_enabled": False,
             "fallback": False,
         }
@@ -279,6 +300,425 @@ class OntologySpineRouter:
 
     def query_compact_with_diagnostics(self, **kwargs: Any) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         return self._fanout_query(compact=True, **kwargs)
+
+    def route_planned_tickers(
+        self,
+        *,
+        clauses: Sequence[Mapping[str, Any]],
+        explicit_tickers: Sequence[str] | None = None,
+        limit: int = 20,
+    ) -> tuple[list[str], dict[str, Any]]:
+        """Resolve plan scope with the derived sidecar and no spine scan fallback."""
+        started_at = time.perf_counter()
+        resolved_limit = max(1, int(limit))
+        normalized_explicit = _normalize_tickers(explicit_tickers) or []
+        if normalized_explicit:
+            available = [
+                ticker for ticker in normalized_explicit if ticker in self._shard_paths
+            ]
+            return available, {
+                "mode": "explicit_plan_scope",
+                "requested_tickers": normalized_explicit,
+                "resolved_tickers": available,
+                "unknown_tickers": self._unknown_tickers(normalized_explicit),
+                "missing_shards": self._missing_shards_for_tickers(normalized_explicit),
+                "fallback_used": False,
+                "timing_ms": {
+                    "total": int((time.perf_counter() - started_at) * 1000)
+                },
+            }
+
+        normalized_clauses = [
+            {
+                "clause_id": str(clause.get("clause_id") or f"clause_{index + 1}"),
+                "query": str(clause.get("query") or "").strip(),
+                "required": bool(clause.get("required", True)),
+            }
+            for index, clause in enumerate(clauses)
+            if str(clause.get("query") or "").strip()
+        ]
+        if not normalized_clauses:
+            return [], {
+                "mode": "planned_router_sidecar",
+                "error": "planned_routing_clauses_missing",
+                "fallback_used": False,
+            }
+        if not self._router_sidecar_path.is_file():
+            return [], {
+                "mode": "planned_router_sidecar",
+                "error": "router_sidecar_unavailable",
+                "router_sidecar_path": str(self._router_sidecar_path),
+                "fallback_used": False,
+            }
+
+        sidecar = self._sidecar()
+        rrf_k = max(1, int(sidecar.ranking_profile.get("rrf_k") or 60))
+        scores: defaultdict[str, float] = defaultdict(float)
+        clause_hits: Counter[str] = Counter()
+        required_clause_hits: Counter[str] = Counter()
+        best_rank: dict[str, int] = {}
+        query_diagnostics: list[dict[str, Any]] = []
+        required_rankings: list[list[str]] = []
+        for clause in normalized_clauses:
+            query = str(clause["query"])
+            required = bool(clause["required"])
+            weight = 2.0 if required else 1.0
+            query_started_at = time.perf_counter()
+            result = sidecar.search(query, limit=resolved_limit)
+            candidates = [
+                candidate
+                for candidate in result.get("ticker_candidates") or []
+                if isinstance(candidate, Mapping)
+            ]
+            seen_for_query: set[str] = set()
+            for rank, candidate in enumerate(candidates, start=1):
+                ticker = str(candidate.get("ticker") or "").strip().upper()
+                if not ticker or ticker not in self._shard_paths or ticker in seen_for_query:
+                    continue
+                seen_for_query.add(ticker)
+                scores[ticker] += weight / (rrf_k + rank)
+                clause_hits[ticker] += 1
+                if required:
+                    required_clause_hits[ticker] += 1
+                best_rank[ticker] = min(best_rank.get(ticker, rank), rank)
+            ranked_for_clause = [
+                str(candidate.get("ticker") or "").strip().upper()
+                for candidate in candidates
+                if str(candidate.get("ticker") or "").strip().upper() in seen_for_query
+            ]
+            if required:
+                required_rankings.append(ranked_for_clause)
+            query_diagnostics.append(
+                {
+                    "clause_id": clause["clause_id"],
+                    "required": required,
+                    "weight": weight,
+                    "query": query,
+                    "query_terms": list(result.get("query_terms") or []),
+                    "candidate_count": len(seen_for_query),
+                    "resolved_tickers": sorted(seen_for_query),
+                    "score_summary": _score_summary(candidates),
+                    "timing_ms": int(
+                        (time.perf_counter() - query_started_at) * 1000
+                    ),
+                }
+            )
+
+        aggregate_ranked = sorted(
+            scores,
+            key=lambda ticker: (
+                -required_clause_hits[ticker],
+                -scores[ticker],
+                -clause_hits[ticker],
+                best_rank.get(ticker, resolved_limit + 1),
+                ticker,
+            ),
+        )
+        ranked: list[str] = []
+        for clause_ranking in required_rankings:
+            top = next((ticker for ticker in clause_ranking if ticker not in ranked), None)
+            if top:
+                ranked.append(top)
+            if len(ranked) >= resolved_limit:
+                break
+        for ticker in aggregate_ranked:
+            if ticker not in ranked:
+                ranked.append(ticker)
+            if len(ranked) >= resolved_limit:
+                break
+        return ranked, {
+            "mode": "planned_router_sidecar",
+            "resolved_tickers": ranked,
+            "query_count": len(normalized_clauses),
+            "required_query_count": sum(
+                1 for clause in normalized_clauses if clause["required"]
+            ),
+            "queries": query_diagnostics,
+            "ranking_profile_id": sidecar.ranking_profile.get("profile_id"),
+            "ranking_profile_sha256": sidecar.metadata.get(
+                "ranking_profile_sha256"
+            ),
+            "build_fingerprint_sha256": sidecar.metadata.get(
+                "build_fingerprint_sha256"
+            ),
+            "release_id": sidecar.metadata.get("release_id"),
+            "timing_ms": {
+                "total": int((time.perf_counter() - started_at) * 1000)
+            },
+            "fallback_used": False,
+        }
+
+    def query_planned_compact_with_diagnostics(
+        self,
+        *,
+        retrieval_query: str,
+        retrieval_terms: Iterable[str] | None = None,
+        predicate_terms: Iterable[str] | None = None,
+        metrics: Iterable[str] | None = None,
+        metric_dimensions: Iterable[str] | None = None,
+        metric_scope: str = "company_total",
+        calculation_window: str | None = None,
+        comparison_axes: Iterable[str] | None = None,
+        tickers: Iterable[str],
+        document_types: Iterable[str] | None = None,
+        periods: Iterable[str] | None = None,
+        object_types: Iterable[str] | None = None,
+        include_rejected: bool = False,
+        allow_relaxed: bool = False,
+        limit: int = 20,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """Execute one SearchPlan clause across resolved shards in rank-balanced order."""
+        result_limit = max(1, int(limit))
+        route_tickers = _normalize_tickers(tickers) or []
+        available_tickers = [
+            ticker for ticker in route_tickers if ticker in self._shard_paths
+        ]
+        shard_diagnostics: dict[str, Any] = {}
+
+        def load_query(_ticker: str, store: OntologyStore) -> dict[str, Any]:
+            rows, diagnostics = store.query_planned_compact_with_diagnostics(
+                retrieval_query=retrieval_query,
+                retrieval_terms=retrieval_terms,
+                predicate_terms=predicate_terms,
+                metrics=metrics,
+                metric_dimensions=metric_dimensions,
+                metric_scope=metric_scope,
+                calculation_window=calculation_window,
+                comparison_axes=comparison_axes,
+                tickers=[_ticker],
+                document_types=document_types,
+                periods=periods,
+                object_types=object_types,
+                include_rejected=include_rejected,
+                allow_relaxed=allow_relaxed,
+                limit=result_limit,
+            )
+            return {"rows": list(rows), "diagnostics": diagnostics}
+
+        payload_by_ticker, shard_errors, worker_count = self._store_fanout(
+            available_tickers,
+            load_query,
+        )
+        rows_by_ticker: dict[str, list[dict[str, Any]]] = {}
+        for ticker in available_tickers:
+            payload = payload_by_ticker.get(ticker)
+            if not isinstance(payload, Mapping):
+                continue
+            rows_by_ticker[ticker] = [
+                dict(row)
+                for row in payload.get("rows") or []
+                if isinstance(row, Mapping)
+            ]
+            diagnostics = payload.get("diagnostics")
+            if isinstance(diagnostics, Mapping):
+                shard_diagnostics[ticker] = dict(diagnostics)
+
+        results: list[dict[str, Any]] = []
+        row_rank = 0
+        while len(results) < result_limit:
+            added = False
+            for ticker in available_tickers:
+                rows = rows_by_ticker.get(ticker) or []
+                if row_rank >= len(rows):
+                    continue
+                row = dict(rows[row_rank])
+                row["planned_ticker_rank"] = available_tickers.index(ticker) + 1
+                row["planned_within_ticker_rank"] = row_rank + 1
+                results.append(row)
+                added = True
+                if len(results) >= result_limit:
+                    break
+            if not added:
+                break
+            row_rank += 1
+
+        fanout = self._fanout_diagnostics(worker_count, shard_errors)
+        return results, {
+            "execution_mode": "planned_shard_fanout",
+            "retrieval_query": retrieval_query,
+            "result_count": len(results),
+            "routing": self._route_payload("planned_shard_fanout", route_tickers),
+            "shard_diagnostics": shard_diagnostics,
+            "missing_shards": self._missing_shards_for_tickers(route_tickers),
+            "unknown_tickers": self._unknown_tickers(route_tickers),
+            "fallback_used": False,
+            **fanout,
+        }
+
+    def query_planned_batch_with_diagnostics(
+        self,
+        *,
+        clauses: Sequence[Mapping[str, Any]],
+        tickers: Iterable[str],
+        document_types: Iterable[str] | None = None,
+        periods: Iterable[str] | None = None,
+        include_rejected: bool = False,
+        limit: int = 20,
+    ) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+        """Execute all plan clauses with one SQLite connection per routed shard."""
+        started_at = time.perf_counter()
+        result_limit = max(1, int(limit))
+        route_tickers = _normalize_tickers(tickers) or []
+        available_tickers = [
+            ticker for ticker in route_tickers if ticker in self._shard_paths
+        ]
+        normalized_clauses = [
+            dict(clause)
+            for clause in clauses
+            if str(clause.get("clause_id") or "").strip()
+            and str(clause.get("retrieval_query") or "").strip()
+        ]
+
+        def load_batch(ticker: str, store: OntologyStore) -> dict[str, Any]:
+            clause_payloads: dict[str, Any] = {}
+            for clause in normalized_clauses:
+                clause_id = str(clause["clause_id"])
+                clause_tickers = _normalize_tickers(clause.get("tickers")) or []
+                if clause_tickers and ticker not in clause_tickers:
+                    clause_payloads[clause_id] = {
+                        "rows": [],
+                        "diagnostics": {
+                            "execution_mode": "planned_shard_batch",
+                            "ticker_scope_skipped": True,
+                        },
+                    }
+                    continue
+                rows, diagnostics = store.query_planned_compact_with_diagnostics(
+                    retrieval_query=str(clause["retrieval_query"]),
+                    retrieval_terms=clause.get("retrieval_terms"),
+                    predicate_terms=clause.get("predicate_terms"),
+                    metrics=clause.get("metrics"),
+                    metric_dimensions=clause.get("metric_dimensions"),
+                    metric_scope=str(clause.get("metric_scope") or "company_total"),
+                    calculation_window=(
+                        str(clause.get("calculation_window") or "").strip() or None
+                    ),
+                    comparison_axes=clause.get("comparison_axes"),
+                    tickers=[ticker],
+                    document_types=document_types,
+                    periods=periods,
+                    object_types=clause.get("object_types"),
+                    include_rejected=include_rejected,
+                    allow_relaxed=bool(clause.get("allow_relaxed")),
+                    limit=result_limit,
+                )
+                clause_payloads[clause_id] = {
+                    "rows": list(rows),
+                    "diagnostics": diagnostics,
+                }
+            return clause_payloads
+
+        payload_by_ticker, shard_errors, worker_count = self._store_fanout(
+            available_tickers,
+            load_batch,
+        )
+        by_clause: dict[str, dict[str, Any]] = {}
+        ticker_rank = {
+            ticker: rank for rank, ticker in enumerate(available_tickers, start=1)
+        }
+        for clause in normalized_clauses:
+            clause_id = str(clause["clause_id"])
+            rows_by_ticker: dict[str, list[dict[str, Any]]] = {}
+            shard_diagnostics: dict[str, Any] = {}
+            for ticker in available_tickers:
+                ticker_payload = payload_by_ticker.get(ticker)
+                if not isinstance(ticker_payload, Mapping):
+                    continue
+                clause_payload = ticker_payload.get(clause_id)
+                if not isinstance(clause_payload, Mapping):
+                    continue
+                rows_by_ticker[ticker] = [
+                    dict(row)
+                    for row in clause_payload.get("rows") or []
+                    if isinstance(row, Mapping)
+                ]
+                diagnostics = clause_payload.get("diagnostics")
+                if isinstance(diagnostics, Mapping):
+                    shard_diagnostics[ticker] = dict(diagnostics)
+
+            rows: list[dict[str, Any]] = []
+            selected_by_ticker: Counter[str] = Counter()
+            pre_truncation_count = sum(len(value) for value in rows_by_ticker.values())
+            row_rank = 0
+            while len(rows) < result_limit:
+                added = False
+                for ticker in available_tickers:
+                    ticker_rows = rows_by_ticker.get(ticker) or []
+                    if row_rank >= len(ticker_rows):
+                        continue
+                    row = dict(ticker_rows[row_rank])
+                    row["planned_ticker_rank"] = ticker_rank[ticker]
+                    row["planned_within_ticker_rank"] = row_rank + 1
+                    rows.append(row)
+                    selected_by_ticker[ticker] += 1
+                    added = True
+                    if len(rows) >= result_limit:
+                        break
+                if not added:
+                    break
+                row_rank += 1
+            by_clause[clause_id] = {
+                "rows": rows,
+                "diagnostics": {
+                    "execution_mode": "planned_shard_batch",
+                    "retrieval_query": clause["retrieval_query"],
+                    "result_count": len(rows),
+                    "pre_truncation_count": pre_truncation_count,
+                    "omitted_count": max(0, pre_truncation_count - len(rows)),
+                    "omitted_tickers": [
+                        ticker
+                        for ticker, ticker_rows in rows_by_ticker.items()
+                        if len(ticker_rows) > selected_by_ticker[ticker]
+                    ],
+                    "truncation_possible": any(
+                        len(ticker_rows) >= result_limit
+                        for ticker_rows in rows_by_ticker.values()
+                    ),
+                    "shard_diagnostics": shard_diagnostics,
+                },
+            }
+
+        failed_tickers = sorted(shard_errors)
+        successful_tickers = [
+            ticker for ticker in available_tickers if ticker not in shard_errors
+        ]
+        fanout = self._fanout_diagnostics(worker_count, shard_errors)
+        routing = self._route_payload("planned_shard_batch", route_tickers)
+        routing.update(
+            {
+                "resolved_tickers": successful_tickers,
+                "failed_tickers": failed_tickers,
+            }
+        )
+        routing.update(fanout)
+        return by_clause, {
+            "execution_mode": "planned_shard_batch",
+            "clause_count": len(normalized_clauses),
+            "ticker_count": len(available_tickers),
+            "shard_open_count": len(payload_by_ticker),
+            "routing": routing,
+            "missing_shards": self._missing_shards_for_tickers(route_tickers),
+            "unknown_tickers": self._unknown_tickers(route_tickers),
+            "failed_tickers": failed_tickers,
+            "warnings": ["ticker_shard_query_failed"] if failed_tickers else [],
+            "pre_truncation_count": sum(
+                int(payload["diagnostics"].get("pre_truncation_count") or 0)
+                for payload in by_clause.values()
+            ),
+            "omitted_count": sum(
+                int(payload["diagnostics"].get("omitted_count") or 0)
+                for payload in by_clause.values()
+            ),
+            "truncation_possible": any(
+                bool(payload["diagnostics"].get("truncation_possible"))
+                for payload in by_clause.values()
+            ),
+            "timing_ms": {
+                "total": int((time.perf_counter() - started_at) * 1000)
+            },
+            "fallback_used": False,
+            **fanout,
+        }
 
     def query_context(
         self,
@@ -512,7 +952,17 @@ class OntologySpineRouter:
         chain = self._store_for_ticker(ticker).chain(object_id, **kwargs)
         if chain is None:
             return None
+        max_depth = max(
+            0,
+            min(int(kwargs.get("max_depth", 2)), _GLOBAL_CHAIN_MAX_DEPTH),
+        )
+        direction = _normalize_global_chain_direction(str(kwargs.get("direction") or "both"))
         chain["global_spine_neighbors"] = self._chain_neighbors(object_id)
+        chain["global_chain"] = self._global_chain_paths(
+            object_id,
+            max_depth=max_depth,
+            direction=direction,
+        )
         chain["routing"] = self._route_payload("object_locator", [ticker])
         chain["object_locator"] = locator
         return chain
@@ -623,7 +1073,11 @@ class OntologySpineRouter:
             return results, errors, worker_count
 
         def run(ticker: str) -> tuple[str, Any]:
-            with OntologyStore(self._shard_paths[ticker], check_same_thread=True) as store:
+            with OntologyStore(
+                self._shard_paths[ticker],
+                check_same_thread=True,
+                immutable=True,
+            ) as store:
                 return ticker, callback(ticker, store)
 
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
@@ -971,7 +1425,11 @@ class OntologySpineRouter:
             raise KeyError(f"ticker shard not found: {normalized or '<missing>'}")
         store = self._shards.get(normalized)
         if store is None:
-            store = OntologyStore(self._shard_paths[normalized], check_same_thread=self.check_same_thread)
+            store = OntologyStore(
+                self._shard_paths[normalized],
+                check_same_thread=self.check_same_thread,
+                immutable=True,
+            )
             self._shards[normalized] = store
         return store
 
@@ -1050,19 +1508,377 @@ class OntologySpineRouter:
         ]
 
     def _chain_neighbors(self, object_id: str) -> list[dict[str, Any]]:
-        rows = self.conn.execute(
-            """
+        rows: dict[str, dict[str, Any]] = {}
+        sql = """
             SELECT link_id, link_type, from_ticker, to_ticker, shared_key,
                    shared_key_type, from_object_id, to_object_id, weight,
-                   confidence, explanation_template
+                   confidence, evidence_grade, materiality, generic_penalty,
+                   recency_score, explanation_template
             FROM global_chain_index
-            WHERE from_object_id = ? OR to_object_id = ?
-            ORDER BY COALESCE(weight, 0) DESC
+            WHERE {column} = ?
+            ORDER BY COALESCE(weight, 0) DESC, link_id
             LIMIT 20
+        """
+        for column in ("from_object_id", "to_object_id"):
+            for row in self.conn.execute(sql.format(column=column), (object_id,)).fetchall():
+                payload = dict(row)
+                payload["semantic_role"] = (
+                    "routing_only_similarity"
+                    if payload.get("link_type") == "similar_topic"
+                    else "cross_company_association"
+                )
+                payload["causal_inference_allowed"] = False
+                rows[str(payload["link_id"])] = payload
+        return sorted(
+            rows.values(),
+            key=lambda row: (-float(row.get("weight") or 0.0), str(row.get("link_id") or "")),
+        )[:20]
+
+    def _global_chain_paths(
+        self,
+        object_id: str,
+        *,
+        max_depth: int,
+        direction: str,
+    ) -> dict[str, Any]:
+        """Traverse local ontology edges and exact cross-company associations.
+
+        The traversal is deliberately bounded and best-first.  Similar-topic
+        links remain visible as one-hop routing candidates, but are excluded
+        from evidence paths because lexical similarity is not proof of a
+        relationship or causal mechanism.
+        """
+        root = self._global_locator_compact(object_id)
+        if root is None or max_depth <= 0:
+            return {
+                "algorithm": "bounded_best_first/v1",
+                "root_object_id": object_id,
+                "max_depth": max_depth,
+                "direction": direction,
+                "paths": [],
+                "path_count": 0,
+                "cross_company_path_count": 0,
+                "expanded_states": 0,
+                "frontier_remaining": 0,
+                "truncated": False,
+                "stop_reason": "max_depth_zero" if max_depth <= 0 else "root_not_found",
+                "similarity_links_in_evidence_paths": False,
+            }
+
+        frontier: list[tuple[float, int, int, str, list[dict[str, Any]], frozenset[str], tuple[str, ...]]] = []
+        sequence = 0
+        heapq.heappush(
+            frontier,
+            (-1.0, 0, sequence, object_id, [], frozenset({object_id}), (str(root.get("ticker") or ""),)),
+        )
+        locator_cache: dict[str, dict[str, Any]] = {object_id: root}
+        paths: list[dict[str, Any]] = []
+        expanded_states = 0
+
+        while (
+            frontier
+            and len(paths) < _GLOBAL_CHAIN_MAX_PATHS
+            and expanded_states < _GLOBAL_CHAIN_MAX_EXPANSIONS
+        ):
+            negative_score, depth, _order, current_id, steps, seen_ids, tickers = heapq.heappop(frontier)
+            score = -negative_score
+            if steps:
+                paths.append(
+                    _global_chain_path_payload(
+                        object_id,
+                        steps=steps,
+                        score=score,
+                        tickers=tickers,
+                    )
+                )
+            if depth >= max_depth:
+                continue
+            current_locator = locator_cache.get(current_id)
+            if current_locator is None:
+                current_locator = self._global_locator_compact(current_id)
+                if current_locator is None:
+                    continue
+                locator_cache[current_id] = current_locator
+            expanded_states += 1
+            for neighbor in self._global_graph_neighbors(
+                current_id,
+                current_locator=current_locator,
+                direction=direction,
+            ):
+                neighbor_id = str(neighbor["neighbor_object_id"])
+                if neighbor_id in seen_ids:
+                    continue
+                locator = dict(neighbor["object_locator"])
+                if str(locator.get("quality_status") or "").lower() == "rejected":
+                    continue
+                locator_cache[neighbor_id] = locator
+                step = dict(neighbor["step"])
+                next_steps = [*steps, step]
+                next_score = score * float(neighbor["step_score"])
+                next_ticker = str(locator.get("ticker") or "")
+                next_tickers = (*tickers, next_ticker)
+                sequence += 1
+                heapq.heappush(
+                    frontier,
+                    (
+                        -next_score,
+                        depth + 1,
+                        sequence,
+                        neighbor_id,
+                        next_steps,
+                        seen_ids | {neighbor_id},
+                        next_tickers,
+                    ),
+                )
+            if len(frontier) > _GLOBAL_CHAIN_MAX_FRONTIER:
+                frontier = heapq.nsmallest(_GLOBAL_CHAIN_MAX_FRONTIER, frontier)
+                heapq.heapify(frontier)
+
+        truncated = bool(frontier) or expanded_states >= _GLOBAL_CHAIN_MAX_EXPANSIONS
+        return {
+            "algorithm": "bounded_best_first/v1",
+            "root_object_id": object_id,
+            "max_depth": max_depth,
+            "direction": direction,
+            "paths": paths,
+            "path_count": len(paths),
+            "cross_company_path_count": sum(
+                1 for path in paths if int(path.get("cross_company_hops") or 0) > 0
+            ),
+            "expanded_states": expanded_states,
+            "frontier_remaining": len(frontier),
+            "truncated": truncated,
+            "stop_reason": (
+                "path_limit"
+                if len(paths) >= _GLOBAL_CHAIN_MAX_PATHS
+                else "expansion_limit"
+                if expanded_states >= _GLOBAL_CHAIN_MAX_EXPANSIONS
+                else "frontier_exhausted"
+            ),
+            "similarity_links_in_evidence_paths": False,
+            "accuracy_policy": {
+                "cross_company_links_are_associations_not_causal_edges": True,
+                "similar_topic_links_are_routing_only": True,
+                "rejected_objects_excluded": True,
+                "cycles_excluded_per_path": True,
+            },
+        }
+
+    def _global_graph_neighbors(
+        self,
+        object_id: str,
+        *,
+        current_locator: Mapping[str, Any],
+        direction: str,
+    ) -> list[dict[str, Any]]:
+        neighbors: list[dict[str, Any]] = []
+        if direction in {"both", "outgoing"}:
+            neighbors.extend(
+                self._global_edge_neighbor_rows(
+                    object_id,
+                    current_locator=current_locator,
+                    outgoing=True,
+                )
+            )
+        if direction in {"both", "incoming"}:
+            neighbors.extend(
+                self._global_edge_neighbor_rows(
+                    object_id,
+                    current_locator=current_locator,
+                    outgoing=False,
+                )
+            )
+        # Cross-company shared-key links are symmetric associations; their
+        # lexical from/to ordering must not make one endpoint undiscoverable.
+        neighbors.extend(
+            self._global_association_neighbor_rows(
+                object_id,
+                current_locator=current_locator,
+            )
+        )
+        deduplicated: dict[tuple[str, str, str], dict[str, Any]] = {}
+        for neighbor in neighbors:
+            step = neighbor["step"]
+            key = (
+                str(step.get("kind") or ""),
+                str(step.get("connection_id") or ""),
+                str(neighbor.get("neighbor_object_id") or ""),
+            )
+            previous = deduplicated.get(key)
+            if previous is None or float(neighbor["step_score"]) > float(previous["step_score"]):
+                deduplicated[key] = neighbor
+        return sorted(
+            deduplicated.values(),
+            key=lambda row: (
+                -float(row["step_score"]),
+                str(row["step"].get("connection_id") or ""),
+                str(row["neighbor_object_id"]),
+            ),
+        )[:_GLOBAL_CHAIN_NEIGHBORS_PER_NODE]
+
+    def _global_edge_neighbor_rows(
+        self,
+        object_id: str,
+        *,
+        current_locator: Mapping[str, Any],
+        outgoing: bool,
+    ) -> list[dict[str, Any]]:
+        source_column, target_column = (
+            ("from_object_id", "to_object_id")
+            if outgoing
+            else ("to_object_id", "from_object_id")
+        )
+        rows = self.conn.execute(
+            f"""
+            SELECT edge.edge_id, edge.from_object_id, edge.to_object_id,
+                   edge.from_ticker, edge.to_ticker, edge.relation_type,
+                   edge.edge_scope, edge.source_object_type, edge.target_object_type,
+                   edge.confidence, edge.evidence_grade, edge.materiality,
+                   edge.recency_score, edge.shard_hint, edge.compact_reason,
+                   locator.object_id AS neighbor_object_id,
+                   locator.ticker AS neighbor_ticker,
+                   locator.document_id AS neighbor_document_id,
+                   locator.document_type AS neighbor_document_type,
+                   locator.period AS neighbor_period,
+                   locator.filing_date AS neighbor_filing_date,
+                   locator.object_type AS neighbor_object_type,
+                   locator.compact_label AS neighbor_label,
+                   locator.compact_summary AS neighbor_summary,
+                   locator.quality_status AS neighbor_quality_status
+            FROM global_edge_spine AS edge
+            JOIN global_object_locator AS locator
+              ON locator.object_id = edge.{target_column}
+            WHERE edge.{source_column} = ?
+            ORDER BY COALESCE(edge.confidence, 0.5) DESC,
+                     edge.relation_type, edge.edge_id
+            LIMIT ?
             """,
-            (object_id, object_id),
+            (object_id, _GLOBAL_CHAIN_NEIGHBORS_PER_NODE),
         ).fetchall()
-        return [dict(row) for row in rows]
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            locator = _locator_from_global_chain_row(row)
+            temporal = _global_temporal_alignment(current_locator, locator)
+            step_score = _global_edge_step_score(dict(row), temporal_score=temporal["score"])
+            results.append(
+                {
+                    "neighbor_object_id": row["neighbor_object_id"],
+                    "object_locator": locator,
+                    "step_score": step_score,
+                    "step": {
+                        "kind": "ontology_edge",
+                        "connection_id": row["edge_id"],
+                        "direction": "outgoing" if outgoing else "incoming",
+                        "relation_type": row["relation_type"],
+                        "from_object_id": row["from_object_id"],
+                        "to_object_id": row["to_object_id"],
+                        "confidence": row["confidence"],
+                        "evidence_grade": row["evidence_grade"],
+                        "materiality": row["materiality"],
+                        "recency_score": row["recency_score"],
+                        "reason": row["compact_reason"],
+                        "semantic_role": "ontology_relation",
+                        "causal_inference_allowed": False,
+                        "temporal_alignment": temporal,
+                        "step_score": step_score,
+                        "object": locator,
+                    },
+                }
+            )
+        return results
+
+    def _global_association_neighbor_rows(
+        self,
+        object_id: str,
+        *,
+        current_locator: Mapping[str, Any],
+    ) -> list[dict[str, Any]]:
+        sql = """
+            SELECT link.link_id, link.link_type, link.from_ticker, link.to_ticker,
+                   link.shared_key, link.shared_key_type, link.from_object_id,
+                   link.to_object_id, link.weight, link.confidence,
+                   link.evidence_grade, link.materiality, link.generic_penalty,
+                   link.recency_score, link.explanation_template,
+                   locator.object_id AS neighbor_object_id,
+                   locator.ticker AS neighbor_ticker,
+                   locator.document_id AS neighbor_document_id,
+                   locator.document_type AS neighbor_document_type,
+                   locator.period AS neighbor_period,
+                   locator.filing_date AS neighbor_filing_date,
+                   locator.object_type AS neighbor_object_type,
+                   locator.compact_label AS neighbor_label,
+                   locator.compact_summary AS neighbor_summary,
+                   locator.quality_status AS neighbor_quality_status
+            FROM global_chain_index AS link
+            JOIN global_object_locator AS locator
+              ON locator.object_id = link.{target_column}
+            WHERE link.{source_column} = ?
+              AND link.link_type != 'similar_topic'
+              AND COALESCE(link.generic_penalty, 0) < 0.8
+            ORDER BY COALESCE(link.weight, 0) DESC, link.link_id
+            LIMIT ?
+        """
+        rows: list[tuple[sqlite3.Row, str]] = []
+        for source_column, target_column, direction in (
+            ("from_object_id", "to_object_id", "undirected_from"),
+            ("to_object_id", "from_object_id", "undirected_to"),
+        ):
+            query = sql.format(source_column=source_column, target_column=target_column)
+            rows.extend(
+                (row, direction)
+                for row in self.conn.execute(
+                    query,
+                    (object_id, _GLOBAL_CHAIN_NEIGHBORS_PER_NODE),
+                ).fetchall()
+            )
+        results: list[dict[str, Any]] = []
+        for row, association_direction in rows:
+            locator = _locator_from_global_chain_row(row)
+            temporal = _global_temporal_alignment(current_locator, locator)
+            step_score = _global_association_step_score(dict(row), temporal_score=temporal["score"])
+            results.append(
+                {
+                    "neighbor_object_id": row["neighbor_object_id"],
+                    "object_locator": locator,
+                    "step_score": step_score,
+                    "step": {
+                        "kind": "cross_company_association",
+                        "connection_id": row["link_id"],
+                        "direction": association_direction,
+                        "link_type": row["link_type"],
+                        "shared_key_type": row["shared_key_type"],
+                        "shared_key": row["shared_key"],
+                        "from_object_id": row["from_object_id"],
+                        "to_object_id": row["to_object_id"],
+                        "weight": row["weight"],
+                        "confidence": row["confidence"],
+                        "evidence_grade": row["evidence_grade"],
+                        "materiality": row["materiality"],
+                        "generic_penalty": row["generic_penalty"],
+                        "recency_score": row["recency_score"],
+                        "reason": row["explanation_template"],
+                        "semantic_role": "discovery_association",
+                        "causal_inference_allowed": False,
+                        "temporal_alignment": temporal,
+                        "step_score": step_score,
+                        "object": locator,
+                    },
+                }
+            )
+        return results
+
+    def _global_locator_compact(self, object_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            """
+            SELECT object_id, ticker, document_id, document_type, period,
+                   filing_date, object_type, compact_label, compact_summary,
+                   quality_status
+            FROM global_object_locator
+            WHERE object_id = ?
+            """,
+            (object_id,),
+        ).fetchone()
+        return dict(row) if row else None
 
     def _global_object_counts(self) -> dict[str, int]:
         rows = self.conn.execute(
@@ -1125,9 +1941,19 @@ class OntologySpineRouter:
 
     def _spine_connection(self) -> sqlite3.Connection:
         if self._spine_conn is None:
-            self._spine_conn = sqlite3.connect(self.global_spine_path, check_same_thread=self.check_same_thread)
+            uri = self.global_spine_path.resolve().as_uri() + "?mode=ro&immutable=1"
+            self._spine_conn = sqlite3.connect(
+                uri,
+                uri=True,
+                check_same_thread=self.check_same_thread,
+            )
             self._spine_conn.row_factory = sqlite3.Row
         return self._spine_conn
+
+    def _sidecar(self) -> RouterSidecar:
+        if self._router_sidecar is None:
+            self._router_sidecar = RouterSidecar(self._router_sidecar_path)
+        return self._router_sidecar
 
     def _load_shard_paths(self) -> tuple[dict[str, Path], dict[str, Path], dict[str, Path]]:
         raw_shards = self._shard_manifest.get("shards")
@@ -1546,6 +2372,155 @@ def _merge_discovery_payloads(
     }
 
 
+def _normalize_global_chain_direction(direction: str) -> str:
+    value = str(direction or "both").strip().lower()
+    if value in {"incoming", "in", "upstream", "up"}:
+        return "incoming"
+    if value in {"outgoing", "out", "downstream", "down"}:
+        return "outgoing"
+    return "both"
+
+
+def _locator_from_global_chain_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "object_id": row["neighbor_object_id"],
+        "ticker": row["neighbor_ticker"],
+        "document_id": row["neighbor_document_id"],
+        "document_type": row["neighbor_document_type"],
+        "period": row["neighbor_period"],
+        "filing_date": row["neighbor_filing_date"],
+        "object_type": row["neighbor_object_type"],
+        "compact_label": row["neighbor_label"],
+        "compact_summary": row["neighbor_summary"],
+        "quality_status": row["neighbor_quality_status"],
+    }
+
+
+def _global_temporal_alignment(
+    left: Mapping[str, Any],
+    right: Mapping[str, Any],
+) -> dict[str, Any]:
+    left_period = str(left.get("period") or "").strip()
+    right_period = str(right.get("period") or "").strip()
+    if left_period and left_period == right_period:
+        return {
+            "status": "same_period",
+            "score": 1.0,
+            "from_period": left_period,
+            "to_period": right_period,
+        }
+    left_year = _period_year(left_period)
+    right_year = _period_year(right_period)
+    if left_year is None or right_year is None:
+        status, score = "unknown", 0.8
+    else:
+        year_gap = abs(left_year - right_year)
+        if year_gap <= 1:
+            status, score = "near_period", 0.9
+        elif year_gap <= 3:
+            status, score = "distant_period", 0.72
+        else:
+            status, score = "stale_period_gap", 0.55
+    return {
+        "status": status,
+        "score": score,
+        "from_period": left_period or None,
+        "to_period": right_period or None,
+    }
+
+
+def _period_year(period: str) -> int | None:
+    match = re.search(r"(?:19|20)\d{2}", str(period or ""))
+    return int(match.group(0)) if match else None
+
+
+def _global_edge_step_score(row: Mapping[str, Any], *, temporal_score: float) -> float:
+    confidence = _bounded_score(row.get("confidence"), default=0.6)
+    evidence = _evidence_grade_score(row.get("evidence_grade"))
+    materiality = _bounded_score(row.get("materiality"), default=0.5)
+    recency = _bounded_score(row.get("recency_score"), default=temporal_score)
+    score = (
+        0.42 * confidence
+        + 0.28 * evidence
+        + 0.15 * materiality
+        + 0.15 * recency
+    ) * (0.9 + 0.1 * temporal_score)
+    return round(max(0.05, min(score, 1.0)), 6)
+
+
+def _global_association_step_score(
+    row: Mapping[str, Any],
+    *,
+    temporal_score: float,
+) -> float:
+    weight = min(_bounded_score(row.get("weight"), default=0.0) / 0.75, 1.0)
+    confidence = _bounded_score(row.get("confidence"), default=0.55)
+    evidence = _evidence_grade_score(row.get("evidence_grade"))
+    generic_penalty = _bounded_score(row.get("generic_penalty"), default=0.0)
+    score = (
+        0.55 * weight
+        + 0.25 * confidence
+        + 0.20 * evidence
+    )
+    score *= 1.0 - (0.5 * generic_penalty)
+    score *= temporal_score
+    score *= 0.88  # Associations rank below equally strong ontology edges.
+    return round(max(0.03, min(score, 0.88)), 6)
+
+
+def _bounded_score(value: Any, *, default: float) -> float:
+    try:
+        score = float(value)
+    except (TypeError, ValueError):
+        return default
+    return max(0.0, min(score, 1.0))
+
+
+def _evidence_grade_score(value: Any) -> float:
+    grade = str(value or "").strip().lower()
+    return {
+        "direct": 1.0,
+        "primary": 1.0,
+        "verified": 0.95,
+        "explicit": 0.95,
+        "high": 0.9,
+        "medium": 0.72,
+        "inferred": 0.62,
+        "derived": 0.55,
+        "low": 0.4,
+        "unsupported": 0.15,
+        # Old v2 fragments accidentally projected review status here.  Treat
+        # it as neutral, never as strong evidence.
+        "accepted": 0.6,
+    }.get(grade, 0.58)
+
+
+def _global_chain_path_payload(
+    root_object_id: str,
+    *,
+    steps: Sequence[Mapping[str, Any]],
+    score: float,
+    tickers: Sequence[str],
+) -> dict[str, Any]:
+    connection_ids = [str(step.get("connection_id") or "") for step in steps]
+    terminal = dict(steps[-1].get("object") or {}) if steps else {}
+    encoded = "|".join([root_object_id, *connection_ids]).encode("utf-8")
+    cross_company_hops = sum(
+        1 for step in steps if step.get("kind") == "cross_company_association"
+    )
+    return {
+        "path_id": f"chain:{hashlib.sha256(encoded).hexdigest()[:24]}",
+        "score": round(float(score), 6),
+        "depth": len(steps),
+        "cross_company_hops": cross_company_hops,
+        "contains_discovery_association": cross_company_hops > 0,
+        "causal_inference_allowed": False,
+        "tickers": list(dict.fromkeys(str(ticker) for ticker in tickers if ticker)),
+        "terminal_object": terminal,
+        "steps": [dict(step) for step in steps],
+    }
+
+
 def _normalize_tickers(tickers: Iterable[str] | None) -> list[str] | None:
     if tickers is None:
         return None
@@ -1574,6 +2549,32 @@ def _read_int_env(name: str, default: int, *, min_value: int) -> int:
     except ValueError:
         return default
     return value if value >= min_value else default
+
+
+def _score_summary(candidates: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    scores = sorted(
+        (
+            max(0.0, float(candidate.get("score") or 0.0))
+            for candidate in candidates
+        ),
+        reverse=True,
+    )
+    total = sum(scores)
+    entropy = 0.0
+    if total > 0 and len(scores) > 1:
+        probabilities = [score / total for score in scores if score > 0]
+        if len(probabilities) > 1:
+            entropy = -sum(
+                probability * math.log(probability)
+                for probability in probabilities
+            ) / math.log(len(probabilities))
+    top_score = scores[0] if scores else 0.0
+    return {
+        "candidate_count": len(scores),
+        "top_score": top_score,
+        "top_score_gap": top_score - scores[1] if len(scores) > 1 else top_score,
+        "normalized_entropy": round(entropy, 6),
+    }
 
 
 def _tickerless_query_context_limit(requested_limit: int) -> int:

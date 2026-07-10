@@ -38,14 +38,15 @@ Tier 5 social/forum/video sources are not used as final-answer evidence unless t
 ## Tool behavior gates
 
 ```text
-query_context is the first ontology call after current-event extraction
+model-authored SearchPlan v2 exists before query_context, the first ontology call after current-event extraction
+query_context arguments are exactly {search_plan}; legacy top-level arguments = 0
 news-mode research uses stock-news event discovery before query_context
-if only low-quality sources appear, run one constrained official/major-source confirmation search before converting the event into ontology search
+if only low-quality sources appear, run constrained official/major-source confirmation searches as needed until the event is confirmed or the source-quality boundary is clear
 legacy generic web-search tool references = 0
 stock-news event tool names in final answers = 0
-MCP research uses an internal English investment brief that preserves user intent, tickers, periods, metrics, and comparison axes
-the English investment brief is ontology/MCP-aware and optimized for evidence retrieval, not literal translation
-retrieve is legacy fallback only; do not use after sufficient query_context
+SearchPlan preserves user intent, tickers/universe, periods, metrics, dimensions, predicates, comparison axes, and calculation windows in atomic clauses
+ResearchState required clause/calculation coverage is checked before synthesis
+retrieve is a targeted recall extension for a named missing clause only; do not use after sufficient ResearchState coverage
 trace/chain selected roots only; never brute-force every candidate
 no repeated equivalent query
 no broad full-response first pass

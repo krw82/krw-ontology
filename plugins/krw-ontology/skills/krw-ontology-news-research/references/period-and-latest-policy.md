@@ -45,30 +45,31 @@ historical trend
 change, persistence, improvement, or deterioration
 ```
 
-## MCP filing document roles
+## ResearchState source anchors
 
-When MCP responses include `filing_document_roles`, follow those roles before generic document ordering.
+Read `ResearchState.source_anchors` before applying generic document ordering.
+Each anchor contains `ticker`, `period`, `document_type`, `role`, and
+`source_label`.
 
-The role contract is 10-Q/10-K only:
+Use returned roles as follows:
 
 ```text
-filing_document_roles.<TICKER>.current_driver
-  latest available 10-Q when it exists
-  otherwise latest available 10-K
-  use as the latest reported financial baseline for current/news-event interpretation
+current_driver
+  use as the latest reported financial baseline for current-event interpretation
 
-filing_document_roles.<TICKER>.annual_baseline
-  latest available 10-K
-  use for annual business mix, segment structure, annual revenue/cost baseline, and historical risk baseline
+annual_baseline
+  use for annual business mix, segment structure, annual revenue/cost baseline,
+  and historical risk baseline
 
-filing_document_roles.<TICKER>.latest_available
-  latest available 10-Q/10-K filing
-  usually the same as current_driver
+latest_available
+  use as the latest confirmed 10-Q/10-K source
+
+retrieved_evidence
+  treat as a neutral evidence anchor; do not infer current/annual role from the
+  label alone
 ```
 
-`current_document_anchors` is compatibility shorthand for `filing_document_roles.<TICKER>.current_driver`.
-
-Do not introduce other filing-form roles. In this ontology workflow, the document-role boundary is `10-Q` and `10-K`.
+Do not invent an anchor or filing role that is absent from ResearchState.
 
 ## Recent/latest questions
 

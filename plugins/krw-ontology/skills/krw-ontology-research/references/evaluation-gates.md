@@ -26,10 +26,11 @@ final answers do not expose the internal English brief
 ## Tool behavior gates
 
 ```text
-query_context first
-MCP research uses an internal English investment brief that preserves user intent, tickers, periods, metrics, and comparison axes
-the English investment brief is ontology/MCP-aware and optimized for evidence retrieval, not literal translation
-retrieve is legacy fallback only; do not use after sufficient query_context
+model-authored SearchPlan v2 exists before the first query_context call
+query_context arguments are exactly {search_plan}; legacy top-level arguments = 0
+SearchPlan preserves user intent, tickers/universe, periods, metrics, dimensions, predicates, comparison axes, and calculation windows in atomic clauses
+ResearchState required clause/calculation coverage is checked before synthesis
+retrieve is a targeted recall extension for a named missing clause only; do not use after sufficient ResearchState coverage
 trace/chain selected roots only; never brute-force every candidate
 no repeated equivalent query
 no broad full-response first pass

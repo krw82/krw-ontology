@@ -15,6 +15,10 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 from krw_ontology.agent_index.retrieval_text import format_metric_compact
+from krw_ontology.agent_index.metric_dictionary import (
+    canonical_metric_name,
+    normalize_dimension_key,
+)
 from krw_ontology.agent_index.research_kernel import ResearchKernel, request_from_query_context_args
 from krw_ontology.agent_index.research_contexts import (
     CompanyOverviewContext,
@@ -56,8 +60,9 @@ DEFAULT_QUERY_TYPES = (
 )
 
 _TERM_RE = re.compile(r"[A-Za-z0-9_]+")
+_PLANNED_TERM_RE = re.compile(r"[0-9A-Za-z\u3131-\u318e\uac00-\ud7a3_]+")
 _STRICT_TOPIC_WARNING_TERM_COUNT = 5
-_CHAIN_MAX_DEPTH = 4
+_CHAIN_MAX_DEPTH = 5
 _CHAIN_MAX_PATHS = 40
 _CHAIN_MAX_TEMPORAL_CONTEXT = 12
 _DEFAULT_READ_CACHE_MIB = 128
@@ -418,12 +423,25 @@ def _read_int_env(name: str, default: int, *, min_value: int) -> int:
 class OntologyStore:
     """Read-only SDK over an agent index SQLite database."""
 
-    def __init__(self, index_path: Path | str, *, check_same_thread: bool = True):
-        self.index_path = Path(index_path)
+    def __init__(
+        self,
+        index_path: Path | str,
+        *,
+        check_same_thread: bool = True,
+        immutable: bool = False,
+    ):
+        self.index_path = Path(index_path).expanduser()
+        self.immutable = bool(immutable)
+        connect_target: Path | str = self.index_path
+        connect_kwargs: dict[str, Any] = {}
+        if self.immutable:
+            connect_target = self.index_path.resolve().as_uri() + "?mode=ro&immutable=1"
+            connect_kwargs["uri"] = True
         self.conn = sqlite3.connect(
-            self.index_path,
+            connect_target,
             cached_statements=512,
             check_same_thread=check_same_thread,
+            **connect_kwargs,
         )
         self.conn.row_factory = sqlite3.Row
         self._configure_read_connection()
@@ -1526,6 +1544,328 @@ class OntologyStore:
         result = (bundles, diagnostics)
         _query_compact_cache_set(cache_key, result)
         return result
+
+    def query_planned_compact_with_diagnostics(
+        self,
+        *,
+        retrieval_query: str,
+        retrieval_terms: Iterable[str] | None = None,
+        predicate_terms: Iterable[str] | None = None,
+        metrics: Iterable[str] | None = None,
+        metric_dimensions: Iterable[str] | None = None,
+        metric_scope: str = "company_total",
+        calculation_window: str | None = None,
+        comparison_axes: Iterable[str] | None = None,
+        tickers: Iterable[str] | None = None,
+        document_types: Iterable[str] | None = None,
+        periods: Iterable[str] | None = None,
+        object_types: Iterable[str] | None = None,
+        include_rejected: bool = False,
+        allow_relaxed: bool = False,
+        limit: int = 20,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """Execute one agent-authored clause without keyword routing or expansion.
+
+        This is the MCP v2 execution primitive.  The caller has already planned the
+        intent and scope, so this method only performs deterministic field-scoped
+        FTS.  Strict results require every supplied lexical token.  An optional OR
+        pass is kept separate and labelled ``relaxed`` so it can never be promoted
+        to direct evidence by the response compiler.
+        """
+        started_at = time.perf_counter()
+        result_limit = max(1, int(limit))
+        original_tickers = list(tickers) if tickers is not None else None
+        available_tickers, unavailable_tickers = self._query_available_tickers(
+            original_tickers
+        )
+        if original_tickers is not None and not available_tickers:
+            diagnostics = _ticker_guard_query_diagnostics(
+                retrieval_query,
+                unavailable_tickers,
+                compact=True,
+            )
+            diagnostics.update(
+                {
+                    "execution_mode": "planned_fts",
+                    "strict_result_count": 0,
+                    "relaxed_result_count": 0,
+                    "timing_ms": {
+                        "total": int((time.perf_counter() - started_at) * 1000)
+                    },
+                }
+            )
+            return [], diagnostics
+
+        selected_types = tuple(object_types or DEFAULT_QUERY_TYPES)
+        requested_metrics = _unique(
+            str(metric).strip() for metric in metrics or [] if str(metric).strip()
+        )
+        requested_comparison_axes = _unique(
+            str(axis).strip().casefold()
+            for axis in comparison_axes or []
+            if str(axis).strip()
+        )
+        lexical_terms = _planned_retrieval_terms(
+            retrieval_query,
+            retrieval_terms=retrieval_terms,
+        )
+        evidence_terms = _planned_evidence_terms(
+            retrieval_query,
+            retrieval_terms=retrieval_terms,
+        )
+        predicate_lexical_terms = _unique(
+            term
+            for value in predicate_terms or []
+            for term in _planned_query_terms(str(value))
+        )[:32]
+        metric_started_at = time.perf_counter()
+        queried_metric_rows = self._query_metrics(
+            requested_metrics,
+            tickers=available_tickers,
+            document_types=document_types,
+            periods=periods,
+            metric_dimensions=metric_dimensions,
+            metric_scope=metric_scope,
+            calculation_window=calculation_window,
+            comparison_axes=requested_comparison_axes,
+            limit_per_metric=result_limit,
+        )
+        metric_elapsed_ms = int((time.perf_counter() - metric_started_at) * 1000)
+        metric_groups_by_name: dict[str, list[sqlite3.Row]] = {}
+        for row in queried_metric_rows:
+            metric_groups_by_name.setdefault(str(row["metric_name"] or ""), []).append(row)
+        metric_groups = list(metric_groups_by_name.values())
+        metric_rows: list[sqlite3.Row] = []
+        metric_row_index = 0
+        while len(metric_rows) < result_limit:
+            added = False
+            for group in metric_groups:
+                if metric_row_index >= len(group):
+                    continue
+                metric_rows.append(group[metric_row_index])
+                added = True
+                if len(metric_rows) >= result_limit:
+                    break
+            if not added:
+                break
+            metric_row_index += 1
+
+        strict_query = " ".join(f"{term}*" for term in lexical_terms)
+        fts_started_at = time.perf_counter()
+        predicate_query = " ".join(
+            [
+                strict_query,
+                *[f"{term}*" for term in predicate_lexical_terms],
+            ]
+        ).strip()
+        fts_predicate_rows = (
+            self._execute_fts(
+                predicate_query,
+                tickers=available_tickers,
+                document_types=document_types,
+                periods=periods,
+                object_types=selected_types,
+                include_rejected=include_rejected,
+                limit=result_limit,
+            )
+            if strict_query and predicate_lexical_terms
+            else []
+        )
+        fts_strict_rows = (
+            self._execute_fts(
+                strict_query,
+                tickers=available_tickers,
+                document_types=document_types,
+                periods=periods,
+                object_types=selected_types,
+                include_rejected=include_rejected,
+                limit=result_limit,
+            )
+            if strict_query
+            else []
+        )
+        fts_elapsed_ms = int((time.perf_counter() - fts_started_at) * 1000)
+
+        balanced_strict_rows: list[sqlite3.Row] = []
+        balanced_strict_ids: set[str] = set()
+
+        def append_strict_row(row: sqlite3.Row) -> None:
+            row_id = str(row["id"] or "")
+            if not row_id or row_id in balanced_strict_ids:
+                return
+            balanced_strict_ids.add(row_id)
+            balanced_strict_rows.append(row)
+
+        # QueryClause validation keeps metric propositions independent from
+        # qualitative propositions. Preserve exact metric observations first so
+        # a two-row response can still carry a temporal pair (or two conflicting
+        # values for the same observation context) instead of one fact + one FTS hit.
+        if requested_metrics:
+            for row in metric_rows:
+                append_strict_row(row)
+                if len(balanced_strict_rows) >= result_limit:
+                    break
+
+        strict_row_index = 0
+        strict_groups = [list(fts_predicate_rows), list(fts_strict_rows)]
+        while len(balanced_strict_rows) < result_limit:
+            progressed = False
+            for group in strict_groups:
+                if strict_row_index >= len(group):
+                    continue
+                progressed = True
+                append_strict_row(group[strict_row_index])
+                if len(balanced_strict_rows) >= result_limit:
+                    break
+            if not progressed:
+                break
+            strict_row_index += 1
+        ordered_rows = balanced_strict_rows
+        metric_ids = {str(row["id"]) for row in metric_rows if row["id"]}
+        strict_ids = {
+            str(row["id"])
+            for row in [*metric_rows, *fts_predicate_rows, *fts_strict_rows]
+            if row["id"]
+        }
+        predicate_ids = {
+            str(row["id"]) for row in fts_predicate_rows if row["id"]
+        }
+        relaxed_ids: set[str] = set()
+        relaxed_elapsed_ms = 0
+        if allow_relaxed and lexical_terms and len(ordered_rows) < result_limit:
+            relaxed_started_at = time.perf_counter()
+            relaxed_query = " OR ".join(f"{term}*" for term in lexical_terms)
+            relaxed_rows = self._execute_fts(
+                relaxed_query,
+                tickers=available_tickers,
+                document_types=document_types,
+                periods=periods,
+                object_types=selected_types,
+                include_rejected=include_rejected,
+                limit=result_limit,
+            )
+            for row in relaxed_rows:
+                row_id = str(row["id"] or "")
+                if not row_id or row_id in strict_ids or row_id in relaxed_ids:
+                    continue
+                relaxed_ids.add(row_id)
+                ordered_rows.append(row)
+                if len(ordered_rows) >= result_limit:
+                    break
+            relaxed_elapsed_ms = int(
+                (time.perf_counter() - relaxed_started_at) * 1000
+            )
+
+        bundles = self._compact_bundles_from_rows(ordered_rows[:result_limit])
+        metric_metadata_by_id = {
+            str(row["id"]): row
+            for row in ordered_rows
+            if str(row["id"] or "") in metric_ids
+            and "planned_metric_is_company_total" in row.keys()
+        }
+        for bundle in bundles:
+            row_id = str(bundle.get("id") or "")
+            metadata = metric_metadata_by_id.get(row_id)
+            if metadata is not None:
+                obj = dict(bundle.get("object") or {})
+                obj["is_company_total"] = bool(
+                    metadata["planned_metric_is_company_total"]
+                )
+                try:
+                    dimensions = json.loads(
+                        str(metadata["planned_metric_dimensions_json"] or "{}")
+                    )
+                except (TypeError, ValueError):
+                    dimensions = {}
+                if isinstance(dimensions, Mapping):
+                    obj["dimensions"] = dict(dimensions)
+                if metadata["planned_metric_canonical_metric"]:
+                    obj["canonical_metric"] = metadata[
+                        "planned_metric_canonical_metric"
+                    ]
+                if metadata["planned_metric_unit"] and not obj.get("unit"):
+                    obj["unit"] = metadata["planned_metric_unit"]
+                observation_period = str(
+                    metadata["planned_metric_observation_period"] or ""
+                ).strip()
+                filing_period = str(
+                    metadata["planned_metric_filing_period"] or ""
+                ).strip()
+                if observation_period:
+                    bundle["period"] = observation_period
+                    obj["observation_period"] = observation_period
+                if filing_period:
+                    bundle["filing_period"] = filing_period
+                    obj["filing_period"] = filing_period
+                period_type = str(
+                    metadata["planned_metric_observation_period_type"] or ""
+                ).strip()
+                if period_type:
+                    obj["period_type"] = period_type
+                if metadata["planned_metric_observation_start_date"]:
+                    obj["period_start"] = metadata[
+                        "planned_metric_observation_start_date"
+                    ]
+                if metadata["planned_metric_observation_end_date"]:
+                    obj["period_end"] = metadata[
+                        "planned_metric_observation_end_date"
+                    ]
+                obj["observation_context_key"] = metadata[
+                    "planned_metric_observation_context_key"
+                ]
+                conflict_count = int(
+                    metadata["planned_metric_conflict_value_count"] or 0
+                )
+                if conflict_count > 1:
+                    obj["metric_conflict"] = True
+                    obj["metric_conflict_value_count"] = conflict_count
+                bundle["object"] = obj
+            bundle["planned_match_mode"] = (
+                "strict" if row_id in strict_ids else "relaxed"
+            )
+            bundle["planned_lexical_terms"] = lexical_terms
+            bundle["planned_evidence_terms"] = evidence_terms
+
+        diagnostics: dict[str, Any] = {
+            "execution_mode": "planned_fts",
+            "retrieval_query": retrieval_query,
+            "lexical_terms": lexical_terms,
+            "evidence_terms": evidence_terms,
+            "predicate_terms": predicate_lexical_terms,
+            "predicate_boost_result_count": len(predicate_ids),
+            "strict_operator": "AND",
+            "strict_result_count": len(strict_ids),
+            "fts_strict_result_count": len(fts_strict_rows),
+            "metric_lookup_used": bool(requested_metrics),
+            "requested_metrics": requested_metrics,
+            "metric_result_count": len(metric_ids),
+            "calculation_window": calculation_window,
+            "comparison_axes": sorted(requested_comparison_axes),
+            "metric_observation_period_v2": bool(requested_metrics),
+            "metric_conflict_result_count": sum(
+                1
+                for bundle in bundles
+                if bool((bundle.get("object") or {}).get("metric_conflict"))
+            ),
+            "relaxed_enabled": bool(allow_relaxed),
+            "relaxed_result_count": len(relaxed_ids),
+            "result_count": len(bundles),
+            "compact_fast_path": True,
+            "keyword_expansion_used": False,
+            "intent_reclassification_used": False,
+            "warnings": [],
+            "timing_ms": {
+                "metric_lookup": metric_elapsed_ms,
+                "strict_fts": fts_elapsed_ms,
+                "relaxed_fts": relaxed_elapsed_ms,
+                "total": int((time.perf_counter() - started_at) * 1000),
+            },
+        }
+        if unavailable_tickers:
+            diagnostics["warnings"].append("ticker_not_available")
+            diagnostics["unavailable_tickers"] = unavailable_tickers
+            diagnostics["ticker_guard"] = True
+        return bundles, diagnostics
 
     def _current_document_prior_context(
         self,
@@ -3320,12 +3660,12 @@ class OntologyStore:
             if period_values:
                 placeholders = ",".join("?" for _ in period_values)
                 period_clause_parts.append(
-                    f"(metric_lookup.fiscal_year IS NULL AND metric_lookup.period IN ({placeholders}))"
+                    f"(metric_lookup.fiscal_year IS NULL AND metric_lookup.observation_period IN ({placeholders}))"
                 )
                 period_params.extend(period_values)
         elif period_values:
             placeholders = ",".join("?" for _ in period_values)
-            period_clause_parts.append(f"metric_lookup.period IN ({placeholders})")
+            period_clause_parts.append(f"metric_lookup.observation_period IN ({placeholders})")
             period_params.extend(period_values)
         if period_clause_parts:
             where_parts.append("(" + " OR ".join(period_clause_parts) + ")")
@@ -3416,7 +3756,7 @@ class OntologyStore:
                 metric_match_score DESC,
                 metric_lookup.is_company_total {"ASC" if dimension_anchors else "DESC"},
                 metric_lookup.fiscal_year ASC,
-                metric_lookup.period ASC,
+                metric_lookup.observation_period ASC,
                 metric_lookup.object_type ASC,
                 metric_lookup.object_id ASC
             LIMIT ?
@@ -3542,11 +3882,11 @@ class OntologyStore:
                 period_params.extend(years)
                 if period_values:
                     placeholders = ",".join("?" for _ in period_values)
-                    period_clause_parts.append(f"({prefix}.fiscal_year IS NULL AND {prefix}.period IN ({placeholders}))")
+                    period_clause_parts.append(f"({prefix}.fiscal_year IS NULL AND {prefix}.observation_period IN ({placeholders}))")
                     period_params.extend(period_values)
             elif period_values:
                 placeholders = ",".join("?" for _ in period_values)
-                period_clause_parts.append(f"{prefix}.period IN ({placeholders})")
+                period_clause_parts.append(f"{prefix}.observation_period IN ({placeholders})")
                 period_params.extend(period_values)
             if period_clause_parts:
                 parts.append("(" + " OR ".join(period_clause_parts) + ")")
@@ -3620,7 +3960,7 @@ class OntologyStore:
                 metric_dimension_lookup.dimension_key ASC,
                 metric_match_score DESC,
                 metric_dimension_lookup.fiscal_year ASC,
-                metric_dimension_lookup.period ASC,
+                metric_dimension_lookup.observation_period ASC,
                 metric_lookup.object_id ASC
             LIMIT ?
             """,
@@ -3667,7 +4007,7 @@ class OntologyStore:
                 ORDER BY
                     metric_match_score DESC,
                     metric_lookup.fiscal_year ASC,
-                    metric_lookup.period ASC,
+                    metric_lookup.observation_period ASC,
                     metric_lookup.object_id ASC
                 LIMIT ?
                 """,
@@ -3856,24 +4196,255 @@ class OntologyStore:
         periods: Iterable[str] | None,
         limit: int,
     ) -> list[sqlite3.Row]:
-        where, params = _object_filters(
+        return self._query_metrics(
+            [metric],
             tickers=[ticker],
             document_types=document_types,
             periods=periods,
-            object_types=("MetricObservation",),
-            include_rejected=False,
+            metric_dimensions=None,
+            metric_scope="any",
+            calculation_window=None,
+            comparison_axes=None,
+            limit_per_metric=limit,
+        )[:limit]
+
+    def _query_metrics(
+        self,
+        metrics: Iterable[str],
+        *,
+        tickers: Iterable[str] | None,
+        document_types: Iterable[str] | None,
+        periods: Iterable[str] | None,
+        metric_dimensions: Iterable[str] | None,
+        metric_scope: str,
+        limit_per_metric: int,
+        calculation_window: str | None = None,
+        comparison_axes: Iterable[str] | None = None,
+    ) -> list[sqlite3.Row]:
+        requested = _unique(
+            str(metric).strip() for metric in metrics if str(metric).strip()
         )
-        metric_candidates = _unique([metric, _canonical_metric_name(metric)])
-        placeholders = ",".join("?" for _ in metric_candidates)
-        return self.conn.execute(
+        if not requested:
+            return []
+        normalized_scope = str(metric_scope or "company_total").strip().lower()
+        if normalized_scope not in {"company_total", "dimensioned", "any"}:
+            raise ValueError(f"unsupported metric_scope: {metric_scope!r}")
+        metric_candidates = _unique(
+            candidate
+            for metric in requested
+            for candidate in (metric, _canonical_metric_name(metric))
+            if candidate
+        )
+        clauses = [
+            "(lower(COALESCE(metric_lookup.canonical_metric, '')) IN ({metrics}) "
+            "OR lower(COALESCE(metric_lookup.metric_name, '')) IN ({metrics}))"
+        ]
+        params: list[Any] = [
+            *[candidate.casefold() for candidate in metric_candidates],
+            *[candidate.casefold() for candidate in metric_candidates],
+        ]
+        normalized_tickers = _unique(
+            str(ticker).strip().upper() for ticker in tickers or [] if str(ticker).strip()
+        )
+        if normalized_tickers:
+            clauses.append(
+                "metric_lookup.ticker IN ("
+                + ",".join("?" for _ in normalized_tickers)
+                + ")"
+            )
+            params.extend(normalized_tickers)
+        normalized_document_types = _unique(
+            str(value).strip().upper()
+            for value in document_types or []
+            if str(value).strip()
+        )
+        if normalized_document_types:
+            clauses.append(
+                "upper(metric_lookup.document_type) IN ("
+                + ",".join("?" for _ in normalized_document_types)
+                + ")"
+            )
+            params.extend(normalized_document_types)
+        normalized_periods = _unique(
+            str(value).strip() for value in periods or [] if str(value).strip()
+        )
+        if normalized_periods:
+            period_clauses = [
+                "metric_lookup.observation_period IN ("
+                + ",".join("?" for _ in normalized_periods)
+                + ")"
+            ]
+            params.extend(normalized_periods)
+            for year, quarter in _planned_metric_period_coordinates(
+                normalized_periods
+            ):
+                if quarter is None:
+                    period_clauses.append(
+                        "(metric_lookup.fiscal_year = ? "
+                        "AND metric_lookup.fiscal_quarter IS NULL)"
+                    )
+                    params.append(year)
+                else:
+                    period_clauses.append(
+                        "(metric_lookup.fiscal_year = ? "
+                        "AND metric_lookup.fiscal_quarter = ?)"
+                    )
+                    params.extend([year, quarter])
+            clauses.append("(" + " OR ".join(period_clauses) + ")")
+        if normalized_scope == "company_total":
+            clauses.append("metric_lookup.is_company_total = 1")
+        elif normalized_scope == "dimensioned":
+            clauses.append("metric_lookup.is_company_total = 0")
+        dimension_keys = _unique(
+            key
+            for value in metric_dimensions or []
+            if (key := _metric_dimension_key(value))
+        )
+        for dimension_key in dimension_keys:
+            # Dimension identity is exact.  Substring matching here can turn
+            # selectors such as ``US`` into matches for ``business`` or
+            # ``Russia`` and may consume the bounded result set before the true
+            # member is seen.
+            clauses.append(
+                "EXISTS ("
+                "SELECT 1 FROM metric_dimension_lookup AS planned_dimension "
+                "WHERE planned_dimension.object_id = metric_lookup.object_id "
+                "AND (planned_dimension.dimension_key = ? "
+                "OR planned_dimension.member_key = ?)"
+                ")"
+            )
+            params.extend([dimension_key, dimension_key])
+        metric_placeholders = ",".join("?" for _ in metric_candidates)
+        clauses[0] = clauses[0].format(metrics=metric_placeholders)
+        normalized_axes = {
+            str(axis).strip().casefold()
+            for axis in comparison_axes or []
+            if str(axis).strip()
+        }
+        temporal = (
+            str(calculation_window or "").strip()
+            in {"period_over_period", "year_over_year"}
+            and bool(normalized_axes.intersection({"absolute_change", "growth_rate"}))
+        )
+        observation_depth = max(
+            4 if temporal else 2,
+            len(normalized_periods),
+        )
+        params.append(observation_depth)
+        rows = self.conn.execute(
             f"""
-            SELECT * FROM objects
-            {where} AND metric_name IN ({placeholders})
-            ORDER BY period DESC, type
-            LIMIT ?
+            WITH filtered AS (
+                SELECT
+                    metric_lookup.*,
+                    lower(COALESCE(
+                        metric_lookup.canonical_metric,
+                        metric_lookup.metric_name,
+                        ''
+                    )) AS metric_key,
+                    CASE
+                        WHEN metric_lookup.value_numeric IS NOT NULL
+                            THEN 'n:' || printf('%.17g', metric_lookup.value_numeric)
+                        ELSE 't:' || COALESCE(metric_lookup.value_text, '__NULL__')
+                    END AS value_identity
+                FROM metric_lookup
+                WHERE {" AND ".join(clauses)}
+            ), ranked AS (
+                SELECT
+                    filtered.*,
+                    DENSE_RANK() OVER (
+                        PARTITION BY
+                            filtered.ticker,
+                            filtered.metric_key,
+                            COALESCE(filtered.unit, ''),
+                            COALESCE(filtered.dimensions_json, ''),
+                            filtered.is_company_total,
+                            filtered.observation_period_type
+                        ORDER BY
+                            COALESCE(filtered.fiscal_year, 0) DESC,
+                            COALESCE(filtered.fiscal_quarter, 0) DESC,
+                            filtered.observation_period DESC,
+                            filtered.observation_context_key DESC
+                    ) AS observation_rank,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY
+                            filtered.ticker,
+                            filtered.metric_key,
+                            COALESCE(filtered.unit, ''),
+                            COALESCE(filtered.dimensions_json, ''),
+                            filtered.is_company_total,
+                            filtered.observation_period_type,
+                            filtered.observation_context_key,
+                            filtered.value_identity
+                        ORDER BY filtered.filing_period DESC, filtered.object_id
+                    ) AS duplicate_value_rank
+                FROM filtered
+            ), context_variants AS (
+                SELECT
+                    ticker,
+                    metric_key,
+                    COALESCE(unit, '') AS unit_key,
+                    COALESCE(dimensions_json, '') AS dimensions_key,
+                    is_company_total,
+                    observation_period_type,
+                    observation_context_key,
+                    COUNT(DISTINCT value_identity) AS conflict_value_count
+                FROM filtered
+                GROUP BY
+                    ticker,
+                    metric_key,
+                    COALESCE(unit, ''),
+                    COALESCE(dimensions_json, ''),
+                    is_company_total,
+                    observation_period_type,
+                    observation_context_key
+            )
+            SELECT
+                objects.*,
+                ranked.is_company_total AS planned_metric_is_company_total,
+                ranked.dimensions_json AS planned_metric_dimensions_json,
+                ranked.canonical_metric AS planned_metric_canonical_metric,
+                ranked.unit AS planned_metric_unit,
+                ranked.filing_period AS planned_metric_filing_period,
+                ranked.observation_period AS planned_metric_observation_period,
+                ranked.observation_period_type AS planned_metric_observation_period_type,
+                ranked.observation_start_date AS planned_metric_observation_start_date,
+                ranked.observation_end_date AS planned_metric_observation_end_date,
+                ranked.observation_context_key AS planned_metric_observation_context_key,
+                ranked.fiscal_year AS planned_metric_fiscal_year,
+                ranked.fiscal_quarter AS planned_metric_fiscal_quarter,
+                context_variants.conflict_value_count AS planned_metric_conflict_value_count
+            FROM ranked
+            JOIN objects ON objects.id = ranked.object_id
+            JOIN context_variants
+              ON context_variants.ticker = ranked.ticker
+             AND context_variants.metric_key = ranked.metric_key
+             AND context_variants.unit_key = COALESCE(ranked.unit, '')
+             AND context_variants.dimensions_key = COALESCE(ranked.dimensions_json, '')
+             AND context_variants.is_company_total = ranked.is_company_total
+             AND context_variants.observation_period_type = ranked.observation_period_type
+             AND context_variants.observation_context_key = ranked.observation_context_key
+            WHERE ranked.observation_rank <= ?
+              AND ranked.duplicate_value_rank = 1
+              AND (objects.review_status IS NULL OR objects.review_status != 'rejected')
+            ORDER BY
+                (context_variants.conflict_value_count > 1) DESC,
+                ranked.observation_rank,
+                ranked.ticker,
+                ranked.metric_key,
+                ranked.dimensions_json,
+                ranked.observation_period DESC,
+                ranked.value_identity,
+                ranked.object_id
             """,
-            [*params, *metric_candidates, limit],
+            params,
         ).fetchall()
+        return _select_planned_metric_rows(
+            rows,
+            limit_per_group=max(1, int(limit_per_metric)),
+            calculation_window=str(calculation_window or "").strip() or None,
+            comparison_axes=normalized_axes,
+            requested_periods=normalized_periods,
+        )
 
     def _topic_map_objects(
         self,
@@ -6515,6 +7086,258 @@ def _query_terms(topic: str | None) -> list[str]:
     return _unique(term.lower() for term in _TERM_RE.findall(topic or "") if len(term) > 1)
 
 
+def _planned_retrieval_terms(
+    retrieval_query: str,
+    *,
+    retrieval_terms: Iterable[str] | None,
+) -> list[str]:
+    """Return bounded lexical tokens without domain-specific query expansion."""
+    hint_terms = _unique(
+        term
+        for value in retrieval_terms or []
+        for term in _planned_query_terms(str(value))
+    )
+    if hint_terms:
+        return hint_terms[:64]
+    return _planned_query_terms(retrieval_query)[:64]
+
+
+def _planned_evidence_terms(
+    retrieval_query: str,
+    *,
+    retrieval_terms: Iterable[str] | None,
+) -> list[str]:
+    hint_terms = _unique(
+        term
+        for value in retrieval_terms or []
+        for term in _planned_query_terms(str(value))
+    )
+    return (hint_terms or _planned_query_terms(retrieval_query))[:64]
+
+
+def _planned_query_terms(value: str | None) -> list[str]:
+    return _unique(
+        term.casefold()
+        for term in _PLANNED_TERM_RE.findall(value or "")
+        if len(term) > 1
+    )
+
+
+def _planned_metric_period_coordinates(
+    periods: Iterable[str],
+) -> list[tuple[int, int | None]]:
+    coordinates: list[tuple[int, int | None]] = []
+    for period in periods:
+        match = re.search(
+            r"(?:CY|FY)?(19\d{2}|20\d{2})(?:Q([1-4]))?",
+            str(period),
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            continue
+        value = (int(match.group(1)), int(match.group(2)) if match.group(2) else None)
+        if value not in coordinates:
+            coordinates.append(value)
+    return coordinates
+
+
+def _select_planned_metric_rows(
+    rows: Sequence[sqlite3.Row],
+    *,
+    limit_per_group: int,
+    calculation_window: str | None,
+    comparison_axes: set[str],
+    requested_periods: Sequence[str],
+) -> list[sqlite3.Row]:
+    """Select atomic conflict sets or compatible period bundles per metric series."""
+    temporal = calculation_window in {"period_over_period", "year_over_year"} and (
+        not comparison_axes
+        or bool(comparison_axes.intersection({"absolute_change", "growth_rate"}))
+    )
+    grouped: dict[tuple[str, str], list[sqlite3.Row]] = {}
+    for row in rows:
+        metric = str(
+            row["planned_metric_canonical_metric"] or row["metric_name"] or ""
+        ).casefold()
+        ticker = str(row["ticker"] or "").upper()
+        grouped.setdefault((ticker, metric), []).append(row)
+
+    selected_by_group: dict[tuple[str, str], list[sqlite3.Row]] = {}
+    for group_key, group_rows in grouped.items():
+        by_series: dict[tuple[Any, ...], list[sqlite3.Row]] = {}
+        for row in group_rows:
+            by_series.setdefault(
+                (
+                    str(row["planned_metric_unit"] or ""),
+                    str(row["planned_metric_dimensions_json"] or ""),
+                    int(row["planned_metric_is_company_total"] or 0),
+                    str(row["planned_metric_observation_period_type"] or "unknown"),
+                ),
+                [],
+            ).append(row)
+
+        bundles: list[tuple[bool, tuple[int, int, str], str, list[sqlite3.Row]]] = []
+        for series_key, series_rows in by_series.items():
+            by_context: dict[str, list[sqlite3.Row]] = {}
+            for row in series_rows:
+                by_context.setdefault(
+                    str(row["planned_metric_observation_context_key"] or ""),
+                    [],
+                ).append(row)
+            context_rows = [
+                sorted(values, key=lambda row: str(row["id"]))
+                for values in by_context.values()
+            ]
+            context_rows.sort(
+                key=lambda values: _planned_metric_row_period_key(values[0]),
+                reverse=True,
+            )
+            requested_contexts = [
+                values
+                for values in context_rows
+                if not requested_periods
+                or _planned_metric_row_matches_periods(values[0], requested_periods)
+            ]
+            considered = requested_contexts or context_rows
+            conflict_contexts = [
+                values
+                for values in considered
+                if int(values[0]["planned_metric_conflict_value_count"] or 0) > 1
+            ]
+            if conflict_contexts:
+                conflict = conflict_contexts[0]
+                bundles.append(
+                    (
+                        True,
+                        _planned_metric_row_period_key(conflict[0]),
+                        repr(series_key),
+                        conflict,
+                    )
+                )
+                continue
+
+            representatives = [values[0] for values in considered]
+            if temporal:
+                compatible_pairs = [
+                    (previous, current)
+                    for previous_index, previous in enumerate(reversed(representatives))
+                    for current in list(reversed(representatives))[previous_index + 1 :]
+                    if _planned_metric_rows_match_window(
+                        previous,
+                        current,
+                        calculation_window=calculation_window,
+                    )
+                ]
+                if requested_periods and len(representatives) >= 2:
+                    bundle = sorted(
+                        representatives,
+                        key=_planned_metric_row_period_key,
+                        reverse=True,
+                    )
+                elif compatible_pairs:
+                    previous, current = max(
+                        compatible_pairs,
+                        key=lambda pair: (
+                            _planned_metric_row_period_key(pair[1]),
+                            _planned_metric_row_period_key(pair[0]),
+                        ),
+                    )
+                    bundle = [current, previous]
+                else:
+                    bundle = representatives[:2]
+            else:
+                bundle = representatives[: max(2, len(requested_periods))]
+            if bundle:
+                bundles.append(
+                    (
+                        False,
+                        max(_planned_metric_row_period_key(row) for row in bundle),
+                        repr(series_key),
+                        bundle,
+                    )
+                )
+
+        bundles.sort(key=lambda item: (not item[0], tuple(-value if isinstance(value, int) else value for value in item[1][:2]), item[2]))
+        selected: list[sqlite3.Row] = []
+        for _conflict, _period_key, _series_key, bundle in bundles:
+            remaining = limit_per_group - len(selected)
+            if remaining <= 0:
+                break
+            selected.extend(bundle[:remaining])
+        selected_by_group[group_key] = selected
+
+    result: list[sqlite3.Row] = []
+    group_keys = sorted(selected_by_group)
+    row_index = 0
+    while True:
+        added = False
+        for group_key in group_keys:
+            group_rows = selected_by_group[group_key]
+            if row_index >= len(group_rows):
+                continue
+            result.append(group_rows[row_index])
+            added = True
+        if not added:
+            break
+        row_index += 1
+    return result
+
+
+def _planned_metric_row_period_key(row: sqlite3.Row) -> tuple[int, int, str]:
+    return (
+        int(row["planned_metric_fiscal_year"] or 0),
+        int(row["planned_metric_fiscal_quarter"] or 0),
+        str(row["planned_metric_observation_period"] or ""),
+    )
+
+
+def _planned_metric_row_matches_periods(
+    row: sqlite3.Row,
+    periods: Sequence[str],
+) -> bool:
+    observation_period = str(row["planned_metric_observation_period"] or "").casefold()
+    if observation_period in {str(period).casefold() for period in periods}:
+        return True
+    coordinates = _planned_metric_period_coordinates(periods)
+    row_coordinate = (
+        int(row["planned_metric_fiscal_year"] or 0),
+        int(row["planned_metric_fiscal_quarter"])
+        if row["planned_metric_fiscal_quarter"] is not None
+        else None,
+    )
+    return row_coordinate in coordinates
+
+
+def _planned_metric_rows_match_window(
+    previous: sqlite3.Row,
+    current: sqlite3.Row,
+    *,
+    calculation_window: str | None,
+) -> bool:
+    previous_year, previous_quarter, _ = _planned_metric_row_period_key(previous)
+    current_year, current_quarter, _ = _planned_metric_row_period_key(current)
+    if not previous_year or not current_year:
+        return False
+    period_type = str(
+        previous["planned_metric_observation_period_type"] or "unknown"
+    )
+    if period_type != str(
+        current["planned_metric_observation_period_type"] or "unknown"
+    ):
+        return False
+    if period_type == "year_to_date" and calculation_window != "year_over_year":
+        return False
+    if previous_quarter == current_quarter == 0:
+        return current_year - previous_year == 1
+    if not previous_quarter or not current_quarter:
+        return False
+    if calculation_window == "year_over_year":
+        return current_year - previous_year == 1 and current_quarter == previous_quarter
+    return (current_year * 4 + current_quarter) - (
+        previous_year * 4 + previous_quarter
+    ) == 1
+
+
 def _query_wants_current_document_prior(topic: str | None) -> bool:
     text = str(topic or "").strip()
     if not text:
@@ -6813,13 +7636,7 @@ def _metric_lookup_needs_denominator(topic: str | None) -> bool:
 
 
 def _metric_dimension_key(value: Any) -> str:
-    text = str(value or "").strip().lower()
-    text = text.split("#")[-1].split("/")[-1].split(":")[-1]
-    text = re.sub(r"(?:member|axis|domain)$", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", text)
-    text = re.sub(r"[^a-z0-9]+", "_", text)
-    text = re.sub(r"_+", "_", text).strip("_")
-    return text
+    return normalize_dimension_key(value)
 
 
 def _metric_lookup_period_values(periods: Iterable[str] | None) -> list[str]:
@@ -6883,7 +7700,7 @@ def _dedupe_object_rows(rows: Sequence[sqlite3.Row], *, limit: int) -> list[sqli
 
 def _canonical_metric_name(metric: str | None) -> str:
     """Normalize human metric input to the canonical metric_name token shape."""
-    return "_".join(_query_terms(metric))
+    return canonical_metric_name(metric)
 
 
 def _expanded_topic(topic: str) -> str:

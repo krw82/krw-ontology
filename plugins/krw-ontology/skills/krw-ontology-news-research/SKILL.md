@@ -67,10 +67,11 @@ Follow this order unless the user explicitly asks for a different format:
 3. Resolve covered tickers and avoid introducing non-covered companies unless the user asks for them.
 4. Extract the current event or URL hypothesis: company, event type, claimed impact, uncertainty, and financial channel.
 5. Convert the narrative into an ontology-aware internal English investment brief.
-6. Use KRW ontology query_context to retrieve the company-specific baseline.
-7. Use targeted ontology follow-up only for a specific missing metric, filing comment, exposure, or comparison axis.
-8. If the user asks for event impact, apply the economic-impact causal spine.
-9. Write one fused Korean investor interpretation.
+6. Before the first filing call, author one complete SearchPlan v2 for the event-specific filing baseline. Use atomic clauses, relation predicates, separate exact-metric clauses, and explicit tickers or universe="covered".
+7. Call KRW ontology query_context with exactly {search_plan}, then read ResearchState v2 answerability, clause_coverage, evidence_units, computed_values, calculation_coverage, missing_parts, recommended_actions, continuation, and warnings.
+8. Use targeted ontology follow-up only for a material required clause named by missing_parts/recommended_actions; never repeat the same plan.
+9. If the user asks for event impact, apply the economic-impact causal spine.
+10. Write one fused Korean investor interpretation.
 ```
 
 Never expose the internal English brief.
@@ -180,7 +181,7 @@ risk factors and direct exposure
 MD&A, notes, and management discussion
 ```
 
-Do not send broad Korean topic text directly to ontology `query_context`.
+Do not send broad Korean topic text or legacy top-level question/ticker/limit arguments to ontology `query_context`. Put concise English filing-language retrieval queries inside the model-authored SearchPlan.
 
 ## 7. Economic Impact Path
 
@@ -222,7 +223,11 @@ Do not claim what is priced in, estimate revisions, portfolio impact, or current
 
 ## 8. KRW Ontology Use
 
-Use ontology after news discovery. The first ontology call should normally be `query_context` with the event-specific internal English investment brief.
+Use ontology after news discovery. Before the first ontology call, the model must author the complete event-specific SearchPlan v2. Call `query_context` with exactly `{search_plan}`; there is no server-side planning fallback.
+
+Build clauses around independently verifiable event-to-company propositions. A multi-concept qualitative clause needs `required_predicates` so the relation is supported in one evidence span. Exact metrics, dimensions, periods, comparison axes, and calculation windows belong in separate metric clauses. Size `limit_results` and `limit_tickers` to cover the required clauses and selected universe rather than applying a fixed top-k or call count.
+
+Treat ResearchState as the filing baseline: use `evidence_units` and `clause_coverage` for qualitative support, `computed_values` plus `calculation_coverage` for exact arithmetic, and `missing_parts`/`recommended_actions`/`continuation` only for focused continuation.
 
 Use targeted follow-up only when it answers a clear missing part:
 
@@ -235,7 +240,7 @@ specific comparison axis
 specific trace/chain root
 ```
 
-Do not loop over similar searches. Do not use broad retrieve after sufficient `query_context`.
+Do not loop over similar searches. Do not use broad retrieve after the required ResearchState clauses are covered.
 
 ## 9. Answer Style
 

@@ -26,11 +26,18 @@ def test_krw_ontology_skill_documents_match_current_web_chat_contract() -> None:
     assert "chain = mechanism expansion around one selected object" in skill_text
     assert "Do not call broad retrieve after a sufficient query_context" in skill_text
     assert 'response_detail="full"' in skill_text
+    assert "Before the first filing call, the model authors one complete SearchPlan v2" in skill_text
+    assert "Call query_context with exactly {search_plan}" in skill_text
+    assert "ResearchState v2 policy" in skill_text
+    assert "computed_values + calculation_coverage" in skill_text
+    assert "limit_results <= 3" not in skill_text
+    assert "query_context(question=" not in skill_text
 
-    assert "Default first call for natural-language research" in tool_policy_text
-    assert "Never request `response_detail=\"full\"` in normal web chat" in tool_policy_text
-    assert "selected trace/chain when stronger verification is needed" in tool_policy_text
-    assert "Legacy fallback only. Do not use after sufficient query_context" in tool_policy_text
+    assert "Default first ontology call. Accepts only {search_plan}" in tool_policy_text
+    assert "DeepSeek-authored SearchPlan" in tool_policy_text
+    assert "targeted actions for missing_parts/recommended_actions" in tool_policy_text
+    assert "Rare bounded evidence expansion for a specific gap" in tool_policy_text
+    assert "fixed top-5, limit-3, one-follow-up, or hard tool-call caps" in tool_policy_text
 
     assert "공시자료 기반 한계" in forbidden_text
     assert "참고: 위 분석은" in forbidden_text

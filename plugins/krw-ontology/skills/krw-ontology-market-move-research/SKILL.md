@@ -165,7 +165,7 @@ KRW ontology is available in this skill, but it is not mandatory for every first
 
 Use KRW ontology after the market move and candidate explanation are identified only when the question requires filing-grounded interpretation or durable thesis impact.
 
-The first ontology call should normally be `query_context` using an internal English brief that includes:
+Before the first ontology call, author one complete SearchPlan v2 from an internal English brief that includes:
 
 ```text
 ticker
@@ -188,7 +188,9 @@ specific margin/cost/revenue channel
 specific trace/chain root
 ```
 
-Do not loop over similar searches. Do not use broad retrieve after sufficient `query_context`.
+Split the filing-grounded explanation, transmission mechanism, durable thesis effect, falsifier, and any exact metrics into atomic clauses. Use required_predicates for multi-concept qualitative relations; keep metric propositions separate with explicit scope, dimensions, axes, and calculation window.
+
+Call `query_context` with exactly `{search_plan}`. Read ResearchState v2 clause_coverage/evidence_units for qualitative support and computed_values/calculation_coverage for arithmetic. Follow missing_parts/recommended_actions/continuation only when a material required clause remains open; do not loop over similar searches or use broad retrieve after sufficient coverage.
 
 If the user only asks "why did it move today?", the normal answer can stop before ontology and use the follow-up questions to offer filing-grounded checks.
 

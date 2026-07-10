@@ -1,155 +1,272 @@
 # Query Context Contract
 
-Use `krw_ontology_query_context` as the default research workbench for normal questions.
+Use `krw_ontology_query_context` as the first ontology research call. It accepts
+one public input only:
 
-## Field paths
-
-Current MCP builds may return fields like:
-
-```text
-research_context_version
-research_status
-research_pack.metric_series_pack
-research_pack.projection_pack
-research_pack.chain_pack
-research_pack.company_topic_pack
-research_pack.directness_guard
-research_pack.stop_guard
-research_pack.valuation_guard
-agent_autonomy.mode
-agent_autonomy.may_continue_research
-agent_autonomy.allowed_next_tools
-agent_autonomy.disallowed_next_tools
-agent_autonomy.max_additional_tool_calls
-missing_parts
-do_not_call
-recommended_tools
-final_answer_guidance
-answerability
-query_frame
-ticker_candidates
-results_by_ticker
-search_diagnostics
-kernel
-current_document_anchors
-filing_document_roles
+```json
+{
+  "search_plan": {
+    "question": "original user question",
+    "intent": "stable_lowercase_intent",
+    "clauses": [
+      {
+        "clause_id": "demand_support",
+        "retrieval_query": "customer demand supports revenue growth",
+        "required_concepts": ["customer demand", "revenue growth"],
+        "required_predicates": ["supports"],
+        "required": true,
+        "tickers": [],
+        "directness": "direct_preferred",
+        "object_types": [],
+        "metrics": [],
+        "metric_dimensions": [],
+        "metric_scope": "company_total",
+        "calculation_window": null
+      }
+    ],
+    "tickers": [],
+    "document_types": [],
+    "periods": [],
+    "universe": "covered",
+    "comparison_axes": [],
+    "answer_scope": "direct",
+    "uncertainty": "low",
+    "limit_results": 12,
+    "limit_tickers": 20
+  }
+}
 ```
 
-Do not assume pack fields are top-level. In normal JSON responses they are usually nested under `research_pack`, `agent_autonomy`, or `kernel`.
+Do not call it with `question`, `ticker`, `tickers`, `response_detail`,
+`response_format`, or any other legacy top-level argument. There is no v1
+compatibility path.
 
-## Filing document roles
+The active DeepSeek agent must author the complete `SearchPlan` before the
+first ontology call. `krw_ontology_plan_query` is validation/debug only: it
+normalizes and validates a plan but performs no retrieval. Do not insert it as
+a mandatory preflight before every normal query.
 
-Current MCP builds may return `filing_document_roles` at the top level, under `research_pack`, or under routing diagnostics.
+## SearchPlan
 
-Use it as the authoritative document-role map when present:
-
-```text
-filing_document_roles.<TICKER>.current_driver
-  latest available 10-Q when it exists, otherwise latest available 10-K
-  use for current/latest/recent questions and current investor interpretation
-
-filing_document_roles.<TICKER>.annual_baseline
-  latest available 10-K
-  use for business mix, segment structure, annual baseline, historical risk baseline
-
-filing_document_roles.<TICKER>.latest_available
-  latest available 10-Q/10-K filing
-```
-
-`current_document_anchors` is compatibility shorthand for `filing_document_roles.<TICKER>.current_driver`.
-
-When both fields exist, follow `filing_document_roles` and use `current_document_anchors` only as a quick label.
-
-The role contract is intentionally limited to 10-Q and 10-K. Do not infer or invent other filing-form roles.
-
-## Compatibility fallback
-
-Older or partially deployed MCP builds may omit some fields.
-
-Use conservative fallback:
+Set these fields deliberately:
 
 ```text
-answerability.direct_answerable = true and recommended trace roots exist:
-treat as sufficient_but_trace_recommended
+question
+  Preserve the original user question for synthesis and audit. It is not a
+  substitute for clause retrieval queries.
 
-answerability.negative_answer_supported = true:
-treat as sufficient for a negative direct-exposure answer
+intent
+  Use a stable lowercase slug selected by the agent.
 
-ticker_candidates contain traceable direct or related candidates:
-treat as sufficient for a default answer unless exhaustive audit is requested
+clauses
+  Split the question into independently verifiable propositions. At least one
+  clause must be required.
 
-no candidates returned:
-allow at most one targeted structured follow-up query
+tickers / universe
+  Use explicit uppercase tickers for known-company research. For tickerless
+  discovery use universe="covered". They are mutually exclusive.
 
-target price, fair value, investment recommendation, 12-month price target:
-treat as out of scope for filing-only ontology unless external valuation inputs are supplied
+document_types / periods
+  Add only filters requested by the user or required by the research design.
+
+comparison_axes
+  Use value, absolute_change, growth_rate, value_difference, directness, or
+  evidence_grade only when the answer needs that axis.
+
+answer_scope
+  Use direct unless ontology evidence is only supporting context.
+
+uncertainty
+  Report planning uncertainty honestly; higher uncertainty preserves a wider
+  retrieval candidate set.
+
+limit_results / limit_tickers
+  Choose adaptive evidence and discovery budgets for this plan.
 ```
 
-Do not compensate for missing research-pack fields by launching open-ended query, retrieve, compare, trace, or chain loops.
+Do not impose a universal top-5, limit-3, or hard tool-call policy. Set
+`limit_results` high enough to cover every required clause, clause ticker,
+metric period/pair, and potential conflicting observation. Set
+`limit_tickers` high enough for the requested discovery breadth. Reduce these
+budgets only after production logs and quality evaluation show that doing so
+does not lose required coverage.
 
-## Research status interpretation
+## QueryClause
+
+Each clause supports:
 
 ```text
-sufficient_for_default_answer:
-answer without broad follow-up
-
-sufficient_but_trace_recommended:
-trace/chain selected roots only before strong claims
-
-partial_answer_possible:
-answer narrowly; fill explicit missing parts only if cheap and targeted
-
-needs_targeted_followup:
-use allowed_next_tools only
-
-no_direct_evidence_with_related_context:
-separate direct absence from related context
-
-out_of_scope_for_filing_ontology:
-stop searching and explain using filing-supported assumptions only
-
-not_answerable:
-do not force a conclusion
+clause_id
+retrieval_query
+required_concepts
+required_predicates
+required
+tickers
+directness
+object_types
+metrics
+metric_dimensions
+metric_scope
+calculation_window
 ```
 
-## Internal English investment brief
+Write `retrieval_query` as a self-contained, concise English filing query. For
+a Korean request, translate the retrieval concepts into filing vocabulary such
+as `management discussion`, `customer demand`, `revenue`, `gross margin`,
+`operating cash flow`, `capital expenditures`, `backlog`, or `direct exposure`.
+Do not use broad conversational Korean as the retrieval query.
 
-For normal KRW ontology research, query_context should receive a concise internal English investment brief. Do not send broad Korean topic text directly to query_context.
+Name every required concept, predicate, metric, and dimension in
+`retrieval_query`. Put canonical metric identifiers in `metrics`; readable
+metric aliases may appear in `retrieval_query` when the metric dictionary maps
+them to the same canonical identity.
 
-The brief is not a literal translation. Build it with awareness of the KRW ontology schema, evidence types, research packs, and MCP retrieval surface so it is optimized for ontology evidence retrieval.
-
-The English investment brief should preserve:
+Use the clause fields as follows:
 
 ```text
-user intent
-tickers and company names
-periods
-exact metrics
-comparison axes
-direct-exposure factors
-capital-allocation or cash-flow concepts
+required_concepts
+  The complete non-metric concepts the evidence must establish.
+
+required_predicates
+  Relation/mechanism terms that must co-occur with all required concepts in
+  one traceable span. A qualitative clause with multiple concepts requires at
+  least one predicate.
+
+tickers
+  An optional subset of SearchPlan.tickers for this clause. Empty inherits the
+  plan scope; a subset cannot name a ticker outside the plan.
+
+directness
+  any, direct_preferred, or direct_required.
+
+object_types
+  Optional ontology object filters chosen from known index capabilities.
+
+metrics
+  Canonical metric identifiers required for exact metric lineage.
+
+metric_dimensions
+  Exact segment, geography, product, counterparty, or other dimensions.
+
+metric_scope
+  company_total, dimensioned, or intentionally broad any.
+
+calculation_window
+  period_over_period or year_over_year when a temporal calculation is needed.
 ```
 
-Map user intent to ontology-friendly retrieval concepts when useful:
+Do not mix a metric proposition with a causal, mechanism, risk, or other
+qualitative proposition in one clause. Metric clauses cannot set
+`required_predicates`; split the qualitative statement into another clause.
+For a pure metric clause, normally leave `required_concepts` empty and express
+the identity through `metrics` and `metric_dimensions`.
+
+Example qualitative clause:
+
+```json
+{
+  "clause_id": "demand_to_margin",
+  "retrieval_query": "customer demand affects gross margin management discussion",
+  "required_concepts": ["customer demand", "gross margin"],
+  "required_predicates": ["affects"],
+  "required": true,
+  "tickers": ["MSFT"],
+  "directness": "direct_preferred",
+  "object_types": ["ResearchClaim", "EvidenceQuote"],
+  "metrics": [],
+  "metric_dimensions": [],
+  "metric_scope": "company_total"
+}
+```
+
+Example metric clause:
+
+```json
+{
+  "clause_id": "revenue_yoy",
+  "retrieval_query": "revenue year over year",
+  "required_concepts": [],
+  "required_predicates": [],
+  "required": true,
+  "tickers": ["MSFT"],
+  "directness": "direct_required",
+  "object_types": ["MetricObservation"],
+  "metrics": ["revenue"],
+  "metric_dimensions": [],
+  "metric_scope": "company_total",
+  "calculation_window": "year_over_year"
+}
+```
+
+## Metric and period semantics
+
+`absolute_change` and `growth_rate` require `calculation_window` on every
+required metric clause. Use:
 
 ```text
-explanatory filing text / notes
-MD&A / management discussion
-segment commentary
-revenue recognition / RPO / backlog
-cost of revenue / gross margin / operating margin
-cash flow / FCF / capex
-business combinations / acquisitions
-share repurchases / dilution management
-SBC / R&D / talent investment
-direct exposure / related pressure channel
-business model / product platform / customer demand
+period_over_period
+  Adjacent annual observations or adjacent quarter observations.
+
+year_over_year
+  The same annual period or same fiscal/calendar quarter one year apart.
+  YTD observations support year_over_year only.
 ```
 
-For broad sector/global/macro questions, pair the internal English investment brief with a bounded covered universe when possible.
+Require exact `metric_scope` and `metric_dimensions` for the requested series.
+Do not mix FY and CY bases, quarter and YTD durations, annual and quarterly
+amounts, different units/currencies, or total-company and dimensioned series.
+Cross-company `value_difference` requires aligned metric identity, scope,
+dimensions, period basis, duration, unit, and currency for every requested
+ticker pair.
 
-For concrete tickerless questions with a specific factor, channel, product, business model, metric, event type, or company type, query_context may receive `tickers=[]` with `limit_tickers <= 5` and `limit_results <= 3`. Treat the v3 global spine result as candidate ticker ranking and evidence routing, not as the final answer.
+## ResearchState v2
 
-Use only one bounded global-spine route for the first tickerless pass. Do not repeat the same broad query_context with slightly different wording. If the route is weak, narrow by channel, selected ticker, or user-facing follow-up prompt.
+`krw_ontology_query_context` returns `research-state/v2`. Read these fields
+directly:
 
-Do not use `tickers=[]` for conditionless discovery questions such as "good stocks", "companies to enter now", or "what should I buy" when the user did not provide a concrete factor, channel, product, business model, metric, event type, company type, or exclusion. In that case, first present a short set of ontology-friendly narrowing prompts rather than running broad retrieval.
+```text
+resolved_scope
+  Requested/resolved/unknown/missing/failed tickers plus document and period
+  scope.
+
+source_anchors
+  Ticker, period, document type, role, and source label for current, annual,
+  latest, or retrieved evidence anchors.
+
+answerability.status / answerability.strong_claim_allowed
+  Overall answer policy: answerable, partial, not_answerable, or
+  supporting_context_only.
+
+clause_coverage
+  covered/partial/missing state, ticker coverage, best directness/evidence
+  grade, and strong_claim_ready for every clause.
+
+evidence_units
+  Deduplicated facts and metrics with clause support and traceable source IDs.
+
+computed_values / calculation_coverage
+  Deterministic values plus covered/partial/missing calculation support for
+  each requested metric axis.
+
+missing_parts / recommended_actions
+  Precise gaps and bounded next actions tied to a clause, ticker, or object.
+
+continuation
+  Whether bounded evidence was omitted and why.
+
+warnings
+  Conflicts, truncation, or other conditions that narrow safe interpretation.
+```
+
+Make a strong qualitative claim only when overall
+`answerability.strong_claim_allowed` and the relevant required clause coverage
+support it. Make a strong numeric or comparative claim only when the relevant
+`calculation_coverage` is covered and its `computed_values` have complete,
+aligned lineage. Related evidence is context, not proof of a requested
+directional relation.
+
+When the state is partial, continue only for specific `missing_parts` or
+`recommended_actions`. Do not obey a fixed one-follow-up cap, and do not repeat
+the same broad plan with cosmetic wording changes. Stop when required clause
+and calculation coverage support the intended answer, or when another call
+would add volume without changing correctness.

@@ -2,7 +2,7 @@
 
 Use this reference only for `krw-ontology-market-move-research`.
 
-The bridge converts a market observation into filing-grounded research when filing-grounded depth is needed. It should be concise, English, and optimized for `query_context`.
+The bridge converts a market observation into filing-grounded research when filing-grounded depth is needed. It should be concise, English, and optimized for a model-authored SearchPlan v2.
 
 Do not invoke the bridge automatically for every first-turn market-move question. A simple "why did it move today?" question can be answered from the app-provided price/news context, with follow-up prompts guiding the user toward KRW ontology research.
 
@@ -32,6 +32,18 @@ confirmation and falsification conditions
 ```
 
 Do not send raw Korean topic text or raw provider output directly to ontology tools.
+
+Before the first filing call, convert the brief into one complete SearchPlan v2.
+Use atomic qualitative clauses with `required_concepts` and
+`required_predicates`; put exact metrics in separate clauses with metric scope,
+dimensions, comparison axes, and calculation window. Use explicit tickers for
+the named company and size result limits to the required clause coverage.
+
+Call `query_context` with exactly `{search_plan}`. Read ResearchState v2
+`clause_coverage`/`evidence_units` for filing support and
+`computed_values`/`calculation_coverage` for arithmetic. Continue only through
+material `missing_parts`, `recommended_actions`, or `continuation`; never send
+legacy top-level question/ticker/limit arguments or repeat a covered clause.
 
 ## 2. Ontology-Friendly Channels
 

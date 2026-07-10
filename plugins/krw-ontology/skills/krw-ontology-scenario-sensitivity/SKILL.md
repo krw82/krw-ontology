@@ -55,7 +55,7 @@ These rules govern:
 
 ```text
 internal English investment briefs
-query_context-first research
+model-authored SearchPlan v2 before query_context
 MCP `filing_document_roles` for current_driver / annual_baseline
 latest 10-Q as current driver
 latest 10-K as annual business baseline
@@ -177,20 +177,22 @@ references/output-contract.md
 Follow this order:
 
 ```text
-1. Build the internal English investment-assumption brief.
+1. Build the internal English investment-assumption brief, then author one complete SearchPlan v2 before any filing call.
 2. Classify the request: downside, upside, thesis-break, sensitivity, event path, or liquidity stress.
 3. Confirm the covered company and newest available filing boundary without doing a broad company overview.
-4. Start with query_context for the named company plus the assumption variable, event, or downside path.
-5. Define the current tested assumption in one sentence.
-6. Collect only evidence relevant to that assumption: management commentary, notes, segment discussion, risk factors, commitments, liquidity, capex, debt, and cash-flow path.
-7. Identify one to three binding variables. Do not model every possible input.
-8. Map the assumption through company evidence -> business mechanism -> revenue/margin/working-capital/cash-flow/liquidity path -> investor meaning.
-9. Separate reported facts, filing-derived assumptions, user assumptions, and analyst conditional inference.
-10. Build base, upside, and downside cases only as different states of the same tested assumption.
-11. Define observable evidence that strengthens, maintains, weakens, or breaks the assumption.
-12. Use one targeted query only for a material missing axis.
-13. Use selected trace/chain only when a strong mechanism, amount, date, term, or direct-exposure claim needs support.
-14. Write the Korean assumption stress-test report.
+4. Put the assumption, transmission mechanism, financial channel, falsifier, and any exact metrics in atomic clauses. Use required_predicates for qualitative relations and separate metric clauses with scope/dimensions/window for arithmetic.
+5. Call query_context with exactly {search_plan}; never send legacy top-level question/ticker/limit arguments.
+6. Read ResearchState v2 clause_coverage, evidence_units, computed_values, calculation_coverage, missing_parts, recommended_actions, continuation, and warnings.
+7. Define the current tested assumption in one sentence.
+8. Collect only evidence relevant to that assumption: management commentary, notes, segment discussion, risk factors, commitments, liquidity, capex, debt, and cash-flow path.
+9. Identify the binding variables supported by the evidence; do not impose a fixed count or model every possible input.
+10. Map the assumption through company evidence -> business mechanism -> revenue/margin/working-capital/cash-flow/liquidity path -> investor meaning.
+11. Separate reported facts, filing-derived assumptions, user assumptions, and analyst conditional inference.
+12. Build base, upside, and downside cases only as different states of the same tested assumption.
+13. Define observable evidence that strengthens, maintains, weakens, or breaks the assumption.
+14. Follow only material missing_parts/recommended_actions; do not impose a fixed follow-up count.
+15. Use selected trace/chain only when a strong mechanism, amount, date, term, or direct-exposure claim needs support.
+16. Write the Korean assumption stress-test report.
 ```
 
 Do not request `response_detail="full"` in normal web chat.

@@ -1,0 +1,103 @@
+{
+  "aggregation": {
+    "score_decay": [
+      1.0,
+      0.3,
+      0.1
+    ],
+    "units_per_ticker": 3
+  },
+  "alias": {
+    "allow_company_alias_without_explicit_scope": false,
+    "facet_max_ticker_df_ratio": 0.85,
+    "facet_max_unit_df_ratio": 0.7,
+    "facet_min_information": 0.5,
+    "max_ngram_tokens": 4,
+    "minimum_unique_token_length": 3,
+    "per_query_term_cap": 64
+  },
+  "bigram": {
+    "field_weights": {
+      "company_text": 5.0,
+      "entity_text": 1.5,
+      "factor_text": 2.25,
+      "mechanism_text": 1.0,
+      "metric_text": 2.0,
+      "topic_text": 3.0
+    },
+    "hangul_only_when_hangul_present": true,
+    "minimum_ngram_coverage_ratio": 0.75,
+    "minimum_primary_results": 8
+  },
+  "build": {
+    "max_source_object_ids": 128,
+    "max_value_chars": 240,
+    "max_values_per_field": 256,
+    "micro_source_kinds": [
+      "topic",
+      "factor",
+      "metric",
+      "counterparty"
+    ],
+    "overview_family_key": "__company__"
+  },
+  "candidate_limit": 200,
+  "channel_weights": {
+    "exact_alias": 4.0,
+    "facet": 0.1,
+    "fielded_fts": 1.0,
+    "short_token": 0.2
+  },
+  "default_limit": 20,
+  "format": "krw-ontology-router-ranking-profile/v1",
+  "fts_field_weights": {
+    "company_text": 6.0,
+    "entity_text": 1.5,
+    "factor_text": 2.5,
+    "mechanism_text": 1.0,
+    "metric_text": 2.25,
+    "topic_text": 3.5
+  },
+  "graph": {
+    "enabled": false,
+    "minimum_seed_score": 0.85
+  },
+  "lexical": {
+    "bm25_weight": 0.2,
+    "candidate_multiplier": 4,
+    "coverage_weight": 0.45,
+    "information_coverage_weight": 0.35,
+    "min_should_match_ratio": 0.6,
+    "relaxed_penalty": 0.25
+  },
+  "micro_rerank": {
+    "anchor_gate_min_tickers": 32,
+    "anchor_max_ticker_df_ratio": 0.25,
+    "anchor_min_information": 4.0,
+    "bm25_weight": 0.2,
+    "candidate_ticker_multiplier": 4,
+    "coarse_weight": 0.35,
+    "coherence_gate": true,
+    "coverage_weight": 0.45,
+    "enabled": false,
+    "fallback": "preserve_coarse_order",
+    "information_coverage_weight": 0.35,
+    "max_pair_queries": 8,
+    "micro_unit_candidate_limit": 4096,
+    "micro_weight": 0.65,
+    "min_should_match_ratio": 0.5,
+    "minimum_coherent_terms": 2,
+    "minimum_anchor_terms": 1,
+    "minimum_query_terms": 2,
+    "pair_query_limit": 128,
+    "score_decay": [
+      1.0,
+      0.25
+    ],
+    "units_per_ticker": 2
+  },
+  "max_query_terms": 24,
+  "profile_id": "router-source-coherent-v4",
+  "rrf_k": 60,
+  "version": 4
+}

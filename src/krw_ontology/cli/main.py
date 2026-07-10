@@ -59,7 +59,23 @@ from krw_ontology.pipeline.queue import (
     QueueJob,
     is_pid_running,
 )
-from krw_ontology.agent_index.spine_schema import GLOBAL_SPINE_LAYOUT
+from krw_ontology.agent_index.source_artifact_sqlite import (
+    SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION,
+    SOURCE_ARTIFACT_SQLITE_SCHEMA_VERSION,
+)
+from krw_ontology.agent_index.spine_builder import (
+    COMPANY_SHARD_SCHEMA_VERSION,
+    SPINE_PROJECTION_VERSION,
+)
+from krw_ontology.agent_index.spine_schema import (
+    GLOBAL_SPINE_BUILDER_VERSION,
+    GLOBAL_SPINE_LAYOUT,
+    GLOBAL_SPINE_SCHEMA_VERSION,
+)
+from krw_ontology.agent_index.router_sidecar import (
+    ROUTER_SIDECAR_RELATIVE_PATH,
+    rebind_router_sidecar_release,
+)
 from krw_ontology.release import (
     ALLOWED_ONTOLOGY_ENVS,
     FAILED_RELEASE_DIRNAME,
@@ -199,7 +215,10 @@ index_app = typer.Typer(
 )
 index_cache_app = typer.Typer(
     name="cache",
-    help="Inspect and garbage-collect v3 company shard and spine fragment cache files.",
+    help=(
+        "Inspect and garbage-collect artifact fragment, v3 company shard, "
+        "and spine fragment cache files."
+    ),
     no_args_is_help=True,
 )
 source_manifest_app = typer.Typer(
@@ -2969,10 +2988,6 @@ def _ignore_legacy_agent_index_files(_directory: str, names: list[str]) -> set[s
     return {name for name in names if _is_legacy_agent_index_file_name(name)}
 
 
-def _ignore_materialized_source_indexes(_directory: str, names: list[str]) -> set[str]:
-    return {name for name in names if name != "source_manifest.json"}
-
-
 def _remove_legacy_agent_index_files(root: Path) -> None:
     indexes_dir = root / "indexes"
     if not indexes_dir.exists():
@@ -2986,8 +3001,17 @@ def _remove_legacy_agent_index_files(root: Path) -> None:
             path.unlink(missing_ok=True)
 
 
-def _materialize_release_root_from_source(source_root: Path, release_root: Path) -> None:
+def _materialize_release_root_from_source(
+    source_root: Path,
+    release_root: Path,
+) -> dict[str, int]:
     """Copy source ontology artifacts into an immutable release root candidate."""
+    from krw_ontology.agent_index.spine_builder import (
+        clone_or_copy_immutable_file,
+        clone_or_copy_immutable_tree,
+    )
+
+    copy_modes = {"reflink": 0, "copy": 0}
     release_root.mkdir(parents=True, exist_ok=True)
     for source_path in source_root.iterdir():
         if source_path.name in _MATERIALIZED_SOURCE_IGNORED_TOP_LEVEL:
@@ -2999,20 +3023,28 @@ def _materialize_release_root_from_source(source_root: Path, release_root: Path)
             else:
                 target_path.unlink()
         if source_path.is_dir() and not source_path.is_symlink():
-            ignore = (
-                _ignore_materialized_source_indexes
-                if source_path.name == "indexes"
-                else shutil.ignore_patterns(".krw_pipeline")
-            )
-            shutil.copytree(
+            if source_path.name == "indexes":
+                source_manifest_path = source_path / "source_manifest.json"
+                if source_manifest_path.is_file():
+                    target_path.mkdir(parents=True, exist_ok=True)
+                    mode = clone_or_copy_immutable_file(
+                        source_manifest_path,
+                        target_path / source_manifest_path.name,
+                    )
+                    copy_modes[mode] += 1
+                continue
+            mode = clone_or_copy_immutable_tree(
                 source_path,
                 target_path,
-                ignore=ignore,
+                ignored_names=(".krw_pipeline",),
             )
+            copy_modes[mode] += 1
         else:
             if _is_legacy_agent_index_file_name(source_path.name):
                 continue
-            shutil.copy2(source_path, target_path)
+            mode = clone_or_copy_immutable_file(source_path, target_path)
+            copy_modes[mode] += 1
+    return copy_modes
 
 
 def _release_disk_preflight(*, source_root: Path, release_root: Path) -> None:
@@ -4174,6 +4206,11 @@ def release_materialize_prod_cmd(
 
     _copy_release_tree(source_root, prod_root)
     shutil.rmtree(prod_root / ".krw_pipeline", ignore_errors=True)
+    rebind_router_sidecar_release(
+        prod_root / ROUTER_SIDECAR_RELATIVE_PATH,
+        release_id=target_id,
+        expected_previous_release_id=source_release_id,
+    )
     manifest = write_release_manifest_v3(
         prod_root,
         release_id=target_id,
@@ -8192,6 +8229,10 @@ def _build_prod_release_bundle(stable_root: Path, bundle_path: Path, release_id:
 
 def _materialize_verified_prod_release(stable_root: Path, candidate_root: Path, release_id: str) -> None:
     _materialize_prod_bundle_root(stable_root, candidate_root)
+    rebind_router_sidecar_release(
+        candidate_root / ROUTER_SIDECAR_RELATIVE_PATH,
+        release_id=release_id,
+    )
     write_release_manifest_v3(
         candidate_root,
         release_id=release_id,
@@ -8701,7 +8742,12 @@ from pathlib import Path
 
 release_root = Path(sys.argv[1]).resolve()
 release_id = sys.argv[2]
-GLOBAL_SPINE_SCHEMA_VERSION = "krw-ontology-global-spine/v1"
+GLOBAL_SPINE_SCHEMA_VERSION = __KRW_GLOBAL_SPINE_SCHEMA_VERSION__
+GLOBAL_SPINE_BUILDER_VERSION = __KRW_GLOBAL_SPINE_BUILDER_VERSION__
+SPINE_PROJECTION_VERSION = __KRW_SPINE_PROJECTION_VERSION__
+SOURCE_ARTIFACT_SQLITE_SCHEMA_VERSION = __KRW_SOURCE_ARTIFACT_SQLITE_SCHEMA_VERSION__
+SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION = __KRW_SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION__
+COMPANY_SHARD_SCHEMA_VERSION = __KRW_COMPANY_SHARD_SCHEMA_VERSION__
 GLOBAL_SPINE_LAYOUT = "global-spine-and-company-shards"
 GLOBAL_SPINE_TABLES = (
     "metadata",
@@ -8724,10 +8770,46 @@ GLOBAL_SPINE_REQUIRED_METADATA_KEYS = (
     "created_at",
 )
 SHARD_QUALITY_SUMMARY_FORMAT_VERSION = "krw-ontology-shard-quality-summary/v1"
+MANIFEST_BUILDER_BINDINGS = {
+    "spine_schema_version": GLOBAL_SPINE_SCHEMA_VERSION,
+    "spine_builder_version": GLOBAL_SPINE_BUILDER_VERSION,
+    "spine_projection_version": SPINE_PROJECTION_VERSION,
+    "source_artifact_sqlite_schema_version": SOURCE_ARTIFACT_SQLITE_SCHEMA_VERSION,
+    "source_artifact_sqlite_builder_version": SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION,
+    "company_shard_schema_version": COMPANY_SHARD_SCHEMA_VERSION,
+}
+GLOBAL_SPINE_MANIFEST_BINDINGS = {
+    "schema_version": GLOBAL_SPINE_SCHEMA_VERSION,
+    "builder_version": GLOBAL_SPINE_BUILDER_VERSION,
+    "spine_projection_version": SPINE_PROJECTION_VERSION,
+}
+GLOBAL_SPINE_METADATA_BINDINGS = {
+    **GLOBAL_SPINE_MANIFEST_BINDINGS,
+    "source_artifact_sqlite_schema_version": SOURCE_ARTIFACT_SQLITE_SCHEMA_VERSION,
+    "source_artifact_sqlite_builder_version": SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION,
+    "company_shard_schema_version": COMPANY_SHARD_SCHEMA_VERSION,
+}
+COMPANY_SHARDS_BINDINGS = {
+    "schema_version": COMPANY_SHARD_SCHEMA_VERSION,
+    "source_artifact_sqlite_schema_version": SOURCE_ARTIFACT_SQLITE_SCHEMA_VERSION,
+    "source_artifact_sqlite_builder_version": SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION,
+}
+SHARD_MANIFEST_BINDINGS = {
+    "company_shard_schema_version": COMPANY_SHARD_SCHEMA_VERSION,
+    "source_artifact_sqlite_schema_version": SOURCE_ARTIFACT_SQLITE_SCHEMA_VERSION,
+    "source_artifact_sqlite_builder_version": SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION,
+}
 
 def fail(message):
     print(message, file=sys.stderr)
     sys.exit(1)
+
+def require_bindings(payload, expected, label):
+    if not isinstance(payload, dict):
+        fail("%s missing" % label)
+    for key, value in expected.items():
+        if payload.get(key) != value:
+            fail("%s binding mismatch: %s" % (label, key))
 
 def load_json(path):
     try:
@@ -8954,6 +9036,7 @@ if manifest.get("monolith_required") is not False:
     fail("remote manifest monolith_required is not false")
 if manifest.get("status") != "ready":
     fail("remote manifest status is not ready")
+require_bindings(manifest.get("builder"), MANIFEST_BUILDER_BINDINGS, "remote manifest builder")
 
 indexes = manifest.get("indexes")
 if not isinstance(indexes, dict):
@@ -8961,6 +9044,7 @@ if not isinstance(indexes, dict):
 global_spine = indexes.get("global_spine")
 if not isinstance(global_spine, dict):
     fail("remote manifest missing global_spine")
+require_bindings(global_spine, GLOBAL_SPINE_MANIFEST_BINDINGS, "remote manifest global_spine")
 global_spine_path = resolve_rel(global_spine.get("path"), "global_spine")
 if not global_spine_path.is_file():
     fail("remote global_spine missing")
@@ -8989,6 +9073,7 @@ if metadata.get("schema_version") != GLOBAL_SPINE_SCHEMA_VERSION:
     fail("remote global_spine schema_version mismatch")
 if metadata.get("index_layout") != GLOBAL_SPINE_LAYOUT:
     fail("remote global_spine index_layout mismatch")
+require_bindings(metadata, GLOBAL_SPINE_METADATA_BINDINGS, "remote global_spine metadata")
 
 shard_manifest_entry = indexes.get("shard_manifest")
 if not isinstance(shard_manifest_entry, dict):
@@ -9021,12 +9106,14 @@ for raw_path, metadata in sorted(changed_files.items()):
         fail("remote delta changed file sha256 mismatch: %s" % raw_path)
 
 shard_manifest = load_json(shard_manifest_path)
+require_bindings(shard_manifest, SHARD_MANIFEST_BINDINGS, "remote shard_manifest")
 raw_shards = shard_manifest.get("shards")
 if not isinstance(raw_shards, dict):
     fail("remote shard_manifest missing shards")
 company_shards = indexes.get("company_shards")
 if not isinstance(company_shards, dict):
     fail("remote manifest missing company_shards")
+require_bindings(company_shards, COMPANY_SHARDS_BINDINGS, "remote manifest company_shards")
 manifest_tickers = company_shards.get("tickers")
 if not isinstance(manifest_tickers, dict):
     fail("remote manifest company_shards missing tickers")
@@ -9041,6 +9128,8 @@ for ticker, entry in sorted(manifest_tickers.items()):
     shard_entry = raw_shards.get(ticker)
     if not isinstance(shard_entry, dict):
         fail("remote shard_manifest shard invalid: %s" % ticker)
+    require_bindings(entry, COMPANY_SHARDS_BINDINGS, "remote manifest company shard:%s" % ticker)
+    require_bindings(shard_entry, COMPANY_SHARDS_BINDINGS, "remote shard_manifest shard:%s" % ticker)
     manifest_shard_path = resolve_rel(entry.get("path"), "company_shard:%s" % ticker)
     shard_path = resolve_shard_manifest_path(shard_entry.get("path"), "shard_manifest:%s" % ticker)
     if manifest_shard_path != shard_path:
@@ -9148,6 +9237,18 @@ fi
         .replace("__KRW_RELOAD_COMMAND__", reload_q)
         .replace("__KRW_HEALTH_URL__", health_q)
         .replace("__KRW_KEEP_RELEASES__", str(keep_releases))
+        .replace("__KRW_GLOBAL_SPINE_SCHEMA_VERSION__", json.dumps(GLOBAL_SPINE_SCHEMA_VERSION))
+        .replace("__KRW_GLOBAL_SPINE_BUILDER_VERSION__", json.dumps(GLOBAL_SPINE_BUILDER_VERSION))
+        .replace("__KRW_SPINE_PROJECTION_VERSION__", json.dumps(SPINE_PROJECTION_VERSION))
+        .replace(
+            "__KRW_SOURCE_ARTIFACT_SQLITE_SCHEMA_VERSION__",
+            json.dumps(SOURCE_ARTIFACT_SQLITE_SCHEMA_VERSION),
+        )
+        .replace(
+            "__KRW_SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION__",
+            json.dumps(SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION),
+        )
+        .replace("__KRW_COMPANY_SHARD_SCHEMA_VERSION__", json.dumps(COMPANY_SHARD_SCHEMA_VERSION))
     )
 
 def _prod_rollback_script(
@@ -9201,7 +9302,12 @@ from pathlib import Path
 
 release_root = Path(sys.argv[1]).resolve()
 release_id = sys.argv[2]
-GLOBAL_SPINE_SCHEMA_VERSION = "krw-ontology-global-spine/v1"
+GLOBAL_SPINE_SCHEMA_VERSION = __KRW_GLOBAL_SPINE_SCHEMA_VERSION__
+GLOBAL_SPINE_BUILDER_VERSION = __KRW_GLOBAL_SPINE_BUILDER_VERSION__
+SPINE_PROJECTION_VERSION = __KRW_SPINE_PROJECTION_VERSION__
+SOURCE_ARTIFACT_SQLITE_SCHEMA_VERSION = __KRW_SOURCE_ARTIFACT_SQLITE_SCHEMA_VERSION__
+SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION = __KRW_SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION__
+COMPANY_SHARD_SCHEMA_VERSION = __KRW_COMPANY_SHARD_SCHEMA_VERSION__
 GLOBAL_SPINE_LAYOUT = "global-spine-and-company-shards"
 GLOBAL_SPINE_TABLES = (
     "metadata",
@@ -9224,10 +9330,46 @@ GLOBAL_SPINE_REQUIRED_METADATA_KEYS = (
     "created_at",
 )
 SHARD_QUALITY_SUMMARY_FORMAT_VERSION = "krw-ontology-shard-quality-summary/v1"
+MANIFEST_BUILDER_BINDINGS = {
+    "spine_schema_version": GLOBAL_SPINE_SCHEMA_VERSION,
+    "spine_builder_version": GLOBAL_SPINE_BUILDER_VERSION,
+    "spine_projection_version": SPINE_PROJECTION_VERSION,
+    "source_artifact_sqlite_schema_version": SOURCE_ARTIFACT_SQLITE_SCHEMA_VERSION,
+    "source_artifact_sqlite_builder_version": SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION,
+    "company_shard_schema_version": COMPANY_SHARD_SCHEMA_VERSION,
+}
+GLOBAL_SPINE_MANIFEST_BINDINGS = {
+    "schema_version": GLOBAL_SPINE_SCHEMA_VERSION,
+    "builder_version": GLOBAL_SPINE_BUILDER_VERSION,
+    "spine_projection_version": SPINE_PROJECTION_VERSION,
+}
+GLOBAL_SPINE_METADATA_BINDINGS = {
+    **GLOBAL_SPINE_MANIFEST_BINDINGS,
+    "source_artifact_sqlite_schema_version": SOURCE_ARTIFACT_SQLITE_SCHEMA_VERSION,
+    "source_artifact_sqlite_builder_version": SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION,
+    "company_shard_schema_version": COMPANY_SHARD_SCHEMA_VERSION,
+}
+COMPANY_SHARDS_BINDINGS = {
+    "schema_version": COMPANY_SHARD_SCHEMA_VERSION,
+    "source_artifact_sqlite_schema_version": SOURCE_ARTIFACT_SQLITE_SCHEMA_VERSION,
+    "source_artifact_sqlite_builder_version": SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION,
+}
+SHARD_MANIFEST_BINDINGS = {
+    "company_shard_schema_version": COMPANY_SHARD_SCHEMA_VERSION,
+    "source_artifact_sqlite_schema_version": SOURCE_ARTIFACT_SQLITE_SCHEMA_VERSION,
+    "source_artifact_sqlite_builder_version": SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION,
+}
 
 def fail(message):
     print(message, file=sys.stderr)
     sys.exit(1)
+
+def require_bindings(payload, expected, label):
+    if not isinstance(payload, dict):
+        fail("%s missing" % label)
+    for key, value in expected.items():
+        if payload.get(key) != value:
+            fail("%s binding mismatch: %s" % (label, key))
 
 def load_json(path):
     try:
@@ -9452,12 +9594,14 @@ if manifest.get("index_layout") != "global-spine-and-company-shards":
     fail("rollback manifest index_layout is not v3")
 if manifest.get("monolith_required") is not False:
     fail("rollback manifest monolith_required is not false")
+require_bindings(manifest.get("builder"), MANIFEST_BUILDER_BINDINGS, "rollback manifest builder")
 indexes = manifest.get("indexes")
 if not isinstance(indexes, dict):
     fail("rollback manifest missing indexes")
 global_spine = indexes.get("global_spine")
 if not isinstance(global_spine, dict):
     fail("rollback manifest missing global_spine")
+require_bindings(global_spine, GLOBAL_SPINE_MANIFEST_BINDINGS, "rollback manifest global_spine")
 global_spine_path = resolve_rel(global_spine.get("path"), "global_spine")
 if not global_spine_path.is_file():
     fail("rollback global_spine missing")
@@ -9486,6 +9630,7 @@ if metadata.get("schema_version") != GLOBAL_SPINE_SCHEMA_VERSION:
     fail("rollback global_spine schema_version mismatch")
 if metadata.get("index_layout") != GLOBAL_SPINE_LAYOUT:
     fail("rollback global_spine index_layout mismatch")
+require_bindings(metadata, GLOBAL_SPINE_METADATA_BINDINGS, "rollback global_spine metadata")
 shard_manifest_entry = indexes.get("shard_manifest")
 if not isinstance(shard_manifest_entry, dict):
     fail("rollback manifest missing shard_manifest")
@@ -9500,12 +9645,14 @@ if (
 ):
     fail("rollback shard_manifest sha256 mismatch")
 shard_manifest = load_json(shard_manifest_path)
+require_bindings(shard_manifest, SHARD_MANIFEST_BINDINGS, "rollback shard_manifest")
 raw_shards = shard_manifest.get("shards")
 if not isinstance(raw_shards, dict):
     fail("rollback shard_manifest missing shards")
 company_shards = indexes.get("company_shards")
 if not isinstance(company_shards, dict) or not isinstance(company_shards.get("tickers"), dict):
     fail("rollback manifest missing company_shards")
+require_bindings(company_shards, COMPANY_SHARDS_BINDINGS, "rollback manifest company_shards")
 manifest_tickers = company_shards["tickers"]
 expected_count = company_shards.get("count")
 if not isinstance(expected_count, int) or expected_count != len(manifest_tickers):
@@ -9518,6 +9665,8 @@ for ticker, entry in sorted(company_shards["tickers"].items()):
     shard_entry = raw_shards.get(ticker)
     if not isinstance(shard_entry, dict):
         fail("rollback shard_manifest shard invalid: %s" % ticker)
+    require_bindings(entry, COMPANY_SHARDS_BINDINGS, "rollback manifest company shard:%s" % ticker)
+    require_bindings(shard_entry, COMPANY_SHARDS_BINDINGS, "rollback shard_manifest shard:%s" % ticker)
     manifest_shard_path = resolve_rel(entry.get("path"), "company_shard:%s" % ticker)
     shard_path = resolve_shard_manifest_path(shard_entry.get("path"), "shard_manifest:%s" % ticker)
     if manifest_shard_path != shard_path:
@@ -9578,6 +9727,18 @@ printf '%s\n' "$TARGET"
         .replace("__KRW_RELEASE_ID__", release_q)
         .replace("__KRW_RELOAD_COMMAND__", reload_q)
         .replace("__KRW_HEALTH_URL__", health_q)
+        .replace("__KRW_GLOBAL_SPINE_SCHEMA_VERSION__", json.dumps(GLOBAL_SPINE_SCHEMA_VERSION))
+        .replace("__KRW_GLOBAL_SPINE_BUILDER_VERSION__", json.dumps(GLOBAL_SPINE_BUILDER_VERSION))
+        .replace("__KRW_SPINE_PROJECTION_VERSION__", json.dumps(SPINE_PROJECTION_VERSION))
+        .replace(
+            "__KRW_SOURCE_ARTIFACT_SQLITE_SCHEMA_VERSION__",
+            json.dumps(SOURCE_ARTIFACT_SQLITE_SCHEMA_VERSION),
+        )
+        .replace(
+            "__KRW_SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION__",
+            json.dumps(SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION),
+        )
+        .replace("__KRW_COMPANY_SHARD_SCHEMA_VERSION__", json.dumps(COMPANY_SHARD_SCHEMA_VERSION))
     )
 
 def _publish_prod_root(
@@ -10124,6 +10285,10 @@ def index_cache_status_cmd(
     )
     typer.echo(f"Company cache: referenced={snapshot['referenced_by_kind']['company_shard']}")
     typer.echo(f"Spine cache: referenced={snapshot['referenced_by_kind']['spine_fragment']}")
+    typer.echo(
+        "Artifact fragment cache: "
+        f"referenced={snapshot['referenced_by_kind']['artifact_fragment']}"
+    )
     typer.echo(f"Bytes: {snapshot['total_size_bytes']}")
     tickers = snapshot.get("tickers") or []
     typer.echo(f"Tickers: {', '.join(tickers) if tickers else '<none>'}")
@@ -10172,7 +10337,7 @@ def index_cache_gc_cmd(
     ),
     limit: int = typer.Option(50, "--limit", min=0, help="Maximum candidate entries to print."),
 ) -> None:
-    """Garbage-collect stale v3 company shard and spine fragment cache files."""
+    """Garbage-collect stale artifact, company shard, and spine fragment caches."""
     output_root = resolve_ontology_root(root)
     snapshot = _v3_index_cache_snapshot(
         output_root,
@@ -10198,9 +10363,10 @@ def index_cache_gc_cmd(
                 continue
             deleted_count += 1
             deleted_bytes += size
+    candidate_bytes = sum(int(entry.get("size_bytes") or 0) for entry in candidates)
     typer.echo(f"V3 index cache GC: {'deleted' if yes else 'dry-run'}")
     typer.echo(f"Cache root: {snapshot['cache_root']}")
-    typer.echo(f"Candidates: {len(candidates)}")
+    typer.echo(f"Candidates: {len(candidates)} bytes={candidate_bytes}")
     typer.echo(f"Deleted: {deleted_count} bytes={deleted_bytes}")
     for entry in candidates[:limit]:
         typer.echo(f"candidate: {entry['kind']} {entry['path']} ({entry['size_bytes']} bytes)")
@@ -10237,6 +10403,23 @@ def _v3_index_cache_snapshot(
     resolved_cache_root = Path(str(plan["cache_root"])).expanduser().resolve()
     referenced: dict[Path, dict[str, Any]] = {}
     tickers: set[str] = set()
+    plan_payload = plan.get("plan") if isinstance(plan.get("plan"), Mapping) else {}
+    artifact_items = plan_payload.get("items") if isinstance(plan_payload, Mapping) else []
+    for row in artifact_items or []:
+        if not isinstance(row, Mapping):
+            continue
+        fragment_path = str(row.get("fragment_path") or "")
+        if not fragment_path:
+            continue
+        path = Path(fragment_path).expanduser().resolve()
+        ticker = str(row.get("ticker") or "")
+        if ticker:
+            tickers.add(ticker)
+        referenced[path] = {
+            "kind": "artifact_fragment",
+            "ticker": ticker or None,
+            "cache_key": row.get("cache_key"),
+        }
     for row in plan.get("companies") or []:
         if not isinstance(row, Mapping):
             continue
@@ -10283,7 +10466,7 @@ def _v3_index_cache_snapshot(
     actual_files = set(_iter_v3_cache_files(resolved_cache_root))
     referenced_paths = set(referenced)
     for path in sorted(actual_files - referenced_paths, key=str):
-        kind = "company_shard" if "/company_shards/" in path.as_posix() else "spine_fragment"
+        kind = _index_cache_kind(path, resolved_cache_root)
         size = path.stat().st_size if path.is_file() else 0
         total_size_bytes += size
         entries.append(
@@ -10299,6 +10482,11 @@ def _v3_index_cache_snapshot(
         )
 
     referenced_by_kind = {
+        "artifact_fragment": sum(
+            1
+            for entry in entries
+            if entry["kind"] == "artifact_fragment" and entry["referenced"]
+        ),
         "company_shard": sum(1 for entry in entries if entry["kind"] == "company_shard" and entry["referenced"]),
         "spine_fragment": sum(1 for entry in entries if entry["kind"] == "spine_fragment" and entry["referenced"]),
     }
@@ -10324,9 +10512,24 @@ def _v3_cache_path_from_key(cache_root: Path, kind: str, cache_key: str) -> Path
 def _iter_v3_cache_files(cache_root: Path) -> list[Path]:
     paths: list[Path] = []
     for directory in (
+        cache_root / "fragments",
         cache_root / "v3" / "company_shards",
         cache_root / "v3" / "spine_fragments",
     ):
         if directory.is_dir():
             paths.extend(path for path in directory.glob("*/*.sqlite") if path.is_file())
     return paths
+
+
+def _index_cache_kind(path: Path, cache_root: Path) -> str:
+    try:
+        relative = path.resolve().relative_to(cache_root.resolve())
+    except ValueError as exc:
+        raise RuntimeError(f"cache file outside cache root: {path}") from exc
+    if relative.parts and relative.parts[0] == "fragments":
+        return "artifact_fragment"
+    if "company_shards" in relative.parts:
+        return "company_shard"
+    if "spine_fragments" in relative.parts:
+        return "spine_fragment"
+    raise RuntimeError(f"unknown cache file kind: {path}")

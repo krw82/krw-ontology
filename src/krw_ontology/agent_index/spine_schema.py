@@ -9,8 +9,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-GLOBAL_SPINE_SCHEMA_VERSION = "krw-ontology-global-spine/v1"
-GLOBAL_SPINE_BUILDER_VERSION = "global-spine-builder/v1"
+GLOBAL_SPINE_SCHEMA_VERSION = "krw-ontology-global-spine/v2"
+GLOBAL_SPINE_BUILDER_VERSION = "global-spine-builder/v2"
+GLOBAL_SPINE_AGENT_GRAPH_INDEX_VERSION = "agent-graph-index/v1"
 GLOBAL_SPINE_RELATIVE_PATH = Path("indexes") / "global_spine.sqlite"
 GLOBAL_SPINE_LAYOUT = "global-spine-and-company-shards"
 
@@ -37,7 +38,11 @@ GLOBAL_SPINE_REQUIRED_METADATA_KEYS = (
 )
 
 
-def create_global_spine_schema(conn: sqlite3.Connection) -> None:
+def create_global_spine_schema(
+    conn: sqlite3.Connection,
+    *,
+    include_secondary_indexes: bool = True,
+) -> None:
     """Create the v3 global spine schema in an open SQLite connection."""
     conn.executescript(
         """
@@ -245,6 +250,10 @@ def create_global_spine_schema(conn: sqlite3.Connection) -> None:
             ON global_edge_spine(from_ticker, to_ticker);
         CREATE INDEX IF NOT EXISTS idx_global_edge_spine_scope
             ON global_edge_spine(edge_scope, relation_type);
+        CREATE INDEX IF NOT EXISTS idx_global_edge_spine_from_relation_to
+            ON global_edge_spine(from_object_id, relation_type, to_object_id);
+        CREATE INDEX IF NOT EXISTS idx_global_edge_spine_to_relation_from
+            ON global_edge_spine(to_object_id, relation_type, from_object_id);
 
         CREATE INDEX IF NOT EXISTS idx_global_factor_spine_key
             ON global_factor_spine(factor_key);
@@ -287,8 +296,35 @@ def create_global_spine_schema(conn: sqlite3.Connection) -> None:
             ON global_chain_index(shared_key_type, shared_key);
         CREATE INDEX IF NOT EXISTS idx_global_chain_index_weight
             ON global_chain_index(weight DESC);
+        CREATE INDEX IF NOT EXISTS idx_global_chain_index_from_object_weight
+            ON global_chain_index(from_object_id, weight DESC, to_object_id);
+        CREATE INDEX IF NOT EXISTS idx_global_chain_index_to_object_weight
+            ON global_chain_index(to_object_id, weight DESC, from_object_id);
+        CREATE INDEX IF NOT EXISTS idx_global_chain_index_from_ticker_weight
+            ON global_chain_index(from_ticker, weight DESC, to_ticker);
+        CREATE INDEX IF NOT EXISTS idx_global_chain_index_to_ticker_weight
+            ON global_chain_index(to_ticker, weight DESC, from_ticker);
         """
     )
+    if not include_secondary_indexes:
+        _drop_global_spine_secondary_indexes(conn)
+
+
+def _drop_global_spine_secondary_indexes(conn: sqlite3.Connection) -> None:
+    """Drop regenerable global-spine indexes before a bulk merge."""
+    names = [
+        str(row[0])
+        for row in conn.execute(
+            """
+            SELECT name
+            FROM sqlite_master
+            WHERE type = 'index' AND name LIKE 'idx_global_%'
+            ORDER BY name
+            """
+        )
+    ]
+    for name in names:
+        conn.execute(f'DROP INDEX IF EXISTS "{name}"')
 
 
 def write_global_spine_metadata(conn: sqlite3.Connection, metadata: Mapping[str, Any] | None = None) -> None:
@@ -297,6 +333,7 @@ def write_global_spine_metadata(conn: sqlite3.Connection, metadata: Mapping[str,
         "schema_version": GLOBAL_SPINE_SCHEMA_VERSION,
         "builder_version": GLOBAL_SPINE_BUILDER_VERSION,
         "index_layout": GLOBAL_SPINE_LAYOUT,
+        "agent_graph_index_version": GLOBAL_SPINE_AGENT_GRAPH_INDEX_VERSION,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     if metadata:
@@ -390,6 +427,8 @@ def verify_global_spine_schema(path: Path) -> dict[str, Any]:
             errors.append(f"global_spine_metadata_missing:{key}")
     if metadata.get("schema_version") != GLOBAL_SPINE_SCHEMA_VERSION:
         errors.append("global_spine_schema_version_mismatch")
+    if metadata.get("builder_version") != GLOBAL_SPINE_BUILDER_VERSION:
+        errors.append("global_spine_builder_version_mismatch")
     if metadata.get("index_layout") != GLOBAL_SPINE_LAYOUT:
         errors.append("global_spine_index_layout_mismatch")
     return {

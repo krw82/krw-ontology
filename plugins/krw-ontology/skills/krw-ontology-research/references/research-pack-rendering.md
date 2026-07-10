@@ -1,89 +1,88 @@
-# Research Pack Rendering Policy
+# ResearchState Rendering Policy
 
-Research packs are runtime response adapters. They are not DB tables, not ontology schema, and not user-facing terms.
+`ResearchState v2` is the model-visible response contract. It is not ontology
+schema and its field names are not user-facing language.
 
-Never mention pack names in normal answers.
+Use it to decide what can be said, which evidence supports each proposition,
+and whether a targeted continuation can materially improve correctness.
 
-## metric_series_pack
+## Scope and source anchors
 
-Use for numeric answers.
+Read `resolved_scope` before synthesizing across companies, documents, or
+periods. Do not silently treat unknown, missing, or failed tickers as covered.
 
-Render as:
+Use `source_anchors` to distinguish the current driver, annual baseline,
+latest available source, and neutral retrieved-evidence anchors. Do not invent a
+document role when the returned role is only `retrieved_evidence`.
 
-```text
-table when values are aligned
-YoY growth / share / growth difference when provided
-short interpretation below the table
-```
+## Answerability and clause coverage
 
-Check:
-
-```text
-period alignment
-unit consistency
-scale consistency
-target dimension vs denominator role
-missing parts
-```
-
-If the pack does not support a precise table, do not invent one and do not explain internal retrieval limits.
-
-## business_profile_pack
-
-Use for company overview, business model, and revenue driver questions.
-
-Render order:
+Read together:
 
 ```text
-recent drivers when requested
-annual revenue mix / business baseline
-segment or product/service explanation
-margin/cash-flow implication
-material caveats
+answerability.status
+answerability.strong_claim_allowed
+clause_coverage[].status
+clause_coverage[].strong_claim_ready
+clause_coverage[].best_directness
+clause_coverage[].best_evidence_grade
 ```
 
-Do not treat missing exact metrics as not answerable by default.
+Render a strong conclusion only when the overall answer policy and every
+load-bearing required clause support it. If a required clause is partial or
+missing, narrow the conclusion to the covered propositions.
 
-## risk_mechanism_pack
+For direct-exposure or directional-relation questions, related evidence is
+context only. It does not establish the requested direction.
 
-Use for thesis/risk/scenario questions.
+## Evidence units
 
-Render each major channel as:
+Use `evidence_units` as the answer-ready evidence set. Match evidence to
+clauses through `supports_clause_ids` and `clause_matches`; use source object,
+quote, and span IDs only for internal traceability.
+
+For company overview, mechanism, risk, and event questions, synthesize:
 
 ```text
-risk or premise -> financial path -> affected metric/channel -> implication
+evidence -> mechanism -> financial meaning -> investor interpretation
 ```
 
-Representative metrics are context only unless metric lineage is strong.
+Do not render an object inventory or infer a relation from broad co-occurrence.
 
-## comparison_view
+## Numeric rendering
 
-Use for comparison questions.
-
-Compare only rows with the same basis, period, or context. MCP can provide conclusion hints, but the AI analyst writes the final comparison judgment.
-
-Do not declare a winner from broad hit counts.
-
-## direct_exposure_pack
-
-Use for direct exposure questions.
-
-Separate:
+For numeric and comparison answers, read together:
 
 ```text
-direct evidence
-related context
-no direct evidence
+evidence_units[].metric
+evidence_units[].metric_points
+evidence_units[].unit
+evidence_units[].currency
+evidence_units[].dimensions
+evidence_units[].metric_scope
+computed_values
+calculation_coverage
 ```
 
-If strong_claim_allowed is false, do not use direct exposure wording.
+Render a precise value, change, growth rate, or cross-company difference only
+when the relevant `calculation_coverage.status` is `covered` and the aligned
+`computed_values` support it.
 
-## scope_guard_pack
+Check metric identity, scope, dimensions, period basis, duration, unit,
+currency, calculation window, and source lineage. Do not combine FY with CY,
+quarter with YTD, annual with quarterly, or company-total with dimensioned
+series.
 
-Use for target price, fair value, investment recommendation, or final valuation questions.
+If calculation coverage is partial or missing, omit the unsupported arithmetic
+or state a narrower qualitative conclusion. Do not invent a table.
 
-Stop valuation conclusion. Provide only filing-supported assumptions or caveats.
+## Targeted continuation and stop
 
-## evidence_index and chain_pack
+Use `missing_parts` and `recommended_actions` to choose a specific next
+action. Use `continuation` and `warnings` to detect omitted evidence,
+conflicts, or truncation that can weaken an otherwise plausible conclusion.
 
-Use as selected trace/chain root suggestions. Do not expand every candidate.
+Do not apply a universal one-follow-up or fixed tool-call cap. Continue only
+when a named gap could change answer correctness, directness, or calculation
+coverage. Stop when required clause and calculation coverage support the
+intended answer or when another call would only add volume.

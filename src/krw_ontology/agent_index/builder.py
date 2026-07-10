@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import resource
@@ -22,12 +23,20 @@ from concurrent.futures.process import BrokenProcessPool
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
 from krw_ontology.config.constants import normalize_doc_type
 from krw_ontology.schema.objects import SCHEMA_VERSION
+from krw_ontology.agent_index.metric_dictionary import (
+    canonical_metric_for_xbrl_tag,
+    canonical_metric_name,
+    metric_aliases,
+    metric_dictionary_binding,
+    metric_dictionary_binding_errors,
+    normalize_dimension_key,
+)
 from krw_ontology.agent_index.retrieval_text import (
     ObjectLookup,
     RETRIEVAL_TEXT_BUILDER_VERSION,
@@ -42,11 +51,12 @@ from krw_ontology.utils.io import read_jsonl
 
 logger = logging.getLogger("krw_ontology")
 
-AGENT_INDEX_SCHEMA_VERSION = "1.0.0-alpha.3"
-SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION = "source-artifact-sqlite-builder/v1"
+AGENT_INDEX_SCHEMA_VERSION = "1.0.0-alpha.4"
+SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION = "source-artifact-sqlite-builder/v2"
 AGENT_INDEX_BUILDER_VERSION = SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION
 SOURCE_ARTIFACT_SQLITE_BUILD_STAGE = "source_artifact_sqlite"
 DEFAULT_INDEX_RELATIVE_PATH = Path("indexes") / "agent_index.sqlite"
+DEFAULT_INDEX_BUILD_WORKER_CAP = 12
 INDEX_BUILD_PLAN_FORMAT_VERSION = "krw-agent-index-build-plan/v1"
 SOURCE_ARTIFACT_MANIFEST_FORMAT_VERSION = "krw-agent-index-source-manifest/v1"
 INDEX_BUILD_GRAPH_FORMAT_VERSION = "krw-agent-index-build-graph/v1"
@@ -810,6 +820,39 @@ def verify_agent_index(index_path: Path) -> dict[str, Any]:
             existing_tables = {str(row[0]) for row in table_rows}
             for table_name in sorted(required_tables - existing_tables):
                 errors.append(f"table_missing:{table_name}")
+            if "metric_lookup" in existing_tables:
+                metric_columns = {
+                    str(row[1])
+                    for row in conn.execute("PRAGMA table_info(metric_lookup)").fetchall()
+                }
+                required_metric_columns = {
+                    "filing_period",
+                    "observation_period",
+                    "observation_period_type",
+                    "observation_start_date",
+                    "observation_end_date",
+                    "observation_context_key",
+                    "value_numeric",
+                }
+                for column in sorted(required_metric_columns - metric_columns):
+                    errors.append(f"metric_lookup_column_missing:{column}")
+                if required_metric_columns.issubset(metric_columns):
+                    invalid_contexts = int(
+                        conn.execute(
+                            """
+                            SELECT COUNT(*)
+                            FROM metric_lookup
+                            WHERE filing_period = ''
+                               OR observation_period = ''
+                               OR observation_period_type = ''
+                               OR observation_context_key = ''
+                            """
+                        ).fetchone()[0]
+                    )
+                    if invalid_contexts:
+                        errors.append(
+                            f"metric_lookup_observation_context_invalid:{invalid_contexts}"
+                        )
             for table_name in ("documents", "objects", "edges", "quality_events"):
                 if table_name in existing_tables:
                     counts[table_name] = int(conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0])
@@ -826,8 +869,21 @@ def verify_agent_index(index_path: Path) -> dict[str, Any]:
                     if schema_version != AGENT_INDEX_SCHEMA_VERSION:
                         errors.append("agent_index_schema_version_mismatch")
                     source_artifact_schema_version = build_metadata.get("source_artifact_sqlite_schema_version")
-                    if source_artifact_schema_version not in (None, AGENT_INDEX_SCHEMA_VERSION):
+                    if source_artifact_schema_version != AGENT_INDEX_SCHEMA_VERSION:
                         errors.append("source_artifact_sqlite_schema_version_mismatch")
+                    source_artifact_builder_version = build_metadata.get(
+                        "source_artifact_sqlite_builder_version"
+                    )
+                    if (
+                        source_artifact_builder_version
+                        != SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION
+                    ):
+                        errors.append("source_artifact_sqlite_builder_version_mismatch")
+                    errors.extend(
+                        metric_dictionary_binding_errors(
+                            build_metadata.get("metric_dictionary")
+                        )
+                    )
     except sqlite3.Error as exc:
         errors.append(f"sqlite_error:{exc}")
     return {
@@ -1935,6 +1991,27 @@ def write_source_artifact_manifest(
     manifest_path: Path | None = None,
 ) -> dict[str, Any]:
     """Write the canonical artifact source manifest used by production builds."""
+    payload = build_source_artifact_manifest_payload(
+        root,
+        manifest_path=manifest_path,
+    )
+    resolved_manifest_path = Path(str(payload["path"]))
+    resolved_manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = resolved_manifest_path.with_suffix(".json.tmp")
+    tmp_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    tmp_path.replace(resolved_manifest_path)
+    return _json_safe(payload)
+
+
+def build_source_artifact_manifest_payload(
+    root: Path,
+    *,
+    manifest_path: Path | None = None,
+) -> dict[str, Any]:
+    """Build a canonical source-manifest payload without writing release files."""
     resolved_root = root.expanduser().resolve()
     resolved_manifest_path = (
         manifest_path.expanduser().resolve()
@@ -1956,16 +2033,13 @@ def write_source_artifact_manifest(
         "retrieval_text_builder_version": RETRIEVAL_TEXT_BUILDER_VERSION,
         "company_topic_builder_version": COMPANY_TOPIC_BUILDER_VERSION,
         "typed_projection_builder_version": TYPED_PROJECTION_BUILDER_VERSION,
+        "metric_dictionary": metric_dictionary_binding(),
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "artifact_count": len(artifacts),
         "artifacts": artifacts,
     }
     payload["manifest_hash"] = _source_manifest_payload_hash(payload)
     payload["path"] = str(resolved_manifest_path)
-    resolved_manifest_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = resolved_manifest_path.with_suffix(".json.tmp")
-    tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    tmp_path.replace(resolved_manifest_path)
     return _json_safe(payload)
 
 
@@ -2002,6 +2076,9 @@ def verify_source_artifact_manifest(
         }
 
     artifact_paths: list[Path] = []
+    errors.extend(
+        metric_dictionary_binding_errors(manifest.get("metric_dictionary"))
+    )
     try:
         artifact_paths, manifest_hash = _artifact_paths_from_source_manifest(
             resolved_root,
@@ -2306,6 +2383,7 @@ def _company_cache_input_hash(ticker: str, artifact_cache_keys: Sequence[str]) -
         "retrieval_text_builder_version": RETRIEVAL_TEXT_BUILDER_VERSION,
         "company_topic_builder_version": COMPANY_TOPIC_BUILDER_VERSION,
         "typed_projection_builder_version": TYPED_PROJECTION_BUILDER_VERSION,
+        "metric_dictionary": metric_dictionary_binding(),
         "index_layout_version": INDEX_LAYOUT_VERSION,
         "index_shard_tables": list(INDEX_SHARD_TABLES),
     }
@@ -2363,7 +2441,7 @@ def _resolve_build_workers(workers: int | None) -> int:
             return max(1, int(configured))
         except ValueError:
             return 1
-    return min(max((os.cpu_count() or 1) - 1, 1), 8)
+    return min(max((os.cpu_count() or 1) - 1, 1), DEFAULT_INDEX_BUILD_WORKER_CAP)
 
 
 def _artifact_plan_item(*, root: Path, artifact_index_path: Path, cache_root: Path) -> ArtifactPlanItem:
@@ -3014,9 +3092,9 @@ def compile_artifact_fragment(
         _cleanup_sqlite_database_files(tmp_path)
 
 
-def _compile_fragment_worker(args: tuple[ArtifactPlanItem, Path]) -> FragmentCompileResult:
-    item, root = args
-    return compile_artifact_fragment(item, root=root)
+def _compile_fragment_worker(args: tuple[ArtifactPlanItem, Path, bool]) -> FragmentCompileResult:
+    item, root, force = args
+    return compile_artifact_fragment(item, root=root, force=force)
 
 
 def compile_artifact_fragments(
@@ -3024,6 +3102,7 @@ def compile_artifact_fragments(
     *,
     root: Path,
     workers: int = 1,
+    force: bool = False,
 ) -> list[FragmentCompileResult]:
     """Compile/cache artifact fragments, optionally in worker processes."""
     if not items:
@@ -3031,14 +3110,17 @@ def compile_artifact_fragments(
     resolved_root = root.expanduser().resolve()
     worker_count = max(1, min(int(workers), len(items)))
     if worker_count <= 1 or len(items) <= 1:
-        return [compile_artifact_fragment(item, root=resolved_root) for item in items]
+        return [
+            compile_artifact_fragment(item, root=resolved_root, force=force)
+            for item in items
+        ]
 
     results_by_relative_path: dict[str, FragmentCompileResult] = {}
     submission_items = _fragment_compile_submission_order(items)
     try:
         with ProcessPoolExecutor(max_workers=worker_count) as executor:
             futures = {
-                executor.submit(_compile_fragment_worker, (item, resolved_root)): item
+                executor.submit(_compile_fragment_worker, (item, resolved_root, force)): item
                 for item in submission_items
             }
             for future in as_completed(futures):
@@ -3051,11 +3133,29 @@ def compile_artifact_fragments(
                     raise RuntimeError(f"fragment compile failed for {item.relative_path}: {exc}") from exc
                 results_by_relative_path[item.relative_path] = result
     except BrokenProcessPool as exc:
+        retry_workers = max(1, worker_count // 2)
+        remaining_items = [
+            item
+            for item in items
+            if item.relative_path not in results_by_relative_path
+        ]
         logger.warning(
-            "fragment worker pool failed; retrying artifact compile sequentially: %s",
+            "fragment worker pool failed; retrying %d unfinished artifact(s) "
+            "with %d worker(s): %s",
+            len(remaining_items),
+            retry_workers,
             exc,
         )
-        return [compile_artifact_fragment(item, root=resolved_root) for item in items]
+        retried = compile_artifact_fragments(
+            remaining_items,
+            root=resolved_root,
+            workers=retry_workers,
+            force=force,
+        )
+        results_by_relative_path.update(
+            {result.item.relative_path: result for result in retried}
+        )
+        return [results_by_relative_path[item.relative_path] for item in items]
 
     return [results_by_relative_path[item.relative_path] for item in items]
 
@@ -3437,6 +3537,7 @@ def _build_agent_index_direct(
                             "company_topic_profile_mode": "rich_materialized",
                             "object_search_text_enabled": True,
                             "metric_lookup_enabled": True,
+                            "metric_dictionary": metric_dictionary_binding(),
                             "metric_dimension_lookup_enabled": True,
                             "company_dimension_catalog_enabled": True,
                             "typed_projection_builder_version": TYPED_PROJECTION_BUILDER_VERSION,
@@ -3741,12 +3842,19 @@ def _create_schema(conn: sqlite3.Connection) -> None:
             document_type TEXT NOT NULL,
             doc_type_key TEXT NOT NULL,
             period TEXT NOT NULL,
+            filing_period TEXT NOT NULL,
+            observation_period TEXT NOT NULL,
+            observation_period_type TEXT NOT NULL,
+            observation_start_date TEXT,
+            observation_end_date TEXT,
+            observation_context_key TEXT NOT NULL,
             fiscal_year INTEGER,
             fiscal_quarter INTEGER,
             metric_name TEXT,
             canonical_metric TEXT,
             metric_alias_text TEXT,
             value_text TEXT,
+            value_numeric REAL,
             unit TEXT,
             dimensions_json TEXT NOT NULL,
             is_company_total INTEGER DEFAULT 0,
@@ -3762,6 +3870,8 @@ def _create_schema(conn: sqlite3.Connection) -> None:
             object_id TEXT NOT NULL,
             ticker TEXT NOT NULL,
             period TEXT NOT NULL,
+            filing_period TEXT NOT NULL,
+            observation_period TEXT NOT NULL,
             fiscal_year INTEGER,
             fiscal_quarter INTEGER,
             canonical_metric TEXT NOT NULL,
@@ -4003,23 +4113,25 @@ def _create_serving_secondary_indexes(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_object_traceability_ticker_type_status
             ON object_traceability(ticker, object_type, trace_status);
         CREATE INDEX IF NOT EXISTS idx_metric_lookup_ticker_period_metric
-            ON metric_lookup(ticker, period, canonical_metric);
+            ON metric_lookup(ticker, observation_period, canonical_metric);
+        CREATE INDEX IF NOT EXISTS idx_metric_lookup_ticker_filing_period
+            ON metric_lookup(ticker, filing_period, canonical_metric);
         CREATE INDEX IF NOT EXISTS idx_metric_lookup_ticker_year_metric
             ON metric_lookup(ticker, fiscal_year, canonical_metric);
         CREATE INDEX IF NOT EXISTS idx_metric_lookup_ticker_type_period
-            ON metric_lookup(ticker, object_type, period);
+            ON metric_lookup(ticker, object_type, observation_period);
         CREATE INDEX IF NOT EXISTS idx_metric_lookup_total
             ON metric_lookup(ticker, is_company_total, canonical_metric);
         CREATE INDEX IF NOT EXISTS idx_metric_lookup_ticker_metric_year
-            ON metric_lookup(ticker, canonical_metric, fiscal_year, period);
+            ON metric_lookup(ticker, canonical_metric, fiscal_year, observation_period);
         CREATE INDEX IF NOT EXISTS idx_metric_lookup_total_metric_year
-            ON metric_lookup(ticker, canonical_metric, is_company_total, fiscal_year, period);
+            ON metric_lookup(ticker, canonical_metric, is_company_total, fiscal_year, observation_period);
         CREATE INDEX IF NOT EXISTS idx_metric_dim_ticker_key_metric_year
-            ON metric_dimension_lookup(ticker, dimension_key, canonical_metric, fiscal_year, period);
+            ON metric_dimension_lookup(ticker, dimension_key, canonical_metric, fiscal_year, observation_period);
         CREATE INDEX IF NOT EXISTS idx_metric_dim_ticker_metric_year_key
             ON metric_dimension_lookup(ticker, canonical_metric, fiscal_year, dimension_key);
         CREATE INDEX IF NOT EXISTS idx_metric_dim_ticker_kind_key_metric_year
-            ON metric_dimension_lookup(ticker, dimension_kind, dimension_key, canonical_metric, fiscal_year, period);
+            ON metric_dimension_lookup(ticker, dimension_kind, dimension_key, canonical_metric, fiscal_year, observation_period);
         CREATE INDEX IF NOT EXISTS idx_company_dimension_catalog_ticker
             ON company_dimension_catalog(ticker);
         CREATE INDEX IF NOT EXISTS idx_company_dimension_catalog_lookup
@@ -4810,8 +4922,10 @@ def _rebuild_metric_lookup(conn: sqlite3.Connection) -> int:
         segment_name = _metric_lookup_dimension(dimensions, ("segment", "segment_name", "business_segment"))
         product_name = _metric_lookup_dimension(dimensions, ("product", "product_name", "product_line"))
         geography_name = _metric_lookup_dimension(dimensions, ("geography", "geography_name", "region", "country"))
-        fiscal_year = _metric_lookup_year(obj, row["period"])
-        fiscal_quarter = _metric_lookup_quarter(obj, row["period"])
+        observation = _metric_lookup_observation_context(obj, row["period"])
+        fiscal_year = observation["fiscal_year"]
+        fiscal_quarter = observation["fiscal_quarter"]
+        value_text = _metric_lookup_value_text(obj)
         alias_text = _metric_lookup_alias_text(
             metric_name=metric_name,
             canonical_metric=canonical_metric,
@@ -4826,13 +4940,20 @@ def _rebuild_metric_lookup(conn: sqlite3.Connection) -> int:
                 row["ticker"],
                 row["document_type"],
                 row["doc_type_key"],
-                row["period"],
+                observation["filing_period"],
+                observation["filing_period"],
+                observation["observation_period"],
+                observation["period_type"],
+                observation["start_date"],
+                observation["end_date"],
+                observation["context_key"],
                 fiscal_year,
                 fiscal_quarter,
                 metric_name or None,
                 canonical_metric or None,
                 alias_text,
-                _metric_lookup_value_text(obj),
+                value_text,
+                _metric_lookup_numeric_value(value_text),
                 _metric_lookup_unit(obj),
                 json.dumps(dimensions, ensure_ascii=False, sort_keys=True),
                 1
@@ -4895,8 +5016,10 @@ def _rebuild_metric_lookup(conn: sqlite3.Connection) -> int:
         segment_name = _metric_lookup_dimension(dimensions, ("segment", "segment_name", "business_segment"))
         product_name = _metric_lookup_dimension(dimensions, ("product", "product_name", "product_line"))
         geography_name = _metric_lookup_dimension(dimensions, ("geography", "geography_name", "region", "country"))
-        fiscal_year = _metric_lookup_year(obj, row["period"])
-        fiscal_quarter = _metric_lookup_quarter(obj, row["period"])
+        observation = _metric_lookup_observation_context(obj, row["period"])
+        fiscal_year = observation["fiscal_year"]
+        fiscal_quarter = observation["fiscal_quarter"]
+        value_text = _metric_lookup_value_text(obj)
         alias_text = _metric_lookup_alias_text(
             metric_name=metric_name,
             canonical_metric=canonical_metric,
@@ -4911,13 +5034,20 @@ def _rebuild_metric_lookup(conn: sqlite3.Connection) -> int:
                 row["ticker"],
                 row["document_type"],
                 row["doc_type_key"],
-                row["period"],
+                observation["filing_period"],
+                observation["filing_period"],
+                observation["observation_period"],
+                observation["period_type"],
+                observation["start_date"],
+                observation["end_date"],
+                observation["context_key"],
                 fiscal_year,
                 fiscal_quarter,
                 metric_name,
                 canonical_metric or None,
                 alias_text,
-                _metric_lookup_value_text(obj),
+                value_text,
+                _metric_lookup_numeric_value(value_text),
                 _metric_lookup_unit(obj),
                 json.dumps(dimensions, ensure_ascii=False, sort_keys=True),
                 1
@@ -4949,12 +5079,14 @@ def _flush_metric_lookup_batch(conn: sqlite3.Connection, rows: list[tuple[Any, .
         """
         INSERT OR REPLACE INTO metric_lookup(
             object_id, object_type, ticker, document_type, doc_type_key,
-            period, fiscal_year, fiscal_quarter, metric_name, canonical_metric,
-            metric_alias_text, value_text, unit, dimensions_json,
+            period, filing_period, observation_period, observation_period_type,
+            observation_start_date, observation_end_date, observation_context_key,
+            fiscal_year, fiscal_quarter, metric_name, canonical_metric,
+            metric_alias_text, value_text, value_numeric, unit, dimensions_json,
             is_company_total, segment_name, product_name, geography_name,
             trace_status, metric_lineage_status, text
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         rows,
     )
@@ -4970,6 +5102,8 @@ def _rebuild_metric_dimension_lookup(conn: sqlite3.Connection) -> int:
             object_id,
             ticker,
             period,
+            filing_period,
+            observation_period,
             fiscal_year,
             fiscal_quarter,
             canonical_metric,
@@ -4995,6 +5129,8 @@ def _rebuild_metric_dimension_lookup(conn: sqlite3.Connection) -> int:
                     row["object_id"],
                     row["ticker"],
                     row["period"],
+                    row["filing_period"],
+                    row["observation_period"],
                     row["fiscal_year"],
                     row["fiscal_quarter"],
                     row["canonical_metric"],
@@ -5023,6 +5159,8 @@ def _rebuild_metric_dimension_lookup(conn: sqlite3.Connection) -> int:
                         row["object_id"],
                         row["ticker"],
                         row["period"],
+                        row["filing_period"],
+                        row["observation_period"],
                         row["fiscal_year"],
                         row["fiscal_quarter"],
                         row["canonical_metric"],
@@ -5048,11 +5186,12 @@ def _flush_metric_dimension_lookup_batch(conn: sqlite3.Connection, rows: list[tu
     conn.executemany(
         """
         INSERT OR REPLACE INTO metric_dimension_lookup(
-            object_id, ticker, period, fiscal_year, fiscal_quarter,
+            object_id, ticker, period, filing_period, observation_period,
+            fiscal_year, fiscal_quarter,
             canonical_metric, dimension_kind, dimension_key, dimension_label,
             axis_key, member_key, is_company_total, trace_status, metric_lineage_status
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         rows,
     )
@@ -5064,7 +5203,8 @@ def _rebuild_company_dimension_catalog(conn: sqlite3.Connection) -> int:
     conn.execute("DELETE FROM company_dimension_catalog")
     rows = conn.execute(
         """
-        SELECT ticker, dimension_key, dimension_label, dimension_kind, period, object_id
+        SELECT ticker, dimension_key, dimension_label, dimension_kind,
+               observation_period AS period, object_id
         FROM metric_dimension_lookup
         WHERE is_company_total = 0
         """
@@ -5134,11 +5274,286 @@ def _metric_lookup_metric_name(obj: Mapping[str, Any], object_type: str) -> str:
 
 
 def _metric_lookup_canonical(metric_name: str | None) -> str:
-    terms = re.findall(r"[A-Za-z0-9_]+", str(metric_name or "").lower())
-    return "_".join(term for term in terms if term)
+    return canonical_metric_name(metric_name)
 
 
-def _metric_lookup_year(obj: Mapping[str, Any], period: Any) -> int | None:
+def _metric_lookup_observation_context(
+    obj: Mapping[str, Any],
+    filing_period: Any,
+) -> dict[str, Any]:
+    """Derive fact-period identity without changing the canonical ontology object."""
+    context = obj.get("context") if isinstance(obj.get("context"), Mapping) else {}
+    start_date = _metric_lookup_first_date(
+        obj,
+        context,
+        keys=("period_start", "start_date"),
+    )
+    end_date = _metric_lookup_first_date(
+        obj,
+        context,
+        keys=("period_end", "end_date"),
+    )
+    instant = _metric_lookup_first_date(obj, context, keys=("instant",))
+    if instant:
+        start_date = start_date or instant
+        end_date = end_date or instant
+    raw_period_type = _metric_lookup_first_text(
+        obj,
+        context,
+        keys=("period_type", "duration"),
+    )
+    period_type = _metric_lookup_period_type(
+        raw_period_type,
+        start_date=start_date,
+        end_date=end_date,
+    )
+    fiscal_year = _metric_lookup_year(
+        obj,
+        filing_period,
+        end_date=end_date,
+    )
+    fiscal_quarter = _metric_lookup_quarter(
+        obj,
+        filing_period,
+    )
+    if period_type == "annual":
+        fiscal_quarter = None
+    explicit_period = _metric_lookup_first_text(
+        obj,
+        context,
+        keys=("observation_period", "fact_period", "fiscal_period"),
+    )
+    observation_period = _metric_lookup_normalize_period(explicit_period)
+    explicit_coordinates = _metric_lookup_period_coordinates(observation_period)
+    if (
+        observation_period
+        and explicit_coordinates is not None
+        and (
+            (fiscal_year is not None and explicit_coordinates[0] != fiscal_year)
+            or (period_type == "annual" and explicit_coordinates[1] is not None)
+            or (
+                period_type == "annual"
+                and observation_period.startswith("CY")
+                and start_date is not None
+                and end_date is not None
+                and not _metric_lookup_is_calendar_year(start_date, end_date)
+            )
+            or (
+                fiscal_quarter is not None
+                and explicit_coordinates[1] is not None
+                and explicit_coordinates[1] != fiscal_quarter
+            )
+        )
+    ):
+        # Some ingestion paths historically copied the filing label into every
+        # comparative fact. Prefer the fact's fiscal/context dates when they
+        # contradict that label.
+        observation_period = None
+    if not observation_period:
+        observation_period = _metric_lookup_derived_period(
+            filing_period=str(filing_period or "").strip(),
+            fiscal_year=fiscal_year,
+            fiscal_quarter=fiscal_quarter,
+            period_type=period_type,
+            start_date=start_date,
+            end_date=end_date,
+            has_explicit_fiscal_quarter=_metric_lookup_has_explicit_quarter(obj),
+        )
+    observation_period = observation_period or str(filing_period or "unknown").strip()
+    identity_payload = "|".join(
+        (
+            observation_period,
+            period_type,
+            start_date or "",
+            end_date or "",
+        )
+    )
+    return {
+        "filing_period": str(filing_period or "unknown").strip() or "unknown",
+        "observation_period": observation_period,
+        "period_type": period_type,
+        "start_date": start_date,
+        "end_date": end_date,
+        "context_key": hashlib.sha256(identity_payload.encode("utf-8")).hexdigest()[:24],
+        "fiscal_year": fiscal_year,
+        "fiscal_quarter": fiscal_quarter,
+    }
+
+
+def _metric_lookup_first_text(
+    obj: Mapping[str, Any],
+    context: Mapping[str, Any],
+    *,
+    keys: Sequence[str],
+) -> str | None:
+    for source in (obj, context):
+        for key in keys:
+            value = source.get(key)
+            if value is not None and str(value).strip():
+                return str(value).strip()
+    return None
+
+
+def _metric_lookup_first_date(
+    obj: Mapping[str, Any],
+    context: Mapping[str, Any],
+    *,
+    keys: Sequence[str],
+) -> str | None:
+    value = _metric_lookup_first_text(obj, context, keys=keys)
+    if not value:
+        return None
+    try:
+        return date.fromisoformat(value[:10]).isoformat()
+    except ValueError:
+        return None
+
+
+def _metric_lookup_period_type(
+    value: str | None,
+    *,
+    start_date: str | None,
+    end_date: str | None,
+) -> str:
+    normalized = re.sub(r"[^a-z0-9]+", "_", str(value or "").casefold()).strip("_")
+    aliases = {
+        "annual": "annual",
+        "year": "annual",
+        "yearly": "annual",
+        "12_month": "annual",
+        "12_months": "annual",
+        "quarter": "quarter",
+        "quarterly": "quarter",
+        "3_month": "quarter",
+        "3_months": "quarter",
+        "three_month": "quarter",
+        "three_months": "quarter",
+        "year_to_date": "year_to_date",
+        "ytd": "year_to_date",
+        "instant": "instant",
+        "point_in_time": "instant",
+        "ttm": "ttm",
+        "trailing_twelve_months": "ttm",
+    }
+    if normalized in aliases:
+        return aliases[normalized]
+    if start_date and end_date:
+        start = date.fromisoformat(start_date)
+        end = date.fromisoformat(end_date)
+        days = (end - start).days + 1
+        if days == 1:
+            return "instant"
+        if 70 <= days <= 115:
+            return "quarter"
+        if 160 <= days <= 300:
+            return "year_to_date"
+        if 330 <= days <= 400:
+            return "annual"
+    return normalized or "unknown"
+
+
+def _metric_lookup_normalize_period(value: str | None) -> str | None:
+    match = re.fullmatch(
+        r"\s*(?:(CY|FY))?(19\d{2}|20\d{2})(?:Q([1-4]))?\s*",
+        str(value or ""),
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+    prefix = (match.group(1) or "FY").upper()
+    quarter = f"Q{match.group(3)}" if match.group(3) else ""
+    return f"{prefix}{match.group(2)}{quarter}"
+
+
+def _metric_lookup_period_coordinates(
+    value: str | None,
+) -> tuple[int, int | None] | None:
+    match = re.fullmatch(
+        r"(?:CY|FY)(19\d{2}|20\d{2})(?:Q([1-4]))?",
+        str(value or ""),
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2)) if match.group(2) else None
+
+
+def _metric_lookup_is_calendar_year(
+    start_date: str | None,
+    end_date: str | None,
+) -> bool:
+    if not start_date or not end_date:
+        return False
+    start = date.fromisoformat(start_date)
+    end = date.fromisoformat(end_date)
+    return (
+        start.year == end.year
+        and start.month == start.day == 1
+        and end.month == 12
+        and end.day == 31
+    )
+
+
+def _metric_lookup_derived_period(
+    *,
+    filing_period: str,
+    fiscal_year: int | None,
+    fiscal_quarter: int | None,
+    period_type: str,
+    start_date: str | None,
+    end_date: str | None,
+    has_explicit_fiscal_quarter: bool,
+) -> str:
+    normalized_filing = _metric_lookup_normalize_period(filing_period)
+    if fiscal_year is None:
+        return normalized_filing or filing_period
+    if period_type == "annual":
+        if start_date and end_date:
+            start = date.fromisoformat(start_date)
+            end = date.fromisoformat(end_date)
+            if (
+                start.year == end.year == fiscal_year
+                and start.month == start.day == 1
+                and end.month == 12
+                and end.day == 31
+            ):
+                return f"CY{fiscal_year}"
+        return f"FY{fiscal_year}"
+    if has_explicit_fiscal_quarter and fiscal_quarter:
+        return f"FY{fiscal_year}Q{fiscal_quarter}"
+    if (
+        normalized_filing
+        and "Q" not in normalized_filing
+        and period_type == "instant"
+    ):
+        return normalized_filing
+    if end_date and period_type in {"quarter", "year_to_date", "instant", "ttm"}:
+        end = date.fromisoformat(end_date)
+        return f"CY{end.year}Q{((end.month - 1) // 3) + 1}"
+    if fiscal_quarter:
+        filing_prefix = "CY" if (normalized_filing or "").startswith("CY") else "FY"
+        return f"{filing_prefix}{fiscal_year}Q{fiscal_quarter}"
+    if normalized_filing:
+        filing_prefix = "CY" if normalized_filing.startswith("CY") else "FY"
+        return f"{filing_prefix}{fiscal_year}"
+    return f"FY{fiscal_year}"
+
+
+def _metric_lookup_has_explicit_quarter(obj: Mapping[str, Any]) -> bool:
+    context = obj.get("context") if isinstance(obj.get("context"), Mapping) else {}
+    return any(
+        source.get(key) not in (None, "")
+        for source in (obj, context)
+        for key in ("fiscal_quarter", "quarter")
+    )
+
+
+def _metric_lookup_year(
+    obj: Mapping[str, Any],
+    period: Any,
+    *,
+    end_date: str | None = None,
+) -> int | None:
     for key in ("fiscal_year", "year", "calendar_year"):
         value = obj.get(key)
         if isinstance(value, int):
@@ -5152,49 +5567,38 @@ def _metric_lookup_year(obj: Mapping[str, Any], period: Any) -> int | None:
             return value
         if isinstance(value, str) and value.isdigit():
             return int(value)
+    if end_date:
+        return date.fromisoformat(end_date).year
     match = re.search(r"(?:CY|FY)?(20\d{2}|19\d{2})", str(period or ""), re.IGNORECASE)
     return int(match.group(1)) if match else None
 
 
-def _metric_lookup_quarter(obj: Mapping[str, Any], period: Any) -> int | None:
-    for key in ("fiscal_quarter", "quarter"):
-        value = obj.get(key)
-        if isinstance(value, int):
-            return value
-        if isinstance(value, str) and value.isdigit():
-            return int(value)
+def _metric_lookup_quarter(
+    obj: Mapping[str, Any],
+    period: Any,
+) -> int | None:
+    context = obj.get("context") if isinstance(obj.get("context"), Mapping) else {}
+    for source in (obj, context):
+        for key in ("fiscal_quarter", "quarter"):
+            value = source.get(key)
+            if isinstance(value, int) and 1 <= value <= 4:
+                return value
+            if isinstance(value, str) and value.isdigit() and 1 <= int(value) <= 4:
+                return int(value)
     match = re.search(r"Q([1-4])", str(period or ""), re.IGNORECASE)
-    return int(match.group(1)) if match else None
+    if match:
+        return int(match.group(1))
+    # A period end date alone does not establish that a duration fact is a
+    # quarter. Annual facts commonly end on quarter boundaries too, so keep the
+    # coordinate unknown instead of silently turning an annual fact into Q4.
+    return None
 
 
 def _metric_lookup_xbrl_metric_name(obj: Mapping[str, Any]) -> str | None:
-    tag = str(obj.get("safe_taxonomy_tag") or obj.get("taxonomy_tag") or "").split(":")[-1]
-    tag_key = _metric_dimension_key(tag)
-    if not tag_key:
-        return None
-    if "remaining_performance_obligation" in tag_key or tag_key.endswith("percentage"):
-        return None
-    if (
-        tag_key in {"revenue", "revenues"}
-        or "revenue_from_contract" in tag_key
-        or "sales_revenue_net" in tag_key
-        or "net_sales" in tag_key
-    ):
-        return "revenue"
-    if "cost_of_goods" in tag_key or "cost_of_revenue" in tag_key or "cost_of_goods_and_services_sold" in tag_key:
-        return "cost_of_revenue"
-    if "gross_profit" in tag_key:
-        return "gross_profit"
-    if "operating_income_loss" in tag_key or "operating_income" in tag_key:
-        return "operating_income"
-    if "net_income_loss" in tag_key or tag_key == "net_income":
-        return "net_income"
-    if tag_key in {"assets", "liabilities", "stockholders_equity"}:
-        return tag_key
-    if "cash_and_cash_equivalents" in tag_key:
-        return "cash_and_cash_equivalents"
-    if "capital_expenditure" in tag_key or "payments_to_acquire_property_plant_and_equipment" in tag_key:
-        return "capex"
+    for key in ("taxonomy_tag", "safe_taxonomy_tag"):
+        canonical = canonical_metric_for_xbrl_tag(obj.get(key))
+        if canonical:
+            return canonical
     return None
 
 
@@ -5240,6 +5644,19 @@ def _metric_lookup_value_text(obj: Mapping[str, Any]) -> str | None:
         if value is not None:
             return str(value)
     return None
+
+
+def _metric_lookup_numeric_value(value: str | None) -> float | None:
+    normalized = str(value or "").strip().replace(",", "")
+    if not normalized:
+        return None
+    if normalized.startswith("(") and normalized.endswith(")"):
+        normalized = "-" + normalized[1:-1].strip()
+    try:
+        parsed = float(normalized)
+    except ValueError:
+        return None
+    return parsed if math.isfinite(parsed) else None
 
 
 def _metric_lookup_unit(obj: Mapping[str, Any]) -> str | None:
@@ -5308,10 +5725,7 @@ def _metric_lookup_clean_dimension_label(value: Any) -> str:
 
 
 def _metric_dimension_key(value: Any) -> str:
-    text = _metric_lookup_clean_dimension_label(value).lower()
-    text = re.sub(r"[^a-z0-9]+", "_", text)
-    text = re.sub(r"_+", "_", text).strip("_")
-    return text
+    return normalize_dimension_key(value)
 
 
 def _metric_dimension_kind(axis: Any, label: Any) -> str:
@@ -5449,7 +5863,12 @@ def _metric_lookup_alias_text(
     dimensions: Mapping[str, Any],
     text: Any,
 ) -> str:
-    pieces: list[str] = [metric_name, canonical_metric, str(text or "")]
+    pieces: list[str] = [
+        metric_name,
+        canonical_metric,
+        *metric_aliases(canonical_metric),
+        str(text or ""),
+    ]
     for key in (
         "label",
         "description",

@@ -1,6 +1,6 @@
 # Research Synthesis Contract
 
-This contract is optional and legacy-compatible.
+This contract is an optional presentation handoff and is independent of the SearchPlan/ResearchState retrieval contract.
 
 It is not the default web-chat runtime. Default English web chat returns English Markdown only.
 

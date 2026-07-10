@@ -13,12 +13,24 @@ from krw_ontology.agent_index.chart_series import (
     CHART_SERIES_RELATIVE_PATH,
     verify_chart_series_index,
 )
-from krw_ontology.agent_index.source_artifact_sqlite import verify_source_artifact_sqlite
+from krw_ontology.agent_index.router_sidecar import (
+    ROUTER_SIDECAR_RELATIVE_PATH,
+    verify_router_sidecar,
+)
+from krw_ontology.agent_index.source_artifact_sqlite import (
+    SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION,
+    SOURCE_ARTIFACT_SQLITE_SCHEMA_VERSION,
+    verify_source_artifact_sqlite,
+)
+from krw_ontology.agent_index.metric_dictionary import metric_dictionary_binding_errors
 from krw_ontology.agent_index.spine_builder import (
+    COMPANY_SHARD_SCHEMA_VERSION,
     SHARD_QUALITY_SUMMARY_FORMAT_VERSION,
+    SPINE_PROJECTION_VERSION,
     _company_shard_quality_summary,
 )
 from krw_ontology.agent_index.spine_schema import (
+    GLOBAL_SPINE_BUILDER_VERSION,
     GLOBAL_SPINE_LAYOUT,
     GLOBAL_SPINE_REQUIRED_METADATA_KEYS,
     GLOBAL_SPINE_SCHEMA_VERSION,
@@ -59,8 +71,15 @@ def verify_spine_shard_release(
             errors.append("manifest_index_layout_unsupported")
         if manifest.get("monolith_required") is not False:
             errors.append("manifest_monolith_required_not_false")
+        errors.extend(_manifest_serving_binding_errors(manifest))
 
     global_spine_path = _manifest_file_path(root, manifest, "global_spine", default="indexes/global_spine.sqlite")
+    router_sidecar_path = _manifest_file_path(
+        root,
+        manifest,
+        "router_sidecar",
+        default=ROUTER_SIDECAR_RELATIVE_PATH.as_posix(),
+    )
     shard_manifest_path = _manifest_file_path(root, manifest, "shard_manifest", default="indexes/shard_manifest.json")
     company_shards_dir = _manifest_dir_path(root, manifest, "company_shards", default="indexes/companies")
     chart_series_path = _optional_manifest_file_path(
@@ -72,6 +91,9 @@ def verify_spine_shard_release(
 
     if manifest and deep:
         errors.extend(_manifest_file_digest_errors(manifest, "global_spine", global_spine_path))
+        errors.extend(
+            _manifest_file_digest_errors(manifest, "router_sidecar", router_sidecar_path)
+        )
         errors.extend(_manifest_file_digest_errors(manifest, "shard_manifest", shard_manifest_path))
     chart_series_verification: dict[str, Any] | None = None
     chart_series_output = ((manifest.get("indexes") or {}).get("chart_series") or {}) if manifest else {}
@@ -99,6 +121,35 @@ def verify_spine_shard_release(
     )
     if not spine_verification["ok"]:
         errors.extend(f"global_spine:{error}" for error in spine_verification["errors"])
+    errors.extend(
+        f"global_spine:{error}"
+        for error in _serving_metadata_binding_errors(
+            spine_verification.get("metadata") or {}
+        )
+    )
+    router_sidecar_verification = verify_router_sidecar(
+        router_sidecar_path,
+        expected_global_spine_sha256=_manifest_output_sha256(manifest, "global_spine"),
+        expected_release_id=(
+            str(manifest.get("release_id")) if manifest.get("release_id") else None
+        ),
+        expected_ranking_profile_sha256=_manifest_output_value(
+            manifest,
+            "router_sidecar",
+            "ranking_profile_sha256",
+        ),
+        expected_build_fingerprint_sha256=_manifest_output_value(
+            manifest,
+            "router_sidecar",
+            "build_fingerprint_sha256",
+        ),
+        deep=deep,
+    )
+    if not router_sidecar_verification["ok"]:
+        errors.extend(
+            f"router_sidecar:{error}"
+            for error in router_sidecar_verification["errors"]
+        )
 
     shard_manifest = _read_json(shard_manifest_path)
     if shard_manifest is None:
@@ -109,6 +160,38 @@ def verify_spine_shard_release(
         shard_entries = raw_entries if isinstance(raw_entries, dict) else {}
         if not isinstance(raw_entries, dict):
             errors.append("shard_manifest_shards_missing")
+
+    expected_metric_dictionary = manifest.get("metric_dictionary") if manifest else None
+    if manifest:
+        errors.extend(
+            f"metric_dictionary:{error}"
+            for error in metric_dictionary_binding_errors(expected_metric_dictionary)
+        )
+        manifest_company_shards = ((manifest.get("indexes") or {}).get("company_shards") or {})
+        nested_binding = (
+            manifest_company_shards.get("metric_dictionary")
+            if isinstance(manifest_company_shards, Mapping)
+            else None
+        )
+        errors.extend(
+            f"company_shards:{error}"
+            for error in metric_dictionary_binding_errors(
+                nested_binding,
+                expected=expected_metric_dictionary
+                if isinstance(expected_metric_dictionary, Mapping)
+                else None,
+            )
+        )
+    if shard_manifest is not None:
+        errors.extend(
+            f"shard_manifest:{error}"
+            for error in metric_dictionary_binding_errors(
+                shard_manifest.get("metric_dictionary"),
+                expected=expected_metric_dictionary
+                if isinstance(expected_metric_dictionary, Mapping)
+                else None,
+            )
+        )
 
     manifest_shards = ((manifest.get("indexes") or {}).get("company_shards") or {}).get("tickers") or {}
     if manifest and isinstance(manifest_shards, dict) and shard_entries and set(manifest_shards) != set(shard_entries):
@@ -132,6 +215,11 @@ def verify_spine_shard_release(
                         sample_limit=sample_limit,
                         expected_sha256=_expected_shard_sha256(manifest, str(ticker), entry),
                         shard_entry=entry if isinstance(entry, Mapping) else {},
+                        expected_metric_dictionary=(
+                            expected_metric_dictionary
+                            if isinstance(expected_metric_dictionary, Mapping)
+                            else None
+                        ),
                     )
                 else:
                     result = _verify_one_shard_light(
@@ -152,17 +240,73 @@ def verify_spine_shard_release(
         "release_root": str(root),
         "manifest_path": str(manifest_file),
         "global_spine_path": str(global_spine_path),
+        "router_sidecar_path": str(router_sidecar_path),
         "shard_manifest_path": str(shard_manifest_path),
         "company_shards_dir": str(company_shards_dir),
         "chart_series_path": str(chart_series_path) if chart_series_path is not None else None,
         "counts": counts,
         "global_spine_verification": spine_verification,
+        "router_sidecar_verification": router_sidecar_verification,
         "chart_series_verification": chart_series_verification,
         "shards": shard_results,
         "verification_mode": "spine-shard-release-deep" if deep else "spine-shard-release-light",
         "manifest_required": require_manifest,
         "deep": deep,
     }
+
+
+def _serving_metadata_binding_errors(metadata: Mapping[str, Any]) -> list[str]:
+    expected = {
+        "schema_version": GLOBAL_SPINE_SCHEMA_VERSION,
+        "builder_version": GLOBAL_SPINE_BUILDER_VERSION,
+        "spine_projection_version": SPINE_PROJECTION_VERSION,
+        "source_artifact_sqlite_schema_version": SOURCE_ARTIFACT_SQLITE_SCHEMA_VERSION,
+        "source_artifact_sqlite_builder_version": SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION,
+        "company_shard_schema_version": COMPANY_SHARD_SCHEMA_VERSION,
+    }
+    return [
+        f"serving_binding_mismatch:{key}"
+        for key, value in expected.items()
+        if metadata.get(key) != value
+    ]
+
+
+def _manifest_serving_binding_errors(manifest: Mapping[str, Any]) -> list[str]:
+    errors: list[str] = []
+    builder = manifest.get("builder")
+    builder = builder if isinstance(builder, Mapping) else {}
+    expected_builder = {
+        "spine_schema_version": GLOBAL_SPINE_SCHEMA_VERSION,
+        "spine_builder_version": GLOBAL_SPINE_BUILDER_VERSION,
+        "spine_projection_version": SPINE_PROJECTION_VERSION,
+        "source_artifact_sqlite_schema_version": SOURCE_ARTIFACT_SQLITE_SCHEMA_VERSION,
+        "source_artifact_sqlite_builder_version": SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION,
+        "company_shard_schema_version": COMPANY_SHARD_SCHEMA_VERSION,
+    }
+    for key, value in expected_builder.items():
+        if builder.get(key) != value:
+            errors.append(f"manifest_builder_binding_mismatch:{key}")
+    indexes = manifest.get("indexes")
+    indexes = indexes if isinstance(indexes, Mapping) else {}
+    global_spine = indexes.get("global_spine")
+    global_spine = global_spine if isinstance(global_spine, Mapping) else {}
+    if global_spine.get("schema_version") != GLOBAL_SPINE_SCHEMA_VERSION:
+        errors.append("manifest_global_spine_schema_version_mismatch")
+    company_shards = indexes.get("company_shards")
+    company_shards = company_shards if isinstance(company_shards, Mapping) else {}
+    if company_shards.get("schema_version") != COMPANY_SHARD_SCHEMA_VERSION:
+        errors.append("manifest_company_shard_schema_version_mismatch")
+    if (
+        company_shards.get("source_artifact_sqlite_schema_version")
+        != SOURCE_ARTIFACT_SQLITE_SCHEMA_VERSION
+    ):
+        errors.append("manifest_source_artifact_schema_version_mismatch")
+    if (
+        company_shards.get("source_artifact_sqlite_builder_version")
+        != SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION
+    ):
+        errors.append("manifest_source_artifact_builder_version_mismatch")
+    return errors
 
 
 def _verify_one_shard_light(
@@ -259,6 +403,7 @@ def _verify_one_shard(
     sample_limit: int,
     expected_sha256: str | None,
     shard_entry: Mapping[str, Any],
+    expected_metric_dictionary: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
     errors: list[str] = []
     counts: dict[str, int] = {}
@@ -275,15 +420,83 @@ def _verify_one_shard(
     elif _file_sha256(shard_path) != expected_sha256:
         errors.append("sha256_mismatch")
     errors.extend(_quality_summary_errors(shard_path, shard_entry))
+    errors.extend(
+        f"manifest_entry:{error}"
+        for error in metric_dictionary_binding_errors(
+            shard_entry.get("metric_dictionary"),
+            expected=expected_metric_dictionary,
+        )
+    )
     source_artifact_verification = verify_source_artifact_sqlite(shard_path)
     if not source_artifact_verification["ok"]:
         errors.extend(f"source_artifact_sqlite:{error}" for error in source_artifact_verification["errors"])
     spine_conn.execute(f"ATTACH DATABASE ? AS {schema_name}", (str(shard_path),))
     try:
+        shard_binding = _attached_shard_metric_dictionary_binding(
+            spine_conn,
+            schema_name,
+        )
+        errors.extend(
+            f"metadata:{error}"
+            for error in metric_dictionary_binding_errors(
+                shard_binding,
+                expected=expected_metric_dictionary,
+            )
+        )
+        metric_lookup_columns = {
+            str(row[1])
+            for row in spine_conn.execute(
+                f"PRAGMA {schema_name}.table_info(metric_lookup)"
+            ).fetchall()
+        }
+        required_metric_columns = {
+            "filing_period",
+            "observation_period",
+            "observation_period_type",
+            "observation_start_date",
+            "observation_end_date",
+            "observation_context_key",
+            "value_numeric",
+        }
+        for column in sorted(required_metric_columns - metric_lookup_columns):
+            errors.append(f"metric_lookup_column_missing:{column}")
         counts["shard_objects"] = _count(spine_conn, f"{schema_name}.objects")
         counts["shard_documents"] = _count(spine_conn, f"{schema_name}.documents")
         counts["shard_edges"] = _count(spine_conn, f"{schema_name}.edges")
         counts["shard_quality_events"] = _count(spine_conn, f"{schema_name}.quality_events")
+        if required_metric_columns.issubset(metric_lookup_columns):
+            invalid_metric_contexts = int(
+                spine_conn.execute(
+                    f"""
+                    SELECT COUNT(*)
+                    FROM {schema_name}.metric_lookup
+                    WHERE filing_period = ''
+                       OR observation_period = ''
+                       OR observation_period_type = ''
+                       OR observation_context_key = ''
+                    """
+                ).fetchone()[0]
+            )
+            if invalid_metric_contexts:
+                errors.append(
+                    f"metric_lookup_observation_context_invalid:{invalid_metric_contexts}"
+                )
+            global_metric_period_mismatches = int(
+                spine_conn.execute(
+                    f"""
+                    SELECT COUNT(*)
+                    FROM {schema_name}.metric_lookup AS metric
+                    JOIN global_metric_spine AS spine
+                      ON spine.object_id = metric.object_id
+                    WHERE spine.period != metric.observation_period
+                    """
+                ).fetchone()[0]
+            )
+            if global_metric_period_mismatches:
+                errors.append(
+                    "global_metric_observation_period_mismatch:"
+                    f"{global_metric_period_mismatches}"
+                )
         counts["locator_objects"] = int(
             spine_conn.execute(
                 "SELECT COUNT(*) FROM global_object_locator WHERE ticker = ?",
@@ -372,6 +585,26 @@ def _verify_one_shard(
     }
 
 
+def _attached_shard_metric_dictionary_binding(
+    conn: sqlite3.Connection,
+    schema_name: str,
+) -> Mapping[str, Any] | None:
+    try:
+        row = conn.execute(
+            f"SELECT value FROM {schema_name}.metadata WHERE key = 'build'"
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    if row is None:
+        return None
+    try:
+        metadata = json.loads(str(row[0]))
+    except json.JSONDecodeError:
+        return None
+    binding = metadata.get("metric_dictionary")
+    return binding if isinstance(binding, Mapping) else None
+
+
 def _quality_summary_errors(shard_path: Path, shard_entry: Mapping[str, Any]) -> list[str]:
     expected = shard_entry.get("quality_summary")
     manifest_errors = _quality_summary_manifest_errors(shard_entry)
@@ -402,6 +635,22 @@ def _manifest_file_digest_errors(manifest: dict[str, Any], role: str, path: Path
     if not path.is_file():
         return []
     return [f"{role}_sha256_mismatch"] if _file_sha256(path) != expected else []
+
+
+def _manifest_output_sha256(manifest: Mapping[str, Any], role: str) -> str | None:
+    output = ((manifest.get("indexes") or {}).get(role) or {}) if manifest else {}
+    expected = output.get("sha256") if isinstance(output, Mapping) else None
+    return str(expected) if isinstance(expected, str) and expected else None
+
+
+def _manifest_output_value(
+    manifest: Mapping[str, Any],
+    role: str,
+    key: str,
+) -> str | None:
+    output = ((manifest.get("indexes") or {}).get(role) or {}) if manifest else {}
+    value = output.get(key) if isinstance(output, Mapping) else None
+    return str(value) if isinstance(value, str) and value else None
 
 
 def _optional_manifest_file_digest_errors(manifest: dict[str, Any], role: str, path: Path) -> list[str]:

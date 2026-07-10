@@ -1,77 +1,70 @@
 # Bounded Autonomy and Stop Rules
 
-The goal is not to remove AI judgment. The goal is to prevent unstable exploration while preserving analytical autonomy.
+Preserve analytical judgment while making continuation evidence-state driven.
 
 ```text
-AI autonomy to preserve:
+Preserve:
 interpretation
 comparison judgment
 caveats
 business mechanism explanation
 final Korean prose
 
-AI autonomy to bound:
-repeated broad search
-same query with slight wording changes
-unbounded retrieve fallback
+Prevent:
+repeated broad plans with cosmetic wording changes
+unbounded fallback retrieval
 tracing every candidate
 turning related evidence into direct proof
+shrinking evidence budgets before logs show that quality is preserved
 ```
 
 ## Default workflow
 
 ```text
-1. query_context first
-2. targeted query/compare only for explicit gaps
-3. selected trace/chain only when materially useful
-4. final Korean answer
+1. Have the active DeepSeek agent author a complete SearchPlan.
+2. Call query_context with {search_plan}.
+3. Read answerability, clause_coverage, calculation_coverage, missing_parts,
+   recommended_actions, continuation, and warnings.
+4. Continue only for a specific gap that could change correctness.
+5. Use selected trace/chain only when materially useful.
+6. Write the final Korean answer.
 ```
 
-## Tool budgets as behavior, not user-facing content
+`plan_query` is optional validation/debug and performs no retrieval.
 
-Normal answers should not mention budget, mode, tool limit, or internal failure names.
+## Adaptive budgets
 
-Behavioral defaults:
+Do not expose limits, modes, or internal failures in normal answers.
 
-```text
-after query_context:
-at most one targeted query/compare per clear missing part
-
-trace/chain:
-selected roots only, not every candidate
-
-retrieve:
-legacy fallback only; never broad retrieve after sufficient query_context
-
-catalog/index/quality:
-debug, audit, or coverage checks only; not normal answer flow
-```
+Choose `limit_results` and `limit_tickers` for the actual number of required
+clauses, tickers, metric periods/pairs, and possible conflicts. Do not impose a
+fixed top-5, limit-3, one-follow-up, or other hard tool-call rule. Reduce
+budgets later only when production logs and quality evaluation support it.
 
 ## Stop conditions
 
 Stop searching when:
 
 ```text
-research_status is sufficient_for_default_answer
-answerability is enough for a narrow answer
-same ticker/topic has already returned no better candidates
-remaining gap is market data, price target, fair value, or final investment opinion
-direct exposure is unsupported and related context is already identified
-metric dimension evidence is missing after one targeted metric lookup
-the next tool would only make the answer more exhaustive, not more correct
+answerability.status is answerable and every load-bearing required clause is covered
+the requested numeric axes have covered calculation_coverage
+answerability permits only a narrow partial answer and remaining gaps cannot change it
+direct exposure is unsupported and related context is already separated
+the remaining gap requires market price, valuation, or unavailable external data
+the next call would only add volume rather than improve correctness
 ```
 
-## Sector/global stop rule
+Continue when a `missing_parts` or `recommended_actions` entry identifies a
+material, answerable gap. Target that clause, ticker, metric, period, or object;
+do not repeat the full broad plan.
 
-For sector/global/macro questions:
+## Tickerless discovery
 
-```text
-use a bounded covered universe for broad questions
-allow one v3 global-spine query_context pass for concrete tickerless factor/channel questions with limit_tickers <= 5
-synthesize cross-company signals
-avoid whole-catalog inventory
-avoid unsupported tickers
-answer from covered companies and caveat coverage only if it changes interpretation
-```
+For a concrete tickerless factor, channel, product, business model, metric,
+event type, or company type, set `universe="covered"` and leave `tickers`
+empty. For explicit companies, set `tickers` and omit `universe`.
 
-The answer should not become a coverage report. It should explain what the covered company disclosures imply about the macro or sector question.
+Let the agent choose a discovery budget large enough for the user's requested
+breadth and evidence needs. Treat routed companies as candidates until their
+required clauses are covered. Avoid whole-catalog inventory and unsupported
+companies.

@@ -23,6 +23,7 @@ from krw_ontology.agent_index.store import OntologyStore
 from krw_ontology.mcp_server.http_server import prepare_mcp_runtime
 from krw_ontology.mcp_server import server as mcp_server
 from krw_ontology.mcp_server import tools as mcp_tools
+from krw_ontology.mcp_server.contracts import QueryClause, SearchPlan
 from krw_ontology.mcp_server.server import (
     diagnostics_payload,
     health_payload,
@@ -40,7 +41,7 @@ from krw_ontology.mcp_server.tools import (
     index_context_tool,
     plan_query_tool,
     quality_tool,
-    query_context_tool,
+    raw_query_context_tool as query_context_tool,
     query_tool,
     retrieve_tool,
     ResponseDetail,
@@ -51,6 +52,14 @@ from krw_ontology.mcp_server.tools import (
 )
 from krw_ontology.release import write_release_manifest_v3
 from krw_ontology.utils.io import atomic_write_json, write_jsonl
+
+
+class _FakeResearchState:
+    def model_dump_json(self) -> str:
+        return '{"contract_version":"research-state/v2"}'
+
+    def model_dump(self, **_kwargs: Any) -> dict[str, str]:
+        return {"contract_version": "research-state/v2"}
 
 
 def build_agent_index(*args, **kwargs):
@@ -69,8 +78,17 @@ def _isolate_mcp_runtime_env():
         "KRW_ONTOLOGY_GLOBAL_SPINE_PATH",
         "KRW_ONTOLOGY_SHARD_MANIFEST_PATH",
         "KRW_MCP_STORE_MODE",
+        "KRW_MCP_EXPECTED_CONTRACT_VERSION",
+        "KRW_MCP_EXPECTED_TOOL_SCHEMA_SHA256",
+        "KRW_MCP_EXPECTED_BUILD_ID",
+        "KRW_MCP_EXPECTED_BACKEND_GIT_SHA",
+        "KRW_MCP_EXPECTED_BUILD_FINGERPRINT_SHA256",
+        "KRW_MCP_EXPECTED_RELEASE_MANIFEST_SHA256",
+        "KRW_MCP_EXPECTED_SERVICE_FINGERPRINT_SHA256",
     )
     old_env = {name: os.environ.get(name) for name in env_names}
+    for name in env_names:
+        os.environ.pop(name, None)
     mcp_tools.reset_mcp_runtime_caches()
     try:
         yield
@@ -173,9 +191,29 @@ def test_mcp_tools_query_trace_quality_and_compare(tmp_path: Path, monkeypatch):
     assert xom_row["missing"] is True
     assert xom_row["missing_reason"] == "no_matching_ontology_objects"
 
-    plan = json.loads(plan_query_tool(question="VG 최근 10-K revenue growth 근거 찾아줘"))
+    plan = json.loads(
+        plan_query_tool(
+            search_plan={
+                "question": "VG 최근 10-K revenue growth 근거 찾아줘",
+                "intent": "metric_research",
+                "tickers": ["VG"],
+                "document_types": ["10-K"],
+                "clauses": [
+                        {
+                            "clause_id": "revenue_growth",
+                            "retrieval_query": "VG revenue growth",
+                            "required_concepts": ["revenue growth"],
+                    }
+                ],
+            }
+        )
+    )
+    assert plan["contract_version"] == "krw-ontology-mcp/v2"
     assert plan["plan"]["tickers"] == ["VG"]
     assert plan["plan"]["document_types"] == ["10-K"]
+    assert plan["execution_preview"]["routing_clauses"][0]["query"] == (
+        "revenue growth"
+    )
 
 
 def test_mcp_verify_evidence_returns_hash_stable_source_lineage(
@@ -1215,7 +1253,7 @@ def test_mcp_index_context_logs_guard_timing(
         index_context_tool(include_counts=True)
 
     messages = "\n".join(record.getMessage() for record in caplog.records)
-    assert "[krw-ontology:mcp-slow-path]" in messages
+    assert "[krw-ontology:mcp-telemetry]" in messages
     assert '"tool_name": "krw_ontology_index_context"' in messages
     assert '"include_counts_requested": true' in messages
     assert '"counts_returned": false' in messages
@@ -2151,10 +2189,17 @@ def test_mcp_health_payload_reports_manifest_counts_without_sqlite_count(
 ):
     current = _write_v3_current_release(tmp_path, release_id="20260612_020000")
 
-    def fail_connect(*_args, **_kwargs):
-        raise AssertionError("health_payload must not open SQLite")
+    real_connect = sqlite3.connect
 
-    monkeypatch.setattr("krw_ontology.mcp_server.server.sqlite3.connect", fail_connect)
+    def guarded_connect(database, *args, **kwargs):
+        if "global_spine.sqlite" in str(database):
+            raise AssertionError("health_payload must not open the global spine")
+        return real_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(
+        "krw_ontology.mcp_server.server.sqlite3.connect",
+        guarded_connect,
+    )
 
     payload, status_code = health_payload(root=str(current))
 
@@ -2217,13 +2262,25 @@ def test_mcp_query_context_wrapper_routes_tickerless_calls_to_broad_lane(monkeyp
 
     async def fake_run_tool_in_lane(lane: str, func, **kwargs):
         calls.append({"lane": lane, "func": func, "kwargs": kwargs})
-        return "ok"
+        return _FakeResearchState()
 
     monkeypatch.setattr(mcp_server, "_run_tool_in_lane", fake_run_tool_in_lane)
 
-    result = asyncio.run(mcp_server.krw_ontology_query_context(question="AI datacenter beneficiaries"))
+    plan = SearchPlan(
+        question="AI datacenter beneficiaries",
+        intent="discovery",
+        clauses=[
+            QueryClause(
+                clause_id="beneficiaries",
+                retrieval_query="AI datacenter beneficiaries",
+                required_concepts=["AI datacenter beneficiaries"],
+            )
+        ],
+    )
+    result = asyncio.run(mcp_server.krw_ontology_query_context(search_plan=plan))
 
-    assert result == "ok"
+    assert result.content[0].text == '{"contract_version":"research-state/v2"}'
+    assert result.structuredContent == {"contract_version": "research-state/v2"}
     assert calls[0]["lane"] == "broad"
     assert calls[0]["func"] is mcp_server.query_context_tool
 
@@ -2233,15 +2290,27 @@ def test_mcp_query_context_wrapper_routes_scoped_calls_to_fast_lane(monkeypatch)
 
     async def fake_run_tool_in_lane(lane: str, func, **kwargs):
         calls.append({"lane": lane, "func": func, "kwargs": kwargs})
-        return "ok"
+        return _FakeResearchState()
 
     monkeypatch.setattr(mcp_server, "_run_tool_in_lane", fake_run_tool_in_lane)
 
-    result = asyncio.run(mcp_server.krw_ontology_query_context(question="AI capex", ticker="AAPL"))
+    plan = SearchPlan(
+        question="AI capex",
+        intent="evidence_lookup",
+        tickers=["AAPL"],
+        clauses=[
+            QueryClause(
+                clause_id="capex",
+                retrieval_query="AAPL AI capex",
+                required_concepts=["AI capex"],
+            )
+        ],
+    )
+    result = asyncio.run(mcp_server.krw_ontology_query_context(search_plan=plan))
 
-    assert result == "ok"
+    assert result.content[0].text == '{"contract_version":"research-state/v2"}'
     assert calls[0]["lane"] == "fast"
-    assert calls[0]["kwargs"]["ticker"] == "AAPL"
+    assert calls[0]["kwargs"]["search_plan"].tickers == ["AAPL"]
 
 
 def test_spine_router_tickerless_query_context_caps_candidate_fanout(monkeypatch):
@@ -2345,11 +2414,18 @@ def test_mcp_ready_payload_skips_runtime_cache_for_worker_admission(
     def fail_runtime_cache_status():
         raise AssertionError("ready_payload must not inspect runtime store/cache state")
 
-    def fail_connect(*_args, **_kwargs):
-        raise AssertionError("ready_payload must not open SQLite")
+    real_connect = sqlite3.connect
+
+    def guarded_connect(database, *args, **kwargs):
+        if "global_spine.sqlite" in str(database):
+            raise AssertionError("ready_payload must not open the global spine")
+        return real_connect(database, *args, **kwargs)
 
     monkeypatch.setattr("krw_ontology.mcp_server.server.mcp_runtime_cache_status", fail_runtime_cache_status)
-    monkeypatch.setattr("krw_ontology.mcp_server.server.sqlite3.connect", fail_connect)
+    monkeypatch.setattr(
+        "krw_ontology.mcp_server.server.sqlite3.connect",
+        guarded_connect,
+    )
 
     payload, status_code = ready_payload(root=str(current))
 

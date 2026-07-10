@@ -433,7 +433,7 @@ index와 manifest를 고치면 안 된다.
       "path": "indexes/global_spine.sqlite",
       "required": true,
       "sha256": "<sha256>",
-      "schema_version": "krw-ontology-global-spine/v1",
+      "schema_version": "krw-ontology-global-spine/v2",
       "counts": {}
     },
     "company_shards": {
@@ -601,8 +601,8 @@ company-local search index 전체 복제
 현재 schema constant:
 
 ```text
-GLOBAL_SPINE_SCHEMA_VERSION = krw-ontology-global-spine/v1
-GLOBAL_SPINE_BUILDER_VERSION = global-spine-builder/v1
+GLOBAL_SPINE_SCHEMA_VERSION = krw-ontology-global-spine/v2
+GLOBAL_SPINE_BUILDER_VERSION = global-spine-builder/v2
 GLOBAL_SPINE_LAYOUT = global-spine-and-company-shards
 ```
 
@@ -660,7 +660,7 @@ company_topic_fts
 현재 관련 version:
 
 ```text
-COMPANY_SHARD_SCHEMA_VERSION = krw-ontology-company-shard/v1
+COMPANY_SHARD_SCHEMA_VERSION = krw-ontology-company-shard/v2
 AGENT_INDEX_SCHEMA_VERSION = 1.0.0-alpha.3
 ```
 

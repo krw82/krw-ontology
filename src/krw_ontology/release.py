@@ -18,13 +18,32 @@ from krw_ontology.agent_index.chart_series import (
     CHART_SERIES_SCHEMA_VERSION,
     verify_chart_series_index,
 )
+from krw_ontology.agent_index.router_sidecar import (
+    ROUTER_SIDECAR_BUILDER_VERSION,
+    ROUTER_SIDECAR_RELATIVE_PATH,
+    ROUTER_SIDECAR_SCHEMA_VERSION,
+    immutable_file_sha256,
+    verify_router_sidecar,
+)
 from krw_ontology.agent_index.spine_schema import (
+    GLOBAL_SPINE_BUILDER_VERSION,
     GLOBAL_SPINE_LAYOUT,
     GLOBAL_SPINE_RELATIVE_PATH,
     GLOBAL_SPINE_SCHEMA_VERSION,
     read_global_spine_metadata,
 )
+from krw_ontology.agent_index.spine_builder import (
+    COMPANY_SHARD_SCHEMA_VERSION,
+    SPINE_PROJECTION_VERSION,
+)
+from krw_ontology.agent_index.source_artifact_sqlite import (
+    SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION,
+    SOURCE_ARTIFACT_SQLITE_SCHEMA_VERSION,
+)
 from krw_ontology.agent_index.spine_verify import verify_spine_shard_release
+from krw_ontology.agent_index.metric_dictionary import (
+    metric_dictionary_binding_errors,
+)
 from krw_ontology.config.paths import (
     ONTOLOGY_ENV_ENV,
     ONTOLOGY_MANIFEST_PATH_ENV,
@@ -110,6 +129,7 @@ def build_release_manifest_v3(
     env: str | None = None,
     source_root: Path | str | None = None,
     global_spine_path: Path | str | None = None,
+    router_sidecar_path: Path | str | None = None,
     shard_manifest_path: Path | str | None = None,
 ) -> dict[str, Any]:
     """Build a v3 release manifest for global spine + company shards."""
@@ -125,12 +145,26 @@ def build_release_manifest_v3(
         if shard_manifest_path is not None
         else root_path / "indexes" / "shard_manifest.json"
     )
+    resolved_router_sidecar_path = (
+        Path(router_sidecar_path).expanduser().resolve()
+        if router_sidecar_path is not None
+        else root_path / ROUTER_SIDECAR_RELATIVE_PATH
+    )
     index_outputs = _build_release_index_outputs_v3(
         root_path,
+        release_id=release_id,
         global_spine_path=resolved_spine_path,
+        router_sidecar_path=resolved_router_sidecar_path,
         shard_manifest_path=resolved_shard_manifest_path,
     )
     spine_counts = index_outputs["global_spine"].get("counts") or {}
+    dictionary_binding = index_outputs["company_shards"].get("metric_dictionary")
+    binding_errors = metric_dictionary_binding_errors(dictionary_binding)
+    if binding_errors:
+        raise ValueError(
+            "Cannot build a ready v3 manifest with an unbound metric dictionary: "
+            + ", ".join(binding_errors)
+        )
     return {
         "format": RELEASE_FORMAT_V3,
         "release_id": release_id,
@@ -141,6 +175,7 @@ def build_release_manifest_v3(
         "source_root": str(Path(source_root).expanduser().resolve()) if source_root else str(root_path),
         "index_layout": GLOBAL_SPINE_LAYOUT,
         "monolith_required": False,
+        "metric_dictionary": dictionary_binding,
         "global_spine_path": _relative_or_absolute(resolved_spine_path, root_path),
         "indexes": index_outputs,
         "verification": {
@@ -154,6 +189,13 @@ def build_release_manifest_v3(
         "builder": {
             "release_builder_version": "release-builder/v3",
             "spine_schema_version": GLOBAL_SPINE_SCHEMA_VERSION,
+            "spine_builder_version": GLOBAL_SPINE_BUILDER_VERSION,
+            "spine_projection_version": SPINE_PROJECTION_VERSION,
+            "source_artifact_sqlite_schema_version": SOURCE_ARTIFACT_SQLITE_SCHEMA_VERSION,
+            "source_artifact_sqlite_builder_version": SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION,
+            "company_shard_schema_version": COMPANY_SHARD_SCHEMA_VERSION,
+            "router_sidecar_schema_version": ROUTER_SIDECAR_SCHEMA_VERSION,
+            "router_sidecar_builder_version": ROUTER_SIDECAR_BUILDER_VERSION,
         },
         "global_object_count": spine_counts.get("global_object_locator", 0),
         "global_edge_count": spine_counts.get("global_edge_spine", 0),
@@ -169,20 +211,47 @@ def write_release_manifest_v3(
     env: str | None = None,
     source_root: Path | str | None = None,
     global_spine_path: Path | str | None = None,
+    router_sidecar_path: Path | str | None = None,
     shard_manifest_path: Path | str | None = None,
 ) -> dict[str, Any]:
     """Write a v3 manifest.json for a global spine + company shards release."""
     root_path = Path(root).expanduser().resolve()
     _assert_not_active_release_path(root_path, "root")
     root_path.mkdir(parents=True, exist_ok=True)
+    resolved_spine_path = (
+        Path(global_spine_path).expanduser().resolve()
+        if global_spine_path is not None
+        else root_path / GLOBAL_SPINE_RELATIVE_PATH
+    )
+    resolved_router_sidecar_path = (
+        Path(router_sidecar_path).expanduser().resolve()
+        if router_sidecar_path is not None
+        else root_path / ROUTER_SIDECAR_RELATIVE_PATH
+    )
+    if not resolved_spine_path.is_file():
+        raise FileNotFoundError(
+            f"Cannot write a ready v3 manifest without the global spine: {resolved_spine_path}"
+        )
+    if not resolved_router_sidecar_path.is_file():
+        raise FileNotFoundError(
+            "Cannot write a ready v3 manifest without the Serving Index V2 sidecar: "
+            f"{resolved_router_sidecar_path}. Run build_spine_shard_release_outputs first."
+        )
     manifest = build_release_manifest_v3(
         root_path,
         release_id=release_id,
         env=env,
         source_root=source_root,
-        global_spine_path=global_spine_path,
+        global_spine_path=resolved_spine_path,
+        router_sidecar_path=resolved_router_sidecar_path,
         shard_manifest_path=shard_manifest_path,
     )
+    router_output = manifest["indexes"]["router_sidecar"]
+    if not router_output.get("verification_ok"):
+        raise ValueError(
+            "Cannot write a ready v3 manifest with an invalid router sidecar: "
+            + ", ".join(router_output.get("verification_errors") or [])
+        )
     _write_json_atomic(root_path / RELEASE_MANIFEST_FILENAME, manifest)
     return manifest
 
@@ -190,9 +259,14 @@ def write_release_manifest_v3(
 def _build_release_index_outputs_v3(
     root_path: Path,
     *,
+    release_id: str,
     global_spine_path: Path,
+    router_sidecar_path: Path,
     shard_manifest_path: Path,
 ) -> dict[str, Any]:
+    global_spine_sha256 = (
+        immutable_file_sha256(global_spine_path) if global_spine_path.is_file() else None
+    )
     spine_counts = _sqlite_counts_if_present(
         global_spine_path,
         (
@@ -207,20 +281,93 @@ def _build_release_index_outputs_v3(
             "global_chain_index",
         ),
     )
-    shard_entries = _read_v3_shard_entries(root_path, shard_manifest_path)
+    shard_manifest = _read_v3_shard_manifest(shard_manifest_path)
+    shard_entries = _read_v3_shard_entries(
+        root_path,
+        shard_manifest_path,
+        payload=shard_manifest,
+    )
+    shard_binding_errors = _shard_manifest_serving_binding_errors(
+        shard_manifest,
+        shard_entries,
+    )
+    if shard_binding_errors:
+        raise ValueError(
+            "Cannot build a ready v3 manifest with stale company shard bindings: "
+            + ", ".join(shard_binding_errors)
+        )
+    try:
+        with closing(sqlite3.connect(global_spine_path)) as conn:
+            global_spine_metadata = read_global_spine_metadata(conn)
+    except sqlite3.Error as exc:
+        raise ValueError(
+            f"Cannot read global spine serving bindings: {exc}"
+        ) from exc
+    global_binding_errors = _global_spine_serving_binding_errors(
+        global_spine_metadata
+    )
+    if global_binding_errors:
+        raise ValueError(
+            "Cannot build a ready v3 manifest with stale global spine bindings: "
+            + ", ".join(global_binding_errors)
+        )
+    dictionary_binding = shard_manifest.get("metric_dictionary")
+    router_verification = (
+        verify_router_sidecar(
+            router_sidecar_path,
+            expected_global_spine_sha256=global_spine_sha256,
+            expected_release_id=release_id,
+            deep=False,
+        )
+        if router_sidecar_path.is_file()
+        else {
+            "ok": False,
+            "errors": ["router_sidecar_missing"],
+            "counts": {},
+            "metadata": {},
+        }
+    )
+    router_metadata = router_verification.get("metadata") or {}
     outputs: dict[str, Any] = {
         "global_spine": {
             "path": _relative_or_absolute(global_spine_path, root_path),
-            "sha256": _file_sha256(global_spine_path) if global_spine_path.is_file() else None,
+            "sha256": global_spine_sha256,
             "schema_version": GLOBAL_SPINE_SCHEMA_VERSION,
+            "builder_version": GLOBAL_SPINE_BUILDER_VERSION,
+            "spine_projection_version": SPINE_PROJECTION_VERSION,
             "required": True,
             "counts": spine_counts,
+        },
+        "router_sidecar": {
+            "path": _relative_or_absolute(router_sidecar_path, root_path),
+            "sha256": immutable_file_sha256(router_sidecar_path)
+            if router_sidecar_path.is_file()
+            else None,
+            "schema_version": ROUTER_SIDECAR_SCHEMA_VERSION,
+            "builder_version": ROUTER_SIDECAR_BUILDER_VERSION,
+            "required": True,
+            "counts": router_verification.get("counts") or {},
+            "ranking_profile_id": router_metadata.get("ranking_profile_id"),
+            "ranking_profile_sha256": router_metadata.get("ranking_profile_sha256"),
+            "source_global_spine_sha256": router_metadata.get(
+                "source_global_spine_sha256"
+            ),
+            "content_sha256": router_metadata.get("content_sha256"),
+            "build_fingerprint_sha256": router_metadata.get(
+                "build_fingerprint_sha256"
+            ),
+            "verification_ok": bool(router_verification.get("ok")),
+            "verification_errors": list(router_verification.get("errors") or []),
         },
         "company_shards": {
             "dir": _relative_or_absolute(root_path / "indexes" / "companies", root_path),
             "required": True,
+            "schema_version": COMPANY_SHARD_SCHEMA_VERSION,
+            "source_artifact_sqlite_schema_version": SOURCE_ARTIFACT_SQLITE_SCHEMA_VERSION,
+            "source_artifact_sqlite_builder_version": SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION,
             "count": len(shard_entries),
             "tickers": shard_entries,
+            "metric_dictionary": dictionary_binding,
         },
         "shard_manifest": {
             "path": _relative_or_absolute(shard_manifest_path, root_path),
@@ -242,13 +389,23 @@ def _build_release_index_outputs_v3(
     return outputs
 
 
-def _read_v3_shard_entries(root_path: Path, shard_manifest_path: Path) -> dict[str, Any]:
+def _read_v3_shard_manifest(shard_manifest_path: Path) -> dict[str, Any]:
     if not shard_manifest_path.is_file():
         return {}
     try:
         payload = json.loads(shard_manifest_path.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
         return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _read_v3_shard_entries(
+    root_path: Path,
+    shard_manifest_path: Path,
+    *,
+    payload: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    payload = dict(payload or _read_v3_shard_manifest(shard_manifest_path))
     raw_shards = payload.get("shards")
     if not isinstance(raw_shards, Mapping):
         return {}
@@ -270,12 +427,64 @@ def _read_v3_shard_entries(root_path: Path, shard_manifest_path: Path) -> dict[s
             "path": _relative_or_absolute(shard_path, root_path),
             "sha256": raw_entry.get("sha256") or (_file_sha256(shard_path) if shard_path.is_file() else None),
             "schema_version": raw_entry.get("schema_version"),
+            "source_artifact_sqlite_schema_version": raw_entry.get(
+                "source_artifact_sqlite_schema_version"
+            ),
+            "source_artifact_sqlite_builder_version": raw_entry.get(
+                "source_artifact_sqlite_builder_version"
+            ),
             "document_count": raw_entry.get("document_count"),
             "object_count": raw_entry.get("object_count"),
             "edge_count": raw_entry.get("edge_count"),
             "quality_event_count": raw_entry.get("quality_event_count"),
+            "metric_dictionary": raw_entry.get("metric_dictionary"),
         }
     return entries
+
+
+def _shard_manifest_serving_binding_errors(
+    shard_manifest: Mapping[str, Any],
+    shard_entries: Mapping[str, Any],
+) -> list[str]:
+    expected_top_level = {
+        "company_shard_schema_version": COMPANY_SHARD_SCHEMA_VERSION,
+        "source_artifact_sqlite_schema_version": SOURCE_ARTIFACT_SQLITE_SCHEMA_VERSION,
+        "source_artifact_sqlite_builder_version": SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION,
+    }
+    errors = [
+        f"shard_manifest_binding_mismatch:{key}"
+        for key, value in expected_top_level.items()
+        if shard_manifest.get(key) != value
+    ]
+    for ticker, raw_entry in shard_entries.items():
+        entry = raw_entry if isinstance(raw_entry, Mapping) else {}
+        expected_entry = {
+            "schema_version": COMPANY_SHARD_SCHEMA_VERSION,
+            "source_artifact_sqlite_schema_version": SOURCE_ARTIFACT_SQLITE_SCHEMA_VERSION,
+            "source_artifact_sqlite_builder_version": SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION,
+        }
+        for key, value in expected_entry.items():
+            if entry.get(key) != value:
+                errors.append(f"shard_entry_binding_mismatch:{ticker}:{key}")
+    return errors
+
+
+def _global_spine_serving_binding_errors(
+    metadata: Mapping[str, Any],
+) -> list[str]:
+    expected = {
+        "schema_version": GLOBAL_SPINE_SCHEMA_VERSION,
+        "builder_version": GLOBAL_SPINE_BUILDER_VERSION,
+        "spine_projection_version": SPINE_PROJECTION_VERSION,
+        "source_artifact_sqlite_schema_version": SOURCE_ARTIFACT_SQLITE_SCHEMA_VERSION,
+        "source_artifact_sqlite_builder_version": SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION,
+        "company_shard_schema_version": COMPANY_SHARD_SCHEMA_VERSION,
+    }
+    return [
+        f"global_spine_binding_mismatch:{key}"
+        for key, value in expected.items()
+        if metadata.get(key) != value
+    ]
 
 
 def _sqlite_counts_if_present(path: Path, tables: Sequence[str]) -> dict[str, int]:
@@ -385,6 +594,14 @@ def _verify_release_root_v3(
         "global_spine_path": str(global_spine_path),
         "global_spine_present": global_spine_path.exists(),
         "global_spine_verification": spine_shard_verification.get("global_spine_verification"),
+        "router_sidecar_path": spine_shard_verification.get("router_sidecar_path"),
+        "router_sidecar_present": bool(
+            spine_shard_verification.get("router_sidecar_path")
+            and Path(str(spine_shard_verification["router_sidecar_path"])).exists()
+        ),
+        "router_sidecar_verification": spine_shard_verification.get(
+            "router_sidecar_verification"
+        ),
         "chart_series_verification": spine_shard_verification.get("chart_series_verification"),
         "spine_shard_verification": spine_shard_verification,
         "smoke_verification": None,
@@ -425,6 +642,7 @@ def verify_release_startup_v3(
         errors.append("manifest_env_mismatch")
 
     global_spine_path = _resolve_v3_global_spine_path(root_path, manifest)
+    router_sidecar_path = _resolve_v3_router_sidecar_path(root_path, manifest)
     chart_series_path = _resolve_optional_chart_series_path(root_path, manifest)
     spine_verification: dict[str, Any] | None = None
     if not global_spine_path.exists():
@@ -442,6 +660,66 @@ def verify_release_startup_v3(
             "sqlite_checked": False,
             "verification_mode": "startup",
         }
+
+    router_sidecar_verification: dict[str, Any] | None = None
+    if not router_sidecar_path.exists():
+        errors.append("router_sidecar_missing")
+    elif not router_sidecar_path.is_file():
+        errors.append("router_sidecar_not_file")
+    else:
+        index_outputs = (
+            manifest.get("indexes")
+            if isinstance(manifest.get("indexes"), Mapping)
+            else {}
+        )
+        global_spine_output = (
+            index_outputs.get("global_spine")
+            if isinstance(index_outputs.get("global_spine"), Mapping)
+            else {}
+        )
+        router_sidecar_output = (
+            index_outputs.get("router_sidecar")
+            if isinstance(index_outputs.get("router_sidecar"), Mapping)
+            else {}
+        )
+        expected_global_sha = global_spine_output.get("sha256")
+        expected_sidecar_sha = router_sidecar_output.get("sha256")
+        if not isinstance(expected_sidecar_sha, str) or not expected_sidecar_sha:
+            errors.append("router_sidecar:router_sidecar_manifest_sha256_missing")
+        else:
+            try:
+                actual_sidecar_sha = _cached_file_sha256(router_sidecar_path)
+            except (OSError, RuntimeError) as exc:
+                errors.append(f"router_sidecar:router_sidecar_hash_error:{exc}")
+            else:
+                if actual_sidecar_sha != expected_sidecar_sha:
+                    errors.append("router_sidecar:router_sidecar_manifest_sha256_mismatch")
+        router_sidecar_verification = verify_router_sidecar(
+            router_sidecar_path,
+            expected_global_spine_sha256=(
+                str(expected_global_sha) if expected_global_sha else None
+            ),
+            expected_release_id=(
+                str(manifest.get("release_id")) if manifest.get("release_id") else None
+            ),
+            expected_ranking_profile_sha256=(
+                str(router_sidecar_output.get("ranking_profile_sha256"))
+                if router_sidecar_output.get("ranking_profile_sha256")
+                else None
+            ),
+            expected_build_fingerprint_sha256=(
+                str(router_sidecar_output.get("build_fingerprint_sha256"))
+                if router_sidecar_output.get("build_fingerprint_sha256")
+                else None
+            ),
+            deep=False,
+        )
+        router_sidecar_verification["sqlite_checked"] = bool(check_sqlite)
+        router_sidecar_verification["binding_checked"] = True
+        errors.extend(
+            f"router_sidecar:{error}"
+            for error in router_sidecar_verification.get("errors") or []
+        )
 
     chart_series_verification: dict[str, Any] | None = None
     chart_series_output = ((manifest.get("indexes") or {}).get("chart_series") or {}) if manifest else {}
@@ -481,6 +759,9 @@ def verify_release_startup_v3(
         "global_spine_path": str(global_spine_path),
         "global_spine_present": global_spine_path.exists(),
         "global_spine_verification": spine_verification,
+        "router_sidecar_path": str(router_sidecar_path),
+        "router_sidecar_present": router_sidecar_path.exists(),
+        "router_sidecar_verification": router_sidecar_verification,
         "chart_series_path": str(chart_series_path) if chart_series_path is not None else None,
         "chart_series_present": bool(chart_series_path is not None and chart_series_path.exists()),
         "chart_series_verification": chart_series_verification,
@@ -499,6 +780,8 @@ def _release_manifest_startup_errors_v3(root_path: Path, manifest: Mapping[str, 
         errors.append("manifest_index_layout_unsupported")
     if manifest.get("monolith_required") is not False:
         errors.append("manifest_monolith_required_not_false")
+    errors.extend(_release_serving_binding_errors(manifest))
+    errors.extend(metric_dictionary_binding_errors(manifest.get("metric_dictionary")))
     release_id = manifest.get("release_id")
     if not release_id:
         errors.append("manifest_release_id_missing")
@@ -512,7 +795,7 @@ def _release_manifest_startup_errors_v3(root_path: Path, manifest: Mapping[str, 
     if not isinstance(outputs, Mapping):
         errors.append("manifest_indexes_missing")
         return errors
-    for role in ("global_spine", "company_shards", "shard_manifest"):
+    for role in ("global_spine", "router_sidecar", "company_shards", "shard_manifest"):
         output = outputs.get(role)
         if not isinstance(output, Mapping):
             errors.append(f"manifest_indexes_{role}_missing")
@@ -526,8 +809,37 @@ def _release_manifest_startup_errors_v3(root_path: Path, manifest: Mapping[str, 
             errors.append("manifest_indexes_global_spine_path_missing")
         else:
             errors.extend(_release_manifest_relative_file_startup_errors(root_path, "global_spine", raw_path))
+    router_sidecar = outputs.get("router_sidecar")
+    if isinstance(router_sidecar, Mapping):
+        raw_path = router_sidecar.get("path")
+        if not isinstance(raw_path, str) or not raw_path:
+            errors.append("manifest_indexes_router_sidecar_path_missing")
+        else:
+            errors.extend(
+                _release_manifest_relative_file_startup_errors(
+                    root_path,
+                    "router_sidecar",
+                    raw_path,
+                )
+            )
+        for field in (
+            "sha256",
+            "ranking_profile_sha256",
+            "source_global_spine_sha256",
+            "build_fingerprint_sha256",
+        ):
+            if not isinstance(router_sidecar.get(field), str) or not router_sidecar.get(field):
+                errors.append(f"manifest_indexes_router_sidecar_{field}_missing")
+        if router_sidecar.get("verification_ok") is not True:
+            errors.append("manifest_indexes_router_sidecar_verification_not_ok")
     company_shards = outputs.get("company_shards")
     if isinstance(company_shards, Mapping):
+        errors.extend(
+            "manifest_indexes_company_shards_" + error
+            for error in metric_dictionary_binding_errors(
+                company_shards.get("metric_dictionary")
+            )
+        )
         raw_dir = company_shards.get("dir")
         if not isinstance(raw_dir, str) or not raw_dir:
             errors.append("manifest_indexes_company_shards_dir_missing")
@@ -553,6 +865,48 @@ def _release_manifest_startup_errors_v3(root_path: Path, manifest: Mapping[str, 
     debug_monolith = outputs.get("debug_monolith")
     if isinstance(debug_monolith, Mapping) and debug_monolith.get("required") is True:
         errors.append("manifest_debug_monolith_required")
+    return errors
+
+
+def _release_serving_binding_errors(manifest: Mapping[str, Any]) -> list[str]:
+    errors: list[str] = []
+    builder = manifest.get("builder")
+    builder = builder if isinstance(builder, Mapping) else {}
+    expected_builder = {
+        "spine_schema_version": GLOBAL_SPINE_SCHEMA_VERSION,
+        "spine_builder_version": GLOBAL_SPINE_BUILDER_VERSION,
+        "spine_projection_version": SPINE_PROJECTION_VERSION,
+        "source_artifact_sqlite_schema_version": SOURCE_ARTIFACT_SQLITE_SCHEMA_VERSION,
+        "source_artifact_sqlite_builder_version": SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION,
+        "company_shard_schema_version": COMPANY_SHARD_SCHEMA_VERSION,
+    }
+    for key, value in expected_builder.items():
+        if builder.get(key) != value:
+            errors.append(f"manifest_builder_binding_mismatch:{key}")
+    indexes = manifest.get("indexes")
+    indexes = indexes if isinstance(indexes, Mapping) else {}
+    global_spine = indexes.get("global_spine")
+    global_spine = global_spine if isinstance(global_spine, Mapping) else {}
+    if global_spine.get("schema_version") != GLOBAL_SPINE_SCHEMA_VERSION:
+        errors.append("manifest_global_spine_schema_version_mismatch")
+    if global_spine.get("builder_version") != GLOBAL_SPINE_BUILDER_VERSION:
+        errors.append("manifest_global_spine_builder_version_mismatch")
+    if global_spine.get("spine_projection_version") != SPINE_PROJECTION_VERSION:
+        errors.append("manifest_spine_projection_version_mismatch")
+    company_shards = indexes.get("company_shards")
+    company_shards = company_shards if isinstance(company_shards, Mapping) else {}
+    if company_shards.get("schema_version") != COMPANY_SHARD_SCHEMA_VERSION:
+        errors.append("manifest_company_shard_schema_version_mismatch")
+    if (
+        company_shards.get("source_artifact_sqlite_schema_version")
+        != SOURCE_ARTIFACT_SQLITE_SCHEMA_VERSION
+    ):
+        errors.append("manifest_source_artifact_schema_version_mismatch")
+    if (
+        company_shards.get("source_artifact_sqlite_builder_version")
+        != SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION
+    ):
+        errors.append("manifest_source_artifact_builder_version_mismatch")
     return errors
 
 
@@ -608,6 +962,22 @@ def _resolve_v3_global_spine_path(root_path: Path, manifest: Mapping[str, Any]) 
     return (root_path / GLOBAL_SPINE_RELATIVE_PATH).resolve()
 
 
+def _resolve_v3_router_sidecar_path(root_path: Path, manifest: Mapping[str, Any]) -> Path:
+    outputs = manifest.get("indexes")
+    if isinstance(outputs, Mapping):
+        router_sidecar = outputs.get("router_sidecar")
+        if isinstance(router_sidecar, Mapping):
+            raw_path = router_sidecar.get("path")
+            if isinstance(raw_path, str) and raw_path:
+                candidate = Path(raw_path)
+                return (
+                    candidate.expanduser().resolve()
+                    if candidate.is_absolute()
+                    else (root_path / candidate).resolve()
+                )
+    return (root_path / ROUTER_SIDECAR_RELATIVE_PATH).resolve()
+
+
 def _resolve_optional_chart_series_path(root_path: Path, manifest: Mapping[str, Any]) -> Path | None:
     outputs = manifest.get("indexes")
     if not isinstance(outputs, Mapping):
@@ -641,6 +1011,22 @@ def _verify_global_spine_startup(path: Path) -> dict[str, Any]:
         }
     if metadata.get("schema_version") != GLOBAL_SPINE_SCHEMA_VERSION:
         errors.append("global_spine_schema_version_mismatch")
+    if metadata.get("builder_version") != GLOBAL_SPINE_BUILDER_VERSION:
+        errors.append("global_spine_builder_version_mismatch")
+    if metadata.get("spine_projection_version") != SPINE_PROJECTION_VERSION:
+        errors.append("global_spine_projection_version_mismatch")
+    if (
+        metadata.get("source_artifact_sqlite_schema_version")
+        != SOURCE_ARTIFACT_SQLITE_SCHEMA_VERSION
+    ):
+        errors.append("global_spine_source_artifact_schema_version_mismatch")
+    if (
+        metadata.get("source_artifact_sqlite_builder_version")
+        != SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION
+    ):
+        errors.append("global_spine_source_artifact_builder_version_mismatch")
+    if metadata.get("company_shard_schema_version") != COMPANY_SHARD_SCHEMA_VERSION:
+        errors.append("global_spine_company_shard_schema_version_mismatch")
     if metadata.get("index_layout") != GLOBAL_SPINE_LAYOUT:
         errors.append("global_spine_index_layout_mismatch")
     return {
@@ -998,6 +1384,11 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _cached_file_sha256(path: Path) -> str:
+    """Hash an immutable release artifact once per stat identity."""
+    return immutable_file_sha256(path)
+
+
 def release_env_root(releases_root: Path | str, env: str | None = None) -> Path:
     """Return the env-specific release directory under a releases root."""
     resolved_env = normalize_ontology_env(env)
@@ -1104,7 +1495,10 @@ def promote_local_release(
         raise FileNotFoundError(f"Release directory not found: {release_dir}")
     event_log_paths = _release_event_log_paths(env_root=env_root, release_dir=release_dir)
     activated_before = event_log_paths["release_event_log"].exists()
-    verification = verify_release_root(release_dir, env=env)
+    # Promotion is the trust boundary.  A light startup check intentionally
+    # avoids hashing every shard, but activating a candidate must prove every
+    # manifest-bound byte before the current symlink can move.
+    verification = verify_release_root(release_dir, env=env, deep=True)
     if not verification["ok"]:
         if not activated_before:
             write_release_verification_report(

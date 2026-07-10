@@ -32,6 +32,10 @@ semantic neighbors are useful
 
 Trace/chain only selected roots. Do not trace or chain every candidate.
 
-Follow runner budget, `agent_autonomy`, and `kernel` guidance. If no explicit guidance is present, use the smallest number of selected roots that materially improves the answer.
+Use `ResearchState.recommended_actions` and the source IDs in the relevant
+`evidence_units` when a load-bearing claim needs stronger lineage or mechanism
+support. Continue only while that action can change clause coverage,
+directness, calculation support, or answer correctness; do not apply a fixed
+root count.
 
 Keep chain/trace internals out of normal answers.

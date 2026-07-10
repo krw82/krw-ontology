@@ -250,7 +250,7 @@ web catalog는 이 계약을 기준으로 동작해야 한다.
     "global_spine": {
       "path": "indexes/global_spine.sqlite",
       "sha256": "<sha256>",
-      "schema_version": "krw-ontology-global-spine/v1",
+      "schema_version": "krw-ontology-global-spine/v2",
       "counts": {}
     },
     "company_shards": {
@@ -279,7 +279,7 @@ web catalog는 이 계약을 기준으로 동작해야 한다.
   },
   "builder": {
     "release_builder_version": "release-builder/v3",
-    "spine_schema_version": "krw-ontology-global-spine/v1"
+    "spine_schema_version": "krw-ontology-global-spine/v2"
   }
 }
 ```
@@ -1708,4 +1708,3 @@ current release를 직접 수정하지 않는다.
 v1/v2 호환을 정상 path로 되살리지 않는다.
 임시 monolith fallback을 만들지 않는다.
 ```
-

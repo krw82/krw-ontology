@@ -10,7 +10,17 @@ from typer.testing import CliRunner
 
 from krw_ontology.cli import main as cli_main
 from krw_ontology.cli.main import app
-from krw_ontology.agent_index.spine_builder import _company_shard_quality_summary
+from krw_ontology.agent_index.spine_builder import (
+    COMPANY_SHARD_SCHEMA_VERSION,
+    SPINE_PROJECTION_VERSION,
+    _company_shard_quality_summary,
+)
+from krw_ontology.agent_index.source_artifact_sqlite import (
+    SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION,
+    SOURCE_ARTIFACT_SQLITE_SCHEMA_VERSION,
+)
+from krw_ontology.agent_index.router_sidecar import build_router_sidecar
+from krw_ontology.agent_index.metric_dictionary import metric_dictionary_binding
 from krw_ontology.agent_index.spine_schema import create_global_spine_schema, write_global_spine_metadata
 from krw_ontology.quality.models import (
     BATCH_FAILURE,
@@ -861,6 +871,14 @@ def _write_v3_quality_release(tmp_path: Path) -> Path:
             {
                 "release_id": "v3-quality",
                 "source_manifest_hash": "test-source",
+                "spine_projection_version": SPINE_PROJECTION_VERSION,
+                "source_artifact_sqlite_schema_version": (
+                    SOURCE_ARTIFACT_SQLITE_SCHEMA_VERSION
+                ),
+                "source_artifact_sqlite_builder_version": (
+                    SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION
+                ),
+                "company_shard_schema_version": COMPANY_SHARD_SCHEMA_VERSION,
             },
         )
         for ticker, periods in {"OK": ok_periods, "FCX": fcx_periods}.items():
@@ -909,26 +927,50 @@ def _write_v3_quality_release(tmp_path: Path) -> Path:
                 "format": "krw-ontology-shard-manifest/v3",
                 "index_layout": "global-spine-and-company-shards",
                 "release_id": "v3-quality",
+                "company_shard_schema_version": COMPANY_SHARD_SCHEMA_VERSION,
+                "source_artifact_sqlite_schema_version": (
+                    SOURCE_ARTIFACT_SQLITE_SCHEMA_VERSION
+                ),
+                "source_artifact_sqlite_builder_version": (
+                    SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION
+                ),
+                "metric_dictionary": metric_dictionary_binding(),
                 "shards": {
                     "FCX": {
                         "ticker": "FCX",
                         "path": "companies/FCX.sqlite",
+                        "schema_version": COMPANY_SHARD_SCHEMA_VERSION,
+                        "source_artifact_sqlite_schema_version": (
+                            SOURCE_ARTIFACT_SQLITE_SCHEMA_VERSION
+                        ),
+                        "source_artifact_sqlite_builder_version": (
+                            SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION
+                        ),
                         "document_count": 1,
                         "object_count": 0,
                         "edge_count": 0,
                         "quality_event_count": 4,
                         "quality_summary": _company_shard_quality_summary(fcx_shard),
                         "sha256": _sha256(fcx_shard),
+                        "metric_dictionary": metric_dictionary_binding(),
                     },
                     "OK": {
                         "ticker": "OK",
                         "path": "companies/OK.sqlite",
+                        "schema_version": COMPANY_SHARD_SCHEMA_VERSION,
+                        "source_artifact_sqlite_schema_version": (
+                            SOURCE_ARTIFACT_SQLITE_SCHEMA_VERSION
+                        ),
+                        "source_artifact_sqlite_builder_version": (
+                            SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION
+                        ),
                         "document_count": 5,
                         "object_count": 0,
                         "edge_count": 0,
                         "quality_event_count": 0,
                         "quality_summary": _company_shard_quality_summary(ok_shard),
                         "sha256": _sha256(ok_shard),
+                        "metric_dictionary": metric_dictionary_binding(),
                     },
                 },
             },
@@ -936,6 +978,7 @@ def _write_v3_quality_release(tmp_path: Path) -> Path:
         ),
         encoding="utf-8",
     )
+    build_router_sidecar(global_spine_path, release_id="v3-quality")
     write_release_manifest_v3(release_root, release_id="v3-quality", env="dev", source_root=release_root)
     return release_root
 

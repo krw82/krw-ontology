@@ -246,7 +246,7 @@ indexes/agent_index.sqlite
   "builder": {
     "release_builder_version": "v3",
     "spine_schema_version": "krw-spine/v1",
-    "company_shard_schema_version": "krw-company-shard/v1",
+    "company_shard_schema_version": "krw-ontology-company-shard/v2",
     "chain_index_version": "krw-chain-index/v1"
   },
   "indexes": {
@@ -269,7 +269,7 @@ indexes/agent_index.sqlite
         "AAPL": {
           "path": "indexes/companies/AAPL.sqlite",
           "sha256": "<sha256>",
-          "schema_version": "krw-company-shard/v1",
+          "schema_version": "krw-ontology-company-shard/v2",
           "document_count": 0,
           "object_count": 0,
           "edge_count": 0,
@@ -951,6 +951,10 @@ Rules:
 
 Build plan decides dirty companies and cache usage.
 
+`krw-ontology index plan`은 source manifest snapshot을 메모리에서 계산한다. 이
+명령은 `source_manifest.json`, build output, `current` symlink를 쓰거나 갱신하지
+않는다. Manifest 영속화는 실제 candidate build 단계에서만 수행한다.
+
 Dirty inputs:
 
 ```text
@@ -1017,6 +1021,33 @@ artifact fragments
 ```
 
 Same shard SQLite must not receive concurrent writes.
+
+#### Immutable SQLite copy strategy
+
+Company shard cache와 release output 사이의 복사는 기본적으로 filesystem
+Copy-on-Write clone을 먼저 시도한다. macOS/APFS에서는 `cp -c`, Linux에서는
+reflink를 사용하고, 지원되지 않는 filesystem에서는 검증 가능한 `copy2`로
+fallback한다. SQLite 내용과 index contract는 어느 경로에서도 동일하다.
+
+```bash
+# 일반 환경: reflink 우선, 안전한 full copy fallback
+export KRW_INDEX_COPY_MODE=auto
+
+# 저장공간이 제한된 candidate build: reflink가 불가능하면 즉시 실패
+export KRW_INDEX_COPY_MODE=reflink-required
+
+# 운영 진단이나 호환성 검증을 위한 강제 full copy
+export KRW_INDEX_COPY_MODE=copy
+```
+
+`reflink-required`는 지원되지 않는 filesystem에서 대용량 full copy로 조용히
+전환되어 디스크를 소진하는 것을 막는다. Cache hit 경로에서 release별 path를
+수정하더라도 CoW가 변경된 SQLite page만 분리하므로 cache 원본은 불변이다.
+
+`krw-ontology index cache status|gc`의 reachability 계산은 artifact fragment,
+company shard, spine fragment 세 계층을 모두 포함한다. `gc`는 기본 dry-run이며
+`--yes`가 명시된 경우에만 현재 v2 build plan에서 참조되지 않는 SQLite cache를
+제거한다.
 
 ### 9.5 Spine fragment
 

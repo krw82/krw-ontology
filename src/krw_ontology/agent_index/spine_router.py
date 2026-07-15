@@ -10,7 +10,7 @@ import os
 import re
 import sqlite3
 import time
-from collections import Counter, defaultdict
+from collections import Counter, OrderedDict, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
@@ -20,10 +20,12 @@ from krw_ontology.agent_index.chart_series import (
     chart_series_index_status,
     query_chart_series_pack,
 )
+from krw_ontology.agent_index.router_coherence import ROUTER_COHERENCE_RELATIVE_PATH
 from krw_ontology.agent_index.router_sidecar import (
     ROUTER_SIDECAR_RELATIVE_PATH,
     RouterSidecar,
 )
+from krw_ontology.agent_index.semantic_identity import effective_ticker
 from krw_ontology.agent_index.store import (
     OntologyStore,
     filing_document_roles_from_documents,
@@ -48,6 +50,55 @@ _GLOBAL_CHAIN_MAX_PATHS = 32
 _GLOBAL_CHAIN_MAX_EXPANSIONS = 256
 _GLOBAL_CHAIN_MAX_FRONTIER = 128
 _GLOBAL_CHAIN_NEIGHBORS_PER_NODE = 12
+_OBJECT_REPLICA_PREVIEW_LIMIT = 20
+_OBJECT_ID_LOOKUP_CHUNK_SIZE = 500
+_OBJECT_ID_PROJECTION_CACHE_MAX = 50_000
+_OBJECT_ID_SCALAR_FIELDS = frozenset(
+    {
+        "id",
+        "trace_id",
+        "from_id",
+        "to_id",
+        "source_id",
+        "target_id",
+    }
+)
+_OBJECT_ID_LIST_FIELDS = frozenset(
+    {
+        "affected_objects",
+        "claim_ids",
+        "object_ids",
+        "quote_ids",
+        "related_object_ids",
+        "source_ids",
+        "source_object_ids",
+        "span_ids",
+    }
+)
+_OCCURRENCE_TICKER_FIELDS = frozenset(
+    {"ticker", "from_ticker", "neighbor_ticker", "root_ticker", "to_ticker"}
+)
+
+
+def _is_object_id_scalar_field(field: str) -> bool:
+    normalized = str(field or "").strip().casefold()
+    return normalized in _OBJECT_ID_SCALAR_FIELDS or normalized.endswith("_object_id")
+
+
+def _is_object_id_list_field(field: str) -> bool:
+    normalized = str(field or "").strip().casefold()
+    return normalized in _OBJECT_ID_LIST_FIELDS or normalized.endswith("_object_ids")
+
+
+def _prefix_upper_bound(prefix: str) -> str | None:
+    """Return the exclusive BINARY-collation upper bound for a text prefix."""
+    if not prefix:
+        return None
+    for index in range(len(prefix) - 1, -1, -1):
+        codepoint = ord(prefix[index])
+        if codepoint < 0x10FFFF:
+            return f"{prefix[:index]}{chr(codepoint + 1)}"
+    return None
 
 
 class OntologySpineRouter:
@@ -61,13 +112,18 @@ class OntologySpineRouter:
         self.check_same_thread = check_same_thread
         self._shard_manifest_path = self.index_dir / "shard_manifest.json"
         self._shard_manifest = _read_json(self._shard_manifest_path)
-        self._declared_shard_paths, self._shard_paths, self._missing_shard_paths = self._load_shard_paths()
+        self._declared_shard_paths, self._shard_paths, self._missing_shard_paths = (
+            self._load_shard_paths()
+        )
         self._chart_series_path = self.release_root / CHART_SERIES_RELATIVE_PATH
         self._chart_series_status = chart_series_index_status(self._chart_series_path)
         self._router_sidecar_path = self.release_root / ROUTER_SIDECAR_RELATIVE_PATH
+        self._router_coherence_path = self.release_root / ROUTER_COHERENCE_RELATIVE_PATH
         self._spine_conn: sqlite3.Connection | None = None
         self._router_sidecar: RouterSidecar | None = None
+        self._global_metadata_cache: dict[str, Any] | None = None
         self._shards: dict[str, OntologyStore] = {}
+        self._local_to_index_id_cache: OrderedDict[tuple[str, str], str | None] = OrderedDict()
         self._closed = False
 
     @classmethod
@@ -125,6 +181,11 @@ class OntologySpineRouter:
         self._closed = True
 
     def routing_status(self) -> dict[str, Any]:
+        metadata = self._global_metadata()
+        raw_counts = metadata.get("counts")
+        counts = raw_counts if isinstance(raw_counts, Mapping) else {}
+        raw_duplicates = metadata.get("benign_duplicate_counts")
+        benign_duplicates = dict(raw_duplicates) if isinstance(raw_duplicates, Mapping) else {}
         return {
             "mode": "global_spine",
             "index_layout": GLOBAL_SPINE_LAYOUT,
@@ -142,6 +203,23 @@ class OntologySpineRouter:
             "chart_series_path": str(self._chart_series_path),
             "router_sidecar_available": self._router_sidecar_path.is_file(),
             "router_sidecar_path": str(self._router_sidecar_path),
+            "router_coherence_available": self._router_coherence_path.is_file(),
+            "router_coherence_path": str(self._router_coherence_path),
+            "object_resolution": {
+                "canonical_identity": "object_id",
+                "occurrence_identity": "ticker+object_id",
+                "shared_object_requires_ticker": True,
+                "ambiguous_object_policy": "fail_closed_with_ticker_candidates",
+            },
+            "occurrence_counts": {
+                "objects": int(counts.get("global_object_replica") or 0),
+                "edges": int(counts.get("global_edge_replica") or 0),
+            },
+            "canonical_counts": {
+                "objects": int(counts.get("global_object_locator") or 0),
+                "edges": int(counts.get("global_edge_spine") or 0),
+            },
+            "benign_duplicate_counts": benign_duplicates,
             "fallback_enabled": False,
             "fallback": False,
         }
@@ -162,15 +240,27 @@ class OntologySpineRouter:
         self,
         *,
         ticker: str | None = None,
+        tickers: Iterable[str] | None = None,
         document_types: Iterable[str] | None = None,
     ) -> list[dict[str, Any]]:
         ticker_filter = str(ticker).upper() if ticker else None
-        document_type_values = [str(value) for value in (document_types or []) if str(value or "").strip()]
+        ticker_values = list(
+            dict.fromkeys(
+                str(value).strip().upper() for value in (tickers or []) if str(value or "").strip()
+            )
+        )
+        document_type_values = [
+            str(value) for value in (document_types or []) if str(value or "").strip()
+        ]
         clauses: list[str] = []
         params: list[Any] = []
         if ticker_filter:
             clauses.append("ticker = ?")
             params.append(ticker_filter)
+        elif ticker_values:
+            placeholders = ", ".join("?" for _ in ticker_values)
+            clauses.append(f"ticker IN ({placeholders})")
+            params.extend(ticker_values)
         if document_type_values:
             placeholders = ", ".join("?" for _ in document_type_values)
             clauses.append(f"document_type IN ({placeholders})")
@@ -263,6 +353,8 @@ class OntologySpineRouter:
         return payload
 
     def _global_metadata(self) -> dict[str, Any]:
+        if self._global_metadata_cache is not None:
+            return dict(self._global_metadata_cache)
         rows = self.conn.execute("SELECT key, value_json FROM metadata").fetchall()
         metadata: dict[str, Any] = {}
         for row in rows:
@@ -270,13 +362,15 @@ class OntologySpineRouter:
                 metadata[str(row["key"])] = json.loads(str(row["value_json"]))
             except (json.JSONDecodeError, TypeError):
                 metadata[str(row["key"])] = row["value_json"]
-        return metadata
+        self._global_metadata_cache = metadata
+        return dict(metadata)
 
     def company_context(self, *, ticker: str, **kwargs: Any) -> dict[str, Any]:
         normalized = str(ticker or "").upper()
         if normalized in self._missing_shard_paths:
             return self._missing_shard_payload(ticker, operation="company_context")
         payload = self._store_for_ticker(ticker).company_context(ticker=ticker, **kwargs)
+        payload = self._project_shard_payload(payload, ticker=normalized)
         payload.setdefault("routing", self._route_payload("company_shard", [normalized]))
         return payload
 
@@ -288,6 +382,7 @@ class OntologySpineRouter:
             payload.setdefault("topics", [])
             return payload
         payload = self._store_for_ticker(ticker).topic_map(ticker=ticker, **kwargs)
+        payload = self._project_shard_payload(payload, ticker=normalized)
         payload.setdefault("routing", self._route_payload("company_shard", [normalized]))
         return payload
 
@@ -298,7 +393,9 @@ class OntologySpineRouter:
     def query_with_diagnostics(self, **kwargs: Any) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         return self._fanout_query(compact=False, **kwargs)
 
-    def query_compact_with_diagnostics(self, **kwargs: Any) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    def query_compact_with_diagnostics(
+        self, **kwargs: Any
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         return self._fanout_query(compact=True, **kwargs)
 
     def route_planned_tickers(
@@ -313,9 +410,7 @@ class OntologySpineRouter:
         resolved_limit = max(1, int(limit))
         normalized_explicit = _normalize_tickers(explicit_tickers) or []
         if normalized_explicit:
-            available = [
-                ticker for ticker in normalized_explicit if ticker in self._shard_paths
-            ]
+            available = [ticker for ticker in normalized_explicit if ticker in self._shard_paths]
             return available, {
                 "mode": "explicit_plan_scope",
                 "requested_tickers": normalized_explicit,
@@ -323,9 +418,7 @@ class OntologySpineRouter:
                 "unknown_tickers": self._unknown_tickers(normalized_explicit),
                 "missing_shards": self._missing_shards_for_tickers(normalized_explicit),
                 "fallback_used": False,
-                "timing_ms": {
-                    "total": int((time.perf_counter() - started_at) * 1000)
-                },
+                "timing_ms": {"total": int((time.perf_counter() - started_at) * 1000)},
             }
 
         normalized_clauses = [
@@ -351,8 +444,18 @@ class OntologySpineRouter:
                 "fallback_used": False,
             }
 
-        sidecar = self._sidecar()
-        rrf_k = max(1, int(sidecar.ranking_profile.get("rrf_k") or 60))
+        try:
+            sidecar = self._sidecar()
+            rrf_k = max(1, int(sidecar.ranking_profile.get("rrf_k") or 60))
+        except (KeyError, OSError, RuntimeError, TypeError, ValueError, sqlite3.Error) as exc:
+            return [], {
+                "mode": "planned_router_sidecar",
+                "error": "router_sidecar_invalid",
+                "error_type": type(exc).__name__,
+                "router_sidecar_path": str(self._router_sidecar_path),
+                "fallback_used": False,
+                "timing_ms": {"total": int((time.perf_counter() - started_at) * 1000)},
+            }
         scores: defaultdict[str, float] = defaultdict(float)
         clause_hits: Counter[str] = Counter()
         required_clause_hits: Counter[str] = Counter()
@@ -364,7 +467,18 @@ class OntologySpineRouter:
             required = bool(clause["required"])
             weight = 2.0 if required else 1.0
             query_started_at = time.perf_counter()
-            result = sidecar.search(query, limit=resolved_limit)
+            try:
+                result = sidecar.search(query, limit=resolved_limit)
+            except (KeyError, OSError, RuntimeError, TypeError, ValueError, sqlite3.Error) as exc:
+                return [], {
+                    "mode": "planned_router_sidecar",
+                    "error": "router_sidecar_query_failed",
+                    "error_type": type(exc).__name__,
+                    "failed_clause_id": clause["clause_id"],
+                    "router_sidecar_path": str(self._router_sidecar_path),
+                    "fallback_used": False,
+                    "timing_ms": {"total": int((time.perf_counter() - started_at) * 1000)},
+                }
             candidates = [
                 candidate
                 for candidate in result.get("ticker_candidates") or []
@@ -398,9 +512,7 @@ class OntologySpineRouter:
                     "candidate_count": len(seen_for_query),
                     "resolved_tickers": sorted(seen_for_query),
                     "score_summary": _score_summary(candidates),
-                    "timing_ms": int(
-                        (time.perf_counter() - query_started_at) * 1000
-                    ),
+                    "timing_ms": int((time.perf_counter() - query_started_at) * 1000),
                 }
             )
 
@@ -430,21 +542,13 @@ class OntologySpineRouter:
             "mode": "planned_router_sidecar",
             "resolved_tickers": ranked,
             "query_count": len(normalized_clauses),
-            "required_query_count": sum(
-                1 for clause in normalized_clauses if clause["required"]
-            ),
+            "required_query_count": sum(1 for clause in normalized_clauses if clause["required"]),
             "queries": query_diagnostics,
             "ranking_profile_id": sidecar.ranking_profile.get("profile_id"),
-            "ranking_profile_sha256": sidecar.metadata.get(
-                "ranking_profile_sha256"
-            ),
-            "build_fingerprint_sha256": sidecar.metadata.get(
-                "build_fingerprint_sha256"
-            ),
+            "ranking_profile_sha256": sidecar.metadata.get("ranking_profile_sha256"),
+            "build_fingerprint_sha256": sidecar.metadata.get("build_fingerprint_sha256"),
             "release_id": sidecar.metadata.get("release_id"),
-            "timing_ms": {
-                "total": int((time.perf_counter() - started_at) * 1000)
-            },
+            "timing_ms": {"total": int((time.perf_counter() - started_at) * 1000)},
             "fallback_used": False,
         }
 
@@ -470,9 +574,7 @@ class OntologySpineRouter:
         """Execute one SearchPlan clause across resolved shards in rank-balanced order."""
         result_limit = max(1, int(limit))
         route_tickers = _normalize_tickers(tickers) or []
-        available_tickers = [
-            ticker for ticker in route_tickers if ticker in self._shard_paths
-        ]
+        available_tickers = [ticker for ticker in route_tickers if ticker in self._shard_paths]
         shard_diagnostics: dict[str, Any] = {}
 
         def load_query(_ticker: str, store: OntologyStore) -> dict[str, Any]:
@@ -485,7 +587,7 @@ class OntologySpineRouter:
                 metric_scope=metric_scope,
                 calculation_window=calculation_window,
                 comparison_axes=comparison_axes,
-                tickers=[_ticker],
+                tickers=None,
                 document_types=document_types,
                 periods=periods,
                 object_types=object_types,
@@ -505,13 +607,15 @@ class OntologySpineRouter:
             if not isinstance(payload, Mapping):
                 continue
             rows_by_ticker[ticker] = [
-                dict(row)
+                self._project_shard_payload(dict(row), ticker=ticker)
                 for row in payload.get("rows") or []
                 if isinstance(row, Mapping)
             ]
             diagnostics = payload.get("diagnostics")
             if isinstance(diagnostics, Mapping):
-                shard_diagnostics[ticker] = dict(diagnostics)
+                shard_diagnostics[ticker] = self._project_shard_payload(
+                    dict(diagnostics), ticker=ticker
+                )
 
         results: list[dict[str, Any]] = []
         row_rank = 0
@@ -559,9 +663,7 @@ class OntologySpineRouter:
         started_at = time.perf_counter()
         result_limit = max(1, int(limit))
         route_tickers = _normalize_tickers(tickers) or []
-        available_tickers = [
-            ticker for ticker in route_tickers if ticker in self._shard_paths
-        ]
+        available_tickers = [ticker for ticker in route_tickers if ticker in self._shard_paths]
         normalized_clauses = [
             dict(clause)
             for clause in clauses
@@ -594,7 +696,7 @@ class OntologySpineRouter:
                         str(clause.get("calculation_window") or "").strip() or None
                     ),
                     comparison_axes=clause.get("comparison_axes"),
-                    tickers=[ticker],
+                    tickers=None,
                     document_types=document_types,
                     periods=periods,
                     object_types=clause.get("object_types"),
@@ -613,9 +715,7 @@ class OntologySpineRouter:
             load_batch,
         )
         by_clause: dict[str, dict[str, Any]] = {}
-        ticker_rank = {
-            ticker: rank for rank, ticker in enumerate(available_tickers, start=1)
-        }
+        ticker_rank = {ticker: rank for rank, ticker in enumerate(available_tickers, start=1)}
         for clause in normalized_clauses:
             clause_id = str(clause["clause_id"])
             rows_by_ticker: dict[str, list[dict[str, Any]]] = {}
@@ -628,13 +728,15 @@ class OntologySpineRouter:
                 if not isinstance(clause_payload, Mapping):
                     continue
                 rows_by_ticker[ticker] = [
-                    dict(row)
+                    self._project_shard_payload(dict(row), ticker=ticker)
                     for row in clause_payload.get("rows") or []
                     if isinstance(row, Mapping)
                 ]
                 diagnostics = clause_payload.get("diagnostics")
                 if isinstance(diagnostics, Mapping):
-                    shard_diagnostics[ticker] = dict(diagnostics)
+                    shard_diagnostics[ticker] = self._project_shard_payload(
+                        dict(diagnostics), ticker=ticker
+                    )
 
             rows: list[dict[str, Any]] = []
             selected_by_ticker: Counter[str] = Counter()
@@ -671,17 +773,14 @@ class OntologySpineRouter:
                         if len(ticker_rows) > selected_by_ticker[ticker]
                     ],
                     "truncation_possible": any(
-                        len(ticker_rows) >= result_limit
-                        for ticker_rows in rows_by_ticker.values()
+                        len(ticker_rows) >= result_limit for ticker_rows in rows_by_ticker.values()
                     ),
                     "shard_diagnostics": shard_diagnostics,
                 },
             }
 
         failed_tickers = sorted(shard_errors)
-        successful_tickers = [
-            ticker for ticker in available_tickers if ticker not in shard_errors
-        ]
+        successful_tickers = [ticker for ticker in available_tickers if ticker not in shard_errors]
         fanout = self._fanout_diagnostics(worker_count, shard_errors)
         routing = self._route_payload("planned_shard_batch", route_tickers)
         routing.update(
@@ -713,9 +812,7 @@ class OntologySpineRouter:
                 bool(payload["diagnostics"].get("truncation_possible"))
                 for payload in by_clause.values()
             ),
-            "timing_ms": {
-                "total": int((time.perf_counter() - started_at) * 1000)
-            },
+            "timing_ms": {"total": int((time.perf_counter() - started_at) * 1000)},
             "fallback_used": False,
             **fanout,
         }
@@ -741,6 +838,10 @@ class OntologySpineRouter:
             explicit_tickers=scoped_tickers,
             limit=candidate_limit,
         )
+        candidate_routing = self._candidate_routing_diagnostics(
+            explicit_tickers=scoped_tickers,
+            candidate_tickers=candidate_tickers,
+        )
         route_tickers = scoped_tickers or candidate_tickers
         contexts: list[dict[str, Any]] = []
 
@@ -753,14 +854,17 @@ class OntologySpineRouter:
             context.setdefault("routing", self._route_payload("company_shard", [candidate]))
             return context
 
-        context_by_ticker, shard_errors, worker_count = self._store_fanout(candidate_tickers, load_context)
+        context_by_ticker, shard_errors, worker_count = self._store_fanout(
+            candidate_tickers, load_context
+        )
         for candidate in candidate_tickers:
             context = context_by_ticker.get(candidate)
             if isinstance(context, Mapping):
-                contexts.append(context)
+                contexts.append(self._project_shard_payload(dict(context), ticker=candidate))
         if len(contexts) == 1:
             payload = contexts[0]
             payload["routing"] = self._route_payload("company_shard", route_tickers)
+            payload["routing"]["candidate_routing"] = candidate_routing
             payload["routing"].update(self._fanout_diagnostics(worker_count, shard_errors))
             payload["routing"].update(
                 _candidate_budget_payload(
@@ -792,6 +896,7 @@ class OntologySpineRouter:
             )
             return payload
         routing = self._route_payload("global_spine_fanout", route_tickers)
+        routing["candidate_routing"] = candidate_routing
         routing.update(self._fanout_diagnostics(worker_count, shard_errors))
         routing.update(
             _candidate_budget_payload(
@@ -844,6 +949,10 @@ class OntologySpineRouter:
             explicit_tickers=requested_tickers,
             limit=max(1, int(limit_groups or 10)),
         )
+        candidate_routing = self._candidate_routing_diagnostics(
+            explicit_tickers=requested_tickers,
+            candidate_tickers=candidate_tickers,
+        )
         route_tickers = requested_tickers or candidate_tickers
         shard_payloads: list[dict[str, Any]] = []
 
@@ -857,13 +966,16 @@ class OntologySpineRouter:
                 **kwargs,
             )
 
-        payload_by_ticker, shard_errors, worker_count = self._store_fanout(candidate_tickers, load_discovery)
+        payload_by_ticker, shard_errors, worker_count = self._store_fanout(
+            candidate_tickers, load_discovery
+        )
         for ticker in candidate_tickers:
             payload = payload_by_ticker.get(ticker)
             if isinstance(payload, Mapping):
-                shard_payloads.append(dict(payload))
+                shard_payloads.append(self._project_shard_payload(dict(payload), ticker=ticker))
         if shard_payloads:
             routing = self._route_payload("global_spine", route_tickers)
+            routing["candidate_routing"] = candidate_routing
             routing.update(self._fanout_diagnostics(worker_count, shard_errors))
             return _merge_discovery_payloads(
                 shard_payloads,
@@ -891,6 +1003,7 @@ class OntologySpineRouter:
             "search_diagnostics": {
                 "routing": {
                     **self._route_payload("global_spine", route_tickers),
+                    "candidate_routing": candidate_routing,
                     **self._fanout_diagnostics(worker_count, shard_errors),
                 },
                 "candidate_tickers": candidate_tickers,
@@ -901,74 +1014,231 @@ class OntologySpineRouter:
             },
         }
 
-    def get_object(self, object_id: str) -> dict[str, Any] | None:
-        ticker = self._ticker_for_object(object_id)
+    def get_object(
+        self,
+        object_id: str,
+        *,
+        ticker: str | None = None,
+    ) -> dict[str, Any] | None:
+        ticker = self._ticker_for_object(object_id, preferred_ticker=ticker)
         if ticker is None:
             return None
         if ticker in self._missing_shard_paths:
             return None
-        return self._store_for_ticker(ticker).get_object(object_id)
+        local_object_key = self._local_object_key(object_id, ticker=ticker)
+        if local_object_key is None:
+            return None
+        payload = self._store_for_ticker(ticker).get_object(local_object_key)
+        if not isinstance(payload, Mapping):
+            return None
+        return self._project_shard_payload(dict(payload), ticker=ticker)
 
-    def find_object_ids(self, prefix: str, *, limit: int = 20) -> list[dict[str, Any]]:
-        rows = self.conn.execute(
+    def find_object_ids(
+        self,
+        prefix: str,
+        *,
+        ticker: str | None = None,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        candidate_prefix = str(prefix or "").strip()
+        if not candidate_prefix:
+            return []
+        prefix_upper_bound = _prefix_upper_bound(candidate_prefix)
+        if prefix_upper_bound is None:
+            return []
+        preferred_ticker = str(ticker or "").strip().upper()
+        resolved_limit = max(1, int(limit))
+        ticker_scope_sql = ""
+        locator_params: list[Any] = [candidate_prefix, prefix_upper_bound]
+        if preferred_ticker:
+            ticker_scope_sql = """
+                  AND EXISTS (
+                        SELECT 1
+                        FROM global_object_replica AS replica
+                        WHERE replica.object_id = locator.object_id
+                          AND replica.ticker = ?
+                  )
             """
-            SELECT object_id AS id, ticker, object_type AS type, compact_label AS label,
-                   compact_summary AS text
-            FROM global_object_locator
-            WHERE object_id LIKE ?
-            ORDER BY object_id
-            LIMIT ?
-            """,
-            (f"{prefix}%", max(1, int(limit))),
-        ).fetchall()
-        return [dict(row) for row in rows]
+            locator_params.append(preferred_ticker)
+        locator_params.append(resolved_limit)
+        object_ids = {
+            str(row["object_id"])
+            for row in self.conn.execute(
+                f"""
+                SELECT locator.object_id
+                FROM global_object_locator AS locator
+                WHERE locator.object_id >= ?
+                  AND locator.object_id < ?
+                  {ticker_scope_sql}
+                ORDER BY locator.object_id
+                LIMIT ?
+                """,
+                locator_params,
+            ).fetchall()
+        }
 
-    def trace(self, object_id: str) -> dict[str, Any] | None:
-        ticker = self._ticker_for_object(object_id)
+        lookup_tickers = (
+            [preferred_ticker]
+            if preferred_ticker
+            else sorted(
+                set(self._declared_shard_paths)
+                | set(self._shard_paths)
+                | set(self._missing_shard_paths)
+            )
+        )
+        for lookup_ticker in lookup_tickers:
+            local_rows = self.conn.execute(
+                """
+                SELECT object_id
+                FROM global_object_replica
+                WHERE ticker = ?
+                  AND local_object_key >= ?
+                  AND local_object_key < ?
+                ORDER BY local_object_key, object_id
+                LIMIT ?
+                """,
+                (
+                    lookup_ticker,
+                    candidate_prefix,
+                    prefix_upper_bound,
+                    resolved_limit,
+                ),
+            ).fetchall()
+            object_ids.update(str(row["object_id"]) for row in local_rows)
+
+        selected_ids = sorted(object_ids)[:resolved_limit]
+        if not selected_ids:
+            return []
+        placeholders = ",".join("?" for _ in selected_ids)
+        rows = self.conn.execute(
+            f"""
+            SELECT object_id AS id, ticker, object_type AS type,
+                   compact_label AS label, compact_summary AS text,
+                   occurrence_count
+            FROM global_object_locator
+            WHERE object_id IN ({placeholders})
+            ORDER BY object_id
+            """,
+            selected_ids,
+        ).fetchall()
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            result = dict(row)
+            locator = self._object_locator_payload(
+                str(row["id"]),
+                preferred_ticker or None,
+            )
+            result["ticker"] = locator.get("ticker") or result.get("ticker")
+            result["replica_preview_tickers"] = list(
+                dict.fromkeys(
+                    str(item.get("ticker") or "")
+                    for item in locator.get("replica_locations") or []
+                    if item.get("ticker")
+                )
+            )
+            result["replica_locations_truncated"] = bool(locator.get("replica_locations_truncated"))
+            results.append(result)
+        return results
+
+    def trace(
+        self,
+        object_id: str,
+        *,
+        ticker: str | None = None,
+    ) -> dict[str, Any] | None:
+        if not str(ticker or "").strip():
+            ticker_candidates = self._object_ticker_candidates(object_id, limit=2)
+            if len(ticker_candidates) > 1:
+                return self._ambiguous_object_ticker_payload(
+                    object_id,
+                    operation="trace",
+                )
+        ticker = self._ticker_for_object(object_id, preferred_ticker=ticker)
         if ticker is None:
             return None
-        locator = self._object_locator_payload(object_id, ticker)
+        index_object_id = self._index_object_id(object_id, ticker=ticker)
+        if index_object_id is None:
+            return None
+        locator = self._object_locator_payload(index_object_id, ticker)
         if ticker in self._missing_shard_paths:
             payload = self._missing_shard_payload(ticker, operation="trace")
-            payload["object_id"] = object_id
+            payload["object_id"] = index_object_id
             payload["object_locator"] = locator
             return payload
-        payload = self._store_for_ticker(ticker).trace(object_id)
+        local_object_key = self._local_object_key(index_object_id, ticker=ticker)
+        if local_object_key is None:
+            return None
+        payload = self._store_for_ticker(ticker).trace(local_object_key)
         if payload is not None:
+            payload = self._project_shard_payload(payload, ticker=ticker)
             payload.setdefault("routing", self._route_payload("object_locator", [ticker]))
             payload.setdefault("object_locator", locator)
         return payload
 
-    def chain(self, object_id: str, **kwargs: Any) -> dict[str, Any] | None:
-        ticker = self._ticker_for_object(object_id)
+    def chain(
+        self,
+        object_id: str,
+        *,
+        ticker: str | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any] | None:
+        if not str(ticker or "").strip():
+            ticker_candidates = self._object_ticker_candidates(object_id, limit=2)
+            if len(ticker_candidates) > 1:
+                return self._ambiguous_object_ticker_payload(
+                    object_id,
+                    operation="chain",
+                )
+        ticker = self._ticker_for_object(object_id, preferred_ticker=ticker)
         if ticker is None:
             return None
-        locator = self._object_locator_payload(object_id, ticker)
+        index_object_id = self._index_object_id(object_id, ticker=ticker)
+        if index_object_id is None:
+            return None
+        locator = self._object_locator_payload(index_object_id, ticker)
         if ticker in self._missing_shard_paths:
             payload = self._missing_shard_payload(ticker, operation="chain")
-            payload["object_id"] = object_id
+            payload["object_id"] = index_object_id
             payload["object_locator"] = locator
             return payload
-        chain = self._store_for_ticker(ticker).chain(object_id, **kwargs)
+        local_object_key = self._local_object_key(index_object_id, ticker=ticker)
+        if local_object_key is None:
+            return None
+        chain = self._store_for_ticker(ticker).chain(local_object_key, **kwargs)
         if chain is None:
             return None
+        chain = self._project_shard_payload(chain, ticker=ticker)
         max_depth = max(
             0,
             min(int(kwargs.get("max_depth", 2)), _GLOBAL_CHAIN_MAX_DEPTH),
         )
         direction = _normalize_global_chain_direction(str(kwargs.get("direction") or "both"))
-        chain["global_spine_neighbors"] = self._chain_neighbors(object_id)
+        chain["global_spine_neighbors"] = self._chain_neighbors(
+            index_object_id,
+            ticker=ticker,
+        )
         chain["global_chain"] = self._global_chain_paths(
-            object_id,
+            index_object_id,
             max_depth=max_depth,
             direction=direction,
+            root_locator=locator,
         )
         chain["routing"] = self._route_payload("object_locator", [ticker])
         chain["object_locator"] = locator
         return chain
 
     def bundle(self, object_id: str) -> dict[str, Any]:
-        return self._store_for_object_id(object_id).bundle(object_id)
+        ticker = self._ticker_for_object(object_id)
+        if ticker is None:
+            raise KeyError(f"object not found or ambiguous in global locator: {object_id}")
+        index_object_id = self._index_object_id(object_id, ticker=ticker)
+        if index_object_id is None:
+            raise KeyError(f"object location missing in global locator: {object_id}")
+        local_object_key = self._local_object_key(index_object_id, ticker=ticker)
+        if local_object_key is None:
+            raise KeyError(f"object location missing in global locator: {object_id}")
+        payload = self._store_for_ticker(ticker).bundle(local_object_key)
+        return self._project_shard_payload(payload, ticker=ticker)
 
     def compare(self, *, tickers: Iterable[str], **kwargs: Any) -> dict[str, Any]:
         return self._fanout_compare(tickers=tickers, compact=False, **kwargs)
@@ -995,7 +1265,10 @@ class OntologySpineRouter:
                     },
                     "routing": payload["routing"],
                 }
-            payload = self._store_for_ticker(ticker).quality(ticker=ticker, **kwargs)
+            payload = self._project_shard_payload(
+                self._store_for_ticker(ticker).quality(ticker=ticker, **kwargs),
+                ticker=str(ticker).upper(),
+            )
             payload["routing"] = self._route_payload("company_shard", [ticker.upper()])
             return payload
         documents = self.list_documents()
@@ -1004,12 +1277,18 @@ class OntologySpineRouter:
         def load_quality(shard_ticker: str, store: OntologyStore) -> dict[str, Any]:
             return store.quality(ticker=shard_ticker, **kwargs)
 
-        quality_by_ticker, shard_errors, worker_count = self._store_fanout(sorted(self._shard_paths), load_quality)
+        quality_by_ticker, shard_errors, worker_count = self._store_fanout(
+            sorted(self._shard_paths), load_quality
+        )
         for shard_ticker in sorted(self._shard_paths):
             shard_quality = quality_by_ticker.get(shard_ticker)
             if not isinstance(shard_quality, Mapping):
                 continue
-            events.extend(shard_quality.get("events") or [])
+            projected_quality = self._project_shard_payload(
+                dict(shard_quality),
+                ticker=shard_ticker,
+            )
+            events.extend(projected_quality.get("events") or [])
         routing = self._route_payload("quality_release_scan", self.list_companies())
         routing.update(self._fanout_diagnostics(worker_count, shard_errors))
         return {
@@ -1018,9 +1297,15 @@ class OntologySpineRouter:
             "summary": {
                 "documents": len(documents),
                 "events": len(events),
-                "rejected_objects": sum(1 for event in events if event.get("category") == "rejected_object"),
-                "batch_failures": sum(1 for event in events if event.get("category") == "batch_failure"),
-                "section_warnings": sum(1 for event in events if event.get("category") == "section_quality"),
+                "rejected_objects": sum(
+                    1 for event in events if event.get("category") == "rejected_object"
+                ),
+                "batch_failures": sum(
+                    1 for event in events if event.get("category") == "batch_failure"
+                ),
+                "section_warnings": sum(
+                    1 for event in events if event.get("category") == "section_quality"
+                ),
                 "missing_company_shards": len(self._missing_shard_paths),
                 "missing_shards": {
                     ticker: str(path) for ticker, path in sorted(self._missing_shard_paths.items())
@@ -1081,12 +1366,16 @@ class OntologySpineRouter:
                 return ticker, callback(ticker, store)
 
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
-            future_to_ticker = {executor.submit(run, ticker): ticker for ticker in available_tickers}
+            future_to_ticker = {
+                executor.submit(run, ticker): ticker for ticker in available_tickers
+            }
             for future in as_completed(future_to_ticker):
                 ticker = future_to_ticker[future]
                 try:
                     result_ticker, payload = future.result()
-                except Exception as exc:  # pragma: no cover - exercised through integration failures
+                except (
+                    Exception
+                ) as exc:  # pragma: no cover - exercised through integration failures
                     errors[ticker] = _fanout_error(exc)
                     continue
                 results[result_ticker] = payload
@@ -1101,39 +1390,59 @@ class OntologySpineRouter:
             payload["shard_errors"] = dict(sorted(errors.items()))
         return payload
 
-    def _fanout_query(self, *, compact: bool, **kwargs: Any) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    def _fanout_query(
+        self, *, compact: bool, **kwargs: Any
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         explicit_tickers = _normalize_tickers(kwargs.get("tickers"))
         topic = str(kwargs.get("topic") or kwargs.get("question") or "")
         limit = max(1, int(kwargs.get("limit") or 20))
-        candidate_tickers = self._candidate_tickers(topic, explicit_tickers=explicit_tickers, limit=min(limit, 10))
+        candidate_tickers = self._candidate_tickers(
+            topic, explicit_tickers=explicit_tickers, limit=min(limit, 10)
+        )
+        candidate_routing = self._candidate_routing_diagnostics(
+            explicit_tickers=explicit_tickers,
+            candidate_tickers=candidate_tickers,
+        )
         route_tickers = explicit_tickers or candidate_tickers
         results: list[dict[str, Any]] = []
         shard_diagnostics: dict[str, Any] = {}
         primary_diagnostics: dict[str, Any] = {}
 
         def load_query(ticker: str, store: OntologyStore) -> dict[str, Any]:
-            ticker_kwargs = {**kwargs, "tickers": [ticker], "limit": limit}
+            ticker_kwargs = {**kwargs, "tickers": None, "limit": limit}
             if compact:
                 rows, diagnostics = store.query_compact_with_diagnostics(**ticker_kwargs)
             else:
                 rows, diagnostics = store.query_with_diagnostics(**ticker_kwargs)
             return {"rows": list(rows), "diagnostics": diagnostics}
 
-        query_by_ticker, shard_errors, worker_count = self._store_fanout(candidate_tickers, load_query)
+        query_by_ticker, shard_errors, worker_count = self._store_fanout(
+            candidate_tickers, load_query
+        )
         for ticker in candidate_tickers:
             payload = query_by_ticker.get(ticker)
             if not isinstance(payload, Mapping):
                 continue
             rows = list(payload.get("rows") or [])
-            diagnostics = payload.get("diagnostics") if isinstance(payload.get("diagnostics"), Mapping) else {}
+            diagnostics = (
+                payload.get("diagnostics")
+                if isinstance(payload.get("diagnostics"), Mapping)
+                else {}
+            )
+            diagnostics = self._project_shard_payload(dict(diagnostics), ticker=ticker)
             shard_diagnostics[ticker] = diagnostics
             if not primary_diagnostics and isinstance(diagnostics, Mapping):
                 primary_diagnostics = dict(diagnostics)
-            results.extend(rows)
+            results.extend(
+                self._project_shard_payload(row, ticker=ticker)
+                for row in rows
+                if isinstance(row, Mapping)
+            )
             if len(results) >= limit:
                 break
         fanout_diagnostics = self._fanout_diagnostics(worker_count, shard_errors)
         routing = self._route_payload("global_spine_fanout", route_tickers)
+        routing["candidate_routing"] = candidate_routing
         routing.update(fanout_diagnostics)
         diagnostics = dict(primary_diagnostics)
         diagnostics.update(
@@ -1149,7 +1458,9 @@ class OntologySpineRouter:
         )
         return results[:limit], diagnostics
 
-    def _fanout_compare(self, *, tickers: Iterable[str], compact: bool, **kwargs: Any) -> dict[str, Any]:
+    def _fanout_compare(
+        self, *, tickers: Iterable[str], compact: bool, **kwargs: Any
+    ) -> dict[str, Any]:
         ticker_list = _normalize_tickers(tickers) or []
         results: dict[str, list[dict[str, Any]]] = {}
         evaluations: dict[str, dict[str, Any]] = {}
@@ -1157,7 +1468,11 @@ class OntologySpineRouter:
         available_tickers: list[str] = []
         for ticker in ticker_list:
             if ticker not in self._shard_paths:
-                reason = "ticker_shard_missing" if ticker in self._missing_shard_paths else "ticker_shard_not_found"
+                reason = (
+                    "ticker_shard_missing"
+                    if ticker in self._missing_shard_paths
+                    else "ticker_shard_not_found"
+                )
                 results[ticker] = []
                 evaluations[ticker] = {
                     "status": "missing",
@@ -1177,7 +1492,9 @@ class OntologySpineRouter:
             compare_fn = store.compare_compact if compact else store.compare
             return compare_fn(tickers=[ticker], **kwargs)
 
-        payload_by_ticker, shard_errors, worker_count = self._store_fanout(available_tickers, load_compare)
+        payload_by_ticker, shard_errors, worker_count = self._store_fanout(
+            available_tickers, load_compare
+        )
         for ticker in available_tickers:
             payload = payload_by_ticker.get(ticker)
             if not isinstance(payload, Mapping):
@@ -1192,9 +1509,19 @@ class OntologySpineRouter:
                     "routing": self._route_payload("compare_fanout", [ticker]),
                 }
                 continue
-            results[ticker] = list((payload.get("results") or {}).get(ticker) or [])
-            evaluations[ticker] = dict((payload.get("comparison_evaluations") or {}).get(ticker) or {})
-            contexts[ticker] = dict((payload.get("comparison_contexts") or {}).get(ticker) or {})
+            results[ticker] = [
+                self._project_shard_payload(row, ticker=ticker)
+                for row in (payload.get("results") or {}).get(ticker) or []
+                if isinstance(row, Mapping)
+            ]
+            evaluations[ticker] = self._project_shard_payload(
+                dict((payload.get("comparison_evaluations") or {}).get(ticker) or {}),
+                ticker=ticker,
+            )
+            contexts[ticker] = self._project_shard_payload(
+                dict((payload.get("comparison_contexts") or {}).get(ticker) or {}),
+                ticker=ticker,
+            )
             contexts[ticker].setdefault("routing", self._route_payload("company_shard", [ticker]))
         fanout_diagnostics = self._fanout_diagnostics(worker_count, shard_errors)
         routing = self._route_payload("compare_fanout", ticker_list)
@@ -1225,202 +1552,63 @@ class OntologySpineRouter:
         resolved_limit = max(1, int(limit))
         if explicit_tickers:
             return [ticker for ticker in explicit_tickers if ticker in self._shard_paths]
-        ranked_tickers = self._rank_candidate_tickers(question, limit=resolved_limit)
-        if ranked_tickers:
-            return ranked_tickers
-        rows = self.conn.execute(
-            """
-            SELECT ticker, COUNT(*) AS objects
-            FROM global_object_locator
-            GROUP BY ticker
-            ORDER BY objects DESC, ticker
-            LIMIT ?
-            """,
-            (resolved_limit,),
-        ).fetchall()
-        return [str(row["ticker"]).upper() for row in rows if str(row["ticker"]).upper() in self._shard_paths]
+        return self._rank_candidate_tickers(question, limit=resolved_limit)
 
     def _rank_candidate_tickers(self, question: str, *, limit: int) -> list[str]:
-        terms = _like_terms(question)
-        fts_query = _fts_query(question)
-        scores: defaultdict[str, float] = defaultdict(float)
-        row_limit = max(limit * 6, limit)
-        if fts_query:
-            self._add_weighted_rows(
-                scores,
-                """
-                SELECT ticker, COUNT(*) AS score
-                FROM global_search_fts
-                WHERE global_search_fts MATCH ?
-                GROUP BY ticker
-                ORDER BY score DESC, ticker
-                LIMIT ?
-                """,
-                (fts_query, row_limit),
-                weight=10.0,
-            )
-        if terms:
-            self._add_term_table_scores(
-                scores,
-                table="global_topic_spine",
-                columns=(
-                    "topic_key",
-                    "topic_label",
-                    "topic_summary",
-                    "factor_terms",
-                    "metric_terms",
-                    "entity_terms",
-                    "mechanism_terms",
-                    "impact_channels",
-                ),
-                terms=terms,
-                metric_sql="COUNT(*) + COALESCE(MAX(materiality), 0)",
-                weight=5.0,
-                limit=row_limit,
-            )
-            self._add_term_table_scores(
-                scores,
-                table="global_factor_spine",
-                columns=("factor_key", "factor_label", "factor_family", "benchmark", "impact_channel"),
-                terms=terms,
-                metric_sql="COUNT(*) + COALESCE(MAX(materiality), 0)",
-                weight=4.0,
-                limit=row_limit,
-            )
-            self._add_term_table_scores(
-                scores,
-                table="global_metric_spine",
-                columns=("canonical_metric_key", "metric_name", "trend_direction"),
-                terms=terms,
-                metric_sql="COUNT(*) + COALESCE(MAX(confidence), 0)",
-                weight=3.0,
-                limit=row_limit,
-            )
-            self._add_term_table_scores(
-                scores,
-                table="global_entity_spine",
-                columns=("entity_key", "entity_type", "canonical_name", "aliases"),
-                terms=terms,
-                metric_sql="COUNT(*) + COALESCE(MAX(confidence), 0)",
-                weight=2.5,
-                limit=row_limit,
-            )
-            self._add_term_table_scores(
-                scores,
-                table="global_counterparty_spine",
-                columns=("counterparty_key", "counterparty_name", "relationship_type", "agreement_type", "affected_channels"),
-                terms=terms,
-                metric_sql="COUNT(*) + COALESCE(MAX(materiality), 0)",
-                weight=3.0,
-                limit=row_limit,
-            )
-            self._add_chain_scores(scores, terms=terms, limit=row_limit)
-        return [
-            ticker
-            for ticker, _score in sorted(scores.items(), key=lambda item: (-item[1], item[0]))[:limit]
-            if ticker in self._shard_paths
-        ]
-
-    def _add_weighted_rows(
-        self,
-        scores: defaultdict[str, float],
-        sql: str,
-        params: Sequence[Any],
-        *,
-        weight: float,
-    ) -> None:
+        resolved_limit = max(1, int(limit))
+        if not str(question or "").strip() or not self._router_sidecar_path.is_file():
+            return []
         try:
-            rows = self.conn.execute(sql, tuple(params)).fetchall()
-        except sqlite3.Error:
-            return
-        for row in rows:
-            ticker = str(row["ticker"] or "").upper()
-            if ticker not in self._shard_paths:
+            result = self._sidecar().search(question, limit=resolved_limit)
+        except (KeyError, OSError, RuntimeError, TypeError, ValueError, sqlite3.Error):
+            return []
+        ranked: list[str] = []
+        for candidate in result.get("ticker_candidates") or []:
+            if not isinstance(candidate, Mapping):
                 continue
-            try:
-                value = float(row["score"] or 0)
-            except (TypeError, ValueError):
-                value = 0.0
-            scores[ticker] += value * weight
+            ticker = str(candidate.get("ticker") or "").strip().upper()
+            if not ticker or ticker not in self._shard_paths or ticker in ranked:
+                continue
+            ranked.append(ticker)
+            if len(ranked) >= resolved_limit:
+                break
+        return ranked
 
-    def _add_term_table_scores(
+    def _candidate_routing_diagnostics(
         self,
-        scores: defaultdict[str, float],
         *,
-        table: str,
-        columns: Sequence[str],
-        terms: Sequence[str],
-        metric_sql: str,
-        weight: float,
-        limit: int,
-    ) -> None:
-        clauses: list[str] = []
-        params: list[Any] = []
-        for term in terms[:8]:
-            for column in columns:
-                clauses.append(f"{column} LIKE ?")
-                params.append(f"%{term}%")
-        if not clauses:
-            return
-        params.append(max(1, int(limit)))
-        self._add_weighted_rows(
-            scores,
-            f"""
-            SELECT ticker, ({metric_sql}) AS score
-            FROM {table}
-            WHERE {" OR ".join(clauses)}
-            GROUP BY ticker
-            ORDER BY score DESC, ticker
-            LIMIT ?
-            """,
-            params,
-            weight=weight,
-        )
-
-    def _add_chain_scores(
-        self,
-        scores: defaultdict[str, float],
-        *,
-        terms: Sequence[str],
-        limit: int,
-    ) -> None:
-        clauses: list[str] = []
-        params: list[Any] = []
-        for term in terms[:8]:
-            clauses.extend(("shared_key LIKE ?", "shared_key_type LIKE ?", "explanation_template LIKE ?"))
-            params.extend((f"%{term}%", f"%{term}%", f"%{term}%"))
-        if not clauses:
-            return
-        params.append(max(1, int(limit)))
-        try:
-            rows = self.conn.execute(
-                f"""
-                SELECT from_ticker, to_ticker,
-                       SUM(COALESCE(weight, 0) * (1.0 - COALESCE(generic_penalty, 0))) AS score
-                FROM global_chain_index
-                WHERE {" OR ".join(clauses)}
-                GROUP BY from_ticker, to_ticker
-                ORDER BY score DESC, from_ticker, to_ticker
-                LIMIT ?
-                """,
-                params,
-            ).fetchall()
-        except sqlite3.Error:
-            return
-        for row in rows:
-            try:
-                value = max(0.0, float(row["score"] or 0))
-            except (TypeError, ValueError):
-                value = 0.0
-            for raw_ticker in (row["from_ticker"], row["to_ticker"]):
-                ticker = str(raw_ticker or "").upper()
-                if ticker in self._shard_paths:
-                    scores[ticker] += value * 2.0
+        explicit_tickers: Sequence[str] | None,
+        candidate_tickers: Sequence[str],
+    ) -> dict[str, Any]:
+        explicit = bool(explicit_tickers)
+        sidecar_path = self.__dict__.get("_router_sidecar_path")
+        sidecar_available = isinstance(sidecar_path, Path) and sidecar_path.is_file()
+        coherence_path = self.__dict__.get("_router_coherence_path")
+        coherence_available = isinstance(coherence_path, Path) and coherence_path.is_file()
+        status = "resolved" if candidate_tickers else "empty"
+        reason: str | None = None
+        if not explicit and not sidecar_available:
+            reason = "router_sidecar_unavailable"
+        elif not explicit and not candidate_tickers:
+            reason = "router_sidecar_no_candidates"
+        payload: dict[str, Any] = {
+            "source": "explicit_scope" if explicit else "router_sidecar",
+            "status": status,
+            "candidate_count": len(candidate_tickers),
+            "router_sidecar_available": sidecar_available,
+            "router_coherence_available": coherence_available,
+            "fallback_used": False,
+        }
+        if reason:
+            payload["reason"] = reason
+        return payload
 
     def _store_for_ticker(self, ticker: str | None) -> OntologyStore:
         normalized = str(ticker or "").upper()
         if normalized in self._missing_shard_paths:
-            raise FileNotFoundError(f"ticker shard missing: {normalized}: {self._missing_shard_paths[normalized]}")
+            raise FileNotFoundError(
+                f"ticker shard missing: {normalized}: {self._missing_shard_paths[normalized]}"
+            )
         if normalized not in self._shard_paths:
             raise KeyError(f"ticker shard not found: {normalized or '<missing>'}")
         store = self._shards.get(normalized)
@@ -1439,32 +1627,360 @@ class OntologySpineRouter:
             raise KeyError(f"object not found in global locator: {object_id}")
         return self._store_for_ticker(ticker)
 
-    def _ticker_for_object(self, object_id: str) -> str | None:
+    def _ticker_for_object(
+        self,
+        object_id: str,
+        *,
+        preferred_ticker: str | None = None,
+    ) -> str | None:
+        preferred = str(preferred_ticker or "").strip().upper()
+        if preferred:
+            row = self._replica_row_for_object(object_id, ticker=preferred)
+            return str(row["ticker"]).upper() if row else None
+        candidates = self._object_ticker_candidates(object_id, limit=2)
+        return candidates[0] if len(candidates) == 1 else None
+
+    def _index_object_id(self, object_id: str, *, ticker: str) -> str | None:
+        normalized_ticker = str(ticker or "").strip().upper()
+        candidate = str(object_id or "").strip()
+        if not normalized_ticker or not candidate:
+            return None
+        cache_key = (normalized_ticker, candidate)
+        if cache_key in self._local_to_index_id_cache:
+            return self._local_to_index_id_cache[cache_key]
+        row = self._replica_row_for_object(candidate, ticker=normalized_ticker)
+        projected = str(row["object_id"]) if row is not None else None
+        self._remember_object_id_projection(cache_key, projected)
+        if row is not None:
+            local_key = str(row["local_object_key"] or "").strip()
+            if local_key:
+                self._remember_object_id_projection((normalized_ticker, local_key), projected)
+        return projected
+
+    def _remember_object_id_projection(
+        self,
+        key: tuple[str, str],
+        value: str | None,
+    ) -> None:
+        self._local_to_index_id_cache[key] = value
+        self._local_to_index_id_cache.move_to_end(key)
+        while len(self._local_to_index_id_cache) > _OBJECT_ID_PROJECTION_CACHE_MAX:
+            self._local_to_index_id_cache.popitem(last=False)
+
+    def _local_object_key(self, object_id: str, *, ticker: str) -> str | None:
+        row = self._replica_row_for_object(object_id, ticker=str(ticker).upper())
+        if row is None:
+            return None
+        return str(row["local_object_key"] or object_id)
+
+    def _replica_row_for_object(
+        self,
+        object_id: str,
+        *,
+        ticker: str,
+    ) -> sqlite3.Row | None:
+        normalized_ticker = str(ticker or "").strip().upper()
+        candidate = str(object_id or "").strip()
+        if not normalized_ticker or not candidate:
+            return None
         row = self.conn.execute(
-            "SELECT ticker FROM global_object_locator WHERE object_id = ?",
-            (object_id,),
+            """
+            SELECT object_id, ticker, local_object_key
+            FROM global_object_replica
+            WHERE object_id = ? AND ticker = ?
+            ORDER BY document_id, document_type, period, shard_id, shard_path
+            LIMIT 1
+            """,
+            (candidate, normalized_ticker),
         ).fetchone()
-        return str(row["ticker"]).upper() if row else None
+        if row is not None:
+            return row
+        return self.conn.execute(
+            """
+            SELECT object_id, ticker, local_object_key
+            FROM global_object_replica
+            WHERE ticker = ? AND local_object_key = ?
+            ORDER BY document_id, document_type, period, shard_id, shard_path
+            LIMIT 1
+            """,
+            (normalized_ticker, candidate),
+        ).fetchone()
+
+    def _object_ticker_candidates(
+        self,
+        object_id: str,
+        *,
+        limit: int = _OBJECT_REPLICA_PREVIEW_LIMIT + 1,
+    ) -> list[str]:
+        candidate = str(object_id or "").strip()
+        if not candidate:
+            return []
+        resolved_limit = max(1, int(limit))
+        rows = self.conn.execute(
+            """
+            SELECT DISTINCT ticker
+            FROM global_object_replica
+            WHERE object_id = ?
+            ORDER BY ticker
+            LIMIT ?
+            """,
+            (candidate, resolved_limit),
+        ).fetchall()
+        tickers = {str(row["ticker"]).upper() for row in rows}
+        if len(tickers) < resolved_limit:
+            lookup_tickers = sorted(
+                set(self._declared_shard_paths)
+                | set(self._shard_paths)
+                | set(self._missing_shard_paths)
+            )
+            for lookup_ticker in lookup_tickers:
+                row = self.conn.execute(
+                    """
+                    SELECT 1
+                    FROM global_object_replica
+                    WHERE ticker = ? AND local_object_key = ?
+                    LIMIT 1
+                    """,
+                    (lookup_ticker, candidate),
+                ).fetchone()
+                if row is not None:
+                    tickers.add(lookup_ticker)
+                    if len(tickers) >= resolved_limit:
+                        break
+        return sorted(tickers)[:resolved_limit]
+
+    def _object_id_projection_map(
+        self,
+        local_object_keys: Iterable[str],
+        *,
+        ticker: str,
+    ) -> dict[str, str]:
+        normalized_ticker = str(ticker or "").strip().upper()
+        candidates = sorted(
+            {str(value).strip() for value in local_object_keys if str(value or "").strip()}
+        )
+        if not normalized_ticker or not candidates:
+            return {}
+        resolved = {
+            value: projected
+            for value in candidates
+            if (projected := self._local_to_index_id_cache.get((normalized_ticker, value)))
+            is not None
+        }
+        missing = [
+            value
+            for value in candidates
+            if (normalized_ticker, value) not in self._local_to_index_id_cache
+        ]
+        for offset in range(0, len(missing), _OBJECT_ID_LOOKUP_CHUNK_SIZE):
+            chunk = missing[offset : offset + _OBJECT_ID_LOOKUP_CHUNK_SIZE]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = self.conn.execute(
+                f"""
+                SELECT local_object_key, object_id
+                FROM global_object_replica
+                WHERE ticker = ?
+                  AND local_object_key IN ({placeholders})
+                """,
+                [normalized_ticker, *chunk],
+            ).fetchall()
+            found: set[str] = set()
+            for row in rows:
+                local_key = str(row["local_object_key"] or "").strip()
+                if not local_key:
+                    continue
+                projected = str(row["object_id"])
+                found.add(local_key)
+                resolved[local_key] = projected
+                self._remember_object_id_projection((normalized_ticker, local_key), projected)
+                self._remember_object_id_projection((normalized_ticker, projected), projected)
+            for value in chunk:
+                if value not in found:
+                    self._remember_object_id_projection((normalized_ticker, value), None)
+        return resolved
+
+    def _project_shard_payload(self, payload: Any, *, ticker: str) -> Any:
+        normalized_ticker = str(ticker or "").strip().upper()
+        candidates: set[str] = set()
+
+        def collect(value: Any, field: str | None = None) -> None:
+            if isinstance(value, Mapping):
+                for key, item in value.items():
+                    key_text = str(key)
+                    if _is_object_id_scalar_field(key_text) and isinstance(item, str):
+                        candidates.add(item)
+                    elif _is_object_id_list_field(key_text) and isinstance(item, (list, tuple)):
+                        candidates.update(entry for entry in item if isinstance(entry, str))
+                    collect(item, key_text)
+                return
+            if isinstance(value, (list, tuple)):
+                for item in value:
+                    collect(item, field)
+
+        collect(payload)
+        projection = self._object_id_projection_map(candidates, ticker=ticker)
+
+        def rewrite(value: Any, field: str | None = None) -> Any:
+            if isinstance(value, Mapping):
+                rewritten: dict[Any, Any] = {}
+                replaced_id: str | None = None
+                for key, item in value.items():
+                    key_text = str(key)
+                    if _is_object_id_scalar_field(key_text) and isinstance(item, str):
+                        projected = projection.get(item, item)
+                        rewritten[key] = projected
+                        if key_text == "id" and projected != item:
+                            replaced_id = item
+                    elif (
+                        key_text.casefold() in _OCCURRENCE_TICKER_FIELDS
+                        and isinstance(item, str)
+                        and normalized_ticker
+                    ):
+                        rewritten[key] = effective_ticker(item, fallback=normalized_ticker)
+                    elif _is_object_id_list_field(key_text) and isinstance(item, (list, tuple)):
+                        rewritten[key] = [
+                            projection.get(entry, entry)
+                            if isinstance(entry, str)
+                            else rewrite(entry)
+                            for entry in item
+                        ]
+                    else:
+                        rewritten[key] = rewrite(item, key_text)
+                if replaced_id is not None and "local_object_key" not in rewritten:
+                    rewritten["local_object_key"] = replaced_id
+                return rewritten
+            if isinstance(value, list):
+                return [rewrite(item, field) for item in value]
+            if isinstance(value, tuple):
+                return tuple(rewrite(item, field) for item in value)
+            return value
+
+        return rewrite(payload)
+
+    def _ambiguous_object_ticker_payload(
+        self,
+        object_id: str,
+        *,
+        operation: str,
+    ) -> dict[str, Any]:
+        ticker_candidates = self._object_ticker_candidates(object_id)
+        ticker_candidate_count = int(
+            self.conn.execute(
+                """
+                SELECT COUNT(DISTINCT ticker)
+                FROM global_object_replica
+                WHERE object_id = ? OR local_object_key = ?
+                """,
+                (object_id, object_id),
+            ).fetchone()[0]
+        )
+        locator = self._object_locator_payload(
+            object_id,
+            ticker_candidates[0] if ticker_candidates else None,
+        )
+        for key in (
+            "ticker",
+            "company_name",
+            "document_id",
+            "document_type",
+            "period",
+            "filing_date",
+            "shard_id",
+            "shard_path",
+            "local_object_key",
+            "object_hash",
+            "quality_status",
+            "resolved_shard_path",
+        ):
+            locator[key] = None
+        locator.update(
+            {
+                "location_selection": "ambiguous",
+                "shard_available": False,
+                "shard_missing": False,
+            }
+        )
+        return {
+            "error": {
+                "code": "ambiguous_object_ticker",
+                "message": (f"Object id has occurrences in multiple ticker shards: {object_id}"),
+                "suggestion": (
+                    f"Pass one ticker from ticker_candidates to krw_ontology_{operation}."
+                ),
+                "details": {
+                    "object_id": object_id,
+                    "operation": operation,
+                    "ticker_candidate_count": ticker_candidate_count,
+                },
+            },
+            "object_id": object_id,
+            "ticker_candidates": ticker_candidates[:_OBJECT_REPLICA_PREVIEW_LIMIT],
+            "ticker_candidates_truncated": ticker_candidate_count > _OBJECT_REPLICA_PREVIEW_LIMIT,
+            "object_locator": locator,
+            "fallback_used": False,
+        }
 
     def _object_locator_payload(self, object_id: str, ticker: str | None = None) -> dict[str, Any]:
         row = self.conn.execute(
             """
             SELECT object_id, ticker, company_name, document_id, document_type, period,
                    filing_date, object_type, shard_id, shard_path, local_object_key,
-                   object_hash, compact_label, compact_summary, quality_status
+                   object_hash, semantic_hash, compact_label, compact_summary,
+                   quality_status, occurrence_count
             FROM global_object_locator
             WHERE object_id = ?
             """,
             (object_id,),
         ).fetchone()
-        normalized = str(ticker or (row["ticker"] if row else "") or "").upper()
+        canonical = dict(row) if row else {}
+        canonical_ticker = str(canonical.get("ticker") or "").upper()
+        normalized = str(ticker or canonical_ticker or "").upper()
+        replica_rows = self.conn.execute(
+            """
+            SELECT replica.object_id, replica.ticker, catalog.company_name,
+                   replica.document_id, replica.document_type, replica.period,
+                   catalog.filing_date, replica.object_type, replica.shard_id,
+                   replica.shard_path, replica.local_object_key, replica.object_hash,
+                   replica.semantic_hash, replica.quality_status
+            FROM global_object_replica AS replica
+            LEFT JOIN global_document_catalog AS catalog
+              ON catalog.document_id = replica.document_id
+            WHERE replica.object_id = ?
+            ORDER BY CASE WHEN replica.ticker = ? THEN 0 ELSE 1 END,
+                     replica.ticker, replica.document_id, replica.document_type,
+                     replica.period, replica.shard_id, replica.shard_path
+            LIMIT ?
+            """,
+            (object_id, normalized, _OBJECT_REPLICA_PREVIEW_LIMIT + 1),
+        ).fetchall()
+        replica_locations = [
+            _clean_replica_location(dict(replica_row))
+            for replica_row in replica_rows[:_OBJECT_REPLICA_PREVIEW_LIMIT]
+        ]
+        selected_location = next(
+            (
+                location
+                for location in replica_locations
+                if str(location.get("ticker") or "").upper() == normalized
+            ),
+            None,
+        )
+        if selected_location is not None:
+            normalized = str(selected_location.get("ticker") or normalized).upper()
         declared_path = self._declared_shard_paths.get(normalized)
         available_path = self._shard_paths.get(normalized)
         missing_path = self._missing_shard_paths.get(normalized)
-        payload = dict(row) if row else {"object_id": object_id, "ticker": normalized}
+        payload = canonical or {"object_id": object_id, "ticker": normalized}
+        if selected_location is not None:
+            payload.update(selected_location)
         payload.update(
             {
                 "ticker": normalized,
+                "canonical_ticker": canonical_ticker or None,
+                "location_selection": "requested_ticker" if ticker else "canonical",
+                "semantic_shared": int(canonical.get("occurrence_count") or 0) > 1,
+                "replica_locations": replica_locations,
+                "replica_locations_truncated": len(replica_rows) > _OBJECT_REPLICA_PREVIEW_LIMIT,
                 "resolved_shard_path": str(available_path or declared_path or missing_path or ""),
                 "shard_available": normalized in self._shard_paths,
                 "shard_missing": normalized in self._missing_shard_paths,
@@ -1473,12 +1989,18 @@ class OntologySpineRouter:
         )
         return payload
 
-    def _topic_rows_for_ticker(self, ticker: str, *, question: str | None, limit: int) -> list[dict[str, Any]]:
+    def _topic_rows_for_ticker(
+        self, ticker: str, *, question: str | None, limit: int
+    ) -> list[dict[str, Any]]:
         params: list[Any] = [ticker]
         match_sql = ""
         terms = _like_terms(question or "")
         if terms:
-            match_sql = "AND (" + " OR ".join("topic_label LIKE ? OR topic_summary LIKE ?" for _ in terms) + ")"
+            match_sql = (
+                "AND ("
+                + " OR ".join("topic_label LIKE ? OR topic_summary LIKE ?" for _ in terms)
+                + ")"
+            )
             params.extend(value for term in terms for value in (f"%{term}%", f"%{term}%"))
         params.append(max(1, int(limit)))
         rows = self.conn.execute(
@@ -1507,7 +2029,12 @@ class OntologySpineRouter:
             for row in rows
         ]
 
-    def _chain_neighbors(self, object_id: str) -> list[dict[str, Any]]:
+    def _chain_neighbors(
+        self,
+        object_id: str,
+        *,
+        ticker: str,
+    ) -> list[dict[str, Any]]:
         rows: dict[str, dict[str, Any]] = {}
         sql = """
             SELECT link_id, link_type, from_ticker, to_ticker, shared_key,
@@ -1515,12 +2042,21 @@ class OntologySpineRouter:
                    confidence, evidence_grade, materiality, generic_penalty,
                    recency_score, explanation_template
             FROM global_chain_index
-            WHERE {column} = ?
+            WHERE {object_column} = ? AND {ticker_column} = ?
             ORDER BY COALESCE(weight, 0) DESC, link_id
             LIMIT 20
         """
-        for column in ("from_object_id", "to_object_id"):
-            for row in self.conn.execute(sql.format(column=column), (object_id,)).fetchall():
+        for object_column, ticker_column in (
+            ("from_object_id", "from_ticker"),
+            ("to_object_id", "to_ticker"),
+        ):
+            for row in self.conn.execute(
+                sql.format(
+                    object_column=object_column,
+                    ticker_column=ticker_column,
+                ),
+                (object_id, ticker),
+            ).fetchall():
                 payload = dict(row)
                 payload["semantic_role"] = (
                     "routing_only_similarity"
@@ -1540,6 +2076,7 @@ class OntologySpineRouter:
         *,
         max_depth: int,
         direction: str,
+        root_locator: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Traverse local ontology edges and exact cross-company associations.
 
@@ -1548,11 +2085,17 @@ class OntologySpineRouter:
         from evidence paths because lexical similarity is not proof of a
         relationship or causal mechanism.
         """
-        root = self._global_locator_compact(object_id)
+        root = (
+            dict(root_locator)
+            if root_locator is not None
+            else self._global_locator_compact(object_id)
+        )
+        root_ticker = str((root or {}).get("ticker") or "").upper()
         if root is None or max_depth <= 0:
             return {
-                "algorithm": "bounded_best_first/v1",
+                "algorithm": "bounded_best_first_occurrence/v2",
                 "root_object_id": object_id,
+                "root_ticker": root_ticker or None,
                 "max_depth": max_depth,
                 "direction": direction,
                 "paths": [],
@@ -1565,13 +2108,34 @@ class OntologySpineRouter:
                 "similarity_links_in_evidence_paths": False,
             }
 
-        frontier: list[tuple[float, int, int, str, list[dict[str, Any]], frozenset[str], tuple[str, ...]]] = []
+        root_key = (root_ticker, object_id)
+        frontier: list[
+            tuple[
+                float,
+                int,
+                int,
+                str,
+                str,
+                list[dict[str, Any]],
+                frozenset[tuple[str, str]],
+                tuple[str, ...],
+            ]
+        ] = []
         sequence = 0
         heapq.heappush(
             frontier,
-            (-1.0, 0, sequence, object_id, [], frozenset({object_id}), (str(root.get("ticker") or ""),)),
+            (
+                -1.0,
+                0,
+                sequence,
+                root_ticker,
+                object_id,
+                [],
+                frozenset({root_key}),
+                (root_ticker,),
+            ),
         )
-        locator_cache: dict[str, dict[str, Any]] = {object_id: root}
+        locator_cache: dict[tuple[str, str], dict[str, Any]] = {root_key: root}
         paths: list[dict[str, Any]] = []
         expanded_states = 0
 
@@ -1580,12 +2144,22 @@ class OntologySpineRouter:
             and len(paths) < _GLOBAL_CHAIN_MAX_PATHS
             and expanded_states < _GLOBAL_CHAIN_MAX_EXPANSIONS
         ):
-            negative_score, depth, _order, current_id, steps, seen_ids, tickers = heapq.heappop(frontier)
+            (
+                negative_score,
+                depth,
+                _order,
+                current_ticker,
+                current_id,
+                steps,
+                seen_nodes,
+                tickers,
+            ) = heapq.heappop(frontier)
             score = -negative_score
             if steps:
                 paths.append(
                     _global_chain_path_payload(
                         object_id,
+                        root_ticker=root_ticker,
                         steps=steps,
                         score=score,
                         tickers=tickers,
@@ -1593,30 +2167,36 @@ class OntologySpineRouter:
                 )
             if depth >= max_depth:
                 continue
-            current_locator = locator_cache.get(current_id)
+            current_key = (current_ticker, current_id)
+            current_locator = locator_cache.get(current_key)
             if current_locator is None:
-                current_locator = self._global_locator_compact(current_id)
+                current_locator = self._global_locator_compact(
+                    current_id,
+                    ticker=current_ticker,
+                )
                 if current_locator is None:
                     continue
-                locator_cache[current_id] = current_locator
+                locator_cache[current_key] = current_locator
             expanded_states += 1
             for neighbor in self._global_graph_neighbors(
                 current_id,
+                ticker=current_ticker,
                 current_locator=current_locator,
                 direction=direction,
             ):
                 neighbor_id = str(neighbor["neighbor_object_id"])
-                if neighbor_id in seen_ids:
+                neighbor_ticker = str(neighbor["neighbor_ticker"]).upper()
+                neighbor_key = (neighbor_ticker, neighbor_id)
+                if neighbor_key in seen_nodes:
                     continue
                 locator = dict(neighbor["object_locator"])
                 if str(locator.get("quality_status") or "").lower() == "rejected":
                     continue
-                locator_cache[neighbor_id] = locator
+                locator_cache[neighbor_key] = locator
                 step = dict(neighbor["step"])
                 next_steps = [*steps, step]
                 next_score = score * float(neighbor["step_score"])
-                next_ticker = str(locator.get("ticker") or "")
-                next_tickers = (*tickers, next_ticker)
+                next_tickers = (*tickers, neighbor_ticker)
                 sequence += 1
                 heapq.heappush(
                     frontier,
@@ -1624,9 +2204,10 @@ class OntologySpineRouter:
                         -next_score,
                         depth + 1,
                         sequence,
+                        neighbor_ticker,
                         neighbor_id,
                         next_steps,
-                        seen_ids | {neighbor_id},
+                        seen_nodes | {neighbor_key},
                         next_tickers,
                     ),
                 )
@@ -1636,8 +2217,9 @@ class OntologySpineRouter:
 
         truncated = bool(frontier) or expanded_states >= _GLOBAL_CHAIN_MAX_EXPANSIONS
         return {
-            "algorithm": "bounded_best_first/v1",
+            "algorithm": "bounded_best_first_occurrence/v2",
             "root_object_id": object_id,
+            "root_ticker": root_ticker,
             "max_depth": max_depth,
             "direction": direction,
             "paths": paths,
@@ -1660,7 +2242,8 @@ class OntologySpineRouter:
                 "cross_company_links_are_associations_not_causal_edges": True,
                 "similar_topic_links_are_routing_only": True,
                 "rejected_objects_excluded": True,
-                "cycles_excluded_per_path": True,
+                "cycles_excluded_per_occurrence_path": True,
+                "node_identity": "ticker+object_id",
             },
         }
 
@@ -1668,6 +2251,7 @@ class OntologySpineRouter:
         self,
         object_id: str,
         *,
+        ticker: str,
         current_locator: Mapping[str, Any],
         direction: str,
     ) -> list[dict[str, Any]]:
@@ -1676,6 +2260,7 @@ class OntologySpineRouter:
             neighbors.extend(
                 self._global_edge_neighbor_rows(
                     object_id,
+                    ticker=ticker,
                     current_locator=current_locator,
                     outgoing=True,
                 )
@@ -1684,6 +2269,7 @@ class OntologySpineRouter:
             neighbors.extend(
                 self._global_edge_neighbor_rows(
                     object_id,
+                    ticker=ticker,
                     current_locator=current_locator,
                     outgoing=False,
                 )
@@ -1693,15 +2279,17 @@ class OntologySpineRouter:
         neighbors.extend(
             self._global_association_neighbor_rows(
                 object_id,
+                ticker=ticker,
                 current_locator=current_locator,
             )
         )
-        deduplicated: dict[tuple[str, str, str], dict[str, Any]] = {}
+        deduplicated: dict[tuple[str, str, str, str], dict[str, Any]] = {}
         for neighbor in neighbors:
             step = neighbor["step"]
             key = (
                 str(step.get("kind") or ""),
                 str(step.get("connection_id") or ""),
+                str(neighbor.get("neighbor_ticker") or ""),
                 str(neighbor.get("neighbor_object_id") or ""),
             )
             previous = deduplicated.get(key)
@@ -1712,6 +2300,7 @@ class OntologySpineRouter:
             key=lambda row: (
                 -float(row["step_score"]),
                 str(row["step"].get("connection_id") or ""),
+                str(row["neighbor_ticker"]),
                 str(row["neighbor_object_id"]),
             ),
         )[:_GLOBAL_CHAIN_NEIGHBORS_PER_NODE]
@@ -1720,40 +2309,50 @@ class OntologySpineRouter:
         self,
         object_id: str,
         *,
+        ticker: str,
         current_locator: Mapping[str, Any],
         outgoing: bool,
     ) -> list[dict[str, Any]]:
         source_column, target_column = (
-            ("from_object_id", "to_object_id")
-            if outgoing
-            else ("to_object_id", "from_object_id")
+            ("from_object_id", "to_object_id") if outgoing else ("to_object_id", "from_object_id")
         )
         rows = self.conn.execute(
             f"""
-            SELECT edge.edge_id, edge.from_object_id, edge.to_object_id,
-                   edge.from_ticker, edge.to_ticker, edge.relation_type,
+            SELECT replica.edge_id, replica.from_object_id, replica.to_object_id,
+                   replica.ticker AS edge_occurrence_ticker,
+                   replica.relation_type,
                    edge.edge_scope, edge.source_object_type, edge.target_object_type,
-                   edge.confidence, edge.evidence_grade, edge.materiality,
+                   replica.confidence, replica.evidence_grade, edge.materiality,
                    edge.recency_score, edge.shard_hint, edge.compact_reason,
                    locator.object_id AS neighbor_object_id,
-                   locator.ticker AS neighbor_ticker,
-                   locator.document_id AS neighbor_document_id,
-                   locator.document_type AS neighbor_document_type,
-                   locator.period AS neighbor_period,
-                   locator.filing_date AS neighbor_filing_date,
+                   neighbor.ticker AS neighbor_ticker,
+                   neighbor.document_id AS neighbor_document_id,
+                   neighbor.document_type AS neighbor_document_type,
+                   neighbor.period AS neighbor_period,
+                   catalog.filing_date AS neighbor_filing_date,
                    locator.object_type AS neighbor_object_type,
                    locator.compact_label AS neighbor_label,
                    locator.compact_summary AS neighbor_summary,
-                   locator.quality_status AS neighbor_quality_status
-            FROM global_edge_spine AS edge
+                   COALESCE(neighbor.quality_status, locator.quality_status)
+                       AS neighbor_quality_status
+            FROM global_edge_replica AS replica
+            JOIN global_edge_spine AS edge
+              ON edge.edge_id = replica.edge_id
+            JOIN global_object_replica AS neighbor
+              ON neighbor.object_id = replica.{target_column}
+             AND neighbor.ticker = replica.ticker
             JOIN global_object_locator AS locator
-              ON locator.object_id = edge.{target_column}
-            WHERE edge.{source_column} = ?
-            ORDER BY COALESCE(edge.confidence, 0.5) DESC,
-                     edge.relation_type, edge.edge_id
+              ON locator.object_id = neighbor.object_id
+            LEFT JOIN global_document_catalog AS catalog
+              ON catalog.document_id = neighbor.document_id
+            WHERE replica.ticker = ?
+              AND replica.{source_column} = ?
+            ORDER BY COALESCE(replica.confidence, 0.5) DESC,
+                     replica.relation_type, replica.edge_id,
+                     neighbor.document_id, neighbor.period
             LIMIT ?
             """,
-            (object_id, _GLOBAL_CHAIN_NEIGHBORS_PER_NODE),
+            (ticker, object_id, _GLOBAL_CHAIN_NEIGHBORS_PER_NODE),
         ).fetchall()
         results: list[dict[str, Any]] = []
         for row in rows:
@@ -1763,6 +2362,7 @@ class OntologySpineRouter:
             results.append(
                 {
                     "neighbor_object_id": row["neighbor_object_id"],
+                    "neighbor_ticker": row["neighbor_ticker"],
                     "object_locator": locator,
                     "step_score": step_score,
                     "step": {
@@ -1772,6 +2372,9 @@ class OntologySpineRouter:
                         "relation_type": row["relation_type"],
                         "from_object_id": row["from_object_id"],
                         "to_object_id": row["to_object_id"],
+                        "from_ticker": ticker,
+                        "to_ticker": ticker,
+                        "edge_occurrence_ticker": row["edge_occurrence_ticker"],
                         "confidence": row["confidence"],
                         "evidence_grade": row["evidence_grade"],
                         "materiality": row["materiality"],
@@ -1791,6 +2394,7 @@ class OntologySpineRouter:
         self,
         object_id: str,
         *,
+        ticker: str,
         current_locator: Mapping[str, Any],
     ) -> list[dict[str, Any]]:
         sql = """
@@ -1800,35 +2404,65 @@ class OntologySpineRouter:
                    link.evidence_grade, link.materiality, link.generic_penalty,
                    link.recency_score, link.explanation_template,
                    locator.object_id AS neighbor_object_id,
-                   locator.ticker AS neighbor_ticker,
-                   locator.document_id AS neighbor_document_id,
-                   locator.document_type AS neighbor_document_type,
-                   locator.period AS neighbor_period,
-                   locator.filing_date AS neighbor_filing_date,
+                   neighbor.ticker AS neighbor_ticker,
+                   neighbor.document_id AS neighbor_document_id,
+                   neighbor.document_type AS neighbor_document_type,
+                   neighbor.period AS neighbor_period,
+                   catalog.filing_date AS neighbor_filing_date,
                    locator.object_type AS neighbor_object_type,
                    locator.compact_label AS neighbor_label,
                    locator.compact_summary AS neighbor_summary,
-                   locator.quality_status AS neighbor_quality_status
+                   COALESCE(neighbor.quality_status, locator.quality_status)
+                       AS neighbor_quality_status
             FROM global_chain_index AS link
+            JOIN global_object_replica AS neighbor
+              ON neighbor.object_id = link.{target_object_column}
+             AND neighbor.ticker = link.{target_ticker_column}
             JOIN global_object_locator AS locator
-              ON locator.object_id = link.{target_column}
-            WHERE link.{source_column} = ?
+              ON locator.object_id = neighbor.object_id
+            LEFT JOIN global_document_catalog AS catalog
+              ON catalog.document_id = neighbor.document_id
+            WHERE link.{source_object_column} = ?
+              AND link.{source_ticker_column} = ?
               AND link.link_type != 'similar_topic'
               AND COALESCE(link.generic_penalty, 0) < 0.8
             ORDER BY COALESCE(link.weight, 0) DESC, link.link_id
             LIMIT ?
         """
         rows: list[tuple[sqlite3.Row, str]] = []
-        for source_column, target_column, direction in (
-            ("from_object_id", "to_object_id", "undirected_from"),
-            ("to_object_id", "from_object_id", "undirected_to"),
+        for (
+            source_object_column,
+            source_ticker_column,
+            target_object_column,
+            target_ticker_column,
+            direction,
+        ) in (
+            (
+                "from_object_id",
+                "from_ticker",
+                "to_object_id",
+                "to_ticker",
+                "undirected_from",
+            ),
+            (
+                "to_object_id",
+                "to_ticker",
+                "from_object_id",
+                "from_ticker",
+                "undirected_to",
+            ),
         ):
-            query = sql.format(source_column=source_column, target_column=target_column)
+            query = sql.format(
+                source_object_column=source_object_column,
+                source_ticker_column=source_ticker_column,
+                target_object_column=target_object_column,
+                target_ticker_column=target_ticker_column,
+            )
             rows.extend(
                 (row, direction)
                 for row in self.conn.execute(
                     query,
-                    (object_id, _GLOBAL_CHAIN_NEIGHBORS_PER_NODE),
+                    (object_id, ticker, _GLOBAL_CHAIN_NEIGHBORS_PER_NODE),
                 ).fetchall()
             )
         results: list[dict[str, Any]] = []
@@ -1839,6 +2473,7 @@ class OntologySpineRouter:
             results.append(
                 {
                     "neighbor_object_id": row["neighbor_object_id"],
+                    "neighbor_ticker": row["neighbor_ticker"],
                     "object_locator": locator,
                     "step_score": step_score,
                     "step": {
@@ -1850,6 +2485,8 @@ class OntologySpineRouter:
                         "shared_key": row["shared_key"],
                         "from_object_id": row["from_object_id"],
                         "to_object_id": row["to_object_id"],
+                        "from_ticker": row["from_ticker"],
+                        "to_ticker": row["to_ticker"],
                         "weight": row["weight"],
                         "confidence": row["confidence"],
                         "evidence_grade": row["evidence_grade"],
@@ -1867,16 +2504,44 @@ class OntologySpineRouter:
             )
         return results
 
-    def _global_locator_compact(self, object_id: str) -> dict[str, Any] | None:
+    def _global_locator_compact(
+        self,
+        object_id: str,
+        *,
+        ticker: str | None = None,
+    ) -> dict[str, Any] | None:
+        normalized_ticker = str(ticker or "").strip().upper()
+        if not normalized_ticker:
+            row = self.conn.execute(
+                """
+                SELECT object_id, ticker, document_id, document_type, period,
+                       filing_date, object_type, compact_label, compact_summary,
+                       quality_status
+                FROM global_object_locator
+                WHERE object_id = ?
+                """,
+                (object_id,),
+            ).fetchone()
+            return dict(row) if row else None
         row = self.conn.execute(
             """
-            SELECT object_id, ticker, document_id, document_type, period,
-                   filing_date, object_type, compact_label, compact_summary,
-                   quality_status
-            FROM global_object_locator
-            WHERE object_id = ?
+            SELECT locator.object_id, replica.ticker, replica.document_id,
+                   replica.document_type, replica.period, catalog.filing_date,
+                   locator.object_type, locator.compact_label,
+                   locator.compact_summary,
+                   COALESCE(replica.quality_status, locator.quality_status)
+                       AS quality_status
+            FROM global_object_replica AS replica
+            JOIN global_object_locator AS locator
+              ON locator.object_id = replica.object_id
+            LEFT JOIN global_document_catalog AS catalog
+              ON catalog.document_id = replica.document_id
+            WHERE replica.object_id = ? AND replica.ticker = ?
+            ORDER BY replica.document_id, replica.document_type, replica.period,
+                     replica.shard_id, replica.shard_path
+            LIMIT 1
             """,
-            (object_id,),
+            (object_id, normalized_ticker),
         ).fetchone()
         return dict(row) if row else None
 
@@ -1894,8 +2559,10 @@ class OntologySpineRouter:
     def _global_serving_counts(self) -> dict[str, int]:
         tables = (
             "global_object_locator",
+            "global_object_replica",
             "global_document_catalog",
             "global_edge_spine",
+            "global_edge_replica",
             "global_factor_spine",
             "global_topic_spine",
             "global_metric_spine",
@@ -1916,7 +2583,9 @@ class OntologySpineRouter:
 
     def _quality_summary(self) -> dict[str, Any]:
         documents = self.list_documents()
-        statuses = Counter(str(document.get("section_quality_status") or "unknown") for document in documents)
+        statuses = Counter(
+            str(document.get("section_quality_status") or "unknown") for document in documents
+        )
         return {
             "document_quality_status": dict(statuses),
             "critical_errors": 0,
@@ -2014,7 +2683,9 @@ class OntologySpineRouter:
             "routing": self._route_payload("company_shard_missing", [normalized]),
         }
 
-    def _attach_missing_release_parts(self, payload: dict[str, Any], tickers: Iterable[str] | None) -> None:
+    def _attach_missing_release_parts(
+        self, payload: dict[str, Any], tickers: Iterable[str] | None
+    ) -> None:
         normalized = _normalize_tickers(tickers) or []
         missing_shards = self._missing_shards_for_tickers(tickers)
         unknown_tickers = self._unknown_tickers(tickers)
@@ -2056,7 +2727,9 @@ class OntologySpineRouter:
             payload["agent_autonomy"] = autonomy
             payload["partial_answerability"] = {
                 "available_tickers": available_tickers,
-                "missing_tickers": [ticker for ticker in normalized if ticker not in available_tickers],
+                "missing_tickers": [
+                    ticker for ticker in normalized if ticker not in available_tickers
+                ],
                 "instruction": (
                     "Answer using available tickers only, state missing tickers briefly, "
                     "and do not treat one missing shard as a failure for the whole basket."
@@ -2178,7 +2851,9 @@ def _attach_spine_cross_company_pack(
                 "period": document.get("period"),
                 "document_type": document.get("document_type"),
                 "current_driver": document,
-                "annual_baseline": annual_baseline if isinstance(annual_baseline, Mapping) else None,
+                "annual_baseline": annual_baseline
+                if isinstance(annual_baseline, Mapping)
+                else None,
                 "signal": "filing_commentary",
                 "evidence_strength": "medium",
                 "commentary_summary": (
@@ -2396,6 +3071,11 @@ def _locator_from_global_chain_row(row: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _clean_replica_location(row: Mapping[str, Any]) -> dict[str, Any]:
+    """Return bounded public provenance for one semantic-object occurrence."""
+    return {str(key): (None if value == "" else value) for key, value in row.items()}
+
+
 def _global_temporal_alignment(
     left: Mapping[str, Any],
     right: Mapping[str, Any],
@@ -2439,12 +3119,9 @@ def _global_edge_step_score(row: Mapping[str, Any], *, temporal_score: float) ->
     evidence = _evidence_grade_score(row.get("evidence_grade"))
     materiality = _bounded_score(row.get("materiality"), default=0.5)
     recency = _bounded_score(row.get("recency_score"), default=temporal_score)
-    score = (
-        0.42 * confidence
-        + 0.28 * evidence
-        + 0.15 * materiality
-        + 0.15 * recency
-    ) * (0.9 + 0.1 * temporal_score)
+    score = (0.42 * confidence + 0.28 * evidence + 0.15 * materiality + 0.15 * recency) * (
+        0.9 + 0.1 * temporal_score
+    )
     return round(max(0.05, min(score, 1.0)), 6)
 
 
@@ -2457,11 +3134,7 @@ def _global_association_step_score(
     confidence = _bounded_score(row.get("confidence"), default=0.55)
     evidence = _evidence_grade_score(row.get("evidence_grade"))
     generic_penalty = _bounded_score(row.get("generic_penalty"), default=0.0)
-    score = (
-        0.55 * weight
-        + 0.25 * confidence
-        + 0.20 * evidence
-    )
+    score = 0.55 * weight + 0.25 * confidence + 0.20 * evidence
     score *= 1.0 - (0.5 * generic_penalty)
     score *= temporal_score
     score *= 0.88  # Associations rank below equally strong ontology edges.
@@ -2498,18 +3171,29 @@ def _evidence_grade_score(value: Any) -> float:
 def _global_chain_path_payload(
     root_object_id: str,
     *,
+    root_ticker: str,
     steps: Sequence[Mapping[str, Any]],
     score: float,
     tickers: Sequence[str],
 ) -> dict[str, Any]:
-    connection_ids = [str(step.get("connection_id") or "") for step in steps]
+    connection_ids = [
+        "|".join(
+            (
+                str(step.get("connection_id") or ""),
+                str(step.get("from_ticker") or ""),
+                str(step.get("from_object_id") or ""),
+                str(step.get("to_ticker") or ""),
+                str(step.get("to_object_id") or ""),
+            )
+        )
+        for step in steps
+    ]
     terminal = dict(steps[-1].get("object") or {}) if steps else {}
-    encoded = "|".join([root_object_id, *connection_ids]).encode("utf-8")
-    cross_company_hops = sum(
-        1 for step in steps if step.get("kind") == "cross_company_association"
-    )
+    encoded = "|".join([root_ticker, root_object_id, *connection_ids]).encode("utf-8")
+    cross_company_hops = sum(1 for step in steps if step.get("kind") == "cross_company_association")
     return {
         "path_id": f"chain:{hashlib.sha256(encoded).hexdigest()[:24]}",
+        "root_occurrence": {"ticker": root_ticker, "object_id": root_object_id},
         "score": round(float(score), 6),
         "depth": len(steps),
         "cross_company_hops": cross_company_hops,
@@ -2553,10 +3237,7 @@ def _read_int_env(name: str, default: int, *, min_value: int) -> int:
 
 def _score_summary(candidates: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     scores = sorted(
-        (
-            max(0.0, float(candidate.get("score") or 0.0))
-            for candidate in candidates
-        ),
+        (max(0.0, float(candidate.get("score") or 0.0)) for candidate in candidates),
         reverse=True,
     )
     total = sum(scores)
@@ -2565,8 +3246,7 @@ def _score_summary(candidates: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         probabilities = [score / total for score in scores if score > 0]
         if len(probabilities) > 1:
             entropy = -sum(
-                probability * math.log(probability)
-                for probability in probabilities
+                probability * math.log(probability) for probability in probabilities
             ) / math.log(len(probabilities))
     top_score = scores[0] if scores else 0.0
     return {
@@ -2609,11 +3289,6 @@ def _candidate_budget_payload(
 def _fanout_error(exc: Exception) -> str:
     message = str(exc)
     return f"{type(exc).__name__}:{message}" if message else type(exc).__name__
-
-
-def _fts_query(text: str) -> str:
-    terms = _like_terms(text)
-    return " OR ".join(terms[:8])
 
 
 def _like_terms(text: str) -> list[str]:

@@ -157,7 +157,7 @@ def test_extract_evidence_quotes_uses_candidate_text(tmp_path):
     )
 
     class FakeWorker:
-        async def extract(self, prompt_template, input_data, output_schema, stage_name):
+        async def extract(self, prompt_template, input_data, output_schema, stage_name, **_kwargs):
             return [
                 {
                     "candidate_id": "span:AAPL:FY2025:10K:item1a:0001:cand:001",
@@ -240,7 +240,7 @@ def test_extract_evidence_quotes_writes_span_eligibility_audit(tmp_path):
         def __init__(self):
             self.candidate_counts = []
 
-        async def extract(self, prompt_template, input_data, output_schema, stage_name):
+        async def extract(self, prompt_template, input_data, output_schema, stage_name, **_kwargs):
             candidates = json.loads(input_data["candidates_json"])
             self.candidate_counts.append(len(candidates))
             return [
@@ -303,7 +303,7 @@ def test_extract_evidence_quotes_splits_failed_batch(tmp_path):
         def __init__(self):
             self.calls = []
 
-        async def extract(self, prompt_template, input_data, output_schema, stage_name):
+        async def extract(self, prompt_template, input_data, output_schema, stage_name, **_kwargs):
             candidates = json.loads(input_data["candidates_json"])
             self.calls.append(len(candidates))
             if len(candidates) > 1:
@@ -366,7 +366,7 @@ def test_extract_evidence_quotes_does_not_split_rate_limited_batch(tmp_path):
         def __init__(self):
             self.calls = []
 
-        async def extract(self, prompt_template, input_data, output_schema, stage_name):
+        async def extract(self, prompt_template, input_data, output_schema, stage_name, **_kwargs):
             candidates = json.loads(input_data["candidates_json"])
             self.calls.append(len(candidates))
             raise RateLimitError("HTTP 429 too many requests")
@@ -400,7 +400,7 @@ def test_extract_evidence_quotes_does_not_split_rate_limited_batch(tmp_path):
         def __init__(self):
             self.calls = []
 
-        async def extract(self, prompt_template, input_data, output_schema, stage_name):
+        async def extract(self, prompt_template, input_data, output_schema, stage_name, **_kwargs):
             candidates = json.loads(input_data["candidates_json"])
             self.calls.append(len(candidates))
             return [

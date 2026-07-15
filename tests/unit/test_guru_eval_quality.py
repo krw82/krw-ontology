@@ -7,6 +7,7 @@ from typer.testing import CliRunner
 
 from krw_ontology.cli.main import app
 from krw_ontology.guru.eval_quality import (
+    evaluate_guru_quality_gate,
     evaluate_guru_answer_contract,
     run_guru_answer_eval,
     run_guru_answer_eval_batch,
@@ -46,10 +47,69 @@ def test_run_guru_quality_eval_scores_research_pack_and_writes_report(tmp_path: 
     assert report["cases"] == 1
     assert report["passed"] == 1
     assert report["failed"] == 0
+    assert report["pass_ratio"] == 1.0
+    assert report["latency"]["sample_count"] == 1
+    assert report["case_results"][0]["elapsed_ms"] >= 0
     assert report["case_results"][0]["selected_lens_labels"] == ["좋은 사업과 좋은 투자의 구분"]
     assert Path(report["output_path"]).exists()
     written_report = json.loads(Path(report["output_path"]).read_text(encoding="utf-8"))
     assert written_report["output_path"] == report["output_path"]
+
+
+def test_guru_quality_gate_compares_quality_latency_and_baseline() -> None:
+    report = {
+        "cases": 30,
+        "pass_ratio": 1.0,
+        "mean_score": 0.95,
+        "latency": {"cold_ms": 100.0, "warm_p95_ms": 20.0},
+    }
+    budget = {
+        "require_baseline": True,
+        "min_cases": 30,
+        "min_pass_ratio": 1.0,
+        "min_mean_score": 0.9,
+        "max_cold_ms": 200.0,
+        "max_warm_p95_ms": 30.0,
+        "max_mean_score_drop": 0.0,
+        "max_warm_p95_regression_ratio": 1.25,
+    }
+    baseline = {
+        "mean_score": 0.95,
+        "latency": {"warm_p95_ms": 18.0},
+    }
+
+    gate = evaluate_guru_quality_gate(report=report, budget=budget, baseline=baseline)
+
+    assert gate["passed"] is True
+    assert gate["failures"] == []
+
+
+def test_guru_quality_gate_rejects_missing_baseline_and_regressions() -> None:
+    gate = evaluate_guru_quality_gate(
+        report={
+            "cases": 10,
+            "pass_ratio": 0.8,
+            "mean_score": 0.75,
+            "latency": {"cold_ms": 500.0, "warm_p95_ms": 100.0},
+        },
+        budget={
+            "require_baseline": True,
+            "min_cases": 30,
+            "min_pass_ratio": 1.0,
+            "min_mean_score": 0.9,
+            "max_warm_p95_ms": 50.0,
+        },
+        baseline=None,
+    )
+
+    assert gate["passed"] is False
+    assert {failure["name"] for failure in gate["failures"]} == {
+        "accepted_baseline_present",
+        "cases",
+        "mean_score",
+        "pass_ratio",
+        "warm_p95_ms",
+    }
 
 
 def test_run_guru_quality_eval_checks_company_bridge_text(monkeypatch, tmp_path: Path):

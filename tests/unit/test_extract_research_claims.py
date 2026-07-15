@@ -40,7 +40,7 @@ def test_extract_research_claims_splits_failed_batch(tmp_path: Path):
         def __init__(self):
             self.calls = []
 
-        async def extract(self, prompt_template, input_data, output_schema, stage_name):
+        async def extract(self, prompt_template, input_data, output_schema, stage_name, **_kwargs):
             spans = json.loads(input_data["spans_json"])
             quotes = json.loads(input_data["quotes_json"])
             assert "natural_gas_price" in input_data["factor_taxonomy_list"]
@@ -99,7 +99,7 @@ def test_extract_research_claims_does_not_split_rate_limited_batch(tmp_path: Pat
         def __init__(self):
             self.calls = []
 
-        async def extract(self, prompt_template, input_data, output_schema, stage_name):
+        async def extract(self, prompt_template, input_data, output_schema, stage_name, **_kwargs):
             quotes = json.loads(input_data["quotes_json"])
             self.calls.append(len(quotes))
             raise RateLimitError("HTTP 429 too many requests")
@@ -135,7 +135,7 @@ def test_extract_research_claims_records_leaf_failure(tmp_path: Path):
     write_jsonl(tmp_path / "evidence_quotes.jsonl", [_quote(0)])
 
     class FakeWorker:
-        async def extract(self, prompt_template, input_data, output_schema, stage_name):
+        async def extract(self, prompt_template, input_data, output_schema, stage_name, **_kwargs):
             raise TimeoutError("still too large")
 
     with pytest.raises(PipelineStageError):
@@ -160,7 +160,7 @@ def test_extract_research_claims_rejects_unknown_quote_alias(tmp_path: Path):
     write_jsonl(tmp_path / "evidence_quotes.jsonl", [_quote(0)])
 
     class FakeWorker:
-        async def extract(self, prompt_template, input_data, output_schema, stage_name):
+        async def extract(self, prompt_template, input_data, output_schema, stage_name, **_kwargs):
             quotes = json.loads(input_data["quotes_json"])
             assert quotes[0]["id"] == "q1"
             return [
@@ -196,7 +196,7 @@ def test_extract_research_claims_skips_spans_without_quotes(tmp_path: Path):
     write_jsonl(tmp_path / "evidence_quotes.jsonl", [])
 
     class FakeWorker:
-        async def extract(self, prompt_template, input_data, output_schema, stage_name):
+        async def extract(self, prompt_template, input_data, output_schema, stage_name, **_kwargs):
             raise AssertionError("claim extraction should be quote-first")
 
     claims = asyncio.run(
@@ -218,7 +218,7 @@ def test_extract_research_claims_rejects_span_reference(tmp_path: Path):
     write_jsonl(tmp_path / "evidence_quotes.jsonl", [_quote(0)])
 
     class FakeWorker:
-        async def extract(self, prompt_template, input_data, output_schema, stage_name):
+        async def extract(self, prompt_template, input_data, output_schema, stage_name, **_kwargs):
             quotes = json.loads(input_data["quotes_json"])
             assert quotes[0]["id"] == "q1"
             return [
@@ -279,7 +279,7 @@ def test_extract_research_claims_ignores_legacy_span_cache(tmp_path: Path):
     )
 
     class FakeWorker:
-        async def extract(self, prompt_template, input_data, output_schema, stage_name):
+        async def extract(self, prompt_template, input_data, output_schema, stage_name, **_kwargs):
             quotes = json.loads(input_data["quotes_json"])
             return [
                 {

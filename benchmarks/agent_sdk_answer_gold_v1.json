@@ -1,0 +1,38 @@
+{
+  "format": "krw-ontology-agent-sdk-answer-gold/v1",
+  "contract": "raw-korean-user-question-to-plugin-grounded-answer",
+  "source_release": {
+    "release_id": "20260711_121636",
+    "source_manifest_hash": "sha256:61846e490ade39983384a10a48c250b4fcffe6696deea05c6192da0409c3c22e"
+  },
+  "cases": [
+    {
+      "id": "agent_answer_ko_aapl_app_store",
+      "user_question_ko": "앱스토어 관행에 대한 규제와 법적 변경이 판매량과 매출을 줄일 위험이 큰 회사는 어디야? 공시 근거와 투자자가 볼 핵심을 설명해줘.",
+      "expected_tickers": ["AAPL"],
+      "expected_company_aliases": ["Apple", "애플"],
+      "review_focus": ["규제 또는 법적 변경", "App Store", "판매 또는 매출 영향", "불확실성 표현"]
+    },
+    {
+      "id": "agent_answer_ko_nvda_taiwan",
+      "user_question_ko": "대만과 중국의 지정학적 긴장이 핵심 반도체 제조와 매출에 미치는 위험을 공시한 회사를 찾아서, 위험 경로를 쉽게 설명해줘.",
+      "expected_tickers": ["NVDA"],
+      "expected_company_aliases": ["NVIDIA", "엔비디아"],
+      "review_focus": ["대만 또는 중국", "반도체 제조", "매출 위험 경로", "공시와 해석 구분"]
+    },
+    {
+      "id": "agent_answer_ko_wmt_edlc",
+      "user_question_ko": "비용을 통제해 절감액을 고객에게 돌려주는 everyday low cost 전략을 쓰는 회사는 어디야? 이 전략이 투자자에게 왜 중요한지도 설명해줘.",
+      "expected_tickers": ["WMT"],
+      "expected_company_aliases": ["Walmart", "월마트"],
+      "review_focus": ["비용 통제", "고객 절감", "everyday low cost", "투자자 의미"]
+    },
+    {
+      "id": "agent_answer_ko_jpm_rates",
+      "user_question_ko": "금리 상승으로 상업용 및 주거용 부동산 대출 수요가 감소할 위험을 공시한 은행은 어디야? 직접 공시된 내용과 해석을 구분해서 답해줘.",
+      "expected_tickers": ["JPM"],
+      "expected_company_aliases": ["JPMorgan", "JP Morgan", "제이피모건", "JP모건"],
+      "review_focus": ["금리 상승", "상업용 및 주거용 부동산", "대출 수요", "직접 근거와 해석 구분"]
+    }
+  ]
+}

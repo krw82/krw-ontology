@@ -18,7 +18,7 @@ import sqlite3
 import hashlib
 import sys
 import time
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from concurrent.futures.process import BrokenProcessPool
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
@@ -27,6 +27,12 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+from krw_ontology.agent_index.cache_seal import (
+    immutable_sqlite_cache_seal_path,
+    read_immutable_sqlite_cache_seal,
+    remove_immutable_sqlite_cache_seal,
+    write_immutable_sqlite_cache_seal,
+)
 from krw_ontology.config.constants import normalize_doc_type
 from krw_ontology.schema.objects import SCHEMA_VERSION
 from krw_ontology.agent_index.metric_dictionary import (
@@ -339,9 +345,29 @@ TEXT_KEYS_BY_TYPE = {
     ),
     "MetricObservation": ("metric_name", "unit", "source_type", "normalization", "dimensions"),
     "Calculation": ("calculation_type", "formula", "calculation_method", "validation_status"),
-    "BusinessFactor": ("name", "description", "factor_roles", "category", "affected_channels", "materiality_basis"),
-    "AgreementTerm": ("name", "agreement_type", "agreement_subtype", "economic_role", "affected_channels"),
-    "BusinessEvent": ("name", "event_type", "event_subtype", "event_status", "date_expression", "affected_channels"),
+    "BusinessFactor": (
+        "name",
+        "description",
+        "factor_roles",
+        "category",
+        "affected_channels",
+        "materiality_basis",
+    ),
+    "AgreementTerm": (
+        "name",
+        "agreement_type",
+        "agreement_subtype",
+        "economic_role",
+        "affected_channels",
+    ),
+    "BusinessEvent": (
+        "name",
+        "event_type",
+        "event_subtype",
+        "event_status",
+        "date_expression",
+        "affected_channels",
+    ),
     "BusinessActivity": (
         "name",
         "activity_type",
@@ -488,7 +514,12 @@ def _default_progress_log_path(index_path: Path | None = None) -> str:
 
 
 def _build_resource_settings(index_path: Path | None = None) -> dict[str, Any]:
-    profile = str(os.getenv("KRW_BUILD_RESOURCE_PROFILE") or DEFAULT_BUILD_RESOURCE_PROFILE).strip().lower() or DEFAULT_BUILD_RESOURCE_PROFILE
+    profile = (
+        str(os.getenv("KRW_BUILD_RESOURCE_PROFILE") or DEFAULT_BUILD_RESOURCE_PROFILE)
+        .strip()
+        .lower()
+        or DEFAULT_BUILD_RESOURCE_PROFILE
+    )
     default_cache_mib = max(1, DEFAULT_SQLITE_CACHE_SIZE_KIB // 1024)
     default_mmap_gib = DEFAULT_SQLITE_MMAP_SIZE_BYTES / float(1024**3)
     default_batch_size = DEFAULT_BULK_INSERT_CHUNK_SIZE
@@ -526,13 +557,18 @@ def _build_resource_settings(index_path: Path | None = None) -> dict[str, Any]:
             default_checkpoint_every_artifacts,
             min_value=0,
         ),
-        "progress_log_path": os.getenv("KRW_BUILD_PROGRESS_LOG") or _default_progress_log_path(index_path),
+        "progress_log_path": os.getenv("KRW_BUILD_PROGRESS_LOG")
+        or _default_progress_log_path(index_path),
         "progress_log_interval_sec": _env_float("KRW_BUILD_LOG_INTERVAL_SEC", 10.0, min_value=0.0),
     }
 
 
 def _apply_build_resource_settings(settings: Mapping[str, Any]) -> None:
-    global BULK_INSERT_CHUNK_SIZE, COMPANY_TOPIC_BATCH_SIZE, SQLITE_CACHE_SIZE_KIB, SQLITE_MMAP_SIZE_BYTES
+    global \
+        BULK_INSERT_CHUNK_SIZE, \
+        COMPANY_TOPIC_BATCH_SIZE, \
+        SQLITE_CACHE_SIZE_KIB, \
+        SQLITE_MMAP_SIZE_BYTES
     BULK_INSERT_CHUNK_SIZE = int(settings["bulk_insert_chunk_size"])
     COMPANY_TOPIC_BATCH_SIZE = int(settings["company_topic_batch_size"])
     SQLITE_CACHE_SIZE_KIB = int(settings["sqlite_cache_size_kib"])
@@ -593,9 +629,15 @@ class _BuildProgressLogger:
             "pid": os.getpid(),
             "elapsed_sec": round(now - self.started_at, 3),
             "rss_mb": _rss_mb(),
-            "db_size_mb": round(self.index_path.stat().st_size / 1024 / 1024, 1) if self.index_path.exists() else 0.0,
-            "wal_size_mb": round(wal_path.stat().st_size / 1024 / 1024, 1) if wal_path.exists() else 0.0,
-            "shm_size_mb": round(shm_path.stat().st_size / 1024 / 1024, 1) if shm_path.exists() else 0.0,
+            "db_size_mb": round(self.index_path.stat().st_size / 1024 / 1024, 1)
+            if self.index_path.exists()
+            else 0.0,
+            "wal_size_mb": round(wal_path.stat().st_size / 1024 / 1024, 1)
+            if wal_path.exists()
+            else 0.0,
+            "shm_size_mb": round(shm_path.stat().st_size / 1024 / 1024, 1)
+            if shm_path.exists()
+            else 0.0,
             "resource_profile": self.settings.get("resource_profile"),
             "sqlite_synchronous": self.settings.get("sqlite_synchronous"),
             "sqlite_cache_mib": self.settings.get("sqlite_cache_mib"),
@@ -737,7 +779,11 @@ def _path_points_at_active_release(path: Path) -> bool:
             continue
         current = env_root / "current"
         try:
-            if current.is_symlink() and candidate.exists() and candidate.resolve() == current.resolve():
+            if (
+                current.is_symlink()
+                and candidate.exists()
+                and candidate.resolve() == current.resolve()
+            ):
                 return True
         except OSError:
             pass
@@ -753,7 +799,11 @@ def _sqlite_sidecar_paths(index_path: Path) -> tuple[Path, Path]:
 
 
 def _cleanup_sqlite_database_files(index_path: Path) -> None:
-    for path in (index_path, *_sqlite_sidecar_paths(index_path)):
+    for path in (
+        index_path,
+        *_sqlite_sidecar_paths(index_path),
+        immutable_sqlite_cache_seal_path(index_path),
+    ):
         try:
             path.unlink()
         except FileNotFoundError:
@@ -768,10 +818,11 @@ def _replace_sqlite_database(source_path: Path, target_path: Path) -> None:
             sidecar_path.unlink()
         except FileNotFoundError:
             pass
+    remove_immutable_sqlite_cache_seal(target_path)
     os.replace(source_path, target_path)
 
 
-def verify_agent_index(index_path: Path) -> dict[str, Any]:
+def verify_agent_index(index_path: Path, *, trust_seal: bool = True) -> dict[str, Any]:
     """Return verification metadata for a built agent SQLite index."""
     errors: list[str] = []
     required_tables = {
@@ -804,6 +855,43 @@ def verify_agent_index(index_path: Path) -> dict[str, Any]:
             "index_path": str(index_path),
             "integrity_check": None,
             "counts": counts,
+        }
+    seal, seal_status = read_immutable_sqlite_cache_seal(
+        index_path,
+        kind="company_shard",
+    )
+    if trust_seal and seal_status == "valid":
+        raw_metadata = seal.get("metadata")
+        metadata = dict(raw_metadata) if isinstance(raw_metadata, Mapping) else {}
+        raw_counts = seal.get("counts")
+        counts = {
+            str(key): int(value)
+            for key, value in dict(raw_counts or {}).items()
+            if isinstance(value, int) and not isinstance(value, bool)
+        }
+        schema_version = metadata.get("agent_index_schema_version") or metadata.get(
+            "schema_version"
+        )
+        if schema_version != AGENT_INDEX_SCHEMA_VERSION:
+            errors.append("agent_index_schema_version_mismatch")
+        if metadata.get("source_artifact_sqlite_schema_version") != AGENT_INDEX_SCHEMA_VERSION:
+            errors.append("source_artifact_sqlite_schema_version_mismatch")
+        if (
+            metadata.get("source_artifact_sqlite_builder_version")
+            != SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION
+        ):
+            errors.append("source_artifact_sqlite_builder_version_mismatch")
+        errors.extend(metric_dictionary_binding_errors(metadata.get("metric_dictionary")))
+        return {
+            "ok": not errors,
+            "errors": errors,
+            "index_path": str(index_path),
+            "integrity_check": "ok",
+            "integrity_source": "immutable_cache_seal",
+            "seal_status": seal_status,
+            "seal_trusted": True,
+            "counts": counts,
+            "metadata": metadata,
         }
     try:
         with sqlite3.connect(index_path) as conn:
@@ -855,7 +943,9 @@ def verify_agent_index(index_path: Path) -> dict[str, Any]:
                         )
             for table_name in ("documents", "objects", "edges", "quality_events"):
                 if table_name in existing_tables:
-                    counts[table_name] = int(conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0])
+                    counts[table_name] = int(
+                        conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
+                    )
             build_row = conn.execute("SELECT value FROM metadata WHERE key = 'build'").fetchone()
             if build_row is None:
                 errors.append("metadata_build_missing")
@@ -865,24 +955,23 @@ def verify_agent_index(index_path: Path) -> dict[str, Any]:
                 except json.JSONDecodeError:
                     errors.append("metadata_build_invalid_json")
                 else:
-                    schema_version = build_metadata.get("agent_index_schema_version") or build_metadata.get("schema_version")
+                    schema_version = build_metadata.get(
+                        "agent_index_schema_version"
+                    ) or build_metadata.get("schema_version")
                     if schema_version != AGENT_INDEX_SCHEMA_VERSION:
                         errors.append("agent_index_schema_version_mismatch")
-                    source_artifact_schema_version = build_metadata.get("source_artifact_sqlite_schema_version")
+                    source_artifact_schema_version = build_metadata.get(
+                        "source_artifact_sqlite_schema_version"
+                    )
                     if source_artifact_schema_version != AGENT_INDEX_SCHEMA_VERSION:
                         errors.append("source_artifact_sqlite_schema_version_mismatch")
                     source_artifact_builder_version = build_metadata.get(
                         "source_artifact_sqlite_builder_version"
                     )
-                    if (
-                        source_artifact_builder_version
-                        != SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION
-                    ):
+                    if source_artifact_builder_version != SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION:
                         errors.append("source_artifact_sqlite_builder_version_mismatch")
                     errors.extend(
-                        metric_dictionary_binding_errors(
-                            build_metadata.get("metric_dictionary")
-                        )
+                        metric_dictionary_binding_errors(build_metadata.get("metric_dictionary"))
                     )
     except sqlite3.Error as exc:
         errors.append(f"sqlite_error:{exc}")
@@ -930,10 +1019,18 @@ def verify_index_shards(
     if not allow_internal_legacy_builder:
         raise ValueError(LEGACY_SHARD_FACADE_DISABLED_MESSAGE)
     resolved_index_dir = index_dir.expanduser().resolve()
-    resolved_catalog_path = (catalog_path or resolved_index_dir / "global_catalog.sqlite").expanduser().resolve()
-    resolved_global_topics_path = (global_topics_path or resolved_index_dir / "global_topics.sqlite").expanduser().resolve()
-    resolved_companies_dir = (companies_dir or resolved_index_dir / "companies").expanduser().resolve()
-    resolved_monolith_path = monolith_index_path.expanduser().resolve() if monolith_index_path is not None else None
+    resolved_catalog_path = (
+        (catalog_path or resolved_index_dir / "global_catalog.sqlite").expanduser().resolve()
+    )
+    resolved_global_topics_path = (
+        (global_topics_path or resolved_index_dir / "global_topics.sqlite").expanduser().resolve()
+    )
+    resolved_companies_dir = (
+        (companies_dir or resolved_index_dir / "companies").expanduser().resolve()
+    )
+    resolved_monolith_path = (
+        monolith_index_path.expanduser().resolve() if monolith_index_path is not None else None
+    )
     errors: list[str] = []
     counts = {
         "ticker_count": 0,
@@ -1003,7 +1100,9 @@ def verify_index_shards(
                 )
             counts["ticker_count"] = len(shard_rows)
             if "documents" in existing_tables:
-                counts["catalog_documents"] = int(catalog_conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0])
+                counts["catalog_documents"] = int(
+                    catalog_conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
+                )
     except sqlite3.Error as exc:
         errors.append(f"global_catalog_sqlite_error:{exc}")
         shard_rows = []
@@ -1060,7 +1159,9 @@ def verify_index_shards(
         shard_result["sha256"] = actual_sha256
 
     if counts["catalog_documents"] != counts["documents"]:
-        errors.append(f"catalog_document_count_mismatch:{counts['catalog_documents']}!={counts['documents']}")
+        errors.append(
+            f"catalog_document_count_mismatch:{counts['catalog_documents']}!={counts['documents']}"
+        )
 
     global_topics_verification = _verify_global_topics_index(
         resolved_global_topics_path,
@@ -1068,8 +1169,12 @@ def verify_index_shards(
     )
     if not global_topics_verification["ok"]:
         errors.extend(f"global_topics:{error}" for error in global_topics_verification["errors"])
-    counts["global_topics"] = int((global_topics_verification.get("counts") or {}).get("company_topic_index") or 0)
-    counts["global_topic_sources"] = int((global_topics_verification.get("counts") or {}).get("company_topic_source_objects") or 0)
+    counts["global_topics"] = int(
+        (global_topics_verification.get("counts") or {}).get("company_topic_index") or 0
+    )
+    counts["global_topic_sources"] = int(
+        (global_topics_verification.get("counts") or {}).get("company_topic_source_objects") or 0
+    )
 
     if resolved_monolith_path is not None and resolved_monolith_path.exists():
         try:
@@ -1077,7 +1182,9 @@ def verify_index_shards(
                 for table_name in ("documents", "objects", "edges", "quality_events"):
                     monolith_count = _table_count(monolith_conn, "main", table_name)
                     if counts[table_name] != monolith_count:
-                        errors.append(f"shard_sum_mismatch:{table_name}:{counts[table_name]}!={monolith_count}")
+                        errors.append(
+                            f"shard_sum_mismatch:{table_name}:{counts[table_name]}!={monolith_count}"
+                        )
         except sqlite3.Error as exc:
             errors.append(f"monolith_sqlite_error:{exc}")
 
@@ -1126,7 +1233,11 @@ def _verify_global_topics_index(
             existing_tables = {str(row[0]) for row in table_rows}
             for table_name in sorted({"metadata", *GLOBAL_TOPIC_TABLES} - existing_tables):
                 errors.append(f"table_missing:{table_name}")
-            metadata = _read_metadata_json_from_schema(conn, "main", "topics") if "metadata" in existing_tables else {}
+            metadata = (
+                _read_metadata_json_from_schema(conn, "main", "topics")
+                if "metadata" in existing_tables
+                else {}
+            )
             if metadata.get("index_layout_version") != INDEX_LAYOUT_VERSION:
                 errors.append("metadata_layout_version_mismatch")
             if metadata.get("index_role") != "global_topics":
@@ -1164,7 +1275,9 @@ def _write_build_summary(
     verification: Mapping[str, Any],
 ) -> dict[str, Any]:
     build_settings = dict(result.get("build_settings") or {})
-    progress_path = Path(str(build_settings.get("progress_log_path") or index_path.parent / "build_progress.jsonl"))
+    progress_path = Path(
+        str(build_settings.get("progress_log_path") or index_path.parent / "build_progress.jsonl")
+    )
     progress_summary = _summarize_progress_log(progress_path)
     summary_path = index_path.parent / "build_summary.json"
     summary = {
@@ -1183,7 +1296,9 @@ def _write_build_summary(
         "shards": _json_safe(result.get("shards") or {}),
         **progress_summary,
     }
-    summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    summary_path.write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
     return summary
 
 
@@ -1192,7 +1307,9 @@ def _write_build_plan(index_path: Path, plan: IndexBuildPlan) -> dict[str, Any]:
     payload = plan.to_dict(include_items=True)
     payload["path"] = str(plan_path)
     tmp_path = plan_path.with_suffix(".json.tmp")
-    tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
     tmp_path.replace(plan_path)
     return payload
 
@@ -1227,7 +1344,9 @@ def _write_artifact_manifest(plan: IndexBuildPlan) -> dict[str, Any]:
     payload["path"] = str(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_suffix(".json.tmp")
-    tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
     tmp_path.replace(path)
     return _json_safe(payload)
 
@@ -1264,7 +1383,9 @@ def _write_build_graph(
                 "cache_hit": item.cache_hit,
                 "status": "cached" if item.cache_hit else "rebuilt",
                 "skip_reason": "fragment_cache_hit" if item.cache_hit else None,
-                "rebuild_reason": None if item.cache_hit else ",".join(item.cache_errors or ("fragment_cache_miss",)),
+                "rebuild_reason": None
+                if item.cache_hit
+                else ",".join(item.cache_errors or ("fragment_cache_miss",)),
                 "path": item.relative_path,
                 "fragment_path": str(item.fragment_path),
             }
@@ -1284,15 +1405,23 @@ def _write_build_graph(
                 "cache_hit": company.cache_hit,
                 "status": "cached" if company.cache_hit else "rebuilt",
                 "skip_reason": "company_cache_hit" if company.cache_hit else None,
-                "rebuild_reason": None if company.cache_hit else ",".join(company.cache_errors or ("company_cache_miss",)),
+                "rebuild_reason": None
+                if company.cache_hit
+                else ",".join(company.cache_errors or ("company_cache_miss",)),
                 "shard_cache_path": str(company.shard_cache_path),
             }
         )
         for artifact in plan.items:
             if artifact.ticker == company.ticker:
-                edges.append({"from": f"artifact:{artifact.relative_path}", "to": node_id, "type": "feeds"})
+                edges.append(
+                    {"from": f"artifact:{artifact.relative_path}", "to": node_id, "type": "feeds"}
+                )
 
-    shard_entries = ((result.get("shards") or {}).get("shards") or {}) if isinstance(result.get("shards"), Mapping) else {}
+    shard_entries = (
+        ((result.get("shards") or {}).get("shards") or {})
+        if isinstance(result.get("shards"), Mapping)
+        else {}
+    )
     for ticker, company_node_id in company_nodes.items():
         entry = shard_entries.get(ticker) if isinstance(shard_entries, Mapping) else None
         output_hash = entry.get("sha256") if isinstance(entry, Mapping) else None
@@ -1301,9 +1430,13 @@ def _write_build_graph(
                 "id": f"shard:{ticker}",
                 "type": "company_shard",
                 "ticker": ticker,
-                "input_hash": next((item.input_hash for item in plan.company_items if item.ticker == ticker), None),
+                "input_hash": next(
+                    (item.input_hash for item in plan.company_items if item.ticker == ticker), None
+                ),
                 "output_hash": output_hash,
-                "status": "cached" if isinstance(entry, Mapping) and entry.get("cache_hit") else "rebuilt",
+                "status": "cached"
+                if isinstance(entry, Mapping) and entry.get("cache_hit")
+                else "rebuilt",
                 "path": entry.get("path") if isinstance(entry, Mapping) else None,
             }
         )
@@ -1322,7 +1455,9 @@ def _write_build_graph(
                 {
                     "id": "global_topics",
                     "type": "global_topics",
-                    "input_hash": _build_graph_hash([item.cache_key for item in plan.company_items]),
+                    "input_hash": _build_graph_hash(
+                        [item.cache_key for item in plan.company_items]
+                    ),
                     "output_hash": (result.get("shards") or {}).get("global_topics_sha256"),
                     "status": "rebuilt",
                     "path": "global_topics.sqlite",
@@ -1331,7 +1466,9 @@ def _write_build_graph(
         )
         for ticker in company_nodes:
             edges.append({"from": f"shard:{ticker}", "to": "global_catalog", "type": "registers"})
-            edges.append({"from": company_nodes[ticker], "to": "global_topics", "type": "contributes"})
+            edges.append(
+                {"from": company_nodes[ticker], "to": "global_topics", "type": "contributes"}
+            )
 
     payload = {
         "format": INDEX_BUILD_GRAPH_FORMAT_VERSION,
@@ -1340,7 +1477,9 @@ def _write_build_graph(
         "index_path": str(index_path),
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "discovery_mode": plan.discovery_mode,
-        "source_manifest_path": str(plan.source_manifest_path) if plan.source_manifest_path else None,
+        "source_manifest_path": str(plan.source_manifest_path)
+        if plan.source_manifest_path
+        else None,
         "source_manifest_hash": plan.source_manifest_hash,
         "node_count": len(nodes),
         "edge_count": len(edges),
@@ -1348,7 +1487,9 @@ def _write_build_graph(
         "edges": edges,
     }
     tmp_path = graph_path.with_suffix(".json.tmp")
-    tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
     tmp_path.replace(graph_path)
     return _json_safe(payload)
 
@@ -1390,7 +1531,9 @@ def _stage_index_shards(
                 table_name: _table_count(source_conn, "main", table_name)
                 for table_name in ("documents", "objects", "edges", "quality_events")
             }
-            company_plan_by_ticker = {item.ticker: item for item in (plan.company_items if plan is not None else ())}
+            company_plan_by_ticker = {
+                item.ticker: item for item in (plan.company_items if plan is not None else ())
+            }
             shard_cache_hits = 0
             shard_cache_misses = 0
             shard_entries: dict[str, dict[str, Any]] = {}
@@ -1411,7 +1554,9 @@ def _stage_index_shards(
                         ticker,
                         logical_index_path=logical_source_path,
                         source_build_metadata=source_build_metadata,
-                        company_cache_key=company_plan.cache_key if company_plan is not None else None,
+                        company_cache_key=company_plan.cache_key
+                        if company_plan is not None
+                        else None,
                     )
                 verification = verify_agent_index(shard_path)
                 if not verification["ok"]:
@@ -1442,7 +1587,9 @@ def _stage_index_shards(
                     "sha256": _file_sha256(shard_path),
                     "cache_hit": cache_hit,
                     "cache_key": company_plan.cache_key if company_plan is not None else None,
-                    "shard_cache_path": str(company_plan.shard_cache_path) if company_plan is not None else None,
+                    "shard_cache_path": str(company_plan.shard_cache_path)
+                    if company_plan is not None
+                    else None,
                 }
 
             _build_global_catalog(
@@ -1474,7 +1621,10 @@ def _stage_index_shards(
             "global_catalog_sha256": _file_sha256(catalog_stage_path),
             "global_topics": "global_topics.sqlite",
             "global_topics_sha256": _file_sha256(global_topics_stage_path),
-            "global_topics_counts": (verification.get("global_topics_verification") or {}).get("counts") or {},
+            "global_topics_counts": (verification.get("global_topics_verification") or {}).get(
+                "counts"
+            )
+            or {},
             "companies_dir": "companies",
             "ticker_count": len(shard_entries),
             "source_counts": source_counts,
@@ -1740,7 +1890,9 @@ def _build_global_catalog(
                         int(entry["edge_count"]),
                         int(entry["quality_event_count"]),
                         entry["sha256"],
-                        json.dumps(entry.get("row_counts") or {}, ensure_ascii=False, sort_keys=True),
+                        json.dumps(
+                            entry.get("row_counts") or {}, ensure_ascii=False, sort_keys=True
+                        ),
                     )
                     for ticker, entry in sorted(shard_entries.items())
                 ],
@@ -1868,10 +2020,7 @@ def _expected_shard_counts(source_conn: sqlite3.Connection, ticker: str) -> dict
 
 def _sqlite_table_counts(index_path: Path, table_names: Sequence[str]) -> dict[str, int]:
     with sqlite3.connect(index_path) as conn:
-        return {
-            table_name: _table_count(conn, "main", table_name)
-            for table_name in table_names
-        }
+        return {table_name: _table_count(conn, "main", table_name) for table_name in table_names}
 
 
 def _table_count(conn: sqlite3.Connection, schema_name: str, table_name: str) -> int:
@@ -1881,7 +2030,9 @@ def _table_count(conn: sqlite3.Connection, schema_name: str, table_name: str) ->
     return int(row[0]) if row is not None else 0
 
 
-def _read_metadata_json_from_schema(conn: sqlite3.Connection, schema_name: str, key: str) -> dict[str, Any]:
+def _read_metadata_json_from_schema(
+    conn: sqlite3.Connection, schema_name: str, key: str
+) -> dict[str, Any]:
     try:
         row = conn.execute(
             f"SELECT value FROM {_qualified_table_name(schema_name, 'metadata')} WHERE key = ?",
@@ -1963,7 +2114,9 @@ def _summarize_progress_log(path: Path) -> dict[str, Any]:
         fields = row.get("fields") if isinstance(row.get("fields"), Mapping) else {}
         elapsed = fields.get("elapsed_seconds") if isinstance(fields, Mapping) else None
         if phase == "finalize_done":
-            total_elapsed_sec = fields.get("total_elapsed_seconds") if isinstance(fields, Mapping) else None
+            total_elapsed_sec = (
+                fields.get("total_elapsed_seconds") if isinstance(fields, Mapping) else None
+            )
         if not isinstance(elapsed, (int, float)):
             continue
         if phase == "index_artifact_done":
@@ -2076,9 +2229,7 @@ def verify_source_artifact_manifest(
         }
 
     artifact_paths: list[Path] = []
-    errors.extend(
-        metric_dictionary_binding_errors(manifest.get("metric_dictionary"))
-    )
+    errors.extend(metric_dictionary_binding_errors(manifest.get("metric_dictionary")))
     try:
         artifact_paths, manifest_hash = _artifact_paths_from_source_manifest(
             resolved_root,
@@ -2087,7 +2238,9 @@ def verify_source_artifact_manifest(
         )
     except ValueError as exc:
         errors.append(str(exc))
-        manifest_hash = _source_manifest_payload_hash(manifest) if isinstance(manifest, Mapping) else None
+        manifest_hash = (
+            _source_manifest_payload_hash(manifest) if isinstance(manifest, Mapping) else None
+        )
     return {
         "ok": not errors,
         "errors": errors,
@@ -2140,7 +2293,9 @@ def diff_source_artifact_manifests(
 
 def _source_manifest_artifact_entry(root: Path, artifact_index_path: Path) -> dict[str, Any]:
     artifact_index = json.loads(artifact_index_path.read_text(encoding="utf-8"))
-    ticker, document_type, doc_type_key, period = _artifact_identity(root, artifact_index_path, artifact_index)
+    ticker, document_type, doc_type_key, period = _artifact_identity(
+        root, artifact_index_path, artifact_index
+    )
     content_hash, input_paths, missing_inputs, estimated_bytes = _artifact_content_hash(
         root,
         artifact_index_path,
@@ -2166,7 +2321,9 @@ def _source_manifest_payload_hash(payload: Mapping[str, Any]) -> str:
         for key, value in payload.items()
         if key not in {"generated_at", "manifest_hash", "path", "root"}
     }
-    encoded = json.dumps(canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    encoded = json.dumps(
+        canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
     return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
 
 
@@ -2222,18 +2379,139 @@ def _artifact_paths_from_source_manifest(
         if not artifact_path.is_file():
             raise ValueError(f"source_manifest_artifact_missing:{relative_path}")
         artifact_index = json.loads(artifact_path.read_text(encoding="utf-8"))
-        actual_content_hash, _input_paths, missing_inputs, _estimated_bytes = _artifact_content_hash(
-            root,
-            artifact_path,
-            artifact_index,
+        actual_content_hash, _input_paths, missing_inputs, _estimated_bytes = (
+            _artifact_content_hash(
+                root,
+                artifact_path,
+                artifact_index,
+            )
         )
         if missing_inputs:
-            raise ValueError(f"source_manifest_artifact_inputs_missing:{relative_path}:{','.join(missing_inputs)}")
+            raise ValueError(
+                f"source_manifest_artifact_inputs_missing:{relative_path}:{','.join(missing_inputs)}"
+            )
         expected_content_hash = artifact.get("content_hash")
         if expected_content_hash != actual_content_hash:
             raise ValueError(f"source_manifest_content_hash_mismatch:{relative_path}")
         paths.append(artifact_path)
     return sorted(paths), actual_manifest_hash
+
+
+def _validated_source_manifest_entries(
+    root: Path,
+    manifest: Mapping[str, Any],
+) -> tuple[tuple[Mapping[str, Any], ...], str]:
+    """Validate an in-process manifest envelope without rereading artifact bytes."""
+    payload = dict(manifest)
+    if payload.get("format") != SOURCE_ARTIFACT_MANIFEST_FORMAT_VERSION:
+        raise ValueError("source_manifest_format_mismatch")
+    actual_manifest_hash = _source_manifest_payload_hash(payload)
+    expected_manifest_hash = payload.get("manifest_hash")
+    if expected_manifest_hash != actual_manifest_hash:
+        raise ValueError("source_manifest_hash_mismatch")
+    artifacts = payload.get("artifacts")
+    if not isinstance(artifacts, Sequence) or isinstance(artifacts, (str, bytes, bytearray)):
+        raise ValueError("source_manifest_artifacts_invalid")
+    if payload.get("artifact_count") != len(artifacts):
+        raise ValueError("source_manifest_artifact_count_mismatch")
+    seen: set[str] = set()
+    entries: list[Mapping[str, Any]] = []
+    for index, raw_artifact in enumerate(artifacts):
+        if not isinstance(raw_artifact, Mapping):
+            raise ValueError(f"source_manifest_artifact_invalid:{index}")
+        artifact = dict(raw_artifact)
+        relative_path = artifact.get("relative_path")
+        if not isinstance(relative_path, str) or not relative_path:
+            raise ValueError(f"source_manifest_artifact_path_missing:{index}")
+        if relative_path in seen:
+            raise ValueError(f"source_manifest_artifact_duplicate:{relative_path}")
+        seen.add(relative_path)
+        artifact_path = (root / relative_path).resolve()
+        try:
+            artifact_path.relative_to(root)
+        except ValueError as exc:
+            raise ValueError(f"source_manifest_artifact_escapes_root:{relative_path}") from exc
+        if not artifact_path.is_file():
+            raise ValueError(f"source_manifest_artifact_missing:{relative_path}")
+        missing_inputs = artifact.get("missing_inputs")
+        if missing_inputs:
+            raise ValueError(
+                f"source_manifest_artifact_inputs_missing:{relative_path}:"
+                + ",".join(str(value) for value in missing_inputs)
+            )
+        entries.append(artifact)
+    return tuple(entries), actual_manifest_hash
+
+
+def _artifact_plan_item_from_manifest_entry(
+    *,
+    root: Path,
+    artifact: Mapping[str, Any],
+    cache_root: Path,
+) -> ArtifactPlanItem:
+    """Build one plan item from bytes hashed by the immediately preceding manifest stage."""
+    relative_path = str(artifact.get("relative_path") or "")
+    artifact_index_path = (root / relative_path).resolve()
+    required_strings = {
+        key: str(artifact.get(key) or "").strip()
+        for key in (
+            "ticker",
+            "document_type",
+            "doc_type_key",
+            "period",
+            "content_hash",
+        )
+    }
+    missing = [key for key, value in required_strings.items() if not value]
+    if missing:
+        raise ValueError(
+            f"source_manifest_artifact_fields_missing:{relative_path}:{','.join(missing)}"
+        )
+    input_paths_raw = artifact.get("input_paths")
+    if not isinstance(input_paths_raw, Sequence) or isinstance(
+        input_paths_raw, (str, bytes, bytearray)
+    ):
+        raise ValueError(f"source_manifest_artifact_input_paths_invalid:{relative_path}")
+    input_paths = tuple(str(value) for value in input_paths_raw)
+    cache_key = _artifact_fragment_cache_key(required_strings["content_hash"])
+    fragment_path = _fragment_path(cache_root, cache_key)
+    expected_fragment = _expected_fragment_metadata(
+        relative_path=relative_path,
+        ticker=required_strings["ticker"].upper(),
+        document_type=required_strings["document_type"],
+        doc_type_key=required_strings["doc_type_key"],
+        period=required_strings["period"],
+        content_hash=required_strings["content_hash"],
+        cache_key=cache_key,
+    )
+    fragment_verification = verify_index_fragment(
+        fragment_path,
+        expected=expected_fragment,
+        seal_on_success=True,
+    )
+    cache_errors = tuple(fragment_verification["errors"])
+    estimated_rows = artifact.get("estimated_rows")
+    return ArtifactPlanItem(
+        artifact_index_path=artifact_index_path,
+        relative_path=relative_path,
+        ticker=required_strings["ticker"].upper(),
+        document_type=required_strings["document_type"],
+        doc_type_key=required_strings["doc_type_key"],
+        period=required_strings["period"],
+        content_hash=required_strings["content_hash"],
+        cache_key=cache_key,
+        fragment_path=fragment_path,
+        cache_hit=bool(fragment_verification["ok"]),
+        estimated_bytes=int(artifact.get("estimated_bytes") or 0),
+        estimated_rows=(
+            int(estimated_rows)
+            if isinstance(estimated_rows, int) and not isinstance(estimated_rows, bool)
+            else None
+        ),
+        input_paths=input_paths,
+        missing_inputs=(),
+        cache_errors=cache_errors,
+    )
 
 
 def plan_agent_index(
@@ -2244,6 +2522,7 @@ def plan_agent_index(
     layout: str = "monolith-and-shards",
     workers: int | None = None,
     source_manifest_path: Path | None = None,
+    source_manifest_payload: Mapping[str, Any] | None = None,
     allow_internal_legacy_builder: bool = False,
 ) -> IndexBuildPlan:
     """Create a deterministic build plan for the legacy agent index.
@@ -2253,7 +2532,9 @@ def plan_agent_index(
     if not allow_internal_legacy_builder:
         raise ValueError(LEGACY_BUILDER_DISABLED_MESSAGE)
     resolved_root = root.expanduser().resolve()
-    resolved_index_path = (index_path or resolved_root / DEFAULT_INDEX_RELATIVE_PATH).expanduser().resolve()
+    resolved_index_path = (
+        (index_path or resolved_root / DEFAULT_INDEX_RELATIVE_PATH).expanduser().resolve()
+    )
     resolved_layout = _normalize_index_layout(layout)
     resolved_cache_root = (
         cache_root.expanduser().resolve()
@@ -2263,11 +2544,19 @@ def plan_agent_index(
     resolved_workers = _resolve_build_workers(workers)
     build_settings = _build_resource_settings(resolved_index_path)
     resolved_source_manifest_path = (
-        source_manifest_path.expanduser().resolve()
-        if source_manifest_path is not None
-        else None
+        source_manifest_path.expanduser().resolve() if source_manifest_path is not None else None
     )
-    if resolved_source_manifest_path is None:
+    manifest_entries: tuple[Mapping[str, Any], ...] | None = None
+    if source_manifest_payload is not None:
+        if resolved_source_manifest_path is None:
+            raise ValueError("source_manifest_payload_requires_path")
+        manifest_entries, source_manifest_hash = _validated_source_manifest_entries(
+            resolved_root,
+            source_manifest_payload,
+        )
+        artifact_indexes = []
+        discovery_mode = "trusted-in-process-source-manifest"
+    elif resolved_source_manifest_path is None:
         artifact_indexes = discover_artifact_indexes(resolved_root)
         discovery_mode = "filesystem-scan"
         source_manifest_hash = None
@@ -2277,14 +2566,31 @@ def plan_agent_index(
             resolved_source_manifest_path,
         )
         discovery_mode = "source-manifest"
-    items = tuple(
-        _artifact_plan_item(
-            root=resolved_root,
-            artifact_index_path=artifact_index_path,
-            cache_root=resolved_cache_root,
-        )
-        for artifact_index_path in artifact_indexes
-    )
+    if manifest_entries is not None:
+        item_inputs = tuple(manifest_entries)
+
+        def build_item(entry: Mapping[str, Any]) -> ArtifactPlanItem:
+            return _artifact_plan_item_from_manifest_entry(
+                root=resolved_root,
+                artifact=entry,
+                cache_root=resolved_cache_root,
+            )
+
+    else:
+        item_inputs = tuple(artifact_indexes)
+
+        def build_item(entry: Mapping[str, Any] | Path) -> ArtifactPlanItem:
+            return _artifact_plan_item(
+                root=resolved_root,
+                artifact_index_path=Path(entry),
+                cache_root=resolved_cache_root,
+            )
+
+    if resolved_workers > 1 and len(item_inputs) > 1:
+        with ThreadPoolExecutor(max_workers=min(resolved_workers, len(item_inputs))) as executor:
+            items = tuple(executor.map(build_item, item_inputs))
+    else:
+        items = tuple(build_item(entry) for entry in item_inputs)
     cached_items = tuple(item for item in items if item.cache_hit)
     dirty_items = tuple(item for item in items if not item.cache_hit)
     company_items = _plan_company_items(items, cache_root=resolved_cache_root)
@@ -2353,7 +2659,8 @@ def _company_plan_item(
     cache_root: Path,
 ) -> CompanyPlanItem:
     artifact_cache_keys = tuple(
-        f"{item.relative_path}={item.cache_key}" for item in sorted(items, key=lambda item: item.relative_path)
+        f"{item.relative_path}={item.cache_key}"
+        for item in sorted(items, key=lambda item: item.relative_path)
     )
     input_hash = _company_cache_input_hash(ticker, artifact_cache_keys)
     cache_key = _company_shard_cache_key(input_hash)
@@ -2444,9 +2751,13 @@ def _resolve_build_workers(workers: int | None) -> int:
     return min(max((os.cpu_count() or 1) - 1, 1), DEFAULT_INDEX_BUILD_WORKER_CAP)
 
 
-def _artifact_plan_item(*, root: Path, artifact_index_path: Path, cache_root: Path) -> ArtifactPlanItem:
+def _artifact_plan_item(
+    *, root: Path, artifact_index_path: Path, cache_root: Path
+) -> ArtifactPlanItem:
     artifact_index = json.loads(artifact_index_path.read_text(encoding="utf-8"))
-    ticker, document_type, doc_type_key, period = _artifact_identity(root, artifact_index_path, artifact_index)
+    ticker, document_type, doc_type_key, period = _artifact_identity(
+        root, artifact_index_path, artifact_index
+    )
     content_hash, input_paths, missing_inputs, estimated_bytes = _artifact_content_hash(
         root,
         artifact_index_path,
@@ -2463,7 +2774,11 @@ def _artifact_plan_item(*, root: Path, artifact_index_path: Path, cache_root: Pa
         content_hash=content_hash,
         cache_key=cache_key,
     )
-    fragment_verification = verify_index_fragment(fragment_path, expected=expected_fragment)
+    fragment_verification = verify_index_fragment(
+        fragment_path,
+        expected=expected_fragment,
+        seal_on_success=True,
+    )
     cache_errors = tuple(fragment_verification["errors"])
     cache_hit = not missing_inputs and fragment_verification["ok"]
     return ArtifactPlanItem(
@@ -2491,14 +2806,13 @@ def _artifact_identity(
     artifact_index: Mapping[str, Any],
 ) -> tuple[str, str, str, str]:
     required_fields = ("ticker", "document_type", "doc_type_key", "period")
-    values = {
-        field: str(artifact_index.get(field) or "").strip()
-        for field in required_fields
-    }
+    values = {field: str(artifact_index.get(field) or "").strip() for field in required_fields}
     missing_fields = tuple(field for field, value in values.items() if not value)
     if missing_fields:
         missing = ",".join(missing_fields)
-        raise KeyError(f"artifact_index_missing_required:{missing}:{_path_label(root, artifact_index_path)}")
+        raise KeyError(
+            f"artifact_index_missing_required:{missing}:{_path_label(root, artifact_index_path)}"
+        )
     return (
         values["ticker"].upper(),
         values["document_type"],
@@ -2680,64 +2994,91 @@ def verify_index_fragment(
     fragment_path: Path,
     *,
     expected: Mapping[str, Any] | ArtifactPlanItem | None = None,
+    trust_seal: bool = True,
+    seal_on_success: bool = False,
 ) -> dict[str, Any]:
     """Verify a cached artifact fragment before treating it as a cache hit."""
     errors: list[str] = []
     metadata: dict[str, Any] = {}
     counts: dict[str, int] = {}
     integrity_check = None
+    integrity_source = "none"
+    expected_metadata = _coerce_expected_fragment_metadata(expected)
+    expected_cache_key = expected_metadata.get("cache_key")
+    seal, seal_status = read_immutable_sqlite_cache_seal(
+        fragment_path,
+        kind="artifact_fragment",
+        cache_key=str(expected_cache_key) if expected_cache_key else None,
+    )
     if not fragment_path.exists():
         return {
             "ok": False,
             "errors": ["fragment_missing"],
             "fragment_path": str(fragment_path),
             "integrity_check": None,
+            "integrity_source": integrity_source,
+            "seal_status": seal_status,
+            "seal_trusted": False,
             "metadata": metadata,
             "counts": counts,
         }
-    try:
-        with sqlite3.connect(fragment_path) as conn:
-            integrity_check = conn.execute("PRAGMA integrity_check").fetchone()[0]
-            if integrity_check != "ok":
-                errors.append(f"integrity_check_failed:{integrity_check}")
-            table_rows = conn.execute(
-                """
-                SELECT name
-                FROM sqlite_master
-                WHERE type IN ('table', 'view')
-                """
-            ).fetchall()
-            existing_tables = {str(row[0]) for row in table_rows}
-            required_tables = {"fragment_metadata", *BASE_FRAGMENT_TABLES}
-            for table_name in sorted(required_tables - existing_tables):
-                errors.append(f"table_missing:{table_name}")
-            table_row = conn.execute(
-                """
-                SELECT name
-                FROM sqlite_master
-                WHERE type = 'table' AND name = 'fragment_metadata'
-                """
-            ).fetchone()
-            if table_row is None:
-                errors.append("table_missing:fragment_metadata")
-            else:
-                metadata_row = conn.execute(
-                    "SELECT value FROM fragment_metadata WHERE key = 'fragment'"
+    if trust_seal and seal_status == "valid":
+        integrity_check = "ok"
+        integrity_source = "immutable_cache_seal"
+        raw_metadata = seal.get("metadata")
+        raw_counts = seal.get("counts")
+        metadata = dict(raw_metadata) if isinstance(raw_metadata, Mapping) else {}
+        counts = {
+            str(key): int(value)
+            for key, value in dict(raw_counts or {}).items()
+            if isinstance(value, int) and not isinstance(value, bool)
+        }
+    else:
+        try:
+            with sqlite3.connect(fragment_path) as conn:
+                integrity_check = conn.execute("PRAGMA integrity_check").fetchone()[0]
+                integrity_source = "sqlite_integrity_check"
+                if integrity_check != "ok":
+                    errors.append(f"integrity_check_failed:{integrity_check}")
+                table_rows = conn.execute(
+                    """
+                    SELECT name
+                    FROM sqlite_master
+                    WHERE type IN ('table', 'view')
+                    """
+                ).fetchall()
+                existing_tables = {str(row[0]) for row in table_rows}
+                required_tables = {"fragment_metadata", *BASE_FRAGMENT_TABLES}
+                for table_name in sorted(required_tables - existing_tables):
+                    errors.append(f"table_missing:{table_name}")
+                table_row = conn.execute(
+                    """
+                    SELECT name
+                    FROM sqlite_master
+                    WHERE type = 'table' AND name = 'fragment_metadata'
+                    """
                 ).fetchone()
-                if metadata_row is None:
-                    errors.append("metadata_fragment_missing")
+                if table_row is None:
+                    errors.append("table_missing:fragment_metadata")
                 else:
-                    try:
-                        metadata = json.loads(metadata_row[0])
-                    except json.JSONDecodeError:
-                        errors.append("metadata_fragment_invalid_json")
-            for table_name in BASE_FRAGMENT_TABLES:
-                if table_name in existing_tables:
-                    counts[table_name] = int(conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0])
-    except sqlite3.Error as exc:
-        errors.append(f"sqlite_error:{exc}")
+                    metadata_row = conn.execute(
+                        "SELECT value FROM fragment_metadata WHERE key = 'fragment'"
+                    ).fetchone()
+                    if metadata_row is None:
+                        errors.append("metadata_fragment_missing")
+                    else:
+                        try:
+                            metadata = json.loads(metadata_row[0])
+                        except json.JSONDecodeError:
+                            errors.append("metadata_fragment_invalid_json")
+                for table_name in BASE_FRAGMENT_TABLES:
+                    if table_name in existing_tables:
+                        counts[table_name] = int(
+                            conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
+                        )
+        except sqlite3.Error as exc:
+            errors.append(f"sqlite_error:{exc}")
 
-    expected_metadata = _coerce_expected_fragment_metadata(expected)
     if metadata:
         required_versions = {
             "fragment_cache_format_version": INDEX_FRAGMENT_CACHE_FORMAT_VERSION,
@@ -2768,14 +3109,28 @@ def verify_index_fragment(
                 if expected_count != actual_count:
                     errors.append(f"row_count_mismatch:{table_name}")
 
-    return {
+    result = {
         "ok": not errors,
         "errors": errors,
         "fragment_path": str(fragment_path),
         "integrity_check": integrity_check,
+        "integrity_source": integrity_source,
+        "seal_status": seal_status,
+        "seal_trusted": bool(trust_seal and seal_status == "valid"),
         "metadata": metadata,
         "counts": counts,
     }
+    if result["ok"] and seal_on_success and seal_status != "valid":
+        write_immutable_sqlite_cache_seal(
+            fragment_path,
+            kind="artifact_fragment",
+            cache_key=str(metadata.get("cache_key") or expected_cache_key or ""),
+            verification=result,
+            metadata=metadata,
+            counts=counts,
+        )
+        result["seal_status"] = "written"
+    return result
 
 
 def _coerce_expected_fragment_metadata(
@@ -2815,9 +3170,17 @@ def inspect_index_fragment_cache(
 
     for fragment_path in _iter_fragment_cache_sqlite_files(resolved_cache_root):
         verification = verify_index_fragment(fragment_path)
-        metadata = verification.get("metadata") if isinstance(verification.get("metadata"), Mapping) else {}
-        counts = verification.get("counts") if isinstance(verification.get("counts"), Mapping) else {}
-        referenced = None if referenced_paths is None else str(fragment_path.resolve()) in referenced_paths
+        metadata = (
+            verification.get("metadata")
+            if isinstance(verification.get("metadata"), Mapping)
+            else {}
+        )
+        counts = (
+            verification.get("counts") if isinstance(verification.get("counts"), Mapping) else {}
+        )
+        referenced = (
+            None if referenced_paths is None else str(fragment_path.resolve()) in referenced_paths
+        )
         size_bytes = _sqlite_database_file_size(fragment_path)
         total_size_bytes += size_bytes
         if verification["ok"]:
@@ -2853,7 +3216,9 @@ def inspect_index_fragment_cache(
             "invalid_fragment_count": invalid_count,
             "referenced_fragment_count": None if referenced_paths is None else referenced_count,
             "unreferenced_fragment_count": None if referenced_paths is None else unreferenced_count,
-            "referenced_plan_fragment_count": None if referenced_paths is None else len(referenced_paths),
+            "referenced_plan_fragment_count": None
+            if referenced_paths is None
+            else len(referenced_paths),
             "total_size_bytes": total_size_bytes,
             "counts": total_counts,
             "tickers": sorted(tickers),
@@ -3007,7 +3372,9 @@ def _delete_fragment_cache_file(fragment_path: Path, cache_root: Path) -> int:
     if resolved_fragment_path.suffix != ".sqlite":
         raise RuntimeError(f"refusing to delete non-sqlite cache file: {resolved_fragment_path}")
     if not _path_is_inside(resolved_fragment_path, resolved_cache_root):
-        raise RuntimeError(f"refusing to delete cache file outside cache root: {resolved_fragment_path}")
+        raise RuntimeError(
+            f"refusing to delete cache file outside cache root: {resolved_fragment_path}"
+        )
     removed_bytes = _sqlite_database_file_size(resolved_fragment_path)
     _cleanup_sqlite_database_files(resolved_fragment_path)
     return removed_bytes
@@ -3040,7 +3407,11 @@ def compile_artifact_fragment(
 ) -> FragmentCompileResult:
     """Compile one artifact into a cacheable SQLite fragment."""
     fragment_path = item.fragment_path
-    existing_verification = verify_index_fragment(fragment_path, expected=item)
+    existing_verification = verify_index_fragment(
+        fragment_path,
+        expected=item,
+        seal_on_success=True,
+    )
     if existing_verification["ok"] and not force:
         return FragmentCompileResult(
             item=item,
@@ -3072,11 +3443,24 @@ def compile_artifact_fragment(
                 row_counts=row_counts,
             )
             conn.execute("PRAGMA optimize")
-        verification = verify_index_fragment(tmp_path, expected=item)
+        verification = verify_index_fragment(
+            tmp_path,
+            expected=item,
+            trust_seal=False,
+        )
         if not verification["ok"]:
             errors = ", ".join(verification["errors"])
             raise RuntimeError(f"compiled fragment failed verification: {errors}")
         _replace_sqlite_database(tmp_path, fragment_path)
+        write_immutable_sqlite_cache_seal(
+            fragment_path,
+            kind="artifact_fragment",
+            cache_key=item.cache_key,
+            verification=verification,
+            metadata=verification.get("metadata") or {},
+            counts=verification.get("counts") or {},
+            source_path=tmp_path,
+        )
         final_verification = verify_index_fragment(fragment_path, expected=item)
         if not final_verification["ok"]:
             errors = ", ".join(final_verification["errors"])
@@ -3110,10 +3494,7 @@ def compile_artifact_fragments(
     resolved_root = root.expanduser().resolve()
     worker_count = max(1, min(int(workers), len(items)))
     if worker_count <= 1 or len(items) <= 1:
-        return [
-            compile_artifact_fragment(item, root=resolved_root, force=force)
-            for item in items
-        ]
+        return [compile_artifact_fragment(item, root=resolved_root, force=force) for item in items]
 
     results_by_relative_path: dict[str, FragmentCompileResult] = {}
     submission_items = _fragment_compile_submission_order(items)
@@ -3130,18 +3511,17 @@ def compile_artifact_fragments(
                 except BrokenProcessPool:
                     raise
                 except Exception as exc:
-                    raise RuntimeError(f"fragment compile failed for {item.relative_path}: {exc}") from exc
+                    raise RuntimeError(
+                        f"fragment compile failed for {item.relative_path}: {exc}"
+                    ) from exc
                 results_by_relative_path[item.relative_path] = result
     except BrokenProcessPool as exc:
         retry_workers = max(1, worker_count // 2)
         remaining_items = [
-            item
-            for item in items
-            if item.relative_path not in results_by_relative_path
+            item for item in items if item.relative_path not in results_by_relative_path
         ]
         logger.warning(
-            "fragment worker pool failed; retrying %d unfinished artifact(s) "
-            "with %d worker(s): %s",
+            "fragment worker pool failed; retrying %d unfinished artifact(s) with %d worker(s): %s",
             len(remaining_items),
             retry_workers,
             exc,
@@ -3152,9 +3532,7 @@ def compile_artifact_fragments(
             workers=retry_workers,
             force=force,
         )
-        results_by_relative_path.update(
-            {result.item.relative_path: result for result in retried}
-        )
+        results_by_relative_path.update({result.item.relative_path: result for result in retried})
         return [results_by_relative_path[item.relative_path] for item in items]
 
     return [results_by_relative_path[item.relative_path] for item in items]
@@ -3183,8 +3561,7 @@ def _write_fragment_metadata_row(
         ),
         "input_paths": list(item.input_paths),
         "row_counts": {
-            table_name: int(row_counts.get(table_name) or 0)
-            for table_name in BASE_FRAGMENT_TABLES
+            table_name: int(row_counts.get(table_name) or 0) for table_name in BASE_FRAGMENT_TABLES
         },
         "compile_complete": True,
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -3301,7 +3678,9 @@ def _plan_summary(plan: IndexBuildPlan) -> dict[str, Any]:
         "plan_format_version": plan.plan_format_version,
         "cache_root": str(plan.cache_root),
         "discovery_mode": plan.discovery_mode,
-        "source_manifest_path": str(plan.source_manifest_path) if plan.source_manifest_path else None,
+        "source_manifest_path": str(plan.source_manifest_path)
+        if plan.source_manifest_path
+        else None,
         "source_manifest_hash": plan.source_manifest_hash,
         "artifact_count": len(plan.items),
         "dirty_artifact_count": len(plan.dirty_items),
@@ -3344,7 +3723,9 @@ def _build_agent_index_direct(
     progress_log_path = str(build_settings.get("progress_log_path") or "").strip()
     previous_progress_logger = _ACTIVE_BUILD_PROGRESS_LOGGER
     _ACTIVE_BUILD_PROGRESS_LOGGER = (
-        _BuildProgressLogger(path=Path(progress_log_path), index_path=index_path, settings=build_settings)
+        _BuildProgressLogger(
+            path=Path(progress_log_path), index_path=index_path, settings=build_settings
+        )
         if progress_log_path
         else None
     )
@@ -3516,7 +3897,9 @@ def _build_agent_index_direct(
                             "root": str(root),
                             "artifact_root": str(root),
                             "artifact_manifest_hash": _artifact_manifest_hash(artifact_indexes),
-                            "source_manifest_path": str(plan.source_manifest_path) if plan.source_manifest_path else None,
+                            "source_manifest_path": str(plan.source_manifest_path)
+                            if plan.source_manifest_path
+                            else None,
                             "source_manifest_hash": plan.source_manifest_hash,
                             "discovery_mode": plan.discovery_mode,
                             "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -3597,6 +3980,7 @@ def _plan_artifact_index_inputs(
     cache_root: Path | None = None,
     workers: int | None = None,
     source_manifest_path: Path | None = None,
+    source_manifest_payload: Mapping[str, Any] | None = None,
 ) -> IndexBuildPlan:
     """Plan source artifact inputs for v3 shard materialization."""
     return plan_agent_index(
@@ -3606,6 +3990,7 @@ def _plan_artifact_index_inputs(
         workers=workers,
         layout="shards",
         source_manifest_path=source_manifest_path,
+        source_manifest_payload=source_manifest_payload,
         allow_internal_legacy_builder=True,
     )
 
@@ -3653,7 +4038,9 @@ def discover_artifact_indexes(root: Path) -> list[Path]:
     return sorted(found)
 
 
-def _configure_connection(conn: sqlite3.Connection, settings: Mapping[str, Any] | None = None) -> None:
+def _configure_connection(
+    conn: sqlite3.Connection, settings: Mapping[str, Any] | None = None
+) -> None:
     settings = dict(settings or _build_resource_settings())
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute(f"PRAGMA synchronous={settings['sqlite_synchronous']}")
@@ -4194,10 +4581,7 @@ def _index_artifact(
     edge_path = _resolve_artifact_path(root, files.get("edges"))
     edge_rows = read_jsonl(edge_path) if edge_path else []
     objects_by_id = {
-        obj["id"]: obj
-        for rows in object_rows_by_key.values()
-        for obj in rows
-        if obj.get("id")
+        obj["id"]: obj for rows in object_rows_by_key.values() for obj in rows if obj.get("id")
     }
     retrieval_lookup = ObjectLookup(
         objects_by_id=objects_by_id,
@@ -4578,7 +4962,11 @@ def _traceability_for_object(
         calculation_ids = _unique_list(
             [
                 *([obj["calculation_id"]] if obj.get("calculation_id") else []),
-                *[calc.get("id") for calc in calculations_by_output.get(obj_id, []) if calc.get("id")],
+                *[
+                    calc.get("id")
+                    for calc in calculations_by_output.get(obj_id, [])
+                    if calc.get("id")
+                ],
                 *[
                     _support_object_id(link)
                     for link in incoming
@@ -4588,14 +4976,20 @@ def _traceability_for_object(
         )
         traceable = bool(fact_ids or source_metric_ids or calculation_ids)
         return {
-            "trace_status": "traceable_metric_lineage" if traceable else "untraced_metric_candidate",
+            "trace_status": "traceable_metric_lineage"
+            if traceable
+            else "untraced_metric_candidate",
             "evidence_chain_count": len(fact_ids) + len(source_metric_ids) + len(calculation_ids),
-            "support_depth": 1 if fact_ids else (2 if source_metric_ids or calculation_ids else None),
+            "support_depth": 1
+            if fact_ids
+            else (2 if source_metric_ids or calculation_ids else None),
             "support_quote_count": 0,
             "support_claim_count": 0,
             "support_link_count": len(incoming),
             "trace_method": "metric_lineage" if traceable else "none",
-            "metric_lineage_status": "traceable_metric_lineage" if traceable else "missing_metric_lineage",
+            "metric_lineage_status": "traceable_metric_lineage"
+            if traceable
+            else "missing_metric_lineage",
             "answer_candidate": True,
         }
 
@@ -4624,7 +5018,9 @@ def _traceability_for_object(
         return {
             "trace_status": "traceable" if traceable else "orphan",
             "evidence_chain_count": len(claim_ids) + len(quote_ids),
-            "support_depth": 2 if claim_quote_ids else (1 if direct_quote_ids or claim_ids else None),
+            "support_depth": 2
+            if claim_quote_ids
+            else (1 if direct_quote_ids or claim_ids else None),
             "support_quote_count": len(quote_ids),
             "support_claim_count": len(claim_ids),
             "support_link_count": len(incoming),
@@ -4634,18 +5030,24 @@ def _traceability_for_object(
         }
 
     if obj_type == "Calculation":
-        metric_ids = _unique_list([*(obj.get("input_metric_ids") or []), *(obj.get("source_metric_ids") or [])])
+        metric_ids = _unique_list(
+            [*(obj.get("input_metric_ids") or []), *(obj.get("source_metric_ids") or [])]
+        )
         output_id = obj.get("output_metric_id")
         traceable = bool(metric_ids or output_id)
         return {
-            "trace_status": "traceable_metric_lineage" if traceable else "untraced_metric_candidate",
+            "trace_status": "traceable_metric_lineage"
+            if traceable
+            else "untraced_metric_candidate",
             "evidence_chain_count": len(metric_ids) + (1 if output_id else 0),
             "support_depth": 1 if traceable else None,
             "support_quote_count": 0,
             "support_claim_count": 0,
             "support_link_count": len(incoming),
             "trace_method": "metric_lineage" if traceable else "none",
-            "metric_lineage_status": "traceable_metric_lineage" if traceable else "missing_metric_lineage",
+            "metric_lineage_status": "traceable_metric_lineage"
+            if traceable
+            else "missing_metric_lineage",
             "answer_candidate": True,
         }
 
@@ -4703,7 +5105,9 @@ def _quote_ids_for_claim(
     return _unique_list(quote_id for quote_id in quote_ids if quote_id in objects)
 
 
-def _trace_method(obj: dict[str, Any], incoming: list[dict[str, Any]], support_ids: list[str]) -> str:
+def _trace_method(
+    obj: dict[str, Any], incoming: list[dict[str, Any]], support_ids: list[str]
+) -> str:
     if incoming and support_ids:
         return "explicit_support_link"
     if support_ids:
@@ -4837,9 +5241,16 @@ def _flush_object_insert_batch(
     if fts_rows:
         fts_rows = [_object_fts_row_with_scope_tokens(row) for row in fts_rows]
         if replace_fts_entries:
-            conn.executemany("DELETE FROM object_fts WHERE object_id = ?", ((row[0],) for row in fts_rows))
-            conn.executemany("DELETE FROM object_search_text WHERE object_id = ?", ((row[0],) for row in fts_rows))
-            conn.executemany("DELETE FROM object_text WHERE object_id = ?", ((row[0],) for row in fts_rows))
+            conn.executemany(
+                "DELETE FROM object_fts WHERE object_id = ?", ((row[0],) for row in fts_rows)
+            )
+            conn.executemany(
+                "DELETE FROM object_search_text WHERE object_id = ?",
+                ((row[0],) for row in fts_rows),
+            )
+            conn.executemany(
+                "DELETE FROM object_text WHERE object_id = ?", ((row[0],) for row in fts_rows)
+            )
         conn.executemany(
             """
             INSERT INTO object_fts(
@@ -4911,7 +5322,9 @@ def _rebuild_metric_lookup(conn: sqlite3.Connection) -> int:
         metric_name = str(row["metric_name"] or _metric_lookup_metric_name(obj, row["type"]) or "")
         metric_text = obj.get("text") or row["text"]
         canonical_metric = _metric_lookup_canonical(metric_name)
-        dimensions = _metric_lookup_normalize_dimensions(obj.get("dimensions") or obj.get("dimension") or {})
+        dimensions = _metric_lookup_normalize_dimensions(
+            obj.get("dimensions") or obj.get("dimension") or {}
+        )
         inferred_dimension = _metric_lookup_infer_dimension_from_text(
             metric_name=metric_name,
             text=metric_text,
@@ -4919,9 +5332,15 @@ def _rebuild_metric_lookup(conn: sqlite3.Connection) -> int:
         )
         if inferred_dimension and inferred_dimension[1] not in set(dimensions.values()):
             dimensions[f"inferred_{inferred_dimension[0]}"] = inferred_dimension[1]
-        segment_name = _metric_lookup_dimension(dimensions, ("segment", "segment_name", "business_segment"))
-        product_name = _metric_lookup_dimension(dimensions, ("product", "product_name", "product_line"))
-        geography_name = _metric_lookup_dimension(dimensions, ("geography", "geography_name", "region", "country"))
+        segment_name = _metric_lookup_dimension(
+            dimensions, ("segment", "segment_name", "business_segment")
+        )
+        product_name = _metric_lookup_dimension(
+            dimensions, ("product", "product_name", "product_line")
+        )
+        geography_name = _metric_lookup_dimension(
+            dimensions, ("geography", "geography_name", "region", "country")
+        )
         observation = _metric_lookup_observation_context(obj, row["period"])
         fiscal_year = observation["fiscal_year"]
         fiscal_quarter = observation["fiscal_quarter"]
@@ -5013,9 +5432,15 @@ def _rebuild_metric_lookup(conn: sqlite3.Connection) -> int:
             period=row["period"],
         )
         canonical_metric = _metric_lookup_canonical(metric_name)
-        segment_name = _metric_lookup_dimension(dimensions, ("segment", "segment_name", "business_segment"))
-        product_name = _metric_lookup_dimension(dimensions, ("product", "product_name", "product_line"))
-        geography_name = _metric_lookup_dimension(dimensions, ("geography", "geography_name", "region", "country"))
+        segment_name = _metric_lookup_dimension(
+            dimensions, ("segment", "segment_name", "business_segment")
+        )
+        product_name = _metric_lookup_dimension(
+            dimensions, ("product", "product_name", "product_line")
+        )
+        geography_name = _metric_lookup_dimension(
+            dimensions, ("geography", "geography_name", "region", "country")
+        )
         observation = _metric_lookup_observation_context(obj, row["period"])
         fiscal_year = observation["fiscal_year"]
         fiscal_quarter = observation["fiscal_quarter"]
@@ -5180,7 +5605,9 @@ def _rebuild_metric_dimension_lookup(conn: sqlite3.Connection) -> int:
     return conn.execute("SELECT COUNT(*) FROM metric_dimension_lookup").fetchone()[0]
 
 
-def _flush_metric_dimension_lookup_batch(conn: sqlite3.Connection, rows: list[tuple[Any, ...]]) -> None:
+def _flush_metric_dimension_lookup_batch(
+    conn: sqlite3.Connection, rows: list[tuple[Any, ...]]
+) -> None:
     if not rows:
         return
     conn.executemany(
@@ -5521,11 +5948,7 @@ def _metric_lookup_derived_period(
         return f"FY{fiscal_year}"
     if has_explicit_fiscal_quarter and fiscal_quarter:
         return f"FY{fiscal_year}Q{fiscal_quarter}"
-    if (
-        normalized_filing
-        and "Q" not in normalized_filing
-        and period_type == "instant"
-    ):
+    if normalized_filing and "Q" not in normalized_filing and period_type == "instant":
         return normalized_filing
     if end_date and period_type in {"quarter", "year_to_date", "instant", "ttm"}:
         end = date.fromisoformat(end_date)
@@ -5622,7 +6045,9 @@ def _metric_lookup_xbrl_text(
     period: Any,
 ) -> str:
     dimensions = _metric_lookup_xbrl_dimensions(obj)
-    dimension_text = ", ".join(_metric_lookup_clean_dimension_label(value) for value in dimensions.values() if value)
+    dimension_text = ", ".join(
+        _metric_lookup_clean_dimension_label(value) for value in dimensions.values() if value
+    )
     role_text = dimension_text or "company total"
     value_text = _metric_lookup_value_text(obj)
     unit = _metric_lookup_unit(obj)
@@ -5680,7 +6105,9 @@ def _metric_lookup_normalize_dimensions(raw_dimensions: Any) -> dict[str, str]:
 
     def walk(value: Any, fallback_key: Any = None) -> None:
         if isinstance(value, Mapping):
-            axis = value.get("axis") or value.get("dimension") or value.get("key") or value.get("name")
+            axis = (
+                value.get("axis") or value.get("dimension") or value.get("key") or value.get("name")
+            )
             member = (
                 value.get("member")
                 or value.get("value")
@@ -5783,8 +6210,15 @@ def _metric_lookup_infer_dimension_from_text(
         "margin",
     )
     for haystack in haystacks:
-        clean = re.sub(r"\b(?:CY|FY)?(?:19|20)\d{2}(?:Q[1-4])?\b", " ", haystack, flags=re.IGNORECASE)
-        clean = re.sub(r"[$€£¥]?\d+(?:\.\d+)?\s*(?:billion|million|thousand|bn|mm|m|b)?", " ", clean, flags=re.IGNORECASE)
+        clean = re.sub(
+            r"\b(?:CY|FY)?(?:19|20)\d{2}(?:Q[1-4])?\b", " ", haystack, flags=re.IGNORECASE
+        )
+        clean = re.sub(
+            r"[$€£¥]?\d+(?:\.\d+)?\s*(?:billion|million|thousand|bn|mm|m|b)?",
+            " ",
+            clean,
+            flags=re.IGNORECASE,
+        )
         clean = re.sub(r"\s+", " ", clean).strip()
         for phrase in metric_phrases:
             match = re.search(
@@ -5802,8 +6236,12 @@ def _metric_lookup_infer_dimension_from_text(
 
 
 def _metric_lookup_clean_inferred_dimension_label(label: str) -> str:
-    text = re.sub(r"\b(?:the|a|an|our|company|total|consolidated|net)\b", " ", label, flags=re.IGNORECASE)
-    text = re.sub(r"\b(?:was|were|is|are|for|of|and|from|in|to|by)\b", " ", text, flags=re.IGNORECASE)
+    text = re.sub(
+        r"\b(?:the|a|an|our|company|total|consolidated|net)\b", " ", label, flags=re.IGNORECASE
+    )
+    text = re.sub(
+        r"\b(?:was|were|is|are|for|of|and|from|in|to|by)\b", " ", text, flags=re.IGNORECASE
+    )
     text = re.sub(r"[^A-Za-z0-9&/ .'-]+", " ", text)
     text = re.sub(r"\s+", " ", text).strip(" .:-")
     if not text:
@@ -5842,17 +6280,29 @@ def _metric_lookup_is_company_total(
     if not any(value for value in dimensions.values()):
         return True
     haystack = f"{metric_name} {text}".lower()
-    segment_markers = ("segment", "product", "geograph", "region", "country", "customer", "axis", "member")
+    segment_markers = (
+        "segment",
+        "product",
+        "geograph",
+        "region",
+        "country",
+        "customer",
+        "axis",
+        "member",
+    )
     if any(marker in str(key).lower() for key in dimensions for marker in segment_markers):
         return False
     for value in dimensions.values():
         value_text = str(value or "").lower()
-        if value_text and value_text not in {"total", "consolidated", "company"} and value_text in haystack:
+        if (
+            value_text
+            and value_text not in {"total", "consolidated", "company"}
+            and value_text in haystack
+        ):
             return False
     if any(term in haystack for term in ("total", "consolidated", "company")):
         return True
     return False
-
 
 
 def _metric_lookup_alias_text(
@@ -5997,8 +6447,12 @@ def _typed_projection_common(
         "specificity_score": topic.get("specificity_score"),
         "generic_score": topic.get("generic_score"),
         "boilerplate_score": topic.get("boilerplate_score"),
-        "support_quote_count": max(int(topic.get("support_quote_count") or 0), int(row["support_quote_count"] or 0)),
-        "support_claim_count": max(int(topic.get("support_claim_count") or 0), int(row["support_claim_count"] or 0)),
+        "support_quote_count": max(
+            int(topic.get("support_quote_count") or 0), int(row["support_quote_count"] or 0)
+        ),
+        "support_claim_count": max(
+            int(topic.get("support_claim_count") or 0), int(row["support_claim_count"] or 0)
+        ),
         "evidence_chain_count": int(row["evidence_chain_count"] or 0),
         "lookup_text": lookup_text,
         "source_text": source_text[:2000],
@@ -6009,12 +6463,20 @@ def _typed_projection_common(
     }
 
 
-def _exposure_lookup_row(row: sqlite3.Row, obj: Mapping[str, Any], common: Mapping[str, Any]) -> tuple[Any, ...]:
+def _exposure_lookup_row(
+    row: sqlite3.Row, obj: Mapping[str, Any], common: Mapping[str, Any]
+) -> tuple[Any, ...]:
     factor = _typed_projection_text(obj, ("factor", "external_factor", "factor_category", "name"))
-    benchmark = _typed_projection_text(obj, ("benchmark", "benchmark_hint", "index", "price_benchmark"))
-    impact_channel = _typed_projection_text(obj, ("impact_channel", "affected_channel", "affected_channels"))
+    benchmark = _typed_projection_text(
+        obj, ("benchmark", "benchmark_hint", "index", "price_benchmark")
+    )
+    impact_channel = _typed_projection_text(
+        obj, ("impact_channel", "affected_channel", "affected_channels")
+    )
     mechanism = _typed_projection_text(obj, ("mechanism", "description", "scenario_effects"))
-    scenario_terms = _typed_projection_text(obj, ("scenario_terms", "scenario_effects", "effect_direction", "direction"))
+    scenario_terms = _typed_projection_text(
+        obj, ("scenario_terms", "scenario_effects", "effect_direction", "direction")
+    )
     return (
         *(_common_projection_values(common)),
         factor,
@@ -6038,15 +6500,23 @@ def _exposure_lookup_row(row: sqlite3.Row, obj: Mapping[str, Any], common: Mappi
     )
 
 
-def _agreement_lookup_row(row: sqlite3.Row, obj: Mapping[str, Any], common: Mapping[str, Any]) -> tuple[Any, ...]:
+def _agreement_lookup_row(
+    row: sqlite3.Row, obj: Mapping[str, Any], common: Mapping[str, Any]
+) -> tuple[Any, ...]:
     return (
         *(_common_projection_values(common)),
         _typed_projection_text(obj, ("agreement_type", "contract_type", "type_name")),
         _typed_projection_text(obj, ("agreement_subtype", "economic_role", "role")),
-        _typed_projection_text(obj, ("counterparty", "counterparties", "customer", "supplier", "lender")),
+        _typed_projection_text(
+            obj, ("counterparty", "counterparties", "customer", "supplier", "lender")
+        ),
         _typed_projection_text(obj, ("amount", "value", "notional_amount", "commitment_amount")),
-        _typed_projection_text(obj, ("maturity_date", "expiration_date", "end_date", "termination_date")),
-        _typed_projection_text(obj, ("termination_terms", "termination", "default_terms", "termination_rights")),
+        _typed_projection_text(
+            obj, ("maturity_date", "expiration_date", "end_date", "termination_date")
+        ),
+        _typed_projection_text(
+            obj, ("termination_terms", "termination", "default_terms", "termination_rights")
+        ),
         _typed_projection_text(obj, ("covenant_terms", "covenants", "financial_covenants")),
         _typed_projection_text(obj, ("collateral_terms", "collateral", "security", "lien")),
         _typed_projection_text(obj, ("affected_channels", "impact_channel", "economic_role")),
@@ -6063,9 +6533,13 @@ def _agreement_lookup_row(row: sqlite3.Row, obj: Mapping[str, Any], common: Mapp
     )
 
 
-def _event_lookup_row(row: sqlite3.Row, obj: Mapping[str, Any], common: Mapping[str, Any]) -> tuple[Any, ...]:
+def _event_lookup_row(
+    row: sqlite3.Row, obj: Mapping[str, Any], common: Mapping[str, Any]
+) -> tuple[Any, ...]:
     event_date = _typed_projection_text(obj, ("event_date", "date", "actual_date"))
-    date_expression = _typed_projection_text(obj, ("date_expression", "target_date", "expected_date", "timing"))
+    date_expression = _typed_projection_text(
+        obj, ("date_expression", "target_date", "expected_date", "timing")
+    )
     return (
         *(_common_projection_values(common)),
         _typed_projection_text(obj, ("event_type", "event_subtype", "change_type")),
@@ -6073,7 +6547,9 @@ def _event_lookup_row(row: sqlite3.Row, obj: Mapping[str, Any], common: Mapping[
         event_date,
         date_expression,
         _typed_projection_date_sort_key(event_date or date_expression or row["period"]),
-        _typed_projection_text(obj, ("project_or_product", "project", "product", "asset", "subject")),
+        _typed_projection_text(
+            obj, ("project_or_product", "project", "product", "asset", "subject")
+        ),
         _typed_projection_text(obj, ("regulatory_body", "agency", "regulator", "authority")),
         _typed_projection_text(obj, ("affected_channels", "impact_channel", "affected_objects")),
         common["trace_status"],
@@ -6089,7 +6565,9 @@ def _event_lookup_row(row: sqlite3.Row, obj: Mapping[str, Any], common: Mapping[
     )
 
 
-def _factor_lookup_row(row: sqlite3.Row, obj: Mapping[str, Any], common: Mapping[str, Any]) -> tuple[Any, ...]:
+def _factor_lookup_row(
+    row: sqlite3.Row, obj: Mapping[str, Any], common: Mapping[str, Any]
+) -> tuple[Any, ...]:
     return (
         *(_common_projection_values(common)),
         _typed_projection_text(obj, ("factor_type", "factor_roles", "category")),
@@ -6210,7 +6688,9 @@ def _projection_object_values_text(obj: Mapping[str, Any]) -> str:
         if isinstance(value, str):
             values.append(value)
         elif isinstance(value, Mapping):
-            values.extend(str(item) for item in value.values() if isinstance(item, (str, int, float)))
+            values.extend(
+                str(item) for item in value.values() if isinstance(item, (str, int, float))
+            )
         elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
             values.extend(str(item) for item in value if isinstance(item, (str, int, float)))
         elif isinstance(value, (int, float)):
@@ -6225,7 +6705,6 @@ def _typed_projection_date_sort_key(value: Any) -> str | None:
         return None
     year, month, day = match.group(1), match.group(2) or "00", match.group(3) or "00"
     return f"{year}-{month}-{day}"
-
 
 
 def _rebuild_company_topic_index(conn: sqlite3.Connection) -> int:
@@ -6330,8 +6809,14 @@ def _rebuild_company_topic_index(conn: sqlite3.Connection) -> int:
                 topic.get("specificity_score"),
                 topic.get("generic_score"),
                 topic.get("boilerplate_score"),
-                max(int(topic.get("support_quote_count") or 0), int(row["trace_support_quote_count"] or 0)),
-                max(int(topic.get("support_claim_count") or 0), int(row["trace_support_claim_count"] or 0)),
+                max(
+                    int(topic.get("support_quote_count") or 0),
+                    int(row["trace_support_quote_count"] or 0),
+                ),
+                max(
+                    int(topic.get("support_claim_count") or 0),
+                    int(row["trace_support_claim_count"] or 0),
+                ),
                 support_metric_count,
                 trace_status,
                 int(row["evidence_chain_count"] or 0),
@@ -6350,7 +6835,9 @@ def _rebuild_company_topic_index(conn: sqlite3.Connection) -> int:
                 (
                     topic["topic_id"],
                     source_id,
-                    _topic_source_object_type(source_id, topic.get("primary_object_type") if role == "primary" else None),
+                    _topic_source_object_type(
+                        source_id, topic.get("primary_object_type") if role == "primary" else None
+                    ),
                     role,
                     rank,
                     trace_status if role == "primary" else None,

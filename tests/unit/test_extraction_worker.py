@@ -8,7 +8,7 @@ import json
 import pytest
 
 import krw_ontology.extraction.worker as worker_module
-from krw_ontology.errors import RateLimitError
+from krw_ontology.errors import ProviderOverloadError, RateLimitError
 from krw_ontology.extraction.worker import ExtractionWorker
 from krw_ontology.extraction.worker import (
     parse_structured_output,
@@ -363,6 +363,125 @@ def test_extract_retries_rate_limit_same_request(monkeypatch, tmp_path):
     assert calls["count"] == 2
     assert len(sleeps) == 1
     assert items[0]["id"] == "claim:1"
+
+
+def test_extract_propagates_provider_overload_to_batch_scheduler(monkeypatch, tmp_path):
+    calls = {"count": 0}
+    sleeps = []
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+
+    async def fake_call_once(*_args, **_kwargs):
+        calls["count"] += 1
+        raise ProviderOverloadError("API Error: 529 [1305] temporarily overloaded")
+
+    monkeypatch.setattr(worker_module.asyncio, "sleep", fake_sleep)
+    extraction_worker = ExtractionWorker(model="claude-test", cwd=tmp_path)
+    monkeypatch.setattr(extraction_worker, "_call_once", fake_call_once)
+
+    with pytest.raises(ProviderOverloadError):
+        asyncio.run(
+            extraction_worker.extract(
+                "Analyze.",
+                {},
+                {"type": "object", "properties": {}, "additionalProperties": False},
+                "extract_research_claims",
+            )
+        )
+
+    assert calls["count"] == 1
+    assert sleeps == []
+
+
+def test_call_once_classifies_cli_1305_as_provider_overload(monkeypatch, tmp_path):
+    class OverloadedProcess:
+        returncode = 1
+
+        async def communicate(self, stdin):
+            return b"", b"API Error: 529 [1305][The service may be temporarily overloaded]"
+
+        def kill(self):
+            pass
+
+        async def wait(self):
+            return self.returncode
+
+    async def fake_create_subprocess_exec(*cmd, **kwargs):
+        return OverloadedProcess()
+
+    monkeypatch.setattr(
+        worker_module.SubprocessCLITransport,
+        "_find_cli",
+        lambda self: "/bin/claude",
+    )
+    monkeypatch.setattr(
+        worker_module.asyncio,
+        "create_subprocess_exec",
+        fake_create_subprocess_exec,
+    )
+
+    extraction_worker = ExtractionWorker(model="claude-test", cwd=tmp_path)
+    with pytest.raises(ProviderOverloadError):
+        asyncio.run(
+            extraction_worker._call_once(
+                "Analyze.",
+                {"type": "object", "properties": {}, "additionalProperties": False},
+                "extract_research_claims",
+            )
+        )
+
+
+def test_call_once_classifies_json_529_1305_as_provider_overload(monkeypatch, tmp_path):
+    class OverloadedProcess:
+        returncode = 0
+
+        async def communicate(self, stdin):
+            return (
+                json.dumps(
+                    {
+                        "type": "result",
+                        "subtype": "success",
+                        "is_error": True,
+                        "api_error_status": 529,
+                        "result": (
+                            "API Error: 529 [1305][The service may be temporarily overloaded, "
+                            "please try again later]"
+                        ),
+                    }
+                ).encode(),
+                b"",
+            )
+
+        def kill(self):
+            pass
+
+        async def wait(self):
+            return self.returncode
+
+    async def fake_create_subprocess_exec(*cmd, **kwargs):
+        return OverloadedProcess()
+
+    monkeypatch.setattr(
+        worker_module.SubprocessCLITransport,
+        "_find_cli",
+        lambda self: "/bin/claude",
+    )
+    monkeypatch.setattr(
+        worker_module.asyncio,
+        "create_subprocess_exec",
+        fake_create_subprocess_exec,
+    )
+
+    extraction_worker = ExtractionWorker(model="claude-test", cwd=tmp_path)
+    with pytest.raises(ProviderOverloadError):
+        asyncio.run(
+            extraction_worker._call_once(
+                "Analyze.",
+                {"type": "object", "properties": {}, "additionalProperties": False},
+                "extract_research_claims",
+            )
+        )
 
 
 def test_call_once_classifies_cli_429_as_rate_limit(monkeypatch, tmp_path):

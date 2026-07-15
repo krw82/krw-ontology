@@ -275,6 +275,103 @@ def test_relational_tokens_in_separate_sentences_never_become_direct() -> None:
     assert positive.clause_coverage[0].status == "partial"
 
 
+def test_recommended_actions_preserve_ticker_for_shared_object_ids() -> None:
+    plan = SearchPlan(
+        question="Compare the shared factor occurrence.",
+        intent="comparison",
+        tickers=["VG", "XOM"],
+        clauses=[
+            QueryClause(
+                clause_id="shared_factor",
+                retrieval_query="shared operating factor",
+                required_concepts=["shared operating factor"],
+            )
+        ],
+    )
+    object_id = "shared:factor:operating"
+    row = {
+        "id": object_id,
+        "type": "BusinessFactor",
+        "ticker": "VG",
+        "text": "Shared operating factor.",
+        "trace_status": "traceable",
+        "answer_candidate": True,
+        "_plan_clause_matches": [
+            {
+                "clause_id": "shared_factor",
+                "planned_match_mode": "strict",
+                "planned_evidence_terms": ["shared operating factor"],
+            }
+        ],
+    }
+    state = compile_research_state(
+        search_plan=plan,
+        raw_payload={
+            "results_by_ticker": {"VG": [row]},
+            "recommended_tools": [
+                {"tool": "krw_ontology_trace", "object_id": object_id, "ticker": "VG"},
+                {"tool": "krw_ontology_trace", "object_id": object_id, "ticker": "XOM"},
+            ],
+        },
+        release_id="release",
+    )
+
+    assert [
+        (action.object_id, action.ticker)
+        for action in state.recommended_actions
+        if action.object_id == object_id
+    ] == [(object_id, "VG"), (object_id, "XOM")]
+
+
+def test_research_state_preserves_ticker_occurrences_for_shared_object_ids() -> None:
+    plan = SearchPlan(
+        question="Compare the shared operating factor for VG and XOM.",
+        intent="comparison",
+        tickers=["VG", "XOM"],
+        clauses=[
+            QueryClause(
+                clause_id="shared_factor",
+                retrieval_query="shared operating factor",
+                required_concepts=["shared operating factor"],
+            )
+        ],
+    )
+    object_id = "shared:factor:operating"
+
+    def row(ticker: str) -> dict[str, object]:
+        return {
+            "id": object_id,
+            "type": "ResearchClaim",
+            "ticker": ticker,
+            "text": f"{ticker} shared operating factor.",
+            "trace_status": "traceable",
+            "answer_candidate": True,
+            "support_quote_count": 1,
+            "_plan_clause_matches": [
+                {
+                    "clause_id": "shared_factor",
+                    "planned_match_mode": "strict",
+                    "planned_evidence_terms": ["shared operating factor"],
+                }
+            ],
+        }
+
+    state = compile_research_state(
+        search_plan=plan,
+        raw_payload={
+            "results_by_ticker": {
+                "VG": [row("VG")],
+                "XOM": [row("XOM")],
+            }
+        },
+        release_id="release",
+    )
+
+    shared_units = [unit for unit in state.evidence_units if unit.object_id == object_id]
+    assert {unit.ticker for unit in shared_units} == {"VG", "XOM"}
+    assert len({unit.evidence_id for unit in shared_units}) == 2
+
+
 def test_metric_clause_requires_matching_metric_lineage_not_qualitative_mentions() -> None:
     metric_plan = SearchPlan(
         question="What is AAA revenue?",
@@ -485,6 +582,70 @@ def test_strict_visible_match_with_traceable_support_is_direct() -> None:
 
     assert state.clause_coverage[0].status == "covered"
     assert state.evidence_units[0].directness == "direct"
+    assert state.answerability.strong_claim_allowed is True
+
+
+@pytest.mark.parametrize(
+    ("required_terms", "evidence_text"),
+    [
+        (
+            ["loans", "deposits", "ratio", "56", "58", "percent"],
+            "The loans-to-deposits ratio rose from 56% to 58%.",
+        ),
+        (
+            ["operating", "cash", "flow", "debt", "obligations"],
+            (
+                "Cash flow from operations may be insufficient to satisfy obligations "
+                "under existing indebtedness."
+            ),
+        ),
+    ],
+)
+def test_atomic_filing_notation_equivalents_preserve_directness(
+    required_terms: list[str],
+    evidence_text: str,
+) -> None:
+    plan = SearchPlan(
+        question="Does the filing contain this exact claim?",
+        intent="direct_evidence_check",
+        tickers=["VG"],
+        clauses=[
+            QueryClause(
+                clause_id="claim",
+                retrieval_query=" ".join(required_terms),
+                required_concepts=[" ".join(required_terms)],
+            )
+        ],
+    )
+    state = compile_research_state(
+        search_plan=plan,
+        release_id="release",
+        raw_payload={
+            "results_by_ticker": {
+                "VG": [
+                    {
+                        "id": "quote:VG:direct",
+                        "type": "EvidenceQuote",
+                        "ticker": "VG",
+                        "text": evidence_text,
+                        "trace_status": "traceable",
+                        "answer_candidate": True,
+                        "support_quote_count": 1,
+                        "_plan_clause_matches": [
+                            {
+                                "clause_id": "claim",
+                                "planned_match_mode": "strict",
+                                "planned_evidence_terms": required_terms,
+                            }
+                        ],
+                    }
+                ]
+            }
+        },
+    )
+
+    assert state.evidence_units[0].directness == "direct"
+    assert state.clause_coverage[0].status == "covered"
     assert state.answerability.strong_claim_allowed is True
 
 
@@ -1584,6 +1745,7 @@ def test_executor_uses_only_clause_queries_and_plan_uncertainty() -> None:
 
 def test_executor_batches_all_clauses_with_one_call_per_router() -> None:
     batch_calls: list[dict[str, object]] = []
+    document_calls: list[dict[str, object]] = []
 
     class FakeBatchStore:
         def route_planned_tickers(self, **_kwargs):
@@ -1592,6 +1754,17 @@ def test_executor_batches_all_clauses_with_one_call_per_router() -> None:
                 "resolved_tickers": ["VG"],
                 "fallback_used": False,
             }
+
+        def list_documents(self, **kwargs):
+            document_calls.append(kwargs)
+            return [
+                {
+                    "ticker": "VG",
+                    "document_type": "10-K",
+                    "period": "FY2025",
+                    "artifact_index_path": "VG/FY2025/10-K",
+                }
+            ]
 
         def query_planned_batch_with_diagnostics(self, **kwargs):
             batch_calls.append(kwargs)
@@ -1624,6 +1797,7 @@ def test_executor_batches_all_clauses_with_one_call_per_router() -> None:
     raw = _execute_search_plan(store=FakeBatchStore(), search_plan=_plan())
 
     assert len(batch_calls) == 1
+    assert document_calls == [{"tickers": ["VG"], "document_types": ["10-K"]}]
     assert [clause["clause_id"] for clause in batch_calls[0]["clauses"]] == [
         "revenue_growth",
         "regulatory_risk",
@@ -1632,6 +1806,58 @@ def test_executor_batches_all_clauses_with_one_call_per_router() -> None:
     assert batch_calls[0]["clauses"][0]["calculation_window"] is None
     assert batch_calls[0]["clauses"][0]["comparison_axes"] == []
     assert len(raw["results_by_ticker"]["VG"]) == 2
+
+
+def test_executor_does_not_collapse_shared_object_id_across_tickers() -> None:
+    object_id = "shared:factor:operating"
+    plan = SearchPlan(
+        question="Compare a shared factor for VG and XOM.",
+        intent="comparison",
+        tickers=["VG", "XOM"],
+        clauses=[
+            QueryClause(
+                clause_id="shared_factor",
+                retrieval_query="shared operating factor",
+                required_concepts=["shared operating factor"],
+            )
+        ],
+    )
+
+    class FakeBatchStore:
+        def route_planned_tickers(self, **_kwargs):
+            return ["VG", "XOM"], {"resolved_tickers": ["VG", "XOM"]}
+
+        def query_planned_batch_with_diagnostics(self, **_kwargs):
+            rows = [
+                {
+                    "id": object_id,
+                    "type": "ResearchClaim",
+                    "ticker": ticker,
+                    "text": f"{ticker} shared operating factor",
+                    "trace_status": "traceable",
+                    "answer_candidate": True,
+                    "support_quote_count": 1,
+                }
+                for ticker in ("VG", "XOM")
+            ]
+            return {
+                "shared_factor": {
+                    "rows": rows,
+                    "diagnostics": {"execution_mode": "planned_shard_batch"},
+                }
+            }, {"execution_mode": "planned_shard_batch"}
+
+    raw = _execute_search_plan(store=FakeBatchStore(), search_plan=plan)
+
+    assert [row["ticker"] for row in raw["results_by_ticker"]["VG"]] == ["VG"]
+    assert [row["ticker"] for row in raw["results_by_ticker"]["XOM"]] == ["XOM"]
+    assert {
+        (action["tool"], action["object_id"], action.get("ticker"))
+        for action in raw["recommended_tools"]
+    } == {
+        ("krw_ontology_trace", object_id, "VG"),
+        ("krw_ontology_trace", object_id, "XOM"),
+    }
 
 
 def test_batch_shard_failure_is_excluded_from_resolved_scope() -> None:
@@ -1868,18 +2094,175 @@ def test_declared_missing_shard_is_not_reported_as_resolved_scope() -> None:
     assert any(part.code == "ticker_shard_missing" for part in state.missing_parts)
 
 
-def test_mcp_query_context_has_required_strict_input_and_structured_output_schema() -> None:
+def test_mcp_query_context_has_required_strict_input_schema() -> None:
     tools = {tool.name: tool for tool in mcp._tool_manager.list_tools()}
 
     assert tuple(sorted(tools)) == EXPECTED_TOOL_NAMES
     query_context = tools["krw_ontology_query_context"]
     assert query_context.parameters["required"] == ["search_plan"]
+    search_plan_input = query_context.parameters["properties"]["search_plan"]
+    assert search_plan_input["anyOf"][0] == {"$ref": "#/$defs/SearchPlan"}
+    assert search_plan_input["anyOf"][1] == {
+        "additionalProperties": True,
+        "type": "object",
+    }
     plan_schema = query_context.parameters["$defs"]["SearchPlan"]
     assert plan_schema["additionalProperties"] is False
     assert plan_schema["required"] == ["question", "intent", "clauses"]
-    assert query_context.fn_metadata.output_schema["properties"]["contract_version"]["const"] == (
-        "research-state/v2"
+    # The tool returns CallToolResult directly so both ResearchState and an
+    # input_correction_required error can traverse the same MCP result channel.
+    assert query_context.fn_metadata.output_schema is None
+
+
+def test_mcp_query_context_returns_structured_english_correction_before_retrieval() -> None:
+    result = asyncio.run(
+        krw_ontology_query_context(
+            {
+                "question": "How much revenue came from Home and Accessories?",
+                "intent": "metric_check",
+                "tickers": ["AAPL"],
+                "clauses": [
+                    {
+                        "clause_id": "product_revenue",
+                        "retrieval_query": "AAPL revenue by product category",
+                        "metrics": ["revenue"],
+                        "metric_dimensions": ["Home and Accessories"],
+                        "metric_scope": "dimensioned",
+                    }
+                ],
+            }
+        )
     )
+
+    assert isinstance(result, CallToolResult)
+    assert result.isError is True
+    assert isinstance(result.content[0], TextContent)
+    payload = json.loads(result.content[0].text)
+    assert payload == result.structuredContent
+    assert payload == {
+        "status": "input_correction_required",
+        "code": "search_plan_validation_failed",
+        "message": (
+            "The SearchPlan has 1 correctable input error(s). Correct every listed "
+            "violation before calling krw_ontology_query_context again."
+        ),
+        "violations": [
+            {
+                "field": "clauses[0].retrieval_query",
+                "rule": "missing_literal_term",
+                "message": (
+                    "The metric_dimensions literal(s) 'Home and Accessories' are "
+                    "missing from clauses[0].retrieval_query."
+                ),
+                "required_change": (
+                    "Include every exact phrase in required_literals in "
+                    "clauses[0].retrieval_query, or remove those values from "
+                    "clauses[0].metric_dimensions."
+                ),
+                "required_literals": ["Home and Accessories"],
+            }
+        ],
+        "allowed_next_tools": ["krw_ontology_query_context"],
+    }
+
+
+def test_mcp_query_context_sends_input_correction_through_fastmcp_boundary() -> None:
+    result = asyncio.run(
+        mcp.call_tool(
+            "krw_ontology_query_context",
+            {
+                "search_plan": {
+                    "question": "How much revenue came from Home and Accessories?",
+                    "intent": "metric_check",
+                    "tickers": ["AAPL"],
+                    "clauses": [
+                        {
+                            "clause_id": "product_revenue",
+                            "retrieval_query": "AAPL revenue by product category",
+                            "metrics": ["revenue"],
+                            "metric_dimensions": ["Home and Accessories"],
+                            "metric_scope": "dimensioned",
+                        }
+                    ],
+                }
+            },
+        )
+    )
+
+    assert isinstance(result, CallToolResult)
+    assert result.isError is True
+    assert result.structuredContent == {
+        "status": "input_correction_required",
+        "code": "search_plan_validation_failed",
+        "message": (
+            "The SearchPlan has 1 correctable input error(s). Correct every listed "
+            "violation before calling krw_ontology_query_context again."
+        ),
+        "violations": [
+            {
+                "field": "clauses[0].retrieval_query",
+                "rule": "missing_literal_term",
+                "message": (
+                    "The metric_dimensions literal(s) 'Home and Accessories' are "
+                    "missing from clauses[0].retrieval_query."
+                ),
+                "required_change": (
+                    "Include every exact phrase in required_literals in "
+                    "clauses[0].retrieval_query, or remove those values from "
+                    "clauses[0].metric_dimensions."
+                ),
+                "required_literals": ["Home and Accessories"],
+            }
+        ],
+        "allowed_next_tools": ["krw_ontology_query_context"],
+    }
+
+
+def test_mcp_query_context_batches_detectable_input_corrections() -> None:
+    result = asyncio.run(
+        krw_ontology_query_context(
+            {
+                "question": "Check AAPL product revenue and lending risks.",
+                "intent": "multi_check",
+                "tickers": ["AAPL"],
+                "comparison_axes": ["growth_rate"],
+                "clauses": [
+                    {
+                        "clause_id": "mixed_metric",
+                        "retrieval_query": "AAPL revenue by product category",
+                        "metrics": ["revenue"],
+                        "metric_dimensions": ["Home and Accessories"],
+                        "required_concepts": ["merchant loan", "Cash App borrowing"],
+                        "required_predicates": ["increases"],
+                        "metric_scope": "dimensioned",
+                    },
+                    {
+                        "clause_id": "credit_risk",
+                        "retrieval_query": "AAPL credit risk",
+                        "required_concepts": ["BNPL credit risk", "loan product"],
+                        "required_predicates": ["affects"],
+                    },
+                ],
+            }
+        )
+    )
+
+    assert isinstance(result, CallToolResult)
+    assert result.isError is True
+    payload = result.structuredContent
+    assert payload["code"] == "search_plan_validation_failed"
+    violations = payload["violations"]
+    assert [violation["rule"] for violation in violations] == [
+        "mixed_metric_and_qualitative_clause",
+        "missing_literal_term",
+        "missing_literal_term",
+        "missing_literal_term",
+        "missing_calculation_window",
+    ]
+    assert violations[1]["required_literals"] == ["Home and Accessories"]
+    assert violations[2]["required_literals"] == ["BNPL credit risk", "loan product"]
+    assert violations[4]["field"] == "clauses[0].calculation_window"
+    assert payload["allowed_next_tools"] == ["krw_ontology_query_context"]
 
 
 def test_mcp_query_context_emits_complete_minified_model_text(

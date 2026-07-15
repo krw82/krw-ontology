@@ -1,0 +1,271 @@
+{
+  "format": "krw-ontology-router-query-gold/v2",
+  "contract": "agent-authored-english-retrieval-query",
+  "source_release": {
+    "release_id": "20260711_121636",
+    "source_manifest_hash": "sha256:61846e490ade39983384a10a48c250b4fcffe6696deea05c6192da0409c3c22e"
+  },
+  "queries": [
+    {
+      "id": "router_gold_aapl_app_store_regulation_en",
+      "query": "App Store business practices regulatory and legal changes reducing sales and revenue",
+      "expected_tickers": ["AAPL"],
+      "distractor_tickers": ["GOOGL", "AMZN"],
+      "max_candidate_count": 20,
+      "provenance": {
+        "ticker": "AAPL",
+        "document_types": ["10-K", "10-Q"],
+        "periods": ["CY2021", "CY2022", "CY2023", "CY2024", "CY2025", "CY2026Q1"],
+        "source_note": "Apple filing risk disclosure on App Store regulation, legal changes, sales, and revenue."
+      }
+    },
+    {
+      "id": "router_gold_aapl_supply_chain",
+      "query": "outsourcing partner shipment delays and supply interruptions preventing product delivery",
+      "expected_tickers": ["AAPL"],
+      "distractor_tickers": ["TSLA", "NVDA"],
+      "max_candidate_count": 20,
+      "provenance": {
+        "ticker": "AAPL",
+        "document_types": ["10-K", "10-Q"],
+        "periods": ["CY2021", "CY2022", "CY2023", "CY2024", "CY2025", "CY2026Q1"],
+        "source_note": "Apple filing supply-chain risk disclosure on outsourcing, shipment delays, and delivery."
+      }
+    },
+    {
+      "id": "router_gold_nvda_china_mellanox",
+      "query": "Chinese regulators examining sales and Mellanox acquisition commitments",
+      "expected_tickers": ["NVDA"],
+      "distractor_tickers": ["AMD", "INTC"],
+      "max_candidate_count": 20,
+      "provenance": {
+        "ticker": "NVDA",
+        "document_types": ["10-K", "10-Q"],
+        "periods": ["CY2024", "CY2025", "CY2026", "CY2026Q2"],
+        "source_note": "NVIDIA filing disclosure on Chinese regulatory review and Mellanox commitments."
+      }
+    },
+    {
+      "id": "router_gold_nvda_taiwan_geopolitics_en",
+      "query": "Taiwan China geopolitical tensions critical semiconductor manufacturing revenue risk",
+      "expected_tickers": ["NVDA"],
+      "distractor_tickers": ["AMD", "INTC"],
+      "max_candidate_count": 20,
+      "provenance": {
+        "ticker": "NVDA",
+        "document_types": ["10-K", "10-Q"],
+        "periods": ["CY2024", "CY2025", "CY2026", "CY2026Q2"],
+        "source_note": "NVIDIA filing risk disclosure on Taiwan, China, manufacturing concentration, and revenue."
+      }
+    },
+    {
+      "id": "router_gold_msft_nuance_acquisition",
+      "query": "Nuance Communications acquisition at 56 dollars per share in an all-cash transaction",
+      "expected_tickers": ["MSFT"],
+      "distractor_tickers": ["AAPL", "GOOGL"],
+      "max_candidate_count": 20,
+      "provenance": {
+        "ticker": "MSFT",
+        "document_types": ["10-K", "10-Q"],
+        "periods": ["CY2021", "CY2022", "CY2023", "CY2024", "CY2025", "CY2026Q1"],
+        "source_note": "Microsoft filing acquisition disclosure for Nuance Communications."
+      }
+    },
+    {
+      "id": "router_gold_msft_fx_hedges",
+      "query": "option and forward contracts hedging forecast international revenue",
+      "expected_tickers": ["MSFT"],
+      "distractor_tickers": ["AAPL", "AMZN"],
+      "max_candidate_count": 20,
+      "provenance": {
+        "ticker": "MSFT",
+        "document_types": ["10-K"],
+        "periods": ["CY2021", "CY2022", "CY2023", "CY2024", "CY2025"],
+        "source_note": "Microsoft filing derivative disclosure for forecast international revenue hedges."
+      }
+    },
+    {
+      "id": "router_gold_amzn_debt_issuance",
+      "query": "no new long-term debt issued in 2023 after large proceeds in 2021 and 2022",
+      "expected_tickers": ["AMZN"],
+      "distractor_tickers": ["WMT", "MSFT"],
+      "max_candidate_count": 20,
+      "provenance": {
+        "ticker": "AMZN",
+        "document_types": ["10-K", "10-Q"],
+        "periods": ["CY2023", "CY2024", "CY2025", "CY2026Q1"],
+        "source_note": "Amazon filing debt issuance and proceeds disclosure covering 2021 through 2023."
+      }
+    },
+    {
+      "id": "router_gold_amzn_content_licenses",
+      "query": "video and music content licensing agreements with fixed and variable payment schedules",
+      "expected_tickers": ["AMZN"],
+      "distractor_tickers": ["NFLX", "DIS"],
+      "max_candidate_count": 20,
+      "provenance": {
+        "ticker": "AMZN",
+        "document_types": ["10-K", "10-Q"],
+        "periods": ["CY2023", "CY2024", "CY2025", "CY2026Q1"],
+        "source_note": "Amazon filing commitment disclosure for video and music content licenses."
+      }
+    },
+    {
+      "id": "router_gold_meta_irish_dpc",
+      "query": "Irish Data Protection Commission final decision issued in May 2023",
+      "expected_tickers": ["META"],
+      "distractor_tickers": ["GOOGL", "AAPL"],
+      "max_candidate_count": 20,
+      "provenance": {
+        "ticker": "META",
+        "document_types": ["10-K", "10-Q"],
+        "periods": ["CY2024", "CY2025", "CY2026Q1"],
+        "source_note": "Meta filing privacy disclosure on the Irish DPC final decision."
+      }
+    },
+    {
+      "id": "router_gold_meta_renewable_energy",
+      "query": "multi-year renewable energy purchase agreements without fixed or minimum volume commitments",
+      "expected_tickers": ["META"],
+      "distractor_tickers": ["GOOGL", "AMZN"],
+      "max_candidate_count": 20,
+      "provenance": {
+        "ticker": "META",
+        "document_types": ["10-K", "10-Q"],
+        "periods": ["CY2024", "CY2025", "CY2026Q1"],
+        "source_note": "Meta filing renewable-energy purchase agreement disclosure."
+      }
+    },
+    {
+      "id": "router_gold_wmt_edlc_en",
+      "query": "controlling costs and passing savings to customers through everyday low cost strategy",
+      "expected_tickers": ["WMT"],
+      "distractor_tickers": ["COST", "TGT"],
+      "max_candidate_count": 20,
+      "provenance": {
+        "ticker": "WMT",
+        "document_types": ["10-K", "10-Q"],
+        "periods": ["CY2024", "CY2025", "CY2026", "CY2026Q2"],
+        "source_note": "Walmart filing strategy disclosure for EDLC and customer savings."
+      }
+    },
+    {
+      "id": "router_gold_wmt_pharmacy_reimbursement",
+      "query": "retail pharmacy prescriptions reimbursed through third-party contracts",
+      "expected_tickers": ["WMT"],
+      "distractor_tickers": ["CVS", "ELV"],
+      "max_candidate_count": 20,
+      "provenance": {
+        "ticker": "WMT",
+        "document_types": ["10-K", "10-Q"],
+        "periods": ["CY2024", "CY2025", "CY2026", "CY2026Q2"],
+        "source_note": "Walmart filing pharmacy reimbursement disclosure."
+      }
+    },
+    {
+      "id": "router_gold_unh_ibnr",
+      "query": "centrally controlled automated actuarial process for incurred but not reported estimates",
+      "expected_tickers": ["UNH"],
+      "distractor_tickers": ["CI", "CVS"],
+      "max_candidate_count": 20,
+      "provenance": {
+        "ticker": "UNH",
+        "document_types": ["10-K", "10-Q"],
+        "periods": ["CY2023", "CY2024", "CY2025", "CY2026Q1"],
+        "source_note": "UnitedHealth filing actuarial disclosure for IBNR estimates."
+      }
+    },
+    {
+      "id": "router_gold_xom_climate_outlook",
+      "query": "corporate outlook consistent with increasingly stringent climate policies and Paris goals",
+      "expected_tickers": ["XOM"],
+      "distractor_tickers": ["CVX", "COP"],
+      "max_candidate_count": 20,
+      "provenance": {
+        "ticker": "XOM",
+        "document_types": ["10-K", "10-Q"],
+        "periods": ["CY2023", "CY2024", "CY2025", "CY2026Q1"],
+        "source_note": "Exxon Mobil filing climate-policy and Paris-aligned outlook disclosure."
+      }
+    },
+    {
+      "id": "router_gold_tsla_debt_cash_flow",
+      "query": "future operating cash flow may be insufficient to satisfy existing debt obligations",
+      "expected_tickers": ["TSLA"],
+      "distractor_tickers": ["F", "GM"],
+      "max_candidate_count": 20,
+      "provenance": {
+        "ticker": "TSLA",
+        "document_types": ["10-K", "10-Q"],
+        "periods": ["CY2023", "CY2024", "CY2025", "CY2026Q1"],
+        "source_note": "Tesla filing liquidity risk disclosure for operating cash flow and debt obligations."
+      }
+    },
+    {
+      "id": "router_gold_tsla_vehicle_spes",
+      "query": "beneficial interests in leased vehicles and financing receivables transferred into special purpose entities",
+      "expected_tickers": ["TSLA"],
+      "distractor_tickers": ["F", "GM"],
+      "max_candidate_count": 20,
+      "provenance": {
+        "ticker": "TSLA",
+        "document_types": ["10-K", "10-Q"],
+        "periods": ["CY2023", "CY2024", "CY2025", "CY2026Q1"],
+        "source_note": "Tesla filing securitization disclosure for leased vehicles and receivables."
+      }
+    },
+    {
+      "id": "router_gold_jpm_loan_sales",
+      "query": "loan sale proceeds rose across 2023 2024 and 2025",
+      "expected_tickers": ["JPM"],
+      "distractor_tickers": ["BAC", "C"],
+      "max_candidate_count": 20,
+      "provenance": {
+        "ticker": "JPM",
+        "document_types": ["10-K"],
+        "periods": ["CY2025"],
+        "source_note": "JPMorgan 2025 filing table with loan sales and proceeds for 2023 through 2025."
+      }
+    },
+    {
+      "id": "router_gold_jpm_loans_deposits",
+      "query": "loans to deposits ratio increased from 56 percent to 58 percent",
+      "expected_tickers": ["JPM"],
+      "distractor_tickers": ["BAC", "C"],
+      "max_candidate_count": 20,
+      "provenance": {
+        "ticker": "JPM",
+        "document_types": ["10-K", "10-Q"],
+        "periods": ["CY2025", "CY2026Q1"],
+        "source_note": "JPMorgan filing ratio disclosure for loans and deposits."
+      }
+    },
+    {
+      "id": "router_gold_jpm_rate_risk_en",
+      "query": "higher interest rates reducing commercial and residential real estate loan demand",
+      "expected_tickers": ["JPM"],
+      "distractor_tickers": ["BAC", "WFC"],
+      "max_candidate_count": 20,
+      "provenance": {
+        "ticker": "JPM",
+        "document_types": ["10-K", "10-Q"],
+        "periods": ["CY2025", "CY2026Q1"],
+        "source_note": "JPMorgan filing risk disclosure on rates and real-estate loan demand."
+      }
+    },
+    {
+      "id": "router_gold_unh_credit_rating",
+      "query": "UnitedHealth Group credit rating downgrade increasing borrowing costs and constraining access to capital",
+      "expected_tickers": ["UNH"],
+      "distractor_tickers": ["CI", "CVS"],
+      "max_candidate_count": 20,
+      "explicit_entity_scope": true,
+      "provenance": {
+        "ticker": "UNH",
+        "document_types": ["10-K", "10-Q"],
+        "periods": ["CY2023", "CY2024", "CY2025", "CY2026Q1"],
+        "source_note": "UnitedHealth filing credit-rating and funding-access risk disclosure."
+      }
+    }
+  ]
+}

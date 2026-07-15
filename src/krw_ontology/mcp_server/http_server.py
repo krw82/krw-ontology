@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 import typer
@@ -23,13 +24,27 @@ def _configure_logging(*, log_level: str, log_file: Path | None) -> None:
     if log_file is not None:
         log_file = log_file.expanduser()
         log_file.parent.mkdir(parents=True, exist_ok=True)
-        handlers.append(logging.FileHandler(log_file, encoding="utf-8"))
+        handlers.append(
+            RotatingFileHandler(
+                log_file,
+                maxBytes=int(os.getenv("KRW_MCP_LOG_MAX_BYTES", "10485760")),
+                backupCount=int(os.getenv("KRW_MCP_LOG_BACKUP_COUNT", "3")),
+                encoding="utf-8",
+            )
+        )
     logging.basicConfig(
         level=level,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
         handlers=handlers,
         force=True,
     )
+    protocol_level_name = os.getenv("KRW_MCP_PROTOCOL_LOG_LEVEL", "WARNING")
+    protocol_level = getattr(logging, protocol_level_name.upper(), logging.WARNING)
+    for logger_name in (
+        "mcp.server.lowlevel.server",
+        "mcp.server.streamable_http",
+    ):
+        logging.getLogger(logger_name).setLevel(protocol_level)
 
 
 def serve(
@@ -118,7 +133,10 @@ def serve(
     mcp.settings.streamable_http_path = mcp_path
     mcp.settings.stateless_http = stateless
     mcp.settings.json_response = json_response
-    mcp.settings.log_level = log_level
+    default_http_log_level = "WARNING" if verification.get("env") == "prod" else log_level
+    mcp.settings.log_level = os.getenv(
+        "KRW_MCP_HTTP_LOG_LEVEL", default_http_log_level
+    )
     LOGGER.info(
         "mcp_server_start env=%s release_id=%s root=%s global_spine_path=%s host=%s port=%s path=%s store_mode=%s",
         verification.get("env"),

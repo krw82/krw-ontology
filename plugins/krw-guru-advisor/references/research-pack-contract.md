@@ -1,102 +1,68 @@
 # Guru ResearchPack Contract
 
-The Guru MCP returns a bounded `GuruResearchPack` for one selected guru lens and one investor question. This pack is the only source for persona, decision frame, selected lenses, source confidence, and tool guidance.
+The Guru MCP returns a bounded `GuruResearchPack` for the fixed selected author
+and investor question. It is the only source for ontology-backed decision rules,
+source confidence, and tool guidance. A skill must not add a remembered
+principle, preferred question, or personality trait.
 
-Skills must not hard-code guru principles, preferred questions, or persona traits. If the pack does not contain a lens or persona trait, the final answer must not invent it.
+Before calling the MCP, the main agent may build an English-first private
+retrieval brief. That brief helps matching only; it is not evidence and cannot
+override the returned pack.
 
-Before requesting the pack, the skill should build an English-first private internal guru consultation brief. The brief improves retrieval. It does not become evidence and does not override the returned ResearchPack.
-
-## Required Shape
+## Relevant Fields
 
 ```text
-research_context_version
 research_status
 answerability
 intent
-agent_autonomy
-do_not_call
-research_pack
+research_pack.philosophy_context
+research_pack.selected_lenses
+research_pack.consultation_moves
+research_pack.data_needs
+research_pack.company_context
+research_pack.company_bridge
+research_pack.clarifying_questions
 ```
 
-`research_pack` contains:
+`philosophy_context` is the authoritative object for the agent-generated brief.
+Each principle includes a selected reviewed ID, source-grounded statement,
+applicability, evidence hooks, and source anchors. Use it to decide which
+company-specific questions are worth investigating. It does not authorize a
+conclusion before relevant filing evidence is retrieved.
+
+`company_context` is bounded runtime orientation. It must come from existing
+application company metadata, never ticker hard-coding, and is not company
+evidence.
+
+## Company Evidence Flow
 
 ```text
-pack_meta
-persona_profile
-selected_lenses
-consultation_moves
-data_needs
-company_context
-source_anchors
-clarifying_questions
-company_bridge
-trace_recommendations
-warnings
+light company context + selected philosophy
+-> main Guru drafts one philosophy-shaped key investigation question
+-> krw_guru_company_brief seals investigation_brief
+-> company_evidence_researcher
+-> runtime-built company research context from actual filing-tool results
+-> private agent_analysis
+-> krw_guru_review_company_evidence linkage validation
+-> final qualitative consultation
 ```
 
-## Company-Aware Serving Contracts
+The runtime-built company research context is the sole source of company object
+IDs available to the default Guru review. The subagent does not author that
+context. The main Guru owns the analysis; the review tool only validates it
+against the sealed key question and exact returned filing evidence.
 
-For company-specific questions, the Guru ResearchPack is not the final answer payload. Use the serving-layer bridge objects:
+`needs_company_evidence` requires this path. A missing or rejected evidence
+context is a reason to narrow the answer, not to invent a company fact.
 
-```text
-app-provided company context when available
--> company_context
--> GuruResearchPack
--> GuruCompanyFilingBrief
--> KRW Ontology company filing evidence from company_evidence_researcher subagent
--> CompanyEvidencePack
--> GuruCompanyEvidenceReview
--> final Guru consultation answer
-```
+## Rendering Boundary
 
-`company_context` is bounded runtime context from existing company ontology reads. It improves retrieval and filing-brief construction, but it is not final company evidence and must not be created from ticker hard-coding.
-
-`GuruCompanyFilingBrief` converts guru lens/data needs and company_context into a company filing research question. It does not contain company facts.
-
-`CompanyEvidencePack` is the exact hash-stable `krw-verified-company-evidence/v1` payload produced by `krw_ontology_verify_evidence` and returned unchanged through the app-provided company_evidence_researcher subagent. It contains source excerpts, metric lineage, filing anchors, rejected references, and per-question answerability. It must not imitate a guru voice or write the final answer.
-
-`GuruCompanyEvidenceReview` reviews how the CompanyEvidencePack strengthens, weakens, or fails to support the selected Guru ResearchPack lenses. It gives interpretation guidance only. It must not introduce new guru principles that were absent from the ResearchPack, new company facts absent from CompanyEvidencePack, or a fixed report template.
-
-`missing_evidence` is an internal completeness signal. It helps the answer agent know where the company-specific judgment is still thin. It is not a required final-answer section. In normal user answers, mention it only as one concise next check when it changes the practical judgment. Do not turn it into a report-style "data limitation" block or invent a long metric checklist from general finance memory.
-
-## Answer Style Inputs
-
-Answer style must come from:
-
-```text
-persona_profile
-selected_lenses
-consultation_moves
-data_needs
-source_anchors
-```
-
-The author adapter may shape tone and question order, but it must not override the ResearchPack. If the pack does not return a supporting lens, the answer should say the current guru ontology has weak support instead of filling from memory.
-
-The private brief may guide which query terms were used. Because guru source materials are English-first, the private brief should lead with English investment language and English retrieval terms. It must not add final-answer content unless the ResearchPack returned supporting lenses, consultation moves, or data needs.
-
-## Status Handling
-
-```text
-sufficient_lens
-- The answer may use selected guru ontology lenses directly.
-
-partial_lens
-- The answer may apply the returned materials, but must keep confidence limits natural and conversational. Do not add a source/disclaimer footer.
-
-ontology_gap
-- Do not fill the gap from memory. Say the current guru ontology did not return enough support.
-
-needs_clarification
-- Ask the returned clarifying question before giving a strong consultation.
-
-needs_company_evidence
-- Guru lens is available, but company-specific judgment needs filing evidence from KRW Ontology company research. Call krw_guru_company_brief with company_context when available; delegate the exact dynamic plan to company_evidence_researcher; require one krw_ontology_verify_evidence call; pass the exact verifier payload to krw_guru_review_company_evidence before final writing. Never substitute a model-authored memo, retrieval plan, status note, or company_filing_brief.
-```
-
-## Evidence Boundary
-
-`direct_source_match=true` means the pack found strong source-grounded support.  
-`direct_source_match=false` is an internal confidence signal. In the final answer, handle it with natural phrases such as "내가 지금 볼 수 있는 자료만 놓고는..." or "아직 단정하면 안 되는 부분은..." without saying "AI lens", "source match", "direct documented guru view", or adding a footer disclaimer.
-
-Source anchors are metadata only. Do not quote full private text unless a trace tool explicitly returns a compliant excerpt.
+Selected ontology philosophy may change the questions, inference priorities,
+and the virtual advisor's narrative stance. It must not be rendered as the
+real author speaking, claiming personal experience, or using fabricated quotes.
+The selected principles and consultation moves must make the final answer feel
+different from a generic analyst summary. Historical comparisons are allowed
+only when the documented episode is actually present in the selected
+ResearchPack, and must be phrased in third person. Final answer rules,
+including the use of material filing figures, are defined by
+`output-contract.md`.

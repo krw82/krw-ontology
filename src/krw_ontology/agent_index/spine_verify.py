@@ -3,19 +3,24 @@
 from __future__ import annotations
 
 import json
-import hashlib
 import sqlite3
 from pathlib import Path
 from collections.abc import Mapping
 from typing import Any
 
+from krw_ontology.agent_index.cache_seal import read_immutable_sqlite_cache_sha256
 from krw_ontology.agent_index.chart_series import (
     CHART_SERIES_RELATIVE_PATH,
     verify_chart_series_index,
 )
 from krw_ontology.agent_index.router_sidecar import (
     ROUTER_SIDECAR_RELATIVE_PATH,
+    immutable_file_sha256,
     verify_router_sidecar,
+)
+from krw_ontology.agent_index.router_coherence import (
+    ROUTER_COHERENCE_RELATIVE_PATH,
+    verify_router_coherence,
 )
 from krw_ontology.agent_index.source_artifact_sqlite import (
     SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION,
@@ -50,7 +55,11 @@ def verify_spine_shard_release(
 ) -> dict[str, Any]:
     """Verify a v3 release without any monolith dependency."""
     root = release_root.expanduser().resolve()
-    manifest_file = manifest_path.expanduser().resolve() if manifest_path is not None else root / "manifest.json"
+    manifest_file = (
+        manifest_path.expanduser().resolve()
+        if manifest_path is not None
+        else root / "manifest.json"
+    )
     errors: list[str] = []
     warnings: list[str] = []
     counts: dict[str, int] = {}
@@ -73,15 +82,27 @@ def verify_spine_shard_release(
             errors.append("manifest_monolith_required_not_false")
         errors.extend(_manifest_serving_binding_errors(manifest))
 
-    global_spine_path = _manifest_file_path(root, manifest, "global_spine", default="indexes/global_spine.sqlite")
+    global_spine_path = _manifest_file_path(
+        root, manifest, "global_spine", default="indexes/global_spine.sqlite"
+    )
     router_sidecar_path = _manifest_file_path(
         root,
         manifest,
         "router_sidecar",
         default=ROUTER_SIDECAR_RELATIVE_PATH.as_posix(),
     )
-    shard_manifest_path = _manifest_file_path(root, manifest, "shard_manifest", default="indexes/shard_manifest.json")
-    company_shards_dir = _manifest_dir_path(root, manifest, "company_shards", default="indexes/companies")
+    router_coherence_path = _optional_manifest_file_path(
+        root,
+        manifest,
+        "router_coherence",
+        default=ROUTER_COHERENCE_RELATIVE_PATH.as_posix(),
+    )
+    shard_manifest_path = _manifest_file_path(
+        root, manifest, "shard_manifest", default="indexes/shard_manifest.json"
+    )
+    company_shards_dir = _manifest_dir_path(
+        root, manifest, "company_shards", default="indexes/companies"
+    )
     chart_series_path = _optional_manifest_file_path(
         root,
         manifest,
@@ -91,22 +112,37 @@ def verify_spine_shard_release(
 
     if manifest and deep:
         errors.extend(_manifest_file_digest_errors(manifest, "global_spine", global_spine_path))
-        errors.extend(
-            _manifest_file_digest_errors(manifest, "router_sidecar", router_sidecar_path)
-        )
+        errors.extend(_manifest_file_digest_errors(manifest, "router_sidecar", router_sidecar_path))
+        if router_coherence_path is not None and isinstance(
+            ((manifest.get("indexes") or {}).get("router_coherence")),
+            Mapping,
+        ):
+            errors.extend(
+                _manifest_file_digest_errors(
+                    manifest,
+                    "router_coherence",
+                    router_coherence_path,
+                )
+            )
         errors.extend(_manifest_file_digest_errors(manifest, "shard_manifest", shard_manifest_path))
     chart_series_verification: dict[str, Any] | None = None
-    chart_series_output = ((manifest.get("indexes") or {}).get("chart_series") or {}) if manifest else {}
+    chart_series_output = (
+        ((manifest.get("indexes") or {}).get("chart_series") or {}) if manifest else {}
+    )
     chart_series_required = bool(
         isinstance(chart_series_output, Mapping) and chart_series_output.get("required") is True
     )
     if chart_series_path is not None:
         chart_series_issues: list[str] = []
         if manifest and deep and isinstance(chart_series_output, Mapping):
-            chart_series_issues.extend(_optional_manifest_file_digest_errors(manifest, "chart_series", chart_series_path))
+            chart_series_issues.extend(
+                _optional_manifest_file_digest_errors(manifest, "chart_series", chart_series_path)
+            )
         if chart_series_path.is_file():
             chart_series_verification = verify_chart_series_index(chart_series_path)
-            chart_series_issues.extend(str(error) for error in chart_series_verification.get("errors") or [])
+            chart_series_issues.extend(
+                str(error) for error in chart_series_verification.get("errors") or []
+            )
         elif chart_series_required:
             chart_series_issues.append("chart_series_missing")
         if chart_series_issues:
@@ -123,9 +159,7 @@ def verify_spine_shard_release(
         errors.extend(f"global_spine:{error}" for error in spine_verification["errors"])
     errors.extend(
         f"global_spine:{error}"
-        for error in _serving_metadata_binding_errors(
-            spine_verification.get("metadata") or {}
-        )
+        for error in _serving_metadata_binding_errors(spine_verification.get("metadata") or {})
     )
     router_sidecar_verification = verify_router_sidecar(
         router_sidecar_path,
@@ -146,10 +180,36 @@ def verify_spine_shard_release(
         deep=deep,
     )
     if not router_sidecar_verification["ok"]:
-        errors.extend(
-            f"router_sidecar:{error}"
-            for error in router_sidecar_verification["errors"]
-        )
+        errors.extend(f"router_sidecar:{error}" for error in router_sidecar_verification["errors"])
+    router_coherence_verification: dict[str, Any] | None = None
+    router_coherence_output = (
+        ((manifest.get("indexes") or {}).get("router_coherence") or {}) if manifest else {}
+    )
+    if isinstance(router_coherence_output, Mapping) and router_coherence_output:
+        if router_coherence_path is None:
+            errors.append("router_coherence:router_coherence_missing")
+        else:
+            router_coherence_verification = verify_router_coherence(
+                router_coherence_path,
+                expected_global_spine_sha256=_manifest_output_sha256(
+                    manifest,
+                    "global_spine",
+                ),
+                expected_release_id=(
+                    str(manifest.get("release_id")) if manifest.get("release_id") else None
+                ),
+                expected_profile_sha256=_manifest_output_value(
+                    manifest,
+                    "router_coherence",
+                    "profile_sha256",
+                ),
+                deep=deep,
+                require_trusted_seal=not deep,
+            )
+            if not router_coherence_verification["ok"]:
+                errors.extend(
+                    f"router_coherence:{error}" for error in router_coherence_verification["errors"]
+                )
 
     shard_manifest = _read_json(shard_manifest_path)
     if shard_manifest is None:
@@ -167,7 +227,7 @@ def verify_spine_shard_release(
             f"metric_dictionary:{error}"
             for error in metric_dictionary_binding_errors(expected_metric_dictionary)
         )
-        manifest_company_shards = ((manifest.get("indexes") or {}).get("company_shards") or {})
+        manifest_company_shards = (manifest.get("indexes") or {}).get("company_shards") or {}
         nested_binding = (
             manifest_company_shards.get("metric_dictionary")
             if isinstance(manifest_company_shards, Mapping)
@@ -193,8 +253,15 @@ def verify_spine_shard_release(
             )
         )
 
-    manifest_shards = ((manifest.get("indexes") or {}).get("company_shards") or {}).get("tickers") or {}
-    if manifest and isinstance(manifest_shards, dict) and shard_entries and set(manifest_shards) != set(shard_entries):
+    manifest_shards = ((manifest.get("indexes") or {}).get("company_shards") or {}).get(
+        "tickers"
+    ) or {}
+    if (
+        manifest
+        and isinstance(manifest_shards, dict)
+        and shard_entries
+        and set(manifest_shards) != set(shard_entries)
+    ):
         errors.append("manifest_shard_manifest_ticker_mismatch")
 
     shard_results: dict[str, Any] = {}
@@ -204,6 +271,12 @@ def verify_spine_shard_release(
             if deep:
                 counts.update(_global_counts(spine_conn))
                 errors.extend(_global_endpoint_errors(spine_conn, sample_limit=sample_limit))
+                errors.extend(
+                    global_replica_consistency_errors(
+                        spine_conn,
+                        sample_limit=sample_limit,
+                    )
+                )
             for index, (ticker, entry) in enumerate(sorted(shard_entries.items()), start=1):
                 shard_path = _resolve_shard_path(root, company_shards_dir, entry)
                 if deep:
@@ -241,12 +314,16 @@ def verify_spine_shard_release(
         "manifest_path": str(manifest_file),
         "global_spine_path": str(global_spine_path),
         "router_sidecar_path": str(router_sidecar_path),
+        "router_coherence_path": (
+            str(router_coherence_path) if router_coherence_path is not None else None
+        ),
         "shard_manifest_path": str(shard_manifest_path),
         "company_shards_dir": str(company_shards_dir),
         "chart_series_path": str(chart_series_path) if chart_series_path is not None else None,
         "counts": counts,
         "global_spine_verification": spine_verification,
         "router_sidecar_verification": router_sidecar_verification,
+        "router_coherence_verification": router_coherence_verification,
         "chart_series_verification": chart_series_verification,
         "shards": shard_results,
         "verification_mode": "spine-shard-release-deep" if deep else "spine-shard-release-light",
@@ -429,7 +506,9 @@ def _verify_one_shard(
     )
     source_artifact_verification = verify_source_artifact_sqlite(shard_path)
     if not source_artifact_verification["ok"]:
-        errors.extend(f"source_artifact_sqlite:{error}" for error in source_artifact_verification["errors"])
+        errors.extend(
+            f"source_artifact_sqlite:{error}" for error in source_artifact_verification["errors"]
+        )
     spine_conn.execute(f"ATTACH DATABASE ? AS {schema_name}", (str(shard_path),))
     try:
         shard_binding = _attached_shard_metric_dictionary_binding(
@@ -486,20 +565,36 @@ def _verify_one_shard(
                     f"""
                     SELECT COUNT(*)
                     FROM {schema_name}.metric_lookup AS metric
+                    JOIN global_object_replica AS replica
+                      ON replica.local_object_key = metric.object_id
+                     AND replica.ticker = ?
                     JOIN global_metric_spine AS spine
-                      ON spine.object_id = metric.object_id
+                      ON spine.object_id = replica.object_id
+                     AND spine.ticker = replica.ticker
                     WHERE spine.period != metric.observation_period
-                    """
+                    """,
+                    (ticker,),
                 ).fetchone()[0]
             )
             if global_metric_period_mismatches:
                 errors.append(
-                    "global_metric_observation_period_mismatch:"
-                    f"{global_metric_period_mismatches}"
+                    f"global_metric_observation_period_mismatch:{global_metric_period_mismatches}"
                 )
-        counts["locator_objects"] = int(
+        counts["canonical_locator_objects"] = int(
             spine_conn.execute(
                 "SELECT COUNT(*) FROM global_object_locator WHERE ticker = ?",
+                (ticker,),
+            ).fetchone()[0]
+        )
+        counts["replica_objects"] = int(
+            spine_conn.execute(
+                "SELECT COUNT(*) FROM global_object_replica WHERE ticker = ?",
+                (ticker,),
+            ).fetchone()[0]
+        )
+        counts["replica_edges"] = int(
+            spine_conn.execute(
+                "SELECT COUNT(*) FROM global_edge_replica WHERE ticker = ?",
                 (ticker,),
             ).fetchone()[0]
         )
@@ -514,59 +609,106 @@ def _verify_one_shard(
                 f"""
                 SELECT COUNT(*)
                 FROM {schema_name}.objects AS objects
-                LEFT JOIN global_object_locator AS locator
-                  ON locator.object_id = objects.id
-                WHERE objects.ticker = ?
-                  AND locator.object_id IS NULL
+                LEFT JOIN global_object_replica AS replica
+                  ON replica.local_object_key = objects.id
+                 AND replica.ticker = ?
+                WHERE replica.object_id IS NULL
                 """,
                 (ticker,),
             ).fetchone()[0]
         )
         if missing_locator:
-            errors.append(f"objects_missing_locator:{missing_locator}")
+            errors.append(f"objects_missing_replica:{missing_locator}")
             errors.extend(
                 _sample_values(
                     spine_conn,
                     f"""
                     SELECT objects.id
                     FROM {schema_name}.objects AS objects
-                    LEFT JOIN global_object_locator AS locator
-                      ON locator.object_id = objects.id
-                    WHERE objects.ticker = ?
-                      AND locator.object_id IS NULL
+                    LEFT JOIN global_object_replica AS replica
+                      ON replica.local_object_key = objects.id
+                     AND replica.ticker = ?
+                    WHERE replica.object_id IS NULL
                     ORDER BY objects.id
                     LIMIT ?
                     """,
                     (ticker, sample_limit),
-                    prefix="object_missing_locator",
+                    prefix="object_missing_replica",
                 )
             )
         missing_object = int(
             spine_conn.execute(
                 f"""
                 SELECT COUNT(*)
-                FROM global_object_locator AS locator
+                FROM global_object_replica AS replica
                 LEFT JOIN {schema_name}.objects AS objects
-                  ON objects.id = locator.object_id
-                WHERE locator.ticker = ?
+                  ON objects.id = replica.local_object_key
+                WHERE replica.ticker = ?
                   AND objects.id IS NULL
                 """,
                 (ticker,),
             ).fetchone()[0]
         )
         if missing_object:
-            errors.append(f"locator_missing_object:{missing_object}")
+            errors.append(f"replica_missing_object:{missing_object}")
+        missing_edge_replica = int(
+            spine_conn.execute(
+                f"""
+                SELECT COUNT(*)
+                FROM {schema_name}.edges AS edges
+                JOIN {schema_name}.objects AS source
+                  ON source.id = edges.from_id
+                JOIN {schema_name}.objects AS target
+                  ON target.id = edges.to_id
+                LEFT JOIN global_edge_replica AS replica
+                  ON replica.edge_id = CASE
+                        WHEN instr(
+                            ':' || upper(edges.id) || ':',
+                            ':' || upper(?) || ':'
+                        ) > 0
+                        THEN edges.id
+                        ELSE 'scoped:' || ? || ':' || edges.id
+                     END
+                 AND replica.ticker = ?
+                WHERE replica.edge_id IS NULL
+                """,
+                (ticker, ticker, ticker),
+            ).fetchone()[0]
+        )
+        if missing_edge_replica:
+            errors.append(f"edges_missing_replica:{missing_edge_replica}")
+        missing_shard_edge = int(
+            spine_conn.execute(
+                f"""
+                SELECT COUNT(*)
+                FROM global_edge_replica AS replica
+                LEFT JOIN {schema_name}.edges AS edges
+                  ON replica.edge_id = CASE
+                        WHEN instr(
+                            ':' || upper(edges.id) || ':',
+                            ':' || upper(?) || ':'
+                        ) > 0
+                        THEN edges.id
+                        ELSE 'scoped:' || ? || ':' || edges.id
+                     END
+                WHERE replica.ticker = ?
+                  AND edges.id IS NULL
+                """,
+                (ticker, ticker, ticker),
+            ).fetchone()[0]
+        )
+        if missing_shard_edge:
+            errors.append(f"replica_missing_edge:{missing_shard_edge}")
         missing_doc = int(
             spine_conn.execute(
                 f"""
                 SELECT COUNT(*)
                 FROM {schema_name}.documents AS docs
                 LEFT JOIN global_document_catalog AS catalog
-                  ON catalog.ticker = docs.ticker
+                  ON catalog.ticker = ?
                  AND catalog.document_type = docs.document_type
                  AND catalog.period = docs.period
-                WHERE docs.ticker = ?
-                  AND catalog.document_id IS NULL
+                WHERE catalog.document_id IS NULL
                 """,
                 (ticker,),
             ).fetchone()[0]
@@ -653,7 +795,9 @@ def _manifest_output_value(
     return str(value) if isinstance(value, str) and value else None
 
 
-def _optional_manifest_file_digest_errors(manifest: dict[str, Any], role: str, path: Path) -> list[str]:
+def _optional_manifest_file_digest_errors(
+    manifest: dict[str, Any], role: str, path: Path
+) -> list[str]:
     output = ((manifest.get("indexes") or {}).get(role) or {}) if manifest else {}
     if not isinstance(output, dict):
         return []
@@ -667,7 +811,11 @@ def _optional_manifest_file_digest_errors(manifest: dict[str, Any], role: str, p
 
 def _expected_shard_sha256(manifest: dict[str, Any], ticker: str, shard_entry: Any) -> str | None:
     manifest_entry = (
-        ((((manifest.get("indexes") or {}).get("company_shards") or {}).get("tickers") or {}).get(ticker))
+        (
+            (
+                ((manifest.get("indexes") or {}).get("company_shards") or {}).get("tickers") or {}
+            ).get(ticker)
+        )
         if manifest
         else None
     )
@@ -683,11 +831,8 @@ def _expected_shard_sha256(manifest: dict[str, Any], ticker: str, shard_entry: A
 
 
 def _file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+    cached = read_immutable_sqlite_cache_sha256(path)
+    return cached if cached is not None else immutable_file_sha256(path)
 
 
 def _global_endpoint_errors(conn: sqlite3.Connection, *, sample_limit: int) -> list[str]:
@@ -769,11 +914,104 @@ def _global_endpoint_errors(conn: sqlite3.Connection, *, sample_limit: int) -> l
     return errors
 
 
+def global_replica_consistency_errors(
+    conn: sqlite3.Connection,
+    *,
+    sample_limit: int = 20,
+) -> list[str]:
+    """Verify occurrence-level object/edge/chain identities in a global spine."""
+    checks = (
+        (
+            "object_replica_orphan_canonical",
+            """
+            SELECT replica.object_id AS id
+            FROM global_object_replica AS replica
+            LEFT JOIN global_object_locator AS canonical
+              ON canonical.object_id = replica.object_id
+            WHERE canonical.object_id IS NULL
+            """,
+        ),
+        (
+            "edge_replica_orphan_canonical",
+            """
+            SELECT replica.edge_id AS id
+            FROM global_edge_replica AS replica
+            LEFT JOIN global_edge_spine AS canonical
+              ON canonical.edge_id = replica.edge_id
+            WHERE canonical.edge_id IS NULL
+            """,
+        ),
+        (
+            "edge_replica_from_occurrence_missing",
+            """
+            SELECT edge.edge_id AS id
+            FROM global_edge_replica AS edge
+            LEFT JOIN global_object_replica AS endpoint
+              ON endpoint.object_id = edge.from_object_id
+             AND endpoint.ticker = edge.ticker
+            WHERE endpoint.object_id IS NULL
+            """,
+        ),
+        (
+            "edge_replica_to_occurrence_missing",
+            """
+            SELECT edge.edge_id AS id
+            FROM global_edge_replica AS edge
+            LEFT JOIN global_object_replica AS endpoint
+              ON endpoint.object_id = edge.to_object_id
+             AND endpoint.ticker = edge.ticker
+            WHERE endpoint.object_id IS NULL
+            """,
+        ),
+        (
+            "chain_from_occurrence_missing",
+            """
+            SELECT link.link_id AS id
+            FROM global_chain_index AS link
+            LEFT JOIN global_object_replica AS endpoint
+              ON endpoint.object_id = link.from_object_id
+             AND endpoint.ticker = link.from_ticker
+            WHERE link.from_object_id IS NOT NULL
+              AND endpoint.object_id IS NULL
+            """,
+        ),
+        (
+            "chain_to_occurrence_missing",
+            """
+            SELECT link.link_id AS id
+            FROM global_chain_index AS link
+            LEFT JOIN global_object_replica AS endpoint
+              ON endpoint.object_id = link.to_object_id
+             AND endpoint.ticker = link.to_ticker
+            WHERE link.to_object_id IS NOT NULL
+              AND endpoint.object_id IS NULL
+            """,
+        ),
+    )
+    errors: list[str] = []
+    for code, select_sql in checks:
+        count = int(conn.execute(f"SELECT COUNT(*) FROM ({select_sql}) AS failures").fetchone()[0])
+        if not count:
+            continue
+        errors.append(f"{code}:{count}")
+        errors.extend(
+            _sample_values(
+                conn,
+                select_sql + " ORDER BY id LIMIT ?",
+                (max(1, int(sample_limit)),),
+                prefix=f"{code}_sample",
+            )
+        )
+    return errors
+
+
 def _global_counts(conn: sqlite3.Connection) -> dict[str, int]:
     tables = (
         "global_object_locator",
+        "global_object_replica",
         "global_document_catalog",
         "global_edge_spine",
+        "global_edge_replica",
         "global_factor_spine",
         "global_topic_spine",
         "global_metric_spine",
@@ -789,17 +1027,27 @@ def _manifest_file_path(root: Path, manifest: dict[str, Any], role: str, *, defa
     if not isinstance(raw, str) or not raw:
         raw = default
     candidate = Path(raw)
-    return candidate.expanduser().resolve() if candidate.is_absolute() else (root / candidate).resolve()
+    return (
+        candidate.expanduser().resolve()
+        if candidate.is_absolute()
+        else (root / candidate).resolve()
+    )
 
 
-def _optional_manifest_file_path(root: Path, manifest: dict[str, Any], role: str, *, default: str) -> Path | None:
+def _optional_manifest_file_path(
+    root: Path, manifest: dict[str, Any], role: str, *, default: str
+) -> Path | None:
     output = ((manifest.get("indexes") or {}).get(role) or {}) if manifest else {}
     raw = output.get("path") if isinstance(output, Mapping) else None
     if not isinstance(raw, str) or not raw:
         fallback = (root / default).resolve()
         return fallback if fallback.exists() else None
     candidate = Path(raw)
-    return candidate.expanduser().resolve() if candidate.is_absolute() else (root / candidate).resolve()
+    return (
+        candidate.expanduser().resolve()
+        if candidate.is_absolute()
+        else (root / candidate).resolve()
+    )
 
 
 def _manifest_dir_path(root: Path, manifest: dict[str, Any], role: str, *, default: str) -> Path:
@@ -807,7 +1055,11 @@ def _manifest_dir_path(root: Path, manifest: dict[str, Any], role: str, *, defau
     if not isinstance(raw, str) or not raw:
         raw = default
     candidate = Path(raw)
-    return candidate.expanduser().resolve() if candidate.is_absolute() else (root / candidate).resolve()
+    return (
+        candidate.expanduser().resolve()
+        if candidate.is_absolute()
+        else (root / candidate).resolve()
+    )
 
 
 def _resolve_shard_path(root: Path, company_shards_dir: Path, entry: Mapping[str, Any]) -> Path:

@@ -25,6 +25,10 @@ GURU_RESEARCH_PACK_FORMAT = "krw-guru-research-pack/v1"
 GURU_COMPANY_ONTOLOGY_CONTEXT_FORMAT = "krw-guru-company-ontology-context/v1"
 GURU_COMPANY_FILING_BRIEF_FORMAT = "krw-guru-company-filing-brief/v1"
 GURU_DYNAMIC_QUESTION_PLAN_FORMAT = "krw-guru-dynamic-question-plan/v1"
+GURU_LIGHT_COMPANY_CONTEXT_FORMAT = "krw-guru-light-company-context/v1"
+GURU_INVESTIGATION_BRIEF_FORMAT = "krw-guru-investigation-brief/v1"
+GURU_COMPANY_RESEARCH_CONTEXT_FORMAT = "krw-guru-company-research-context/v1"
+GURU_VALIDATED_EVIDENCE_ANALYSIS_FORMAT = "krw-guru-validated-evidence-analysis/v1"
 GURU_COMPANY_RESEARCH_PACK_FORMAT = "krw-guru-company-research-pack/v1"
 GURU_COMPANY_EVIDENCE_REVIEW_FORMAT = "krw-guru-company-evidence-review/v1"
 GURU_ANSWER_RENDER_PLAN_FORMAT = "krw-guru-answer-render-plan/v1"
@@ -927,6 +931,7 @@ class GuruResearchPack(GuruBaseModel):
     answerability: GuruAnswerability
     intent: GuruResearchIntent
     persona_profile: dict[str, Any] = Field(default_factory=dict)
+    philosophy_context: dict[str, Any] = Field(default_factory=dict)
     selected_lenses: list[dict[str, Any]] = Field(default_factory=list)
     consultation_moves: list[dict[str, Any]] = Field(default_factory=list)
     data_needs: list[dict[str, Any]] = Field(default_factory=list)
@@ -966,6 +971,128 @@ class GuruCompanyOntologyContext(GuruBaseModel):
     context_tags: list[str] = Field(default_factory=list)
     confidence: Literal["low", "medium", "high"] | None = None
     source_payload_keys: list[str] = Field(default_factory=list)
+
+
+class GuruCompanyContextAnchor(GuruBaseModel):
+    """A trusted, neutral fact used to ground an investigation question."""
+
+    anchor_id: str
+    kind: Literal[
+        "business_description",
+        "primary_activity",
+        "product",
+        "segment",
+        "revenue_logic",
+        "sector",
+    ]
+    text: str
+
+
+class GuruLightCompanyContext(GuruBaseModel):
+    """Company identity and neutral business context available before research.
+
+    This is deliberately distinct from filing retrieval output: it must not
+    carry recent performance, investment conclusions, or valuation data.
+    """
+
+    format: str = GURU_LIGHT_COMPANY_CONTEXT_FORMAT
+    ticker: str
+    company_name: str
+    sector: str | None = None
+    industry: str | None = None
+    business_description: str
+    primary_activities: list[str] = Field(default_factory=list)
+    products_or_segments: list[str] = Field(default_factory=list)
+    revenue_logic: str | None = None
+    context_anchors: list[GuruCompanyContextAnchor] = Field(default_factory=list)
+    filing_availability: dict[str, bool] = Field(default_factory=dict)
+
+
+class GuruInvestigationQuestionDraft(GuruBaseModel):
+    """A philosophy-grounded research question authored by the main agent."""
+
+    question: str
+    guru_principle_ids: list[str]
+    company_context_anchor_ids: list[str]
+    hypothesis: str
+    counter_hypothesis: str
+    evidence_needed: list[str]
+    strengthens_if: str
+    weakens_if: str
+    why_material: str
+    # The main agent assigns the role. The server only checks that the
+    # question set has one central tension; it never authors a question.
+    decision_role: Literal[
+        "main_tension",
+        "supporting_evidence",
+        "countercase",
+        "change_condition",
+    ] | None = None
+
+
+class GuruInvestigationQuestion(GuruInvestigationQuestionDraft):
+    """A server-sealed investigation question with a deterministic id."""
+
+    question_id: str
+
+
+class GuruInvestigationBrief(GuruBaseModel):
+    """Bounded handoff from the main Guru to filing evidence retrieval."""
+
+    format: str = GURU_INVESTIGATION_BRIEF_FORMAT
+    brief_hash: str
+    research_pack_id: str
+    author_key: Literal["buffett", "marks", "ackman", "flatt", "terry_smith"]
+    ticker: str
+    company_context_hash: str
+    questions: list[GuruInvestigationQuestion]
+
+
+class GuruEvidenceAssessment(GuruBaseModel):
+    """The main Guru's internal, evidence-bound analysis of one question."""
+
+    question_id: str
+    evidence_object_ids: list[str] = Field(default_factory=list)
+    verdict: Literal["supported", "mixed", "unresolved"]
+    reasoning: str
+
+
+class GuruCompanyResearchContext(GuruBaseModel):
+    """Runtime-built filing context for the default Guru company path.
+
+    This intentionally carries only evidence returned by the company MCP.  It
+    is not a verifier output and therefore cannot authorize a ``supported``
+    verdict by itself.
+    """
+
+    format: Literal["krw-guru-company-research-context/v1"]
+    ticker: str
+    brief_hash: str
+    question_ids: list[str] = Field(min_length=1)
+    evidence_units: list[dict[str, Any]] = Field(min_length=1)
+    source_object_ids: list[str] = Field(min_length=1)
+    research_status: Literal["evidence_found", "partial"] = "partial"
+
+
+class GuruAgentEvidenceAnalysis(GuruBaseModel):
+    """Private main-agent interpretation; never render this object directly."""
+
+    assessments: list[GuruEvidenceAssessment]
+    overall_judgment: str
+
+
+class GuruValidatedEvidenceAnalysis(GuruBaseModel):
+    """Result returned after server validation of a main-agent analysis."""
+
+    format: str = GURU_VALIDATED_EVIDENCE_ANALYSIS_FORMAT
+    brief_hash: str
+    evidence_mode: Literal["contextual"] = "contextual"
+    research_context_hash: str
+    author_key: Literal["buffett", "marks", "ackman", "flatt", "terry_smith"]
+    ticker: str
+    agent_analysis: GuruAgentEvidenceAnalysis
+    decision_frame: dict[str, Any] = Field(default_factory=dict)
+    validation: dict[str, Any] = Field(default_factory=dict)
 
 
 class GuruDynamicQuestionPlanItem(GuruBaseModel):
@@ -1024,6 +1151,7 @@ class GuruCompanyFilingBrief(GuruBaseModel):
     generic_filing_requirements: list[str] = Field(default_factory=list)
     data_need_keys: list[str] = Field(default_factory=list)
     dynamic_question_plan: GuruDynamicQuestionPlan | None = None
+    investigation_brief: GuruInvestigationBrief | None = None
     missing_inputs: list[str] = Field(default_factory=list)
     recommended_company_mcp_call: dict[str, Any] = Field(default_factory=dict)
     boundary: str = (

@@ -16,6 +16,9 @@ a newer 10-Q beats an older 10-K for current drivers; a latest 10-K is primary o
 three short follow-up prompts present under 이어서 볼 질문
 strong claims traceable or metric-lineage grounded
 direct vs related context separated
+investment inferences name the premise, material assumption, and disconfirming signal
+partial, conflicting, or truncated evidence yields a bounded investor conclusion and monitor, not a bare refusal
+strong-claim-disallowed states never become proven, confirmed, or certain conclusions
 normal answers are interpretation-first, not raw-number dumps
 tables use interpretation columns unless exact numbers are requested or required for the conclusion
 exact numbers are limited to the few figures needed to support, qualify, or correct the conclusion
@@ -30,6 +33,7 @@ model-authored SearchPlan v2 exists before the first query_context call
 query_context arguments are exactly {search_plan}; legacy top-level arguments = 0
 SearchPlan preserves user intent, tickers/universe, periods, metrics, dimensions, predicates, comparison axes, and calculation windows in atomic clauses
 ResearchState required clause/calculation coverage is checked before synthesis
+structurally invalid SearchPlan input is repaired before execution; legacy fallback arguments = 0
 retrieve is a targeted recall extension for a named missing clause only; do not use after sufficient ResearchState coverage
 trace/chain selected roots only; never brute-force every candidate
 no repeated equivalent query

@@ -1,0 +1,34 @@
+{
+  "build": {
+    "object_types": [
+      "AgreementTerm",
+      "AssumptionCandidate",
+      "BusinessActivity",
+      "BusinessEvent",
+      "BusinessFactor",
+      "Calculation",
+      "ChangeEvent",
+      "CompanyBusinessProfile",
+      "ExternalFactorExposure",
+      "MetricObservation",
+      "ResearchClaim",
+      "TemporalLink",
+      "TrendObservation"
+    ]
+  },
+  "format": "krw-ontology-router-coherence-profile/v1",
+  "profile_id": "router-source-coherence-v1",
+  "query": {
+    "candidate_ticker_multiplier": 10,
+    "coarse_weight": 0.2,
+    "coherence_weight": 0.8,
+    "coverage_weight": 0.55,
+    "discard_truncated_pairs": true,
+    "information_coverage_weight": 0.45,
+    "max_pair_queries": 12,
+    "max_pair_result_rows": 4096,
+    "minimum_information": 1.5,
+    "minimum_query_terms": 2
+  },
+  "version": 1
+}

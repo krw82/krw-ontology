@@ -47,6 +47,13 @@ from krw_ontology.agent_index.spine_builder import (
     merge_spine_fragments,
     plan_spine_shard_release_outputs,
 )
+from krw_ontology.agent_index.semantic_identity import SEMANTIC_IDENTITY_POLICY_VERSION
+from krw_ontology.agent_index.spine_preflight import (
+    COMPANY_IDENTITY_PREFLIGHT_FORMAT_VERSION,
+    SPINE_SEMANTIC_PREFLIGHT_FORMAT_VERSION,
+    preflight_company_shard_identities,
+    preflight_spine_fragments,
+)
 from krw_ontology.agent_index.spine_schema import (
     GLOBAL_SPINE_BUILDER_VERSION,
     GLOBAL_SPINE_LAYOUT,
@@ -88,6 +95,9 @@ __all__ = [
     "SPINE_FRAGMENT_FORMAT_VERSION",
     "SPINE_FRAGMENT_CACHE_FORMAT_VERSION",
     "SPINE_PROJECTION_VERSION",
+    "SEMANTIC_IDENTITY_POLICY_VERSION",
+    "SPINE_SEMANTIC_PREFLIGHT_FORMAT_VERSION",
+    "COMPANY_IDENTITY_PREFLIGHT_FORMAT_VERSION",
     "SpineFragmentResult",
     "SpineShardReleaseBuildResult",
     "V3_BUILD_SUMMARY_FORMAT_VERSION",
@@ -106,6 +116,8 @@ __all__ = [
     "merge_spine_fragments",
     "open_ontology_store",
     "plan_spine_shard_release_outputs",
+    "preflight_spine_fragments",
+    "preflight_company_shard_identities",
     "query_chart_series_pack",
     "read_global_spine_metadata",
     "refresh_global_key_stats",

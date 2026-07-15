@@ -1,110 +1,150 @@
 # Guru MCP Tool Policy
 
-Use the dedicated Guru MCP as a read-only ontology lens layer. It is separate from the KRW Ontology filing MCP.
+Use the Guru MCP as a read-only ontology layer. The main Guru does not call the
+KRW filing tools directly; the designated company evidence Agent owns that
+work.
 
-## Default Workflow
-
-```text
-English-first private internal guru consultation brief
--> if company-specific: use app-provided company context when it already exists; do not call KRW Ontology filing MCP directly from the main Guru run
--> normalize company_context only from app-provided runtime context, without ticker hard-coding
--> krw_guru_query_context with English-first query text and company_context when available
--> if company-specific: krw_guru_company_brief with the same company_context
--> app-provided company_evidence_researcher receives the exact dynamic_question_plan, searches filings, selects exact object IDs, and calls krw_ontology_verify_evidence once
--> the subagent returns the exact krw-verified-company-evidence/v1 payload unchanged
--> krw_guru_review_company_evidence receives that exact payload before final writing
--> optional krw_guru_trace or krw_guru_chain on selected reviewed_ids only for extra guru-source support; these tools never replace company filing evidence
--> answer
-```
-
-Use `krw_guru_search` only for fallback discovery or debugging. Do not use broad search after `krw_guru_query_context` returns a sufficient or partial pack.
-
-The brief is private. Do not expose it to the user. Guru source materials are English-first, so the actual query text passed to Guru MCP should lead with the English internal investment brief and English retrieval terms. Korean original wording may be included only as secondary context.
-
-All MCP usage is silent. Do not tell the user that you are calling tools, reading files, checking `research_status`, retrying JSON parameters, or waiting for a bridge. Tool outputs are internal materials for the final answer only.
-
-## Tool Roles
+## Default Company Workflow
 
 ```text
-krw_guru_query_context
-- Default first Guru MCP call after the English-first internal guru consultation brief. For company-specific questions, pass company_context only when the app runtime already supplied bounded company context. Returns ResearchPack, answerability, allowed next tools, selected lenses, source anchors, runtime mode, and company bridge needs.
-
-krw_guru_company_brief
-- Company-specific bridge. Converts selected guru lenses, data_needs, company_context, and company_bridge requirements into a KRW Ontology company filing research question and dynamic_question_plan. It does not retrieve company facts. The dynamic_question_plan is the preferred evidence contract for the company_evidence_researcher subagent.
-
-krw_guru_company_pack
-- Legacy/debug post-company-evidence bridge. It is not part of the default product runtime. The default runtime writes the final answer from the Guru ResearchPack, CompanyEvidencePack, and krw_guru_review_company_evidence guidance.
-
-krw_guru_review_company_evidence
-- Required post-company-evidence review for named-company judgments. It accepts only the exact verified payload and reviews how that evidence strengthens, weakens, or fails to support the selected Guru ResearchPack lenses. It returns interpretation guidance only; it does not write final prose or impose a fixed report template.
-
-krw_guru_trace
-- Source support and bounded related objects for one selected ontology object.
-
-krw_guru_chain
-- Compact semantic neighbors around one selected ontology object.
-
-krw_guru_search
-- Fallback discovery only.
-
-krw_guru_status
-- Coverage and curation health only.
-
-krw_guru_index_context
-- Debug/capability/index health only. Not for normal answers. `krw_guru_query_context` is already shard-aware.
-
-krw_guru_data_needs
-- Compatibility bridge for filing evidence needs. Prefer the company_bridge section in query_context.
+English-first private retrieval brief
+-> krw_guru_query_context with fixed author key and light company context
+-> main Guru drafts exactly one company-specific key question from philosophy_context
+-> krw_guru_company_brief(investigation_questions; runtime attaches selected research pack) seals investigation_brief
+-> Agent(company_evidence_researcher, exact sealed brief)
+-> query_context, query, and trace return actual ResearchState v2 filing results
+-> runtime builds krw-guru-company-research-context/v1
+-> private main-Guru agent_analysis
+-> krw_guru_review_company_evidence(question, agent_analysis; runtime attaches brief and context)
+-> final qualitative answer
 ```
 
-## Index And Shard Policy
+`krw_guru_company_brief` validates and seals the one main-agent key-question
+draft against the
+runtime-attached immutable research pack that selected its principles; it does
+not re-query or author a question in this default path. `krw_guru_review_company_evidence`
+validates source linkage and evidence status; it does not supply a Guru
+conclusion or final prose.
 
-The Guru MCP is optimized internally:
+For the default review call, the model sends only the user/company
+question and its `agent_analysis` (`assessments` plus `overall_judgment`). The
+runtime attaches the sealed `investigation_brief`, company research context
+built only from actual filing-tool results, ticker, selected author key, and
+matching identity hashes. Never copy these runtime-owned fields into the tool
+input or reconstruct them from tool output.
+If either company-brief or review returns an English `input_correction_required` JSON, repair only
+the fields named by `invalid_fields` and make the next allowed call in the same
+SDK run; do not restart the workflow or retry unchanged input.
 
-```text
-reviewed JSONL = source of truth
-author SQLite shards = read-optimized serving layer
-guru_shard_manifest.json = lightweight global map
+Valid review input:
+
+```json
+{
+  "question": "Assess AAPL Services durability.",
+  "agent_analysis": {
+    "assessments": [
+      {
+        "question_id": "q_services_durability",
+        "verdict": "mixed",
+        "evidence_object_ids": ["claim:AAPL:q_services_durability"],
+        "reasoning": "The available evidence supports recurring demand, but does not fully separate Services from the device ecosystem."
+      }
+    ],
+    "overall_judgment": "Services durability appears improving but remains only partly verified as independent from devices."
+  }
+}
 ```
 
-Skills must not read shard files directly. Always call `krw_guru_query_context` with the fixed `author_keys` for the selected skill. The MCP will use the author shard when available and fall back to reviewed JSONL if needed.
+If `agent_analysis` is absent, incomplete, or cites evidence outside its sealed
+key question, the review call is not executed. MCP returns an English `isError`
+correction payload in the same run; it does not rewrite the analysis or start
+another run. For a missing analysis, the payload is:
 
-## Stop Rules
-
-```text
-sufficient_lens:
-answer without broad follow-up
-
-partial_lens:
-answer narrowly; do not fill missing lenses from memory
-
-needs_clarification:
-ask the returned clarifying question before strong advice
-
-needs_company_evidence:
-call krw_guru_company_brief with the same author_keys and company_context when available, pass the exact dynamic_question_plan with question_id values to company_evidence_researcher, require one krw_ontology_verify_evidence call, then pass the exact verifier payload to krw_guru_review_company_evidence; retry the subagent if the review rejects a missing or modified pack
-
-ontology_gap:
-state that the current guru ontology did not return enough support
+```json
+{
+  "status": "input_correction_required",
+  "code": "missing_agent_analysis",
+  "message": "agent_analysis is required for the sealed key question.",
+  "required_change": "Provide one assessment for the sealed key question and a complete overall_judgment.",
+  "invalid_fields": ["agent_analysis"],
+  "allowed_next_tools": ["krw_guru_review_company_evidence"]
+}
 ```
 
-Trace or chain only selected reviewed_ids from the ResearchPack. Do not trace every candidate.
+Do not add `company_payload`, `investigation_brief`, `brief_hash`,
+`company_research_context`, `ticker`, or `author_keys` to repair this error.
+They are runtime-owned values.
+For a question-specific failure, the payload includes `violations`. Correct
+only the named assessment; it provides the exact `question_id`, allowed
+`verdict` values, and allowed `evidence_object_ids`. For example:
 
-For named-company or ticker-specific judgment, do not finish from Guru MCP calls alone. The required path is `krw_guru_company_brief -> company_evidence_researcher -> krw_ontology_verify_evidence -> krw_guru_review_company_evidence`. `krw_guru_trace`, `krw_guru_chain`, and `krw_guru_evidence` may improve guru-source support, but they are not company filing research.
-
-Company-specific final-answer gate:
-
-```text
-krw_guru_query_context
--> krw_guru_company_brief
--> Agent(subagent_type="company_evidence_researcher", prompt includes dynamic_question_plan)
--> exact krw-verified-company-evidence/v1 payload
--> krw_guru_review_company_evidence
--> final consultation answer
+```json
+{
+  "status": "input_correction_required",
+  "code": "unsupported_verdict",
+  "message": "Question q_services_durability cannot use verdict 'supported' with answerability=interpretation_only.",
+  "required_change": "Choose one of the allowed verdicts for this question without adding new evidence.",
+  "invalid_fields": ["agent_analysis.assessments[0].verdict"],
+  "violations": [
+    {
+      "question_id": "q_services_durability",
+      "allowed_verdicts": ["mixed", "unresolved"],
+      "allowed_evidence_object_ids": ["claim:AAPL:q_services_durability"]
+    }
+  ],
+  "allowed_next_tools": ["krw_guru_review_company_evidence"]
+}
 ```
 
-Do not answer from `krw_guru_query_context` or `krw_guru_company_brief` alone for durable company claims. If the company evidence Agent or review fails, retry once with the exact question plan and verifier payload. If it still fails, return a brief limitation in advisor voice instead of inventing company facts or claiming filing evidence was checked.
+Never retry the unchanged payload or ask the MCP to infer the intended
+analysis. One initial review call and one corrected call are allowed in the
+same SDK run.
 
-## Hard Boundary
+For the company-brief call, the active generated-brief workflow also returns a
+structured correction rather than letting the runtime invent or split a
+question. For example:
 
-The Guru MCP does not answer company facts, current financials, valuation, market prices, or latest filings. `company_context` is orientation only, not evidence. `krw_guru_company_brief` prepares the company filing research brief and dynamic question plan. `krw_guru_review_company_evidence` only reviews already-supplied company evidence against selected guru lenses and the evidence questions. The app-provided company_evidence_researcher subagent owns the actual KRW Ontology company filing MCP call.
+```json
+{
+  "status": "input_correction_required",
+  "code": "exactly_one_key_question_required",
+  "message": "The Guru company workflow accepts exactly one philosophy-shaped key question.",
+  "required_change": "Provide investigation_questions as an array with exactly one draft. Keep separate filing proof needs in that draft's evidence_needed field, not as additional questions.",
+  "invalid_fields": ["investigation_questions"],
+  "allowed_next_tools": ["krw_guru_company_brief"]
+}
+```
+
+Correct only that call in the same SDK run. The MCP never chooses a substitute
+question or turns its proof needs into a fixed checklist.
+
+The evidence subagent must not return a memo, thesis, recommendation, Guru
+voice, or synthetic evidence pack. It searches only with `query_context`,
+`query`, and `trace`; the runtime extracts the compact research context from
+the returned filing results.
+
+The default selected-company path does not call `krw_ontology_verify_evidence`
+and does not create a `krw-verified-company-evidence/v1` pack. The runtime attaches the exact
+`krw-guru-company-research-context/v1` it built from the subagent's actual
+filing-tool results to the subsequent Guru review call.
+
+Use trace or chain only for selected reviewed IDs when a stronger ontology
+source is necessary. Treat every selected root as `(ticker, object_id)` and
+forward both fields unchanged; never guess a company for a shared object ID.
+Inspect chain `response_budget` before treating the returned paths as complete.
+Trace and chain never replace filing evidence. Use Guru search only for
+fallback discovery or debugging.
+
+A historical comparison may appear in final prose only if the selected Guru
+ResearchPack itself contains the documented episode or prior cycle. Phrase it
+in third person (for example, “Marks가 과거 신용 사이클에서 반복해 경계한…”),
+not as a personal recollection or a claim to be the real investor.
+
+## Emergency Rollback Only
+
+The standard workflow is enabled by default. Setting
+`GURU_AGENT_GENERATED_BRIEF_ENABLED=0` is an operational rollback switch for a
+production incident, not a model choice or a user-facing mode. In that
+exceptional case, the pre-existing `dynamic_question_plan` path may run. The
+two paths are mutually exclusive: never send a legacy plan and an
+investigation brief in the same run.

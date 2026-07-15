@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import shutil
 import sqlite3
@@ -20,7 +21,7 @@ from krw_ontology.agent_index import OntologySpineRouter, build_spine_shard_rele
 from krw_ontology.agent_index.chart_series import query_chart_series_pack
 from krw_ontology.agent_index.builder import build_agent_index as _build_legacy_agent_index
 from krw_ontology.agent_index.store import OntologyStore
-from krw_ontology.mcp_server.http_server import prepare_mcp_runtime
+from krw_ontology.mcp_server.http_server import _configure_logging, prepare_mcp_runtime
 from krw_ontology.mcp_server import server as mcp_server
 from krw_ontology.mcp_server import tools as mcp_tools
 from krw_ontology.mcp_server.contracts import QueryClause, SearchPlan
@@ -33,6 +34,8 @@ from krw_ontology.mcp_server.server import (
     ready_payload,
 )
 from krw_ontology.mcp_server.tools import (
+    MAX_CHAIN_RESPONSE_MODEL_BYTES,
+    _apply_chain_response_budget,
     _normalize_object_types,
     catalog_tool,
     chain_tool,
@@ -65,6 +68,27 @@ class _FakeResearchState:
 def build_agent_index(*args, **kwargs):
     kwargs.setdefault("allow_internal_legacy_builder", True)
     return _build_legacy_agent_index(*args, **kwargs)
+
+
+def test_mcp_http_logging_rotates_files_and_suppresses_protocol_chatter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("KRW_MCP_LOG_MAX_BYTES", "2048")
+    monkeypatch.setenv("KRW_MCP_LOG_BACKUP_COUNT", "2")
+    log_path = tmp_path / "mcp.log"
+
+    _configure_logging(log_level="INFO", log_file=log_path)
+
+    rotating = [
+        handler
+        for handler in logging.getLogger().handlers
+        if handler.__class__.__name__ == "RotatingFileHandler"
+    ]
+    assert len(rotating) == 1
+    assert rotating[0].maxBytes == 2048
+    assert rotating[0].backupCount == 2
+    assert logging.getLogger("mcp.server.streamable_http").level == logging.WARNING
+    assert logging.getLogger("mcp.server.lowlevel.server").level == logging.WARNING
 
 
 @pytest.fixture(autouse=True)
@@ -146,12 +170,12 @@ def test_mcp_tools_query_trace_quality_and_compare(tmp_path: Path, monkeypatch):
     assert chain["object_locator"]["object_id"] == "business_factor:VG:FY2025:10K:revenue-growth"
     assert chain["object_locator"]["ticker"] == "VG"
     assert chain["object_locator"]["shard_available"] is True
-    assert chain["chain"]["evidence_chain"]["claims"][0]["id"] == "claim:VG:FY2025:10K:revenue-growth"
+    assert (
+        chain["chain"]["evidence_chain"]["claims"][0]["id"] == "claim:VG:FY2025:10K:revenue-growth"
+    )
     assert chain["chain"]["evidence_chain"]["quotes"][0]["id"] == "quote:VG:FY2025:10K:0001"
     assert "text" not in chain["chain"]["evidence_chain"]["quotes"][0]
-    assert {
-        neighbor["object"]["id"] for neighbor in chain["chain"]["semantic_neighbors"]
-    } >= {
+    assert {neighbor["object"]["id"] for neighbor in chain["chain"]["semantic_neighbors"]} >= {
         "business_activity:VG:FY2025:10K:lng-sales",
         "external_factor_exposure:VG:FY2025:10K:natural-gas-price-operating-margin",
     }
@@ -199,10 +223,10 @@ def test_mcp_tools_query_trace_quality_and_compare(tmp_path: Path, monkeypatch):
                 "tickers": ["VG"],
                 "document_types": ["10-K"],
                 "clauses": [
-                        {
-                            "clause_id": "revenue_growth",
-                            "retrieval_query": "VG revenue growth",
-                            "required_concepts": ["revenue growth"],
+                    {
+                        "clause_id": "revenue_growth",
+                        "retrieval_query": "VG revenue growth",
+                        "required_concepts": ["revenue growth"],
                     }
                 ],
             }
@@ -211,9 +235,73 @@ def test_mcp_tools_query_trace_quality_and_compare(tmp_path: Path, monkeypatch):
     assert plan["contract_version"] == "krw-ontology-mcp/v2"
     assert plan["plan"]["tickers"] == ["VG"]
     assert plan["plan"]["document_types"] == ["10-K"]
-    assert plan["execution_preview"]["routing_clauses"][0]["query"] == (
-        "revenue growth"
-    )
+    assert plan["execution_preview"]["routing_clauses"][0]["query"] == ("revenue growth")
+
+
+def test_chain_response_budget_preserves_direct_evidence_and_path_diversity() -> None:
+    repeated_text = "x" * 2_000
+    payload = {
+        "object": {"id": "event:AAPL:1", "ticker": "AAPL"},
+        "document": {"id": "doc:AAPL:1"},
+        "object_locator": {
+            "occurrence_count": 20,
+            "replica_locations": [
+                {"ticker": f"T{index:02d}", "object_id": f"event:T{index:02d}:1"}
+                for index in range(20)
+            ],
+            "replica_locations_truncated": False,
+        },
+        "chain": {
+            "evidence_chain": {
+                "claims": [{"id": "claim:AAPL:1", "text": "must-preserve-claim"}],
+                "quotes": [{"id": "quote:AAPL:1", "text": "must-preserve-quote"}],
+                "spans": [{"id": "span:AAPL:1", "text": "must-preserve-span"}],
+            },
+            "edge_paths": [
+                {"depth": 2, "rank": index, "steps": [{"text": repeated_text}]}
+                for index in range(20)
+            ],
+            "semantic_neighbors": [
+                {"object": {"id": f"factor:AAPL:{index}", "text": repeated_text}}
+                for index in range(10)
+            ],
+            "temporal_context": [
+                {"id": f"event:AAPL:{index}", "text": repeated_text} for index in range(10)
+            ],
+        },
+        "global_spine_neighbors": [
+            {"link_id": f"link:{index}", "explanation": repeated_text} for index in range(20)
+        ],
+        "global_chain": {
+            "paths": [
+                {
+                    "path_id": f"path:{index}",
+                    "score": 1.0 / (index + 1),
+                    "cross_company_hops": int(index == 19),
+                    "steps": [{"explanation": repeated_text}],
+                }
+                for index in range(20)
+            ],
+            "path_count": 20,
+            "cross_company_path_count": 1,
+            "truncated": False,
+        },
+    }
+
+    bounded = _apply_chain_response_budget(payload)
+    encoded = json.dumps(
+        bounded,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+    assert len(encoded) <= MAX_CHAIN_RESPONSE_MODEL_BYTES
+    assert bounded["response_budget"]["within_budget"] is True
+    assert bounded["response_budget"]["truncated"] is True
+    assert bounded["chain"]["evidence_chain"] == payload["chain"]["evidence_chain"]
+    assert bounded["global_chain"]["path_count"] == len(bounded["global_chain"]["paths"])
+    assert bounded["global_chain"]["total_path_count"] == 20
+    assert any(path["cross_company_hops"] > 0 for path in bounded["global_chain"]["paths"])
 
 
 def test_mcp_verify_evidence_returns_hash_stable_source_lineage(
@@ -281,7 +369,7 @@ def test_mcp_verify_evidence_rejects_wrong_ticker_and_limits_ids(
     assert wrong_ticker["verification_summary"]["verified_object_count"] == 0
     assert wrong_ticker["rejected_refs"][0]["reason"] == "ticker_mismatch"
 
-    with pytest.raises(ValueError, match="at most 8 unique object ids"):
+    oversized = json.loads(
         verify_evidence_tool(
             ticker="VG",
             questions=[
@@ -292,6 +380,18 @@ def test_mcp_verify_evidence_rejects_wrong_ticker_and_limits_ids(
                 for index in range(5)
             ],
         )
+    )
+    assert oversized == {
+        "status": "input_correction_required",
+        "code": "too_many_unique_object_ids",
+        "message": "The verification request has 10 unique object ids; the maximum is 8.",
+        "required_change": (
+            "Keep no more than 8 unique object ids across all questions, "
+            "prioritizing the direct evidence for the main tension."
+        ),
+        "invalid_fields": ["questions"],
+        "allowed_next_tools": ["krw_ontology_verify_evidence"],
+    }
 
 
 def test_mcp_health_reports_release_manifest(tmp_path: Path, monkeypatch):
@@ -412,9 +512,15 @@ def test_mcp_prepare_runtime_and_health_accept_v3_without_opening_monolith_store
     assert verification["ok"] is True, verification["errors"]
     assert verification["verification_mode"] == "startup-v3"
     assert verification["runtime_store_opened"] is False
-    assert verification["runtime_global_spine_path"] == str(current.absolute() / "indexes" / "global_spine.sqlite")
-    assert os.environ["KRW_ONTOLOGY_GLOBAL_SPINE_PATH"] == str(current.absolute() / "indexes" / "global_spine.sqlite")
-    assert os.environ["KRW_ONTOLOGY_SHARD_MANIFEST_PATH"] == str(current.absolute() / "indexes" / "shard_manifest.json")
+    assert verification["runtime_global_spine_path"] == str(
+        current.absolute() / "indexes" / "global_spine.sqlite"
+    )
+    assert os.environ["KRW_ONTOLOGY_GLOBAL_SPINE_PATH"] == str(
+        current.absolute() / "indexes" / "global_spine.sqlite"
+    )
+    assert os.environ["KRW_ONTOLOGY_SHARD_MANIFEST_PATH"] == str(
+        current.absolute() / "indexes" / "shard_manifest.json"
+    )
     assert os.environ["KRW_ONTOLOGY_INDEX_LAYOUT"] == "global-spine-and-company-shards"
     assert status_code == 200
     assert payload["ok"] is True
@@ -470,37 +576,95 @@ def test_mcp_tools_use_spine_router_for_v3_release(tmp_path: Path, monkeypatch):
     assert quality["routing"]["fallback"] is False
 
 
-def test_spine_router_tickerless_candidates_use_global_signal_tables(tmp_path: Path):
+def test_spine_router_tickerless_candidates_use_immutable_router_sidecar(tmp_path: Path):
     _write_fixture(tmp_path)
     _clone_fixture_company(tmp_path, source_ticker="VG", target_ticker="XOM")
-    index = _build_v3_runtime(tmp_path)
-    with sqlite3.connect(index["index_path"]) as conn:
-        conn.execute(
-            """
-            INSERT INTO global_topic_spine(
-                topic_id, topic_key, topic_label, topic_summary,
-                ticker, shard_id, materiality
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                "topic:XOM:hydrogen-roadmap",
-                "hydrogen_roadmap",
-                "Hydrogen roadmap",
-                "Hydrogen infrastructure roadmap and electrolyzer capacity",
-                "XOM",
-                "XOM",
-                9.0,
-            ),
+    for path in (tmp_path / "companies" / "XOM").rglob("*.jsonl"):
+        text = path.read_text(encoding="utf-8")
+        path.write_text(
+            text.replace("natural_gas_price", "hydrogen_electrolyzer_capacity")
+            .replace("natural gas", "hydrogen electrolyzer roadmap")
+            .replace("Natural gas", "Hydrogen electrolyzer roadmap"),
+            encoding="utf-8",
         )
-        conn.commit()
+    index = _build_v3_runtime(tmp_path)
 
     with OntologySpineRouter(index["index_path"]) as router:
+        assert router.routing_status()["router_sidecar_available"] is True
         assert router._candidate_tickers(
             "hydrogen electrolyzer roadmap",
             explicit_tickers=None,
             limit=1,
         ) == ["XOM"]
+
+
+def test_spine_router_tickerless_query_fails_closed_without_router_sidecar(tmp_path: Path):
+    _write_fixture(tmp_path)
+    index = _build_v3_runtime(tmp_path)
+    index["build_result"].router_sidecar_path.unlink()
+
+    with OntologySpineRouter(index["index_path"]) as router:
+        rows, diagnostics = router.query_with_diagnostics(
+            topic="revenue demand",
+            limit=5,
+        )
+
+    assert rows == []
+    assert diagnostics["routing"]["candidate_routing"] == {
+        "source": "router_sidecar",
+        "status": "empty",
+        "candidate_count": 0,
+        "router_sidecar_available": False,
+        "router_coherence_available": True,
+        "fallback_used": False,
+        "reason": "router_sidecar_unavailable",
+    }
+
+
+def test_spine_router_planned_routing_fails_closed_for_invalid_sidecar(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _write_fixture(tmp_path)
+    index = _build_v3_runtime(tmp_path)
+
+    with OntologySpineRouter(index["index_path"]) as router:
+
+        def fail_sidecar():
+            raise RuntimeError("synthetic corrupt sidecar")
+
+        monkeypatch.setattr(router, "_sidecar", fail_sidecar)
+        tickers, diagnostics = router.route_planned_tickers(
+            clauses=[{"clause_id": "c1", "query": "revenue demand", "required": True}],
+            limit=5,
+        )
+        ranked = router._rank_candidate_tickers("revenue demand", limit=5)
+
+    assert tickers == []
+    assert ranked == []
+    assert diagnostics["error"] == "router_sidecar_invalid"
+    assert diagnostics["error_type"] == "RuntimeError"
+    assert diagnostics["fallback_used"] is False
+
+
+def test_spine_router_document_catalog_filters_multiple_tickers_in_sql(tmp_path: Path):
+    _write_fixture(tmp_path)
+    _clone_fixture_company(tmp_path, source_ticker="VG", target_ticker="XOM")
+    index = _build_v3_runtime(tmp_path)
+
+    statements: list[str] = []
+    with OntologySpineRouter(index["index_path"]) as router:
+        router.conn.set_trace_callback(statements.append)
+        documents = router.list_documents(tickers=["VG"], document_types=["10-K"])
+
+    assert {document["ticker"] for document in documents} == {"VG"}
+    normalized_sql = [" ".join(statement.lower().split()) for statement in statements]
+    assert any(
+        "from global_document_catalog" in statement
+        and "ticker in ('vg')" in statement
+        and "document_type in ('10-k')" in statement
+        for statement in normalized_sql
+    )
 
 
 def test_mcp_tools_report_declared_but_missing_company_shard_without_fallback(
@@ -537,12 +701,16 @@ def test_mcp_tools_report_declared_but_missing_company_shard_without_fallback(
         )
     )
     topic_map = json.loads(topic_map_tool(ticker="VG", limit=5))
-    query_context = json.loads(query_context_tool(question="VG revenue demand", ticker="VG", limit_results=5))
+    query_context = json.loads(
+        query_context_tool(question="VG revenue demand", ticker="VG", limit_results=5)
+    )
     retrieve = json.loads(retrieve_tool(question="VG revenue demand", ticker="VG", limit=5))
     trace = json.loads(trace_tool(object_id="claim:VG:FY2025:10K:revenue-growth"))
     chain = json.loads(chain_tool(object_id="claim:VG:FY2025:10K:revenue-growth"))
     quality = json.loads(quality_tool(ticker="VG"))
-    compare = json.loads(compare_tool(tickers=["VG", "XOM"], topic="revenue demand", limit_per_ticker=2))
+    compare = json.loads(
+        compare_tool(tickers=["VG", "XOM"], topic="revenue demand", limit_per_ticker=2)
+    )
 
     assert catalog["companies"] == ["VG"]
     assert query["results"] == []
@@ -550,7 +718,9 @@ def test_mcp_tools_report_declared_but_missing_company_shard_without_fallback(
     assert query["search_diagnostics"]["missing_shards"] == {"VG": str(missing_shard)}
     assert query["search_diagnostics"]["fallback_used"] is False
     assert "monolith_fallback_used" not in query["search_diagnostics"]
-    assert summary_query["search_diagnostics"]["routing"]["missing_shards"] == {"VG": str(missing_shard)}
+    assert summary_query["search_diagnostics"]["routing"]["missing_shards"] == {
+        "VG": str(missing_shard)
+    }
     assert summary_query["search_diagnostics"]["missing_shards"] == {"VG": str(missing_shard)}
     assert topic_map["error"]["code"] == "ticker_shard_missing"
     assert topic_map["routing"]["fallback"] is False
@@ -590,8 +760,12 @@ def test_mcp_prepare_runtime_preserves_current_symlink_for_hot_swap(tmp_path: Pa
     second_release = releases_root / "20260529_020000"
     _write_fixture(first_release, period="FY2025")
     _write_fixture(second_release, period="FY2026")
-    build_spine_shard_release_outputs(first_release, release_id=first_release.name, workers=1, no_cache=True)
-    build_spine_shard_release_outputs(second_release, release_id=second_release.name, workers=1, no_cache=True)
+    build_spine_shard_release_outputs(
+        first_release, release_id=first_release.name, workers=1, no_cache=True
+    )
+    build_spine_shard_release_outputs(
+        second_release, release_id=second_release.name, workers=1, no_cache=True
+    )
     write_release_manifest_v3(first_release, release_id=first_release.name, env="prod")
     write_release_manifest_v3(second_release, release_id=second_release.name, env="prod")
     current = releases_root / "current"
@@ -614,7 +788,9 @@ def test_mcp_prepare_runtime_preserves_current_symlink_for_hot_swap(tmp_path: Pa
         verification = prepare_mcp_runtime(root=current, env="prod")
         runtime_global_spine_path = Path(os.environ["KRW_ONTOLOGY_GLOBAL_SPINE_PATH"])
         assert verification["runtime_root"] == str(current.absolute())
-        assert verification["runtime_global_spine_path"] == str(current.absolute() / "indexes" / "global_spine.sqlite")
+        assert verification["runtime_global_spine_path"] == str(
+            current.absolute() / "indexes" / "global_spine.sqlite"
+        )
         assert runtime_global_spine_path.parent.parent.name == "current"
 
         with mcp_tools._store(mcp_tools._runtime_global_spine_path()) as first_store:
@@ -680,7 +856,7 @@ def test_mcp_prepare_runtime_rejects_legacy_v1_current_without_sqlite_open(
     def fail_connect(*_args, **_kwargs):
         raise AssertionError("legacy manifest rejection must not open SQLite")
 
-    monkeypatch.setattr("krw_ontology.release.sqlite3.connect", fail_connect)
+    monkeypatch.setattr(sqlite3, "connect", fail_connect)
 
     with pytest.raises(RuntimeError, match="manifest_format_unsupported"):
         prepare_mcp_runtime(root=current, env="prod")
@@ -718,8 +894,12 @@ def test_mcp_persistent_store_pins_inflight_release_and_rotates_after_current_sw
     second_release = releases_root / "20260529_020000"
     _write_fixture(first_release, period="FY2025")
     _write_fixture(second_release, period="FY2026")
-    build_spine_shard_release_outputs(first_release, release_id=first_release.name, workers=1, no_cache=True)
-    build_spine_shard_release_outputs(second_release, release_id=second_release.name, workers=1, no_cache=True)
+    build_spine_shard_release_outputs(
+        first_release, release_id=first_release.name, workers=1, no_cache=True
+    )
+    build_spine_shard_release_outputs(
+        second_release, release_id=second_release.name, workers=1, no_cache=True
+    )
     write_release_manifest_v3(first_release, release_id=first_release.name, env="prod")
     write_release_manifest_v3(second_release, release_id=second_release.name, env="prod")
     current = releases_root / "current"
@@ -748,20 +928,29 @@ def test_mcp_persistent_store_pins_inflight_release_and_rotates_after_current_sw
             assert inflight_status["store"]["retired_oldest_age_sec"] >= 0
             assert len(inflight_status["store"]["retired_global_spine_stores"]) == 1
             assert inflight_status["store"]["retired_global_spine_stores"][0]["retired"] is True
-            assert inflight_status["store"]["last_rotation"]["previous_resolved_global_spine_path"].endswith(
-                "20260529_010000/indexes/global_spine.sqlite"
+            assert inflight_status["store"]["last_rotation"][
+                "previous_resolved_global_spine_path"
+            ].endswith("20260529_010000/indexes/global_spine.sqlite")
+            assert (
+                inflight_status["store"]["last_rotation"]["previous_release_id"]
+                == "20260529_010000"
             )
-            assert inflight_status["store"]["last_rotation"]["previous_release_id"] == "20260529_010000"
             assert inflight_status["store"]["last_rotation"]["previous_global_spine_sha256"]
             assert inflight_status["store"]["last_rotation"]["previous_shard_manifest_sha256"]
-            assert inflight_status["store"]["last_rotation"]["new_resolved_global_spine_path"].endswith(
-                "20260529_020000/indexes/global_spine.sqlite"
-            )
+            assert inflight_status["store"]["last_rotation"][
+                "new_resolved_global_spine_path"
+            ].endswith("20260529_020000/indexes/global_spine.sqlite")
             assert inflight_status["store"]["last_rotation"]["new_release_id"] == "20260529_020000"
             assert inflight_status["store"]["last_rotation"]["new_global_spine_sha256"]
             assert inflight_status["store"]["last_rotation"]["new_shard_manifest_sha256"]
-            assert inflight_status["store"]["global_spine_stores"][0]["release_id"] == "20260529_020000"
-            assert inflight_status["store"]["retired_global_spine_stores"][0]["release_id"] == "20260529_010000"
+            assert (
+                inflight_status["store"]["global_spine_stores"][0]["release_id"]
+                == "20260529_020000"
+            )
+            assert (
+                inflight_status["store"]["retired_global_spine_stores"][0]["release_id"]
+                == "20260529_010000"
+            )
             health, health_status = health_payload(root=str(current))
             assert health_status == 200
             assert health["release_id"] == "20260529_020000"
@@ -769,13 +958,19 @@ def test_mcp_persistent_store_pins_inflight_release_and_rotates_after_current_sw
             assert health["mcp_store_hot_swap"]["retired_leased"] == 1
             assert health["mcp_store_hot_swap"]["rotation_pending"] is True
             assert health["mcp_store_hot_swap"]["retired_oldest_age_sec"] >= 0
-            assert health["mcp_store_hot_swap"]["last_rotation"]["previous_resolved_global_spine_path"].endswith(
-                "20260529_010000/indexes/global_spine.sqlite"
-            )
+            assert health["mcp_store_hot_swap"]["last_rotation"][
+                "previous_resolved_global_spine_path"
+            ].endswith("20260529_010000/indexes/global_spine.sqlite")
             metrics, metrics_status = metrics_payload(root=str(current))
             assert metrics_status == 200
-            assert 'krw_ontology_mcp_store_rotation_pending{env="prod",release_id="20260529_020000"} 1' in metrics
-            assert 'krw_ontology_mcp_store_retired_leased{env="prod",release_id="20260529_020000"} 1' in metrics
+            assert (
+                'krw_ontology_mcp_store_rotation_pending{env="prod",release_id="20260529_020000"} 1'
+                in metrics
+            )
+            assert (
+                'krw_ontology_mcp_store_retired_leased{env="prod",release_id="20260529_020000"} 1'
+                in metrics
+            )
 
             current.unlink()
             current.symlink_to(first_release.name)
@@ -787,12 +982,12 @@ def test_mcp_persistent_store_pins_inflight_release_and_rotates_after_current_sw
             assert aba_status["store"]["retired_leased"] == 1
             assert len(aba_status["store"]["retired_global_spine_stores"]) == 1
             assert len(aba_status["store"]["global_spine_stores"]) == 1
-            assert aba_status["store"]["retired_global_spine_stores"][0]["resolved_global_spine_path"].endswith(
-                "20260529_010000/indexes/global_spine.sqlite"
-            )
-            assert aba_status["store"]["global_spine_stores"][0]["resolved_global_spine_path"].endswith(
-                "20260529_010000/indexes/global_spine.sqlite"
-            )
+            assert aba_status["store"]["retired_global_spine_stores"][0][
+                "resolved_global_spine_path"
+            ].endswith("20260529_010000/indexes/global_spine.sqlite")
+            assert aba_status["store"]["global_spine_stores"][0][
+                "resolved_global_spine_path"
+            ].endswith("20260529_010000/indexes/global_spine.sqlite")
             assert (
                 aba_status["store"]["retired_global_spine_stores"][0]["generation"]
                 != aba_status["store"]["global_spine_stores"][0]["generation"]
@@ -892,12 +1087,8 @@ def test_mcp_topic_map_repackages_company_vocabulary(tmp_path: Path, monkeypatch
     assert topic_map["routing"]["mode"] == "company_shard"
     assert topic_map["routing"]["fallback"] is False
     assert topic_map["routing"]["fallback_used"] is False
-    factor_terms = {
-        entry["term"] for entry in topic_map["topics"]["external_factors"]
-    }
-    activity_terms = {
-        entry["term"] for entry in topic_map["topics"]["business_activities"]
-    }
+    factor_terms = {entry["term"] for entry in topic_map["topics"]["external_factors"]}
+    activity_terms = {entry["term"] for entry in topic_map["topics"]["business_activities"]}
     metric_terms = {entry["term"] for entry in topic_map["topics"]["metrics"]}
     assert "natural_gas_price" in factor_terms
     assert "lng_sales" in activity_terms
@@ -942,9 +1133,10 @@ def test_mcp_compare_quality_topic_and_company_context_report_v3_routing(
     assert set(compare["results"]) == {"VG", "XOM"}
     assert compare["results"]["VG"]
     assert compare["results"]["XOM"]
-    assert {
-        row["comparison_key"] for row in compare["comparison_rows"] if not row["missing"]
-    } == {"VG", "XOM"}
+    assert {row["comparison_key"] for row in compare["comparison_rows"] if not row["missing"]} == {
+        "VG",
+        "XOM",
+    }
     assert compare["comparison_contexts"]["VG"]["routing"]["mode"] == "company_shard"
     assert compare["comparison_contexts"]["XOM"]["routing"]["mode"] == "company_shard"
 
@@ -984,9 +1176,7 @@ def test_mcp_chain_returns_object_specific_chains(tmp_path: Path, monkeypatch):
 
     activity_chain = json.loads(chain_tool(object_id="business_activity:VG:FY2025:10K:lng-sales"))
     assert activity_chain["object"]["type"] == "BusinessActivity"
-    assert {
-        item["id"] for item in activity_chain["chain"]["temporal_context"]
-    } >= {
+    assert {item["id"] for item in activity_chain["chain"]["temporal_context"]} >= {
         "trend:VG:ALL:lng-sales-revenue",
         "change_event:VG:ALL:revenue-growth",
     }
@@ -997,7 +1187,10 @@ def test_mcp_chain_returns_object_specific_chains(tmp_path: Path, monkeypatch):
 
     quote_chain = json.loads(chain_tool(object_id="quote:VG:FY2025:10K:0001"))
     assert quote_chain["object"]["type"] == "EvidenceQuote"
-    assert quote_chain["chain"]["evidence_chain"]["claims"][0]["id"] == "claim:VG:FY2025:10K:revenue-growth"
+    assert (
+        quote_chain["chain"]["evidence_chain"]["claims"][0]["id"]
+        == "claim:VG:FY2025:10K:revenue-growth"
+    )
 
 
 def test_mcp_chain_includes_global_spine_cross_company_neighbors(
@@ -1030,6 +1223,59 @@ def test_mcp_chain_includes_global_spine_cross_company_neighbors(
     )
 
 
+def test_mcp_trace_and_chain_scope_noncanonical_shared_ids_by_ticker(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _write_fixture(tmp_path)
+    _clone_fixture_company(tmp_path, source_ticker="VG", target_ticker="XOM")
+    _add_shared_fixture_object(tmp_path, ticker="VG")
+    _add_shared_fixture_object(tmp_path, ticker="XOM")
+    _build_v3_runtime(tmp_path)
+    monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
+
+    object_id = "shared:factor:natural-gas-price"
+    vg_object_id = f"scoped:VG:{object_id}"
+    xom_object_id = f"scoped:XOM:{object_id}"
+    vg_trace = json.loads(trace_tool(object_id=object_id, ticker="VG"))
+    xom_trace = json.loads(trace_tool(object_id=object_id, ticker="XOM"))
+
+    assert vg_trace["object_locator"]["ticker"] == "VG"
+    assert xom_trace["object_locator"]["ticker"] == "XOM"
+    assert vg_trace["object_locator"]["object_id"] == vg_object_id
+    assert xom_trace["object_locator"]["object_id"] == xom_object_id
+    assert vg_trace["object_locator"]["occurrence_count"] == 1
+    assert xom_trace["object_locator"]["semantic_shared"] is False
+    assert {
+        location["ticker"] for location in xom_trace["object_locator"]["replica_locations"]
+    } == {"XOM"}
+    assert vg_trace["object_locator"]["document_id"] != (xom_trace["object_locator"]["document_id"])
+
+    ambiguous_trace = json.loads(trace_tool(object_id=object_id))
+    assert ambiguous_trace["error"]["code"] == "ambiguous_object_ticker"
+    assert ambiguous_trace["ticker_candidates"] == ["VG", "XOM"]
+
+    xom_chain = json.loads(chain_tool(object_id=object_id, ticker="XOM", max_depth=1))
+    assert xom_chain["object_locator"]["ticker"] == "XOM"
+    assert xom_chain["global_chain"]["root_object_id"] == xom_object_id
+    assert xom_chain["global_chain"]["root_ticker"] == "XOM"
+    ontology_steps = [
+        path["steps"][0]
+        for path in xom_chain["global_chain"]["paths"]
+        if path["steps"][0]["kind"] == "ontology_edge"
+    ]
+    assert ontology_steps
+    assert all(step["from_ticker"] == step["to_ticker"] == "XOM" for step in ontology_steps)
+    assert any(
+        step["to_object_id"] == "business_factor:XOM:FY2025:10K:revenue-growth"
+        for step in ontology_steps
+    )
+    assert all("business_factor:VG:" not in step["to_object_id"] for step in ontology_steps)
+
+    ambiguous_chain = json.loads(chain_tool(object_id=object_id, max_depth=1))
+    assert ambiguous_chain["error"]["code"] == "ambiguous_object_ticker"
+
+
 def test_mcp_chain_respects_depth_and_quote_text_option(tmp_path: Path, monkeypatch):
     _write_fixture(tmp_path)
     _build_v3_runtime(tmp_path)
@@ -1043,9 +1289,7 @@ def test_mcp_chain_respects_depth_and_quote_text_option(tmp_path: Path, monkeypa
         )
     )
     shallow_path_ids = [
-        step["object"]["id"]
-        for path in shallow["chain"]["edge_paths"]
-        for step in path["steps"]
+        step["object"]["id"] for path in shallow["chain"]["edge_paths"] for step in path["steps"]
     ]
     assert "claim:VG:FY2025:10K:revenue-growth" in shallow_path_ids
     assert "quote:VG:FY2025:10K:0001" not in shallow_path_ids
@@ -1059,9 +1303,7 @@ def test_mcp_chain_respects_depth_and_quote_text_option(tmp_path: Path, monkeypa
         )
     )
     deep_path_ids = [
-        step["object"]["id"]
-        for path in deeper["chain"]["edge_paths"]
-        for step in path["steps"]
+        step["object"]["id"] for path in deeper["chain"]["edge_paths"] for step in path["steps"]
     ]
     assert "quote:VG:FY2025:10K:0001" in deep_path_ids
     assert deeper["chain"]["evidence_chain"]["quotes"][0]["text"]
@@ -1191,13 +1433,13 @@ def test_mcp_index_context_defaults_to_lightweight_guard(
         "expensive_counts_requested": False,
         "expensive_quality_summary_requested": False,
         "allow_expensive": False,
-            "counts_returned": False,
-            "quality_summary_returned": False,
-            "reason": (
-                "index_context is an operational/debug capability card for the current v3 ontology release. "
-                "Expensive table counts and quality summary scans are disabled by default; "
-                "use query_context for normal research questions."
-            ),
+        "counts_returned": False,
+        "quality_summary_returned": False,
+        "reason": (
+            "index_context is an operational/debug capability card for the current v3 ontology release. "
+            "Expensive table counts and quality summary scans are disabled by default; "
+            "use query_context for normal research questions."
+        ),
         "how_to_enable_expensive": (
             "Pass allow_expensive=true with include_counts and/or include_quality_summary "
             "only for explicit audit/debug operations."
@@ -1359,9 +1601,11 @@ def test_mcp_query_context_includes_cross_company_signal_pack(
     assert signal_pack["company_evidence_rows"]
     assert signal_pack["signals"]
     assert signal_pack["quality"]["missing_parts"] == []
-    assert {
-        row["evidence_strength"] for row in signal_pack["company_evidence_rows"]
-    } <= {"strong", "medium", "weak"}
+    assert {row["evidence_strength"] for row in signal_pack["company_evidence_rows"]} <= {
+        "strong",
+        "medium",
+        "weak",
+    }
     assert any(
         "revenue" in row["commentary_summary"].lower()
         or "margin" in row["commentary_summary"].lower()
@@ -1386,8 +1630,12 @@ def test_mcp_query_context_uses_latest_document_anchors_for_cross_company_pack(
     tmp_path: Path,
     monkeypatch,
 ):
-    _write_fixture(tmp_path, period="FY2024", text="Revenue growth was slower on softer customer demand.")
-    _write_fixture(tmp_path, period="FY2026", text="Revenue growth accelerated on current customer demand.")
+    _write_fixture(
+        tmp_path, period="FY2024", text="Revenue growth was slower on softer customer demand."
+    )
+    _write_fixture(
+        tmp_path, period="FY2026", text="Revenue growth accelerated on current customer demand."
+    )
     _clone_fixture_company(tmp_path, source_ticker="VG", target_ticker="XOM")
     _build_v3_runtime(tmp_path)
     monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
@@ -1420,7 +1668,9 @@ def test_mcp_query_context_exposes_10q_current_driver_and_10k_annual_baseline(
     tmp_path: Path,
     monkeypatch,
 ):
-    _write_fixture(tmp_path, period="CY2025", text="Revenue growth reflected annual customer demand.")
+    _write_fixture(
+        tmp_path, period="CY2025", text="Revenue growth reflected annual customer demand."
+    )
     _write_fixture(
         tmp_path,
         period="CY2026Q1",
@@ -1474,7 +1724,10 @@ def test_mcp_query_context_partial_answerable_when_one_requested_ticker_is_unkno
     )
 
     assert payload["research_status"] == "partial_answerable_from_current_release"
-    assert payload["answerability"]["recommended_answer_mode"] == "partial_answerable_from_current_release"
+    assert (
+        payload["answerability"]["recommended_answer_mode"]
+        == "partial_answerable_from_current_release"
+    )
     assert payload["unknown_tickers"] == ["WMT"]
     assert payload["partial_answerability"]["available_tickers"] == ["VG"]
     assert payload["partial_answerability"]["missing_tickers"] == ["WMT"]
@@ -1485,8 +1738,12 @@ def test_mcp_query_prioritizes_latest_filing_when_current_intent_is_present(
     tmp_path: Path,
     monkeypatch,
 ):
-    _write_fixture(tmp_path, period="FY2024", text="Revenue growth reflected older customer demand.")
-    _write_fixture(tmp_path, period="FY2026", text="Revenue growth reflects current customer demand.")
+    _write_fixture(
+        tmp_path, period="FY2024", text="Revenue growth reflected older customer demand."
+    )
+    _write_fixture(
+        tmp_path, period="FY2026", text="Revenue growth reflects current customer demand."
+    )
     _build_v3_runtime(tmp_path)
     monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
 
@@ -1502,7 +1759,9 @@ def test_mcp_query_current_prior_uses_10q_current_driver(
     tmp_path: Path,
     monkeypatch,
 ):
-    _write_fixture(tmp_path, period="CY2025", text="Revenue growth reflected annual customer demand.")
+    _write_fixture(
+        tmp_path, period="CY2025", text="Revenue growth reflected annual customer demand."
+    )
     _write_fixture(
         tmp_path,
         period="CY2026Q1",
@@ -1525,8 +1784,12 @@ def test_mcp_query_does_not_override_explicit_period_with_latest_prior(
     tmp_path: Path,
     monkeypatch,
 ):
-    _write_fixture(tmp_path, period="FY2024", text="Revenue growth reflected older customer demand.")
-    _write_fixture(tmp_path, period="FY2026", text="Revenue growth reflects current customer demand.")
+    _write_fixture(
+        tmp_path, period="FY2024", text="Revenue growth reflected older customer demand."
+    )
+    _write_fixture(
+        tmp_path, period="FY2026", text="Revenue growth reflects current customer demand."
+    )
     _build_v3_runtime(tmp_path)
     monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
 
@@ -1647,7 +1910,9 @@ def test_mcp_query_context_attaches_chart_series_sidecar_pack(
     metric_pack = payload["research_pack"]["metric_series_pack"]
     assert metric_pack["mode"] == "chart_series_sidecar"
     assert payload["search_diagnostics"]["chart_series"]["matched"] is True
-    revenue = next(series for series in metric_pack["series"] if series["canonical_metric"] == "revenue")
+    revenue = next(
+        series for series in metric_pack["series"] if series["canonical_metric"] == "revenue"
+    )
     assert revenue["series_key"].startswith("AAPL|revenue|company_total:company_total|USD|annual|")
     assert [point["period"] for point in revenue["points"]] == ["CY2024", "CY2025"]
     assert [point["value"] for point in revenue["points"]] == [110.0, 130.0]
@@ -1726,7 +1991,9 @@ def test_chart_series_sidecar_opens_extended_metrics_from_start(tmp_path: Path):
         "share_repurchase",
         "stock_based_compensation",
     }.issubset(metrics)
-    ma_series = [series for series in pack["series"] if series["canonical_metric"].startswith("ma_")]
+    ma_series = [
+        series for series in pack["series"] if series["canonical_metric"].startswith("ma_")
+    ]
     assert {series["source_class"] for series in ma_series} == {
         "cash_flow_statement",
         "fcf_reconciliation",
@@ -1811,7 +2078,10 @@ def test_mcp_query_context_projection_pack_marks_candidates_search_only_for_dire
     directness = projection_pack["directness"]
     assert top_level_guard["requires_direct_match"] is True
     assert top_level_guard["strong_claim_allowed"] is False
-    assert top_level_guard["strong_claim_requires"] == ["traceable_direct", "traceable_metric_lineage"]
+    assert top_level_guard["strong_claim_requires"] == [
+        "traceable_direct",
+        "traceable_metric_lineage",
+    ]
     assert directness["requires_direct_match"] is True
     assert directness["strong_claim_allowed"] is False
     assert directness["projection_candidates_are_search_candidates_only"] is True
@@ -2153,7 +2423,10 @@ def test_mcp_retrieve_exposes_directness_guard_for_direct_question(
 
     assert payload["directness_guard"]["requires_direct_match"] is True
     assert payload["directness_guard"]["strong_claim_allowed"] is False
-    assert payload["directness_guard"]["strong_claim_requires"] == ["traceable_direct", "traceable_metric_lineage"]
+    assert payload["directness_guard"]["strong_claim_requires"] == [
+        "traceable_direct",
+        "traceable_metric_lineage",
+    ]
 
 
 def test_mcp_markdown_outputs_include_directness_guard(
@@ -2421,7 +2694,9 @@ def test_mcp_ready_payload_skips_runtime_cache_for_worker_admission(
             raise AssertionError("ready_payload must not open the global spine")
         return real_connect(database, *args, **kwargs)
 
-    monkeypatch.setattr("krw_ontology.mcp_server.server.mcp_runtime_cache_status", fail_runtime_cache_status)
+    monkeypatch.setattr(
+        "krw_ontology.mcp_server.server.mcp_runtime_cache_status", fail_runtime_cache_status
+    )
     monkeypatch.setattr(
         "krw_ontology.mcp_server.server.sqlite3.connect",
         guarded_connect,
@@ -2447,7 +2722,9 @@ def test_mcp_metrics_payload_exposes_release_and_hot_swap_metrics(tmp_path: Path
 
     assert status_code == 200
     assert 'krw_ontology_mcp_health_ok{env="prod",release_id="20260612_020000"} 1' in payload
-    assert 'krw_ontology_mcp_release_documents{env="prod",release_id="20260612_020000"} 2' in payload
+    assert (
+        'krw_ontology_mcp_release_documents{env="prod",release_id="20260612_020000"} 2' in payload
+    )
     assert "krw_ontology_mcp_global_topic_spine_rows" in payload
     assert "krw_ontology_mcp_global_topics" not in payload
     assert "krw_ontology_mcp_store_rotation_pending" in payload
@@ -2508,7 +2785,9 @@ def _write_fixture(
     risk_id = f"business_factor:VG:{period}:{doc_key}:regulatory-risk"
     unsupported_risk_id = f"business_factor:VG:{period}:{doc_key}:unsupported-risk"
     activity_id = f"business_activity:VG:{period}:{doc_key}:lng-sales"
-    exposure_id = f"external_factor_exposure:VG:{period}:{doc_key}:natural-gas-price-operating-margin"
+    exposure_id = (
+        f"external_factor_exposure:VG:{period}:{doc_key}:natural-gas-price-operating-margin"
+    )
     agreement_id = f"agreement:VG:{period}:{doc_key}:spa-termination"
     span = {
         "id": span_id,
@@ -2774,7 +3053,66 @@ def _clone_fixture_company(
         if not path.is_file():
             continue
         text = path.read_text(encoding="utf-8")
-        path.write_text(text.replace(source_ticker, target_ticker), encoding="utf-8")
+        cloned = text.replace(source_ticker, target_ticker)
+        if path.name == "edges.jsonl":
+            edge_rows = [json.loads(line) for line in cloned.splitlines() if line.strip()]
+            for edge in edge_rows:
+                edge["id"] = f"{edge['id']}:{target_ticker}"
+            cloned = "".join(json.dumps(edge, sort_keys=True) + "\n" for edge in edge_rows)
+        path.write_text(cloned, encoding="utf-8")
+
+
+def _add_shared_fixture_object(root: Path, *, ticker: str) -> None:
+    ontology_dir = root / "companies" / ticker / "ontology" / "10K" / "FY2025"
+    factors_path = ontology_dir / "business_factors.jsonl"
+    rows = [
+        json.loads(line)
+        for line in factors_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    rows.append(
+        {
+            "id": "shared:factor:natural-gas-price",
+            "type": "CanonicalEntity",
+            "ticker": ticker,
+            "source_document_id": f"source:{ticker}:FY2025:10K",
+            "document_type": "10-K",
+            "period": "FY2025",
+            "entity_type": "ExternalFactor",
+            "canonical_name": "Natural gas price",
+            "aliases": ["natural_gas_price"],
+            "ticker_scope": [ticker],
+            "status": "active",
+        }
+    )
+    write_jsonl(factors_path, rows)
+    artifact_index_path = ontology_dir / "artifact_index.json"
+    artifact_index = json.loads(artifact_index_path.read_text(encoding="utf-8"))
+    artifact_index["counts"]["business_factors"] = len(rows)
+    edges_path = ontology_dir / "edges.jsonl"
+    edges = [
+        json.loads(line)
+        for line in edges_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    edges.append(
+        {
+            "id": f"edge:shared-factor-to-revenue:{ticker}",
+            "type": "Edge",
+            "ticker": ticker,
+            "source_document_id": f"source:{ticker}:FY2025:10K",
+            "document_type": "10-K",
+            "period": "FY2025",
+            "from_id": "shared:factor:natural-gas-price",
+            "to_id": f"business_factor:{ticker}:FY2025:10K:revenue-growth",
+            "relation_id": "influences",
+            "relation_name": "influences",
+            "review_status": "accepted",
+        }
+    )
+    write_jsonl(edges_path, edges)
+    artifact_index["counts"]["edges"] = len(edges)
+    atomic_write_json(artifact_index_path, artifact_index)
 
 
 def _build_v3_runtime(root: Path, *, release_id: str = "test-v3-runtime") -> dict[str, Any]:
@@ -3021,8 +3359,12 @@ def _write_metric_dimension_fixture(root: Path) -> None:
 
     xbrl_facts = [
         xbrl_fact("company-total-revenue", value="416200000000", fiscal_year=2025, dimensions=[]),
-        xbrl_fact("mac-revenue", value="31000000000", fiscal_year=2025, dimensions=["aapl:MacMember"]),
-        xbrl_fact("ipad-revenue", value="28000000000", fiscal_year=2025, dimensions=["aapl:IPadMember"]),
+        xbrl_fact(
+            "mac-revenue", value="31000000000", fiscal_year=2025, dimensions=["aapl:MacMember"]
+        ),
+        xbrl_fact(
+            "ipad-revenue", value="28000000000", fiscal_year=2025, dimensions=["aapl:IPadMember"]
+        ),
     ]
 
     write_jsonl(ontology_dir / "metric_observations.jsonl", metrics)
@@ -3262,7 +3604,9 @@ def _write_chart_metric_fixture(root: Path) -> None:
             "review_status": "accepted",
         }
 
-    def revenue_metric(suffix: str, *, document_period: str, fiscal_year: int, value: str) -> dict[str, Any]:
+    def revenue_metric(
+        suffix: str, *, document_period: str, fiscal_year: int, value: str
+    ) -> dict[str, Any]:
         return metric_observation(
             suffix,
             document_period=document_period,
@@ -3490,7 +3834,9 @@ def test_metric_lookup_is_dimension_aware_not_company_total_only(tmp_path: Path)
         assert iphone_results[0]["id"].endswith("iphone-net-sales")
         assert iphone_results[0]["object"]["dimensions"]["product"] == "iPhone"
         assert iphone_diagnostics["search_strategy"]["dimension_anchors"] == ["iphone"]
-        assert iphone_diagnostics["search_strategy"]["company_total_role"] == "denominator_or_support"
+        assert (
+            iphone_diagnostics["search_strategy"]["company_total_role"] == "denominator_or_support"
+        )
 
         services_results, _services_diagnostics = store.query_compact_with_diagnostics(
             topic="Services net sales",
@@ -3526,7 +3872,10 @@ def test_metric_lookup_is_dimension_aware_not_company_total_only(tmp_path: Path)
         assert mac_results[0]["type"] == "XBRLFact"
         assert mac_diagnostics["search_strategy"]["mode"] == "metric_dimension_lookup"
         assert mac_diagnostics["search_strategy"]["dimension_anchors"] == ["mac"]
-        assert mac_diagnostics["search_strategy"]["metric_roles_by_object_id"][mac_results[0]["id"]] == "target_dimension_metric"
+        assert (
+            mac_diagnostics["search_strategy"]["metric_roles_by_object_id"][mac_results[0]["id"]]
+            == "target_dimension_metric"
+        )
 
         service_xbrl_results, service_xbrl_diagnostics = store.query_compact_with_diagnostics(
             topic="Services revenue",
@@ -3550,7 +3899,10 @@ def test_metric_lookup_is_dimension_aware_not_company_total_only(tmp_path: Path)
         )
         assert missing_results == []
         assert missing_diagnostics["search_strategy"]["dimension_metric_not_found"] is True
-        assert missing_diagnostics["search_strategy"]["fallback_skipped"] == "dimension_metric_not_found"
+        assert (
+            missing_diagnostics["search_strategy"]["fallback_skipped"]
+            == "dimension_metric_not_found"
+        )
 
         compound_results, compound_diagnostics = store.query_compact_with_diagnostics(
             topic="iPhone Services net sales",
@@ -3563,7 +3915,10 @@ def test_metric_lookup_is_dimension_aware_not_company_total_only(tmp_path: Path)
         compound_ids = {result["id"].rsplit(":", 1)[-1] for result in compound_results}
         assert {"iphone-net-sales", "services-net-sales"}.issubset(compound_ids)
         assert "total-revenue" not in compound_ids
-        assert compound_diagnostics["search_strategy"]["dimension_anchors"] == ["iphone", "services"]
+        assert compound_diagnostics["search_strategy"]["dimension_anchors"] == [
+            "iphone",
+            "services",
+        ]
 
         data_center_results, data_center_diagnostics = store.query_compact_with_diagnostics(
             topic="Data Center revenue",
@@ -3575,7 +3930,10 @@ def test_metric_lookup_is_dimension_aware_not_company_total_only(tmp_path: Path)
         )
         assert data_center_results[0]["id"].endswith("data-center-revenue")
         assert data_center_results[0]["object"]["dimensions"]["segment"] == "Data Center"
-        assert data_center_diagnostics["search_strategy"]["company_total_role"] == "denominator_or_support"
+        assert (
+            data_center_diagnostics["search_strategy"]["company_total_role"]
+            == "denominator_or_support"
+        )
 
         aws_results, aws_diagnostics = store.query_compact_with_diagnostics(
             topic="AWS operating income",
@@ -3589,13 +3947,15 @@ def test_metric_lookup_is_dimension_aware_not_company_total_only(tmp_path: Path)
         assert aws_results[0]["object"]["dimensions"]["segment"] == "AWS"
         assert aws_diagnostics["search_strategy"]["dimension_anchors"] == ["aws"]
 
-        intelligent_cloud_results, _intelligent_cloud_diagnostics = store.query_compact_with_diagnostics(
-            topic="Intelligent Cloud revenue",
-            tickers=["MSFT"],
-            document_types=["10-K"],
-            periods=["CY2025"],
-            object_types=["MetricObservation"],
-            limit=3,
+        intelligent_cloud_results, _intelligent_cloud_diagnostics = (
+            store.query_compact_with_diagnostics(
+                topic="Intelligent Cloud revenue",
+                tickers=["MSFT"],
+                document_types=["10-K"],
+                periods=["CY2025"],
+                object_types=["MetricObservation"],
+                limit=3,
+            )
         )
         assert intelligent_cloud_results[0]["id"].endswith("intelligent-cloud-revenue")
         intelligent_cloud_lookup = store.conn.execute(
@@ -3603,7 +3963,10 @@ def test_metric_lookup_is_dimension_aware_not_company_total_only(tmp_path: Path)
             (intelligent_cloud_results[0]["id"],),
         ).fetchone()
         assert intelligent_cloud_lookup["segment_name"] == "Intelligent Cloud"
-        assert json.loads(intelligent_cloud_lookup["dimensions_json"])["Business Segment"] == "Intelligent Cloud"
+        assert (
+            json.loads(intelligent_cloud_lookup["dimensions_json"])["Business Segment"]
+            == "Intelligent Cloud"
+        )
 
         google_cloud_results, _google_cloud_diagnostics = store.query_compact_with_diagnostics(
             topic="Google Cloud revenue",
@@ -3619,7 +3982,9 @@ def test_metric_lookup_is_dimension_aware_not_company_total_only(tmp_path: Path)
             (google_cloud_results[0]["id"],),
         ).fetchone()
         assert google_cloud_lookup["segment_name"] is None
-        assert json.loads(google_cloud_lookup["dimensions_json"])["inferred_unknown"] == "Google Cloud"
+        assert (
+            json.loads(google_cloud_lookup["dimensions_json"])["inferred_unknown"] == "Google Cloud"
+        )
 
         catalog_rows = store.conn.execute(
             """
@@ -3690,18 +4055,36 @@ def test_metric_lookup_is_dimension_aware_not_company_total_only(tmp_path: Path)
         share_strategy = share_diagnostics["search_strategy"]
         assert share_strategy["mode"] == "metric_dimension_lookup"
         assert share_strategy["denominator_needed"] is True
-        assert share_strategy["metric_roles_by_object_id"]["metric_observation:AAPL:CY2025:10K:total-revenue"] == "denominator_metric"
-        assert share_strategy["metric_roles_by_object_id"]["metric_observation:AAPL:CY2025:10K:iphone-net-sales"] == "target_dimension_metric"
+        assert (
+            share_strategy["metric_roles_by_object_id"][
+                "metric_observation:AAPL:CY2025:10K:total-revenue"
+            ]
+            == "denominator_metric"
+        )
+        assert (
+            share_strategy["metric_roles_by_object_id"][
+                "metric_observation:AAPL:CY2025:10K:iphone-net-sales"
+            ]
+            == "target_dimension_metric"
+        )
 
 
 def test_metric_dimension_normalization_uses_generic_rules_not_value_special_cases() -> None:
-    assert agent_index_builder._metric_lookup_clean_dimension_label("aapl:IPhoneMember") == "I Phone"
-    assert agent_index_builder._metric_lookup_clean_dimension_label("us-gaap:ServiceMember") == "Service"
+    assert (
+        agent_index_builder._metric_lookup_clean_dimension_label("aapl:IPhoneMember") == "I Phone"
+    )
+    assert (
+        agent_index_builder._metric_lookup_clean_dimension_label("us-gaap:ServiceMember")
+        == "Service"
+    )
     assert agent_index_builder._metric_dimension_key("aapl:IPhoneMember") == "i_phone"
     assert agent_index_builder._metric_dimension_key("us-gaap:ServiceMember") == "service"
     assert agent_index_builder._metric_dimension_kind("aapl:IPhoneMember", "I Phone") == "unknown"
     assert agent_index_builder._metric_dimension_kind("ProductOrServiceAxis", "IPhone") == "product"
-    assert agent_index_builder._metric_dimension_kind("StatementGeographicalAxis", "Greater China") == "geography"
+    assert (
+        agent_index_builder._metric_dimension_kind("StatementGeographicalAxis", "Greater China")
+        == "geography"
+    )
     aliases = agent_index_builder._metric_dimension_aliases("Service", "service")
     assert "services" in {alias.lower() for alias in aliases}
 
@@ -3713,7 +4096,12 @@ def test_query_ticker_summary_discovery_contract(tmp_path: Path) -> None:
     payload = json.loads(
         query_tool(
             topic="commodity volatility natural gas price revenue exposure",
-            object_types=["ExternalFactorExposure", "ResearchClaim", "EvidenceQuote", "SupportLink"],
+            object_types=[
+                "ExternalFactorExposure",
+                "ResearchClaim",
+                "EvidenceQuote",
+                "SupportLink",
+            ],
             response_detail="ticker_summary",
             group_by="ticker",
             limit=20,
@@ -3733,7 +4121,10 @@ def test_query_ticker_summary_discovery_contract(tmp_path: Path) -> None:
     assert payload["ticker_candidates"][0]["trace_status"] == "traceable"
     assert payload["ticker_candidates"][0]["trace_counts"]["evidence_chains"] > 0
     assert payload["directness_guard"]["strong_claim_allowed"] is True
-    assert payload["directness_guard"]["strong_claim_requires"] == ["traceable_direct", "traceable_metric_lineage"]
+    assert payload["directness_guard"]["strong_claim_requires"] == [
+        "traceable_direct",
+        "traceable_metric_lineage",
+    ]
     assert payload["ticker_candidates"][0]["top_object_ids"]
     assert payload["ticker_candidates"][0]["matched_topics"]
     reason = payload["ticker_candidates"][0]["top_reasons"][0]
@@ -3747,7 +4138,9 @@ def test_query_ticker_summary_discovery_contract(tmp_path: Path) -> None:
     assert len(payload["results_by_ticker"]["VG"]) <= 2
 
 
-def test_query_compact_exposes_directness_guard_for_direct_question(tmp_path: Path, monkeypatch) -> None:
+def test_query_compact_exposes_directness_guard_for_direct_question(
+    tmp_path: Path, monkeypatch
+) -> None:
     _write_fixture(tmp_path)
     _build_v3_runtime(tmp_path)
     monkeypatch.setenv("KRW_ONTOLOGY_ROOT", str(tmp_path))
@@ -3772,7 +4165,10 @@ def test_query_compact_exposes_directness_guard_for_direct_question(tmp_path: Pa
 
     assert payload["directness_guard"]["requires_direct_match"] is True
     assert payload["directness_guard"]["strong_claim_allowed"] is False
-    assert payload["directness_guard"]["strong_claim_requires"] == ["traceable_direct", "traceable_metric_lineage"]
+    assert payload["directness_guard"]["strong_claim_requires"] == [
+        "traceable_direct",
+        "traceable_metric_lineage",
+    ]
     assert "Strong claim allowed: False" in markdown
 
 
@@ -3827,7 +4223,9 @@ def test_retrieve_ticker_summary_discovery_contract(tmp_path: Path) -> None:
     assert len(payload["results_by_ticker"]["VG"]) <= 2
 
 
-def test_retrieve_ticker_summary_exposes_directness_guard_for_direct_question(tmp_path: Path) -> None:
+def test_retrieve_ticker_summary_exposes_directness_guard_for_direct_question(
+    tmp_path: Path,
+) -> None:
     from krw_ontology.mcp_server.tools import retrieve_tool
 
     _write_fixture(tmp_path)
@@ -3846,7 +4244,10 @@ def test_retrieve_ticker_summary_exposes_directness_guard_for_direct_question(tm
 
     assert payload["directness_guard"]["requires_direct_match"] is True
     assert payload["directness_guard"]["strong_claim_allowed"] is False
-    assert payload["directness_guard"]["strong_claim_requires"] == ["traceable_direct", "traceable_metric_lineage"]
+    assert payload["directness_guard"]["strong_claim_requires"] == [
+        "traceable_direct",
+        "traceable_metric_lineage",
+    ]
 
 
 def test_ticker_summary_demotes_untraced_direct_candidate(tmp_path: Path) -> None:

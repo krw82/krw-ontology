@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from krw_ontology.agent_index.builder import (
@@ -51,6 +51,7 @@ def plan_source_artifact_sqlite_inputs(
     cache_root: Path | None = None,
     workers: int | None = None,
     source_manifest_path: Path | None = None,
+    source_manifest_payload: Mapping[str, Any] | None = None,
 ) -> SourceArtifactSqlitePlan:
     """Plan source artifact rows used to materialize v3 company shard SQLite files."""
     return _plan_artifact_index_inputs(
@@ -59,6 +60,7 @@ def plan_source_artifact_sqlite_inputs(
         cache_root=cache_root,
         workers=workers,
         source_manifest_path=source_manifest_path,
+        source_manifest_payload=source_manifest_payload,
     )
 
 

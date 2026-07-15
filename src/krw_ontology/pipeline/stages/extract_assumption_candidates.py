@@ -13,6 +13,7 @@ import re
 from pathlib import Path
 
 from krw_ontology.config.constants import normalize_doc_type
+from krw_ontology.errors import ProviderOverloadError
 from krw_ontology.extraction.worker import ExtractionWorker
 from krw_ontology.pipeline.ai_batches import (
     clear_stage_batch_cache,
@@ -277,6 +278,8 @@ async def extract_assumption_candidates(
                 },
             )
             return materialized_preview, 0, rejected_preview
+        except ProviderOverloadError:
+            raise
         except Exception as e:
             _record_batch_failure(
                 failures_path, ticker, doc_type, period, source_document_id,
@@ -310,6 +313,7 @@ async def extract_assumption_candidates(
         concurrency=concurrency,
         run_one=run_batch,
         on_complete=log_complete,
+        stage_name=stage_name,
     )
 
     for _batch_idx, (items, failed, rejected) in sorted(results, key=lambda row: row[0]):

@@ -1,0 +1,11 @@
+{
+  "format": "krw-ontology-guru-release-budget/v1",
+  "require_baseline": true,
+  "min_cases": 30,
+  "min_pass_ratio": 1.0,
+  "min_mean_score": 0.9,
+  "max_cold_ms": 1000.0,
+  "max_warm_p95_ms": 250.0,
+  "max_mean_score_drop": 0.0,
+  "max_warm_p95_regression_ratio": 1.25
+}

@@ -36,6 +36,7 @@ from krw_ontology.config.paths import (
     resolve_ontology_root,
 )
 from krw_ontology.mcp_server.evidence_pack import (
+    EvidencePackInputError,
     build_verified_company_evidence_pack,
 )
 from krw_ontology.mcp_server.contracts import (
@@ -69,6 +70,8 @@ class ResponseDetail(str, Enum):
 
 LOGGER = logging.getLogger(__name__)
 SLOW_MCP_TOOL_LOG_THRESHOLD_MS = 5_000
+MAX_CHAIN_RESPONSE_MODEL_BYTES = 60_000
+CHAIN_RESPONSE_BUDGET_FORMAT = "krw-ontology-chain-response-budget/v1"
 _SLOW_MCP_TOOL_LOG_MARKER = "[krw-ontology:mcp-slow-path]"
 _MCP_TOOL_TELEMETRY_MARKER = "[krw-ontology:mcp-telemetry]"
 _TRACE_TOOL_CACHE_MAX = 512
@@ -96,7 +99,10 @@ class _IndexSignature:
     router_sidecar_sha256: str | None
 
 
-_TRACE_TOOL_CACHE: OrderedDict[tuple[_IndexSignature, str], dict[str, Any]] = OrderedDict()
+_TRACE_TOOL_CACHE: OrderedDict[
+    tuple[_IndexSignature, str, str | None],
+    dict[str, Any],
+] = OrderedDict()
 
 
 def _read_int_env(name: str, default: int, *, min_value: int) -> int:
@@ -160,9 +166,15 @@ def _manifest_signature_fields(
     if not isinstance(payload, Mapping):
         return None, None, None, None
     indexes = payload.get("indexes") if isinstance(payload.get("indexes"), Mapping) else {}
-    global_spine = indexes.get("global_spine") if isinstance(indexes.get("global_spine"), Mapping) else {}
-    shard_manifest = indexes.get("shard_manifest") if isinstance(indexes.get("shard_manifest"), Mapping) else {}
-    router_sidecar = indexes.get("router_sidecar") if isinstance(indexes.get("router_sidecar"), Mapping) else {}
+    global_spine = (
+        indexes.get("global_spine") if isinstance(indexes.get("global_spine"), Mapping) else {}
+    )
+    shard_manifest = (
+        indexes.get("shard_manifest") if isinstance(indexes.get("shard_manifest"), Mapping) else {}
+    )
+    router_sidecar = (
+        indexes.get("router_sidecar") if isinstance(indexes.get("router_sidecar"), Mapping) else {}
+    )
     release_id = payload.get("release_id")
     return (
         str(release_id) if release_id else None,
@@ -172,8 +184,13 @@ def _manifest_signature_fields(
     )
 
 
-def _trace_cache_key(index_path: Path, object_id: str) -> tuple[_IndexSignature, str]:
-    return (_index_signature(index_path), object_id)
+def _trace_cache_key(
+    index_path: Path,
+    object_id: str,
+    ticker: str | None = None,
+) -> tuple[_IndexSignature, str, str | None]:
+    normalized_ticker = str(ticker or "").strip().upper() or None
+    return (_index_signature(index_path), object_id, normalized_ticker)
 
 
 class _StoreBucket:
@@ -525,16 +542,8 @@ def _log_mcp_tool_timing(
 ) -> None:
     if not force and duration_ms < SLOW_MCP_TOOL_LOG_THRESHOLD_MS:
         return
-    safe_fields = {
-        key: value
-        for key, value in fields.items()
-        if value is not None
-    }
-    log_method = (
-        LOGGER.warning
-        if duration_ms >= SLOW_MCP_TOOL_LOG_THRESHOLD_MS
-        else LOGGER.info
-    )
+    safe_fields = {key: value for key, value in fields.items() if value is not None}
+    log_method = LOGGER.warning if duration_ms >= SLOW_MCP_TOOL_LOG_THRESHOLD_MS else LOGGER.info
     log_method(
         "%s %s",
         (
@@ -884,8 +893,13 @@ def query_tool(
             periods=normalized_periods,
             limit_results=limit,
             result_count=len(payload.get("ticker_candidates") or []),
-            research_pack={"company_topic_pack": {"top_candidates": payload.get("ticker_candidates") or []}},
-            agent_autonomy={"allowed_next_tools": ["krw_ontology_trace"], "max_additional_tool_calls": 1},
+            research_pack={
+                "company_topic_pack": {"top_candidates": payload.get("ticker_candidates") or []}
+            },
+            agent_autonomy={
+                "allowed_next_tools": ["krw_ontology_trace"],
+                "max_additional_tool_calls": 1,
+            },
             do_not_call=["broad_retrieve", "unscoped_query"],
         )
         _log_mcp_tool_timing(
@@ -989,9 +1003,18 @@ def query_tool(
         document_types=normalized_document_types,
         periods=normalized_periods,
         limit_results=limit,
-        result_count=len(results) if "results" in payload else len(payload.get("ticker_candidates") or []),
-        research_pack={"query_results": results if "results" in payload else payload.get("ticker_candidates") or []},
-        agent_autonomy={"allowed_next_tools": ["krw_ontology_trace"], "max_additional_tool_calls": 1},
+        result_count=len(results)
+        if "results" in payload
+        else len(payload.get("ticker_candidates") or []),
+        research_pack={
+            "query_results": results
+            if "results" in payload
+            else payload.get("ticker_candidates") or []
+        },
+        agent_autonomy={
+            "allowed_next_tools": ["krw_ontology_trace"],
+            "max_additional_tool_calls": 1,
+        },
         do_not_call=["broad_retrieve"],
     )
     _log_mcp_tool_timing(
@@ -1007,7 +1030,9 @@ def query_tool(
         group_by=normalized_group_by,
         limit=limit,
         offset=offset,
-        result_count=len(results) if "results" in payload else len(payload.get("ticker_candidates") or []),
+        result_count=len(results)
+        if "results" in payload
+        else len(payload.get("ticker_candidates") or []),
         bundle_count=len(bundles),
         topic_normalized=bool(topic_normalization),
         input_warning_count=len(input_warnings),
@@ -1071,7 +1096,9 @@ def retrieve_tool(
     input_warnings = _input_warnings(extra_args)
     agent_guidance = _retrieve_agent_guidance(agent_context)
     summary_mode = detail == ResponseDetail.TICKER_SUMMARY or normalized_group_by == "ticker"
-    fetch_limit = _discovery_fetch_limit(limit, limit_groups, limit_per_group) if summary_mode else limit
+    fetch_limit = (
+        _discovery_fetch_limit(limit, limit_groups, limit_per_group) if summary_mode else limit
+    )
     if summary_mode:
         with _store(index) as store:
             context = store.query_context(
@@ -1083,11 +1110,7 @@ def retrieve_tool(
                 limit_tickers=limit_groups,
                 include_internal_ids=True,
             )
-            discovery = {
-                key: value
-                for key, value in context.items()
-                if key not in {"question"}
-            }
+            discovery = {key: value for key, value in context.items() if key not in {"question"}}
             if not discovery.get("ticker_candidates"):
                 fallback_discovery = store.discover_company_topics(
                     question=question,
@@ -1108,7 +1131,8 @@ def retrieve_tool(
         }
         payload = {
             "answerability": answerability,
-            "recommended_answer_mode": answerability.get("recommended_answer_mode") or "ticker_discovery",
+            "recommended_answer_mode": answerability.get("recommended_answer_mode")
+            or "ticker_discovery",
             "directness_guard": _directness_guard_from_research_context(discovery),
             "question": question,
             "query": {
@@ -1134,7 +1158,9 @@ def retrieve_tool(
                 ticker_key: list(rows or [])[:limit_per_group]
                 for ticker_key, rows in payload["results_by_ticker"].items()
             }
-        payload["directness_guard"] = payload.get("directness_guard") or _directness_guard_from_summary_payload(
+        payload["directness_guard"] = payload.get(
+            "directness_guard"
+        ) or _directness_guard_from_summary_payload(
             payload,
             topic=question,
         )
@@ -1229,7 +1255,9 @@ def retrieve_tool(
                     "answer_candidate_only": answer_candidate_only,
                 },
                 "answerability": research_context.get("answerability") or {},
-                "recommended_answer_mode": (research_context.get("answerability") or {}).get("recommended_answer_mode"),
+                "recommended_answer_mode": (research_context.get("answerability") or {}).get(
+                    "recommended_answer_mode"
+                ),
                 "directness_guard": _directness_guard_from_research_context(research_context),
                 "research_context_version": research_context.get("research_context_version"),
                 "research_status": research_context.get("research_status"),
@@ -1264,7 +1292,9 @@ def retrieve_tool(
                     "answer_candidate_only": answer_candidate_only,
                 },
                 "answerability": research_context.get("answerability") or {},
-                "recommended_answer_mode": (research_context.get("answerability") or {}).get("recommended_answer_mode"),
+                "recommended_answer_mode": (research_context.get("answerability") or {}).get(
+                    "recommended_answer_mode"
+                ),
                 "directness_guard": _directness_guard_from_research_context(research_context),
                 "research_context_version": research_context.get("research_context_version"),
                 "research_status": research_context.get("research_status"),
@@ -1322,7 +1352,10 @@ def retrieve_tool(
     result["directness_guard"] = _directness_guard_from_research_context(research_context)
     result["kernel"] = research_context.get("kernel")
     result.setdefault("answerability", research_context.get("answerability") or {})
-    result.setdefault("recommended_answer_mode", (research_context.get("answerability") or {}).get("recommended_answer_mode"))
+    result.setdefault(
+        "recommended_answer_mode",
+        (research_context.get("answerability") or {}).get("recommended_answer_mode"),
+    )
     if answer_candidate_only:
         result = _map_retrieval_context(result, _answer_candidate_bundles)
     if summary_mode:
@@ -1346,9 +1379,15 @@ def retrieve_tool(
                 for key, value in result.items()
                 if key not in {"direct_evidence", "related_context", "rejected_context"}
             },
-            "direct_evidence": [_ids_only_bundle(bundle) for bundle in result.get("direct_evidence", [])],
-            "related_context": [_ids_only_bundle(bundle) for bundle in result.get("related_context", [])],
-            "rejected_context": [_ids_only_bundle(bundle) for bundle in result.get("rejected_context", [])],
+            "direct_evidence": [
+                _ids_only_bundle(bundle) for bundle in result.get("direct_evidence", [])
+            ],
+            "related_context": [
+                _ids_only_bundle(bundle) for bundle in result.get("related_context", [])
+            ],
+            "rejected_context": [
+                _ids_only_bundle(bundle) for bundle in result.get("rejected_context", [])
+            ],
         }
     else:
         payload = result if detail == ResponseDetail.FULL else _compact_retrieval(result)
@@ -1374,26 +1413,32 @@ def retrieve_tool(
 def trace_tool(
     *,
     object_id: str,
+    ticker: str | None = None,
     response_format: ResponseFormat = ResponseFormat.JSON,
 ) -> str:
-    """Trace one ontology object to its source document, quotes, spans, and quality."""
+    """Trace one object occurrence to its source document, quotes, spans, and quality."""
     index = _runtime_global_spine_path()
-    cache_key = _trace_cache_key(index, object_id)
+    normalized_ticker = str(ticker or "").strip().upper() or None
+    cache_key = _trace_cache_key(index, object_id, normalized_ticker)
     with _TRACE_TOOL_CACHE_LOCK:
         cached = _TRACE_TOOL_CACHE.get(cache_key)
         if cached is not None:
             _TRACE_TOOL_CACHE.move_to_end(cache_key)
             return _format_response(copy.deepcopy(cached), response_format, _markdown_trace)
     with _store(index) as store:
-        trace = store.trace(object_id)
+        trace = store.trace(object_id, ticker=normalized_ticker)
         resolved_from_prefix = None
         candidates = []
         if trace is None:
-            candidates = store.find_object_ids(object_id, limit=11)
+            candidates = store.find_object_ids(
+                object_id,
+                ticker=normalized_ticker,
+                limit=11,
+            )
             if len(candidates) == 1:
                 resolved_from_prefix = object_id
                 object_id = candidates[0]["id"]
-                trace = store.trace(object_id)
+                trace = store.trace(object_id, ticker=normalized_ticker)
     if trace is None:
         if candidates:
             payload = _error_payload(
@@ -1425,35 +1470,62 @@ def verify_evidence_tool(
     *,
     ticker: str,
     questions: Sequence[Mapping[str, Any]],
+    brief_hash: str | None = None,
     response_format: ResponseFormat = ResponseFormat.JSON,
 ) -> str:
     """Verify exact ontology object ids and return a hash-stable evidence pack."""
     index = _runtime_global_spine_path()
     signature = _index_signature(index)
-    with _store(index) as store:
-        payload = build_verified_company_evidence_pack(
-            store=store,
-            ticker=ticker,
-            questions=questions,
-            release_id=signature.release_id,
-        )
+    try:
+        with _store(index) as store:
+            payload = build_verified_company_evidence_pack(
+                store=store,
+                ticker=ticker,
+                questions=questions,
+                release_id=signature.release_id,
+                brief_hash=brief_hash,
+            )
+    except EvidencePackInputError as exc:
+        payload = {
+            "status": "input_correction_required",
+            "code": exc.code,
+            "message": str(exc),
+            "required_change": exc.required_change,
+            "invalid_fields": exc.invalid_fields,
+            "allowed_next_tools": ["krw_ontology_verify_evidence"],
+        }
+    except ValueError as exc:
+        payload = {
+            "status": "input_correction_required",
+            "code": "evidence_pack_validation_failed",
+            "message": str(exc),
+            "required_change": (
+                "Correct the named evidence-pack input and call "
+                "krw_ontology_verify_evidence again with the same question ids."
+            ),
+            "invalid_fields": ["ticker", "questions", "brief_hash"],
+            "allowed_next_tools": ["krw_ontology_verify_evidence"],
+        }
     return _format_response(payload, response_format, _markdown_verify_evidence)
 
 
 def chain_tool(
     *,
     object_id: str,
+    ticker: str | None = None,
     max_depth: int = 2,
     direction: str = "both",
     include_quote_text: bool = False,
     response_format: ResponseFormat = ResponseFormat.JSON,
 ) -> str:
-    """Return compact evidence, semantic, and temporal chains around one object."""
+    """Return compact evidence, semantic, and temporal chains around one object occurrence."""
     index = _runtime_global_spine_path()
+    normalized_ticker = str(ticker or "").strip().upper() or None
     max_depth = max(0, min(int(max_depth), 5))
     with _store(index) as store:
         chain = store.chain(
             object_id,
+            ticker=normalized_ticker,
             max_depth=max_depth,
             direction=direction,
             include_quote_text=include_quote_text,
@@ -1461,12 +1533,17 @@ def chain_tool(
         resolved_from_prefix = None
         candidates = []
         if chain is None:
-            candidates = store.find_object_ids(object_id, limit=11)
+            candidates = store.find_object_ids(
+                object_id,
+                ticker=normalized_ticker,
+                limit=11,
+            )
             if len(candidates) == 1:
                 resolved_from_prefix = object_id
                 object_id = candidates[0]["id"]
                 chain = store.chain(
                     object_id,
+                    ticker=normalized_ticker,
                     max_depth=max_depth,
                     direction=direction,
                     include_quote_text=include_quote_text,
@@ -1489,6 +1566,7 @@ def chain_tool(
         payload = chain
         if resolved_from_prefix:
             payload["resolved_from_prefix"] = resolved_from_prefix
+        payload = _apply_chain_response_budget(payload)
     return _format_response(payload, response_format, _markdown_chain)
 
 
@@ -1627,13 +1705,18 @@ def compare_tool(
         )
         result["kernel"] = ResearchKernel().build_envelope(
             request,
-            research_status="sufficient_for_default_answer" if result.get("results") else "needs_targeted_followup",
+            research_status="sufficient_for_default_answer"
+            if result.get("results")
+            else "needs_targeted_followup",
             answer_mode="comparison_research_state",
             research_pack={"comparison_contexts": result.get("comparison_contexts") or {}},
             answerability={"related_context_available": bool(result.get("results"))},
             missing_parts=[] if result.get("results") else ["comparison_candidates_not_found"],
             recommended_tools=[],
-            agent_autonomy={"allowed_next_tools": ["krw_ontology_trace"], "max_additional_tool_calls": 1},
+            agent_autonomy={
+                "allowed_next_tools": ["krw_ontology_trace"],
+                "max_additional_tool_calls": 1,
+            },
             do_not_call=["raw_fts_winner_by_hit_count", "broad_retrieve"],
         )
     result["comparison_rows"] = _comparison_rows(result)
@@ -1669,13 +1752,11 @@ def plan_query_tool(
         "plan": plan.model_dump(mode="json"),
         "execution_preview": {
             "clause_count": len(plan.clauses),
-            "required_clause_count": sum(
-                1 for clause in plan.clauses if clause.required
-            ),
+            "required_clause_count": sum(1 for clause in plan.clauses if clause.required),
             "routing_clauses": [
                 {
                     "clause_id": clause.clause_id,
-                    "query": _clause_routing_query(clause),
+                    "query": clause_routing_query(clause),
                     "required": clause.required,
                 }
                 for clause in plan.clauses
@@ -1820,7 +1901,9 @@ def raw_query_context_tool(
         kernel_status=kernel.get("status"),
         ticker_candidate_count=_count_items(payload_dict.get("ticker_candidates")),
         missing_part_count=_count_items(payload_dict.get("missing_parts")),
-        research_pack_keys=sorted(str(key) for key in research_pack.keys()) if research_pack else [],
+        research_pack_keys=sorted(str(key) for key in research_pack.keys())
+        if research_pack
+        else [],
         search_diagnostics_keys=_diagnostic_keys(payload_dict),
         timing_ms=_diagnostic_timing_ms(payload_dict),
     )
@@ -1883,25 +1966,15 @@ def query_context_tool(
             1 for coverage in state.clause_coverage if coverage.status == "missing"
         ),
         evidence_directness_counts={
-            directness: sum(
-                1
-                for unit in state.evidence_units
-                if unit.directness == directness
-            )
+            directness: sum(1 for unit in state.evidence_units if unit.directness == directness)
             for directness in ("direct", "metric_lineage", "related", "unverified")
         },
         evidence_grade_counts={
-            grade: sum(
-                1 for unit in state.evidence_units if unit.evidence_grade == grade
-            )
+            grade: sum(1 for unit in state.evidence_units if unit.evidence_grade == grade)
             for grade in ("strong", "medium", "weak", "unverified")
         },
         calculation_coverage_statuses={
-            status: sum(
-                1
-                for coverage in state.calculation_coverage
-                if coverage.status == status
-            )
+            status: sum(1 for coverage in state.calculation_coverage if coverage.status == status)
             for status in ("covered", "partial", "missing")
         },
         retrieval_ms=retrieval_elapsed_ms,
@@ -1917,7 +1990,7 @@ def _execute_search_plan(*, store: Any, search_plan: SearchPlan) -> dict[str, An
     """Execute only plan-authored compact queries and assemble compiler input."""
     started_at = time.perf_counter()
     results_by_ticker: dict[str, list[dict[str, Any]]] = {}
-    evidence_by_object_id: dict[str, dict[str, Any]] = {}
+    evidence_by_occurrence: dict[tuple[str, str], dict[str, Any]] = {}
     diagnostics: list[Mapping[str, Any]] = []
     unknown_tickers: list[str] = []
     failed_tickers: list[str] = []
@@ -1933,7 +2006,7 @@ def _execute_search_plan(*, store: Any, search_plan: SearchPlan) -> dict[str, An
             clauses=[
                 {
                     "clause_id": clause.clause_id,
-                    "query": _clause_routing_query(clause),
+                    "query": clause_routing_query(clause),
                     "required": clause.required,
                 }
                 for clause in search_plan.clauses
@@ -1961,6 +2034,7 @@ def _execute_search_plan(*, store: Any, search_plan: SearchPlan) -> dict[str, An
             filing_document_roles.update(
                 filing_document_roles_from_documents(
                     list_documents(
+                        tickers=resolved_tickers,
                         document_types=search_plan.document_types or None,
                     ),
                     tickers=resolved_tickers,
@@ -1985,12 +2059,14 @@ def _execute_search_plan(*, store: Any, search_plan: SearchPlan) -> dict[str, An
             object_id = str(row.get("id") or row.get("object_id") or "").strip()
             if not object_id:
                 continue
-            existing = evidence_by_object_id.get(object_id)
+            occurrence_ticker = str(row.get("ticker") or "").strip().upper()
+            occurrence_key = (occurrence_ticker, object_id)
+            existing = evidence_by_occurrence.get(occurrence_key)
             if existing is None:
                 existing = row
                 existing["_plan_clause_ids"] = []
                 existing["_plan_clause_matches"] = []
-                evidence_by_object_id[object_id] = existing
+                evidence_by_occurrence[occurrence_key] = existing
             clause_ids = existing.setdefault("_plan_clause_ids", [])
             if clause.clause_id not in clause_ids:
                 clause_ids.append(clause.clause_id)
@@ -2000,8 +2076,7 @@ def _execute_search_plan(*, store: Any, search_plan: SearchPlan) -> dict[str, An
                     "clause_id": clause.clause_id,
                     "planned_match_mode": row.get("planned_match_mode") or "strict",
                     "planned_evidence_terms": list(
-                        row.get("planned_evidence_terms")
-                        or _clause_evidence_terms(clause)
+                        row.get("planned_evidence_terms") or _clause_evidence_terms(clause)
                     ),
                     "planned_predicate_terms": list(clause.required_predicates),
                     "planned_metric_terms": _clause_metric_terms(clause),
@@ -2078,7 +2153,7 @@ def _execute_search_plan(*, store: Any, search_plan: SearchPlan) -> dict[str, An
             )
             record_clause_rows(clause, rows, clause_diagnostics)
 
-    for row in evidence_by_object_id.values():
+    for row in evidence_by_occurrence.values():
         ticker = str(row.get("ticker") or "").strip().upper() or "UNKNOWN"
         results_by_ticker.setdefault(ticker, []).append(row)
 
@@ -2107,6 +2182,11 @@ def _execute_search_plan(*, store: Any, search_plan: SearchPlan) -> dict[str, An
         {
             "tool": "krw_ontology_chain",
             "object_id": object_id,
+            **(
+                {"ticker": str(row.get("ticker") or occurrence_ticker)}
+                if row.get("ticker") or occurrence_ticker
+                else {}
+            ),
             "clause_id": clause.clause_id,
             "purpose": (
                 "verify the planned directed relation with a structured ontology path; "
@@ -2115,16 +2195,21 @@ def _execute_search_plan(*, store: Any, search_plan: SearchPlan) -> dict[str, An
         }
         for clause in search_plan.clauses
         if clause.required_predicates
-        for object_id, row in evidence_by_object_id.items()
+        for (occurrence_ticker, object_id), row in evidence_by_occurrence.items()
         if clause.clause_id in list(row.get("_plan_clause_ids") or [])
     ]
     trace_tools = [
         {
             "tool": "krw_ontology_trace",
             "object_id": object_id,
+            **(
+                {"ticker": str(row.get("ticker") or occurrence_ticker)}
+                if row.get("ticker") or occurrence_ticker
+                else {}
+            ),
             "purpose": "verify selected evidence lineage before a strong claim",
         }
-        for object_id, row in evidence_by_object_id.items()
+        for (occurrence_ticker, object_id), row in evidence_by_occurrence.items()
         if str(row.get("trace_status") or "") in {"traceable", "traceable_metric_lineage"}
     ]
     recommended_tools = _dedupe_recommended_tools([*relation_tools, *trace_tools])[:8]
@@ -2165,12 +2250,11 @@ def _clause_evidence_terms(clause: Any) -> list[str]:
 
 
 def _clause_metric_terms(clause: Any) -> list[str]:
-    return _dedupe_preserving_order(
-        [*list(clause.metrics), *list(clause.metric_dimensions)]
-    )
+    return _dedupe_preserving_order([*list(clause.metrics), *list(clause.metric_dimensions)])
 
 
-def _clause_routing_query(clause: Any) -> str:
+def clause_routing_query(clause: Any) -> str:
+    """Return the production router text for one validated SearchPlan clause."""
     if (
         clause.required_concepts
         or clause.required_predicates
@@ -2298,9 +2382,7 @@ def _diagnostic_failed_tickers(diagnostics: Mapping[str, Any]) -> list[str]:
     for container in (diagnostics, _safe_payload_dict(diagnostics.get("routing"))):
         raw = container.get("failed_tickers")
         if isinstance(raw, Sequence) and not isinstance(raw, (str, bytes)):
-            values.extend(
-                str(value).strip().upper() for value in raw if str(value).strip()
-            )
+            values.extend(str(value).strip().upper() for value in raw if str(value).strip())
         errors = container.get("shard_errors")
         if isinstance(errors, Mapping):
             values.extend(str(value).strip().upper() for value in errors)
@@ -2336,9 +2418,7 @@ def _planned_execution_telemetry(
         shard_diagnostics = diagnostic.get("shard_diagnostics")
         if isinstance(shard_diagnostics, Mapping):
             leaves.extend(
-                value
-                for value in shard_diagnostics.values()
-                if isinstance(value, Mapping)
+                value for value in shard_diagnostics.values() if isinstance(value, Mapping)
             )
         else:
             leaves.append(diagnostic)
@@ -2375,12 +2455,9 @@ def _planned_execution_telemetry(
         "relaxed_rows": sum(int(item.get("relaxed_result_count") or 0) for item in leaves),
         "metric_rows": sum(int(item.get("metric_result_count") or 0) for item in leaves),
         "clause_query_ms": sum(
-            int(_safe_payload_dict(item.get("timing_ms")).get("total") or 0)
-            for item in leaves
+            int(_safe_payload_dict(item.get("timing_ms")).get("total") or 0) for item in leaves
         ),
-        "pre_truncation_count": int(
-            batch_diagnostic.get("pre_truncation_count") or 0
-        ),
+        "pre_truncation_count": int(batch_diagnostic.get("pre_truncation_count") or 0),
         "omitted_evidence_count": omitted_evidence_count,
         "truncation_possible": truncation_possible,
         "route_score_summaries": score_summaries,
@@ -2419,12 +2496,13 @@ def _dedupe_recommended_tools(
     values: Sequence[Mapping[str, Any]],
 ) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
-    seen: set[tuple[str, str, str]] = set()
+    seen: set[tuple[str, str, str, str]] = set()
     for value in values:
         payload = dict(value)
         key = (
             str(payload.get("tool") or ""),
             str(payload.get("object_id") or ""),
+            str(payload.get("ticker") or ""),
             str(payload.get("clause_id") or ""),
         )
         if not key[0] or key in seen:
@@ -2475,13 +2553,18 @@ def _markdown_query_context(payload: Mapping[str, Any]) -> str:
     ]
     if stop_guard:
         lines.append(f"- cannot_answer_reason: {stop_guard.get('cannot_answer_reason')}")
-    research_pack = payload.get("research_pack") if isinstance(payload.get("research_pack"), Mapping) else {}
+    research_pack = (
+        payload.get("research_pack") if isinstance(payload.get("research_pack"), Mapping) else {}
+    )
     current_anchors = payload.get("current_document_anchors")
     if not isinstance(current_anchors, Mapping) and isinstance(research_pack, Mapping):
         current_anchors = research_pack.get("current_document_anchors")
     if isinstance(current_anchors, Mapping) and current_anchors:
         anchor_text = ", ".join(
-            str(anchor.get("source_label") or f"{ticker} {anchor.get('period')} {anchor.get('document_type')}")
+            str(
+                anchor.get("source_label")
+                or f"{ticker} {anchor.get('period')} {anchor.get('document_type')}"
+            )
             for ticker, anchor in current_anchors.items()
             if isinstance(anchor, Mapping)
         )
@@ -2498,9 +2581,7 @@ def _markdown_query_context(payload: Mapping[str, Any]) -> str:
             current_driver = role_payload.get("current_driver")
             annual_baseline = role_payload.get("annual_baseline")
             current_label = (
-                current_driver.get("source_label")
-                if isinstance(current_driver, Mapping)
-                else None
+                current_driver.get("source_label") if isinstance(current_driver, Mapping) else None
             )
             annual_label = (
                 annual_baseline.get("source_label")
@@ -2521,7 +2602,9 @@ def _markdown_query_context(payload: Mapping[str, Any]) -> str:
     if isinstance(cross_company_pack, Mapping):
         lines.append("- cross_company_signal_pack: available")
         if cross_company_pack.get("latest_period_anchor"):
-            lines.append(f"- latest_period_anchor: {cross_company_pack.get('latest_period_anchor')}")
+            lines.append(
+                f"- latest_period_anchor: {cross_company_pack.get('latest_period_anchor')}"
+            )
         for signal in (cross_company_pack.get("signals") or [])[:4]:
             if not isinstance(signal, Mapping):
                 continue
@@ -2540,7 +2623,9 @@ def _markdown_query_context(payload: Mapping[str, Any]) -> str:
                 f"{row.get('signal')} ({row.get('evidence_strength')}): {summary}"
             )
     for candidate in payload.get("ticker_candidates") or []:
-        lines.append(f"- {candidate.get('ticker')}: {candidate.get('tier') or candidate.get('top_tier')}")
+        lines.append(
+            f"- {candidate.get('ticker')}: {candidate.get('tier') or candidate.get('top_tier')}"
+        )
     return "\n".join(lines)
 
 
@@ -2593,6 +2678,7 @@ def _compare_periods(
         worker_count = min(len(period_values), 4)
         period_results: dict[str, list[dict[str, Any]]] = {}
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
+
             def run_period_with_own_store(period: str) -> tuple[str, list[dict[str, Any]]]:
                 with _store(store.index_path) as period_store:
                     return run_period(period, period_store)
@@ -2702,7 +2788,11 @@ def _coerce_response_detail(response_detail: ResponseDetail | str) -> ResponseDe
 
 
 def _response_detail_value(response_detail: ResponseDetail | str) -> str:
-    return response_detail.value if isinstance(response_detail, ResponseDetail) else str(response_detail)
+    return (
+        response_detail.value
+        if isinstance(response_detail, ResponseDetail)
+        else str(response_detail)
+    )
 
 
 def _response_detail_policy(
@@ -2710,7 +2800,10 @@ def _response_detail_policy(
     effective_response_detail: ResponseDetail,
 ) -> dict[str, str]:
     requested = _response_detail_value(requested_response_detail)
-    if requested == ResponseDetail.FULL.value and effective_response_detail == ResponseDetail.COMPACT:
+    if (
+        requested == ResponseDetail.FULL.value
+        and effective_response_detail == ResponseDetail.COMPACT
+    ):
         action = "downgraded_full_disabled"
     elif requested == effective_response_detail.value:
         action = "as_requested"
@@ -2807,7 +2900,9 @@ def _normalize_object_types(
 def _answer_candidate_object_types(object_types: list[str] | None) -> list[str]:
     if object_types is None:
         return list(DISCOVERY_OBJECT_TYPES)
-    filtered = [object_type for object_type in object_types if object_type not in TRACE_ONLY_OBJECT_TYPES]
+    filtered = [
+        object_type for object_type in object_types if object_type not in TRACE_ONLY_OBJECT_TYPES
+    ]
     return filtered or list(DISCOVERY_OBJECT_TYPES)
 
 
@@ -2856,7 +2951,9 @@ def _ticker_summary_payload(
                 "matched_object_counts": _object_type_counts(ticker_bundles),
                 "evidence_counts": _evidence_counts(ticker_bundles),
                 "top_reasons": [_bundle_reason(bundle) for bundle in selected],
-                "top_object_ids": [str(bundle.get("id")) for bundle in selected if bundle.get("id")],
+                "top_object_ids": [
+                    str(bundle.get("id")) for bundle in selected if bundle.get("id")
+                ],
                 "top_objects": compact_objects,
             }
         )
@@ -2902,7 +2999,13 @@ def _ticker_tier(bundles: Sequence[Mapping[str, Any]]) -> str:
     object_types = {str(bundle.get("type") or "") for bundle in bundles}
     if object_types & {"ExternalFactorExposure", "EvidenceQuote", "ResearchClaim"}:
         return "direct"
-    if object_types & {"BusinessFactor", "BusinessActivity", "BusinessEvent", "AgreementTerm", "MetricObservation"}:
+    if object_types & {
+        "BusinessFactor",
+        "BusinessActivity",
+        "BusinessEvent",
+        "AgreementTerm",
+        "MetricObservation",
+    }:
         return "related"
     if object_types:
         return "inferred"
@@ -2931,7 +3034,15 @@ def _bundle_reason(bundle: Mapping[str, Any]) -> str:
     object_type = str(bundle.get("type") or "")
     obj = bundle.get("object")
     title = None
-    for attr in ("label", "title", "factor_name", "claim_text", "quote_text", "activity_name", "event_name"):
+    for attr in (
+        "label",
+        "title",
+        "factor_name",
+        "claim_text",
+        "quote_text",
+        "activity_name",
+        "event_name",
+    ):
         value = _object_value(obj, attr) if obj is not None else None
         if value:
             title = str(value)
@@ -2956,11 +3067,21 @@ def _compact_retrieval(result: dict[str, Any]) -> dict[str, Any]:
     payload = {
         key: value
         for key, value in result.items()
-        if key not in {"direct_evidence", "related_context", "rejected_context", "results", "compare", "quality"}
+        if key
+        not in {
+            "direct_evidence",
+            "related_context",
+            "rejected_context",
+            "results",
+            "compare",
+            "quality",
+        }
     }
     for field_name in ("direct_evidence", "related_context", "rejected_context"):
         values = result.get(field_name)
-        payload[field_name] = [_compact_bundle(item) for item in values] if isinstance(values, list) else []
+        payload[field_name] = (
+            [_compact_bundle(item) for item in values] if isinstance(values, list) else []
+        )
     if "compare" in result:
         payload["compare"] = _compact_compare(result["compare"])
     if "quality" in result:
@@ -2970,7 +3091,11 @@ def _compact_retrieval(result: dict[str, Any]) -> dict[str, Any]:
 
 def _compact_compare(result: dict[str, Any]) -> dict[str, Any]:
     return {
-        **{key: value for key, value in result.items() if key not in {"results", "comparison_contexts"}},
+        **{
+            key: value
+            for key, value in result.items()
+            if key not in {"results", "comparison_contexts"}
+        },
         "results": {
             ticker: [_compact_bundle(item) for item in items]
             for ticker, items in result.get("results", {}).items()
@@ -3025,7 +3150,9 @@ def _query_kernel_envelope(
     )
     return ResearchKernel().build_envelope(
         request,
-        research_status="sufficient_for_default_answer" if result_count else "needs_targeted_followup",
+        research_status="sufficient_for_default_answer"
+        if result_count
+        else "needs_targeted_followup",
         answer_mode="targeted_search_results",
         research_pack=research_pack,
         answerability={
@@ -3033,7 +3160,9 @@ def _query_kernel_envelope(
             "related_context_available": bool(result_count),
             "negative_answer_supported": False,
             "needs_user_clarification": False,
-            "recommended_answer_mode": "targeted_search_results" if result_count else "needs_targeted_followup",
+            "recommended_answer_mode": "targeted_search_results"
+            if result_count
+            else "needs_targeted_followup",
         },
         missing_parts=[] if result_count else ["query_results_not_found"],
         recommended_tools=[],
@@ -3044,7 +3173,9 @@ def _query_kernel_envelope(
 
 def _directness_guard_from_research_context(context: Mapping[str, Any]) -> dict[str, Any]:
     research_pack = context.get("research_pack") if isinstance(context, Mapping) else None
-    if isinstance(research_pack, Mapping) and isinstance(research_pack.get("directness_guard"), Mapping):
+    if isinstance(research_pack, Mapping) and isinstance(
+        research_pack.get("directness_guard"), Mapping
+    ):
         return dict(research_pack["directness_guard"])
     if isinstance(context.get("directness_guard"), Mapping):
         return dict(context["directness_guard"])
@@ -3086,12 +3217,18 @@ def _release_missing_parts_from_context(context: Mapping[str, Any]) -> list[str]
     return missing_parts
 
 
-def _directness_guard_from_summary_payload(payload: Mapping[str, Any], *, topic: str | None) -> dict[str, Any]:
+def _directness_guard_from_summary_payload(
+    payload: Mapping[str, Any], *, topic: str | None
+) -> dict[str, Any]:
     existing = _directness_guard_from_research_context(payload)
     if existing:
         return existing
     candidates = list(payload.get("ticker_candidates") or [])
-    tiers = [str(candidate.get("tier") or "") for candidate in candidates if isinstance(candidate, Mapping)]
+    tiers = [
+        str(candidate.get("tier") or "")
+        for candidate in candidates
+        if isinstance(candidate, Mapping)
+    ]
     result_rows = list(payload.get("results") or [])
     if not tiers and result_rows:
         tiers = [str(row.get("tier") or "") for row in result_rows if isinstance(row, Mapping)]
@@ -3109,7 +3246,9 @@ def _directness_guard_from_summary_payload(payload: Mapping[str, Any], *, topic:
     )
     if not has_direct and not has_related and result_rows:
         has_related = True
-    query_frame = payload.get("query_frame") if isinstance(payload.get("query_frame"), Mapping) else {}
+    query_frame = (
+        payload.get("query_frame") if isinstance(payload.get("query_frame"), Mapping) else {}
+    )
     requires_direct = bool(
         query_frame.get("question_requires_direct_match")
         or query_frame.get("requires_direct_match")
@@ -3137,7 +3276,10 @@ def _directness_guard_from_summary_payload(payload: Mapping[str, Any], *, topic:
 
 def _topic_text_requires_direct_match(topic: str | None) -> bool:
     text = str(topic or "").lower()
-    return any(term in text for term in ("direct", "directly", "직접", "direct exposure", "directly exposed"))
+    return any(
+        term in text
+        for term in ("direct", "directly", "직접", "direct exposure", "directly exposed")
+    )
 
 
 def _comparison_rows(result: dict[str, Any]) -> list[dict[str, Any]]:
@@ -3209,7 +3351,8 @@ def _comparison_row(
             "direct_answerable": bool(evaluation.get("direct_answerable")),
             "related_context_available": bool(evaluation.get("related_context_available")),
             "negative_answer_supported": bool(evaluation.get("negative_answer_supported")),
-            "recommended_answer_mode": evaluation.get("recommended_answer_mode") or "not_answerable",
+            "recommended_answer_mode": evaluation.get("recommended_answer_mode")
+            or "not_answerable",
             "semantic_relevance": evaluation.get("semantic_relevance"),
             "trace_status": evaluation.get("trace_status"),
             "tier": evaluation.get("tier") or "not_answerable",
@@ -3267,11 +3410,15 @@ def _comparison_row(
     }
 
 
-def _best_comparison_item(items: list[dict[str, Any]], *, topic: str | None = None) -> dict[str, Any]:
+def _best_comparison_item(
+    items: list[dict[str, Any]], *, topic: str | None = None
+) -> dict[str, Any]:
     return max(items, key=lambda item: _comparison_item_score(item, topic=topic))
 
 
-def _comparison_item_score(item: dict[str, Any], *, topic: str | None = None) -> tuple[int, int, int, int, str]:
+def _comparison_item_score(
+    item: dict[str, Any], *, topic: str | None = None
+) -> tuple[int, int, int, int, str]:
     obj = item.get("object") or {}
     evidence = item.get("evidence") or {}
     grade_score = {
@@ -3301,9 +3448,17 @@ def _comparison_item_score(item: dict[str, Any], *, topic: str | None = None) ->
     }.get(str(item.get("tier") or ""), 1)
     support_count = len(evidence.get("claims") or []) + len(evidence.get("quotes") or [])
     if not support_count:
-        support_count = int(item.get("support_claim_count") or 0) + int(item.get("support_quote_count") or 0)
+        support_count = int(item.get("support_claim_count") or 0) + int(
+            item.get("support_quote_count") or 0
+        )
     direct_topic_score = 1 if topic and _comparison_item_directly_matches_topic(item, topic) else 0
-    return (direct_topic_score, tier_score, grade_score + type_score, support_count, str(item.get("id") or ""))
+    return (
+        direct_topic_score,
+        tier_score,
+        grade_score + type_score,
+        support_count,
+        str(item.get("id") or ""),
+    )
 
 
 def _comparison_answerability_fields(
@@ -3321,7 +3476,8 @@ def _comparison_answerability_fields(
         topic
         and direct_topic_match
         and candidate_trace_status in {"traceable", "traceable_metric_lineage"}
-        and str(tier) in {"traceable_related", "untraced_direct_candidate", "broad_related_candidate"}
+        and str(tier)
+        in {"traceable_related", "untraced_direct_candidate", "broad_related_candidate"}
     ):
         tier = "traceable_direct"
     if topic and str(tier) == "traceable_related" and direct_topic_match:
@@ -3333,7 +3489,11 @@ def _comparison_answerability_fields(
         and inferred_tier != "traceable_metric_lineage"
     ):
         tier = "traceable_related"
-    trace_status = item.get("trace_status") or evaluation.get("trace_status") or _infer_trace_status_from_tier(tier)
+    trace_status = (
+        item.get("trace_status")
+        or evaluation.get("trace_status")
+        or _infer_trace_status_from_tier(tier)
+    )
     semantic_relevance = item.get("semantic_relevance") or evaluation.get("semantic_relevance")
     support_quote_count = item.get("support_quote_count")
     if support_quote_count is None:
@@ -3348,19 +3508,28 @@ def _comparison_answerability_fields(
     direct_answerable = tier in {"traceable_direct", "traceable_metric_lineage"}
     return {
         "direct_answerable": bool(direct_answerable),
-        "related_context_available": bool(evaluation.get("related_context_available") or tier == "traceable_related"),
+        "related_context_available": bool(
+            evaluation.get("related_context_available") or tier == "traceable_related"
+        ),
         "negative_answer_supported": bool(evaluation.get("negative_answer_supported")),
         "recommended_answer_mode": evaluation.get("recommended_answer_mode"),
         "semantic_relevance": semantic_relevance,
         "trace_status": trace_status,
         "tier": tier,
-        "evidence_chain_count": item.get("evidence_chain_count") or evaluation.get("evidence_chain_count"),
+        "evidence_chain_count": item.get("evidence_chain_count")
+        or evaluation.get("evidence_chain_count"),
         "support_depth": item.get("support_depth") or evaluation.get("support_depth"),
         "support_quote_count": support_quote_count,
         "support_claim_count": support_claim_count,
-        "matched_required_facets": item.get("matched_required_facets") or evaluation.get("matched_required_facets") or [],
-        "missing_required_facets": item.get("missing_required_facets") or evaluation.get("missing_required_facets") or [],
-        "why_tier": item.get("why_tier") or evaluation.get("why_tier") or _default_compare_why_tier(tier),
+        "matched_required_facets": item.get("matched_required_facets")
+        or evaluation.get("matched_required_facets")
+        or [],
+        "missing_required_facets": item.get("missing_required_facets")
+        or evaluation.get("missing_required_facets")
+        or [],
+        "why_tier": item.get("why_tier")
+        or evaluation.get("why_tier")
+        or _default_compare_why_tier(tier),
     }
 
 
@@ -3439,12 +3608,18 @@ def _topic_term_in_text(term: str, text: str) -> bool:
 
 
 def _infer_trace_status_from_tier(tier: Any) -> str:
-    return "traceable" if str(tier) in {"traceable_direct", "traceable_metric_lineage", "traceable_related"} else "untraced"
+    return (
+        "traceable"
+        if str(tier) in {"traceable_direct", "traceable_metric_lineage", "traceable_related"}
+        else "untraced"
+    )
 
 
 def _default_compare_why_tier(tier: Any) -> str:
     if tier == "traceable_direct":
-        return "Selected comparison evidence is directly traceable to filing claim or quote support."
+        return (
+            "Selected comparison evidence is directly traceable to filing claim or quote support."
+        )
     if tier == "traceable_metric_lineage":
         return "Selected comparison evidence is supported by metric lineage."
     if tier == "traceable_related":
@@ -3528,8 +3703,7 @@ def _compact_bundle(item: dict[str, Any]) -> dict[str, Any]:
             "evidence_grade": (item.get("object") or {}).get("evidence_grade"),
             "quality_event_count": len(quality.get("events") or []),
             "events": [
-                _compact_quality_event(event)
-                for event in (quality.get("events") or [])[:3]
+                _compact_quality_event(event) for event in (quality.get("events") or [])[:3]
             ],
             "batch_failures": (document.get("counts") or {}).get("batch_failures", 0),
             "rejected_objects": (document.get("counts") or {}).get("rejected_objects", 0),
@@ -3744,6 +3918,178 @@ def _error_payload(code: str, message: str, suggestion: str) -> dict[str, Any]:
     }
 
 
+def _compact_json_bytes(payload: Any) -> int:
+    return len(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+    )
+
+
+def _apply_chain_response_budget(
+    payload: dict[str, Any],
+    *,
+    max_model_bytes: int = MAX_CHAIN_RESPONSE_MODEL_BYTES,
+) -> dict[str, Any]:
+    """Bound repeated chain context without dropping direct evidence lineage."""
+    if payload.get("error"):
+        return payload
+
+    resolved_budget = max(1, int(max_model_bytes))
+    bounded = copy.deepcopy(payload)
+    original_model_bytes = _compact_json_bytes(bounded)
+    chain = bounded.get("chain")
+    if not isinstance(chain, dict):
+        chain = {}
+    global_chain = bounded.get("global_chain")
+    if not isinstance(global_chain, dict):
+        nested_global_chain = chain.get("global_chain")
+        global_chain = nested_global_chain if isinstance(nested_global_chain, dict) else {}
+    object_locator = bounded.get("object_locator")
+    if not isinstance(object_locator, dict):
+        object_locator = {}
+
+    collection_specs: list[tuple[str, dict[str, Any], str, tuple[int, int, int]]] = [
+        ("global_spine_neighbors", bounded, "global_spine_neighbors", (4, 2, 1)),
+        ("global_paths", global_chain, "paths", (6, 2, 1)),
+        ("edge_paths", chain, "edge_paths", (8, 4, 1)),
+        ("semantic_neighbors", chain, "semantic_neighbors", (5, 3, 1)),
+        ("temporal_context", chain, "temporal_context", (4, 2, 1)),
+        ("replica_locations", object_locator, "replica_locations", (5, 3, 1)),
+    ]
+    collections: dict[str, list[Any]] = {}
+    original_counts: dict[str, int] = {}
+    for name, container, field, _minimums in collection_specs:
+        value = container.get(field)
+        collection = value if isinstance(value, list) else []
+        collections[name] = collection
+        original_counts[name] = len(collection)
+
+    original_global_cross_company_count = sum(
+        int((path or {}).get("cross_company_hops") or 0) > 0
+        for path in collections["global_paths"]
+        if isinstance(path, Mapping)
+    )
+    original_global_truncated = bool(global_chain.get("truncated"))
+    original_replica_truncated = bool(object_locator.get("replica_locations_truncated"))
+    budget_metadata: dict[str, Any] = {
+        "format": CHAIN_RESPONSE_BUDGET_FORMAT,
+        "max_model_bytes": resolved_budget,
+        "original_model_bytes": original_model_bytes,
+        "final_model_bytes": 0,
+        "within_budget": False,
+        "truncated": False,
+        "omitted_counts": {},
+        "preserved": {
+            "object_and_document": "complete",
+            "evidence_chain": "complete",
+            "highest_ranked_context": True,
+            "cross_company_path_if_available": True,
+        },
+    }
+    bounded["response_budget"] = budget_metadata
+
+    def sync_metadata() -> None:
+        omitted_counts = {
+            name: original_counts[name] - len(collection)
+            for name, collection in collections.items()
+            if original_counts[name] > len(collection)
+        }
+        response_truncated = bool(omitted_counts)
+        budget_metadata["omitted_counts"] = omitted_counts
+        budget_metadata["truncated"] = response_truncated
+
+        returned_global_cross_company_count = sum(
+            int((path or {}).get("cross_company_hops") or 0) > 0
+            for path in collections["global_paths"]
+            if isinstance(path, Mapping)
+        )
+        if global_chain:
+            global_chain["total_path_count"] = original_counts["global_paths"]
+            global_chain["path_count"] = len(collections["global_paths"])
+            global_chain["total_cross_company_path_count"] = original_global_cross_company_count
+            global_chain["cross_company_path_count"] = returned_global_cross_company_count
+            global_chain["response_truncated"] = bool(omitted_counts.get("global_paths"))
+            global_chain["truncated"] = original_global_truncated or bool(
+                omitted_counts.get("global_paths")
+            )
+
+        if chain:
+            chain["total_edge_path_count"] = original_counts["edge_paths"]
+            chain["edge_path_count"] = len(collections["edge_paths"])
+            chain["edge_paths_truncated"] = bool(omitted_counts.get("edge_paths"))
+            chain["total_semantic_neighbor_count"] = original_counts["semantic_neighbors"]
+            chain["semantic_neighbor_count"] = len(collections["semantic_neighbors"])
+            chain["semantic_neighbors_truncated"] = bool(omitted_counts.get("semantic_neighbors"))
+            chain["total_temporal_context_count"] = original_counts["temporal_context"]
+            chain["temporal_context_count"] = len(collections["temporal_context"])
+            chain["temporal_context_truncated"] = bool(omitted_counts.get("temporal_context"))
+
+        bounded["total_global_spine_neighbor_count"] = original_counts["global_spine_neighbors"]
+        bounded["global_spine_neighbor_count"] = len(collections["global_spine_neighbors"])
+        bounded["global_spine_neighbors_truncated"] = bool(
+            omitted_counts.get("global_spine_neighbors")
+        )
+        if object_locator:
+            object_locator["response_replica_location_count"] = len(
+                collections["replica_locations"]
+            )
+            object_locator["response_replica_locations_omitted"] = int(
+                omitted_counts.get("replica_locations") or 0
+            )
+            object_locator["replica_locations_truncated"] = original_replica_truncated or bool(
+                omitted_counts.get("replica_locations")
+            )
+
+    def removable_index(name: str, collection: list[Any]) -> int | None:
+        if name != "global_paths" or original_global_cross_company_count <= 0:
+            return len(collection) - 1 if collection else None
+        returned_cross_company_count = sum(
+            int((path or {}).get("cross_company_hops") or 0) > 0
+            for path in collection
+            if isinstance(path, Mapping)
+        )
+        for index in range(len(collection) - 1, -1, -1):
+            path = collection[index]
+            is_cross_company = bool(
+                isinstance(path, Mapping) and int(path.get("cross_company_hops") or 0) > 0
+            )
+            if not is_cross_company or returned_cross_company_count > 1:
+                return index
+        return None
+
+    sync_metadata()
+    for minimum_index in range(3):
+        for name, _container, _field, minimums in collection_specs:
+            collection = collections[name]
+            minimum = min(original_counts[name], minimums[minimum_index])
+            while _compact_json_bytes(bounded) > resolved_budget and len(collection) > minimum:
+                index = removable_index(name, collection)
+                if index is None:
+                    break
+                collection.pop(index)
+                sync_metadata()
+            if _compact_json_bytes(bounded) <= resolved_budget:
+                break
+        if _compact_json_bytes(bounded) <= resolved_budget:
+            break
+
+    sync_metadata()
+    final_model_bytes = _compact_json_bytes(bounded)
+    budget_metadata["final_model_bytes"] = final_model_bytes
+    final_model_bytes = _compact_json_bytes(bounded)
+    budget_metadata["final_model_bytes"] = final_model_bytes
+    budget_metadata["within_budget"] = final_model_bytes <= resolved_budget
+    if not budget_metadata["within_budget"]:
+        budget_metadata["unbounded_reason"] = "preserved_accuracy_floor_exceeds_budget"
+    final_model_bytes = _compact_json_bytes(bounded)
+    budget_metadata["final_model_bytes"] = final_model_bytes
+    return bounded
+
+
 def _format_response(
     payload: dict[str, Any],
     response_format: ResponseFormat,
@@ -3751,7 +4097,15 @@ def _format_response(
 ) -> str:
     if response_format == ResponseFormat.MARKDOWN:
         return markdown_formatter(payload)
-    return json.dumps(payload, ensure_ascii=False, indent=2, default=str)
+    # MCP tool text is model input, not a human-facing log file.  Compact JSON
+    # preserves the exact data and ordering while avoiding whitespace tokens
+    # on every non-ResearchState tool call.
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        default=str,
+    )
 
 
 def _markdown_catalog(payload: dict[str, Any]) -> str:
@@ -3895,7 +4249,12 @@ def _markdown_ticker_summary(payload: dict[str, Any]) -> str:
             lines.append(f"- Object counts: {counts}")
         for reason in (candidate.get("top_reasons") or [])[:3]:
             if isinstance(reason, Mapping):
-                why = reason.get("why_direct") or reason.get("why_not_direct") or reason.get("topic_label") or reason.get("object_id")
+                why = (
+                    reason.get("why_direct")
+                    or reason.get("why_not_direct")
+                    or reason.get("topic_label")
+                    or reason.get("object_id")
+                )
                 lines.append(f"- {why}")
                 core = reason.get("matched_core_terms") or []
                 mechanisms = reason.get("matched_mechanisms") or []
@@ -3946,10 +4305,10 @@ def _markdown_verify_evidence(payload: dict[str, Any]) -> str:
         f"- Verified objects: {summary.get('verified_object_count', 0)}",
         f"- Strong-claim evidence: {summary.get('strong_claim_evidence_count', 0)}",
     ]
+    if payload.get("brief_hash"):
+        lines.insert(3, f"- Brief hash: `{payload.get('brief_hash')}`")
     for question in payload.get("evidence_by_question") or []:
-        lines.append(
-            f"## {question.get('question_id')} ({question.get('answerability')})"
-        )
+        lines.append(f"## {question.get('question_id')} ({question.get('answerability')})")
         for item in question.get("evidence") or []:
             document = item.get("document") or {}
             lines.append(
@@ -3958,9 +4317,7 @@ def _markdown_verify_evidence(payload: dict[str, Any]) -> str:
                 f"[{item.get('evidence_grade')}]: {_short_text(item.get('verified_excerpt'))}"
             )
     for rejected in payload.get("rejected_refs") or []:
-        lines.append(
-            f"- Rejected `{rejected.get('object_id')}`: {rejected.get('reason')}"
-        )
+        lines.append(f"- Rejected `{rejected.get('object_id')}`: {rejected.get('reason')}")
     return "\n".join(lines)
 
 
@@ -3971,6 +4328,7 @@ def _markdown_chain(payload: dict[str, Any]) -> str:
     chain = payload.get("chain") or {}
     evidence_chain = chain.get("evidence_chain") or {}
     global_chain = payload.get("global_chain") or chain.get("global_chain") or {}
+    response_budget = payload.get("response_budget") or {}
     lines = [
         "# Ontology Chain",
         f"- Object: `{obj.get('id')}` ({obj.get('type')})",
@@ -3986,6 +4344,12 @@ def _markdown_chain(payload: dict[str, Any]) -> str:
         f"(cross-company={global_chain.get('cross_company_path_count', 0)}, "
         f"truncated={bool(global_chain.get('truncated'))})",
     ]
+    if response_budget:
+        lines.append(
+            f"- Response budget: {response_budget.get('final_model_bytes')} / "
+            f"{response_budget.get('max_model_bytes')} bytes; "
+            f"omitted={response_budget.get('omitted_counts') or {}}"
+        )
     warnings = (payload.get("quality") or {}).get("warnings") or []
     if warnings:
         lines.append(f"- Warnings: {', '.join(warnings)}")

@@ -3,14 +3,20 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 import json
+import logging
 import re
 from pathlib import Path
-from typing import Awaitable, Callable, TypeVar
+from typing import Awaitable, Callable, Deque, TypeVar
 
+from krw_ontology.errors import ProviderOverloadError
 from krw_ontology.utils.io import atomic_write_json, read_jsonl
 
 T = TypeVar("T")
+
+_PROVIDER_OVERLOAD_PAUSE_SECONDS = 10 * 60
+logger = logging.getLogger("krw_ontology")
 
 TRANSIENT_PROVIDER_STATUSES = {429, 500, 502, 503, 504, 529}
 TRANSIENT_PROVIDER_ERROR_TYPES = {"RateLimitError", "TransientServiceError"}
@@ -150,19 +156,95 @@ async def run_limited_batches(
     concurrency: int,
     run_one: Callable[[int], Awaitable[T]],
     on_complete: Callable[[int, T], None] | None = None,
+    overload_pause_seconds: float = _PROVIDER_OVERLOAD_PAUSE_SECONDS,
+    stage_name: str | None = None,
 ) -> list[tuple[int, T]]:
-    """Run indexed batches with a semaphore, preserving index in results."""
-    semaphore = asyncio.Semaphore(max(1, concurrency))
+    """Run bounded concurrent batches, pausing and retrying overloads in place.
 
-    async def guarded(batch_index: int) -> tuple[int, T]:
-        async with semaphore:
-            result = await run_one(batch_index)
-            if on_complete:
-                on_complete(batch_index, result)
-            return batch_index, result
+    A 529/1305 is not recorded as a failed extraction batch. The scheduler stops
+    launching new work, waits for already-started work to settle, pauses for ten
+    minutes, and retries the first overloaded batch by itself. Once that probe
+    succeeds, normal concurrency resumes for the remaining work.
+    """
+    if overload_pause_seconds < 0:
+        raise ValueError("overload_pause_seconds must be non-negative")
 
-    tasks = [asyncio.create_task(guarded(batch_index)) for batch_index in batch_indices]
-    return await asyncio.gather(*tasks)
+    pending: Deque[int] = deque(batch_indices)
+    running: dict[asyncio.Task[T], int] = {}
+    results: list[tuple[int, T]] = []
+    retry_probe = False
+
+    def record_success(batch_index: int, result: T) -> None:
+        if on_complete:
+            on_complete(batch_index, result)
+        results.append((batch_index, result))
+
+    async def settle_running_after_overload() -> list[int]:
+        """Finish already-started work without launching any new batch."""
+        overloaded: list[int] = []
+        active = list(running.items())
+        running.clear()
+        settled = await asyncio.gather(
+            *(task for task, _batch_index in active),
+            return_exceptions=True,
+        )
+        for (_task, batch_index), outcome in zip(active, settled):
+            if isinstance(outcome, ProviderOverloadError):
+                overloaded.append(batch_index)
+            elif isinstance(outcome, BaseException):
+                raise outcome
+            else:
+                record_success(batch_index, outcome)
+        return overloaded
+
+    try:
+        while pending or running:
+            launch_limit = 1 if retry_probe else max(1, concurrency)
+            while pending and len(running) < launch_limit:
+                batch_index = pending.popleft()
+                running[asyncio.create_task(run_one(batch_index))] = batch_index
+
+            done, _pending_tasks = await asyncio.wait(
+                running,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            overloaded = []
+            for task in done:
+                batch_index = running.pop(task)
+                try:
+                    outcome = task.result()
+                except ProviderOverloadError:
+                    overloaded.append(batch_index)
+                except BaseException:
+                    raise
+                else:
+                    record_success(batch_index, outcome)
+
+            if overloaded:
+                overloaded.extend(await settle_running_after_overload())
+                retry_indices = sorted(set(overloaded))
+                pending.extendleft(reversed(retry_indices))
+                retry_probe = True
+                first_batch = retry_indices[0] + 1
+                logger.warning(
+                    "provider overload; pausing new batches for %ss before retrying batch %s first",
+                    int(overload_pause_seconds),
+                    first_batch,
+                    extra={"stage": stage_name, "rate_limited": True} if stage_name else None,
+                )
+                await asyncio.sleep(overload_pause_seconds)
+                continue
+
+            if retry_probe and not running:
+                retry_probe = False
+    except BaseException:
+        for task in running:
+            task.cancel()
+        if running:
+            await asyncio.gather(*running, return_exceptions=True)
+        raise
+
+    return results
 
 
 def append_jsonl_rows(path: Path, rows: list[dict]) -> None:

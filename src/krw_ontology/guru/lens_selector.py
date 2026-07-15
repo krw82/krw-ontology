@@ -34,13 +34,21 @@ def select_guru_lenses(
     """
     root_path = mcp_tools._resolve_root(root)
     selected_authors = mcp_tools._selected_author_keys(question, author_keys)
-    bundle = mcp_tools._load_reviewed_bundle(root_path, author_keys=selected_authors)
     intent_families = _intent_families(question, intent_family)
     inferred_intent = intent_families[0] if intent_families else None
     company_context_model = coerce_company_context(company_context or None, ticker=ticker)
     lens_limit = mcp_tools._limit(limit, maximum=20)
     need_limit = mcp_tools._limit(data_need_limit, maximum=30)
     scoring_question = mcp_tools._scoring_query(question, ticker, company_context_model)
+    bundle = mcp_tools._load_reviewed_bundle(
+        root_path,
+        author_keys=selected_authors,
+        query=scoring_question,
+        family_limits={
+            "guru_objects": mcp_tools._fts_shadow_limit(lens_limit),
+            "data_needs": mcp_tools._fts_shadow_limit(need_limit),
+        },
+    )
     company_context_payload = (
         company_context_model.model_dump(mode="json", exclude_none=True)
         if company_context_model is not None
@@ -54,6 +62,8 @@ def select_guru_lenses(
         intent_families=intent_families,
         limit=lens_limit,
     )
+    mcp_tools._hydrate_candidate_payloads(root_path, bundle, lens_rows)
+    mcp_tools._hydrate_candidate_related_objects(root_path, bundle, lens_rows)
     data_need_rows = _select_related_data_needs(
         question=scoring_question,
         bundle=bundle,
@@ -61,6 +71,12 @@ def select_guru_lenses(
         author_keys=selected_authors,
         intent_family=inferred_intent,
         limit=need_limit,
+    )
+    mcp_tools._hydrate_candidate_payloads(root_path, bundle, data_need_rows)
+    mcp_tools._hydrate_candidate_relationships(
+        root_path,
+        bundle,
+        [*lens_rows, *data_need_rows],
     )
     requires_company_evidence = _requires_company_evidence(
         question=question,
@@ -321,7 +337,7 @@ def _preferred_lens_roles(intent_families: Sequence[str]) -> list[str]:
 def _lens_role(row: Mapping[str, Any], question: str, intent_family: str | None) -> str:
     text = mcp_tools._row_text(row)
     object_type = str(row.get("object_type") or "")
-    answer_role = mcp_tools._mapping_value(row.get("answer_role"))
+    answer_role = mcp_tools._resolved_answer_role(row)
     role_values = [
         str(answer_role.get("default") or ""),
         *[str(value) for value in mcp_tools._list_value(answer_role.get("possible_roles"))],
@@ -347,7 +363,9 @@ def _matched_intents(row: Mapping[str, Any], intent_families: Sequence[str]) -> 
     row_intent = row.get("intent_family")
     applicability = mcp_tools._mapping_value(row.get("applicability"))
     strong_for = {str(value) for value in mcp_tools._list_value(applicability.get("strong_for"))}
-    possible_for = {str(value) for value in mcp_tools._list_value(applicability.get("possible_for"))}
+    possible_for = {
+        str(value) for value in mcp_tools._list_value(applicability.get("possible_for"))
+    }
     for intent in intent_families:
         if intent == row_intent or intent in strong_for or intent in possible_for:
             matched.append(intent)
@@ -524,7 +542,7 @@ def _why_selected(
 ) -> str:
     parts: list[str] = []
     label = row.get("label_ko") or row.get("label_en") or row.get("reviewed_id")
-    role = mcp_tools._mapping_value(row.get("answer_role")).get("default")
+    role = mcp_tools._resolved_answer_role(row).get("default")
     applicability = mcp_tools._mapping_value(row.get("applicability"))
     strong_for = [str(value) for value in mcp_tools._list_value(applicability.get("strong_for"))]
     if intent_family and intent_family in strong_for:
@@ -576,7 +594,9 @@ def _evidence_requirements(
 ) -> list[str]:
     requirements = mcp_tools._generic_filing_requirements(question, intent_family)
     for row in data_need_rows:
-        requirements.extend(_normalized_company_hook(value) for value in row.get("company_data_hooks") or [])
+        requirements.extend(
+            _normalized_company_hook(value) for value in row.get("company_data_hooks") or []
+        )
         if row.get("data_need_key"):
             requirements.append(str(row["data_need_key"]))
     requirements.extend(company_context_topics(company_context))
@@ -734,7 +754,9 @@ def _answer_evidence_plan(
 def _lens_specific_requirements(data_need_rows: Sequence[Mapping[str, Any]]) -> list[str]:
     requirements: list[str] = []
     for row in data_need_rows:
-        requirements.extend(_normalized_company_hook(value) for value in row.get("company_data_hooks") or [])
+        requirements.extend(
+            _normalized_company_hook(value) for value in row.get("company_data_hooks") or []
+        )
         if row.get("data_need_key"):
             requirements.append(str(row["data_need_key"]))
     return list(dict.fromkeys(value for value in requirements if value))
@@ -761,9 +783,7 @@ def _selection_status(
 def _data_need_keys(rows: Sequence[Mapping[str, Any]]) -> list[str]:
     return list(
         dict.fromkeys(
-            str(row["data_need_key"])
-            for row in rows
-            if row.get("data_need_key") not in (None, "")
+            str(row["data_need_key"]) for row in rows if row.get("data_need_key") not in (None, "")
         )
     )
 

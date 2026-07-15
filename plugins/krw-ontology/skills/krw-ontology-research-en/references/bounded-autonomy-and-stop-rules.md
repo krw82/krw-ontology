@@ -18,6 +18,11 @@ turning related evidence into direct proof
 shrinking evidence budgets before logs show that quality is preserved
 ```
 
+The model owns the research strategy. The runtime owns the boundary between a
+supported fact, a valid calculation, an investment inference, and a scenario.
+Do not turn this boundary into a fixed tool sequence or a fixed number of
+searches.
+
 ## Default workflow
 
 ```text
@@ -29,6 +34,10 @@ shrinking evidence budgets before logs show that quality is preserved
 5. Use selected trace/chain only when materially useful.
 6. Write the final English answer.
 ```
+
+Before final prose, keep factual and calculated statements tied to verified
+evidence. For an inference, retain the premise, material assumption, and a
+signal that would weaken it. See `grounded-investment-inference.md`.
 
 `plan_query` is optional validation/debug and performs no retrieval.
 

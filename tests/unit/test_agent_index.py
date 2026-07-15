@@ -286,10 +286,19 @@ def test_open_ontology_store_defaults_to_v3_spine_only(tmp_path: Path):
     with open_ontology_store(v3_result.global_spine_path) as store:
         assert isinstance(store, OntologySpineRouter)
         assert store.list_companies() == ["VG"]
-        assert store.routing_status()["mode"] == "global_spine"
-        assert store.routing_status()["fallback"] is False
-        assert store.routing_status()["fallback_enabled"] is False
-        assert "monolith_open" not in store.routing_status()
+        status = store.routing_status()
+        assert status["mode"] == "global_spine"
+        assert status["fallback"] is False
+        assert status["fallback_enabled"] is False
+        assert status["object_resolution"] == {
+            "canonical_identity": "object_id",
+            "occurrence_identity": "ticker+object_id",
+            "shared_object_requires_ticker": True,
+            "ambiguous_object_policy": "fail_closed_with_ticker_candidates",
+        }
+        assert status["occurrence_counts"]["objects"] >= status["canonical_counts"]["objects"]
+        assert status["occurrence_counts"]["edges"] >= status["canonical_counts"]["edges"]
+        assert "monolith_open" not in status
 
 
 def test_build_agent_index_cli(tmp_path: Path):
@@ -388,7 +397,10 @@ def test_build_agent_index_monolith_and_shards_outputs_verified_shards(tmp_path:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert manifest["index_layout_version"] == agent_index_builder.INDEX_LAYOUT_VERSION
     assert manifest["global_topics"] == "global_topics.sqlite"
-    assert manifest["global_topics_counts"]["company_topic_index"] == verification["counts"]["global_topics"]
+    assert (
+        manifest["global_topics_counts"]["company_topic_index"]
+        == verification["counts"]["global_topics"]
+    )
     assert sorted(manifest["shards"]) == ["VG", "XOM"]
 
     with sqlite3.connect(global_topics_path) as conn:
@@ -405,6 +417,7 @@ def test_build_agent_index_monolith_and_shards_outputs_verified_shards(tmp_path:
     build_summary = json.loads(Path(result["build_summary_path"]).read_text(encoding="utf-8"))
     assert build_summary["shards"]["verification"]["ok"] is True
     assert build_summary["build_plan"]["layout"] == "monolith-and-shards"
+
 
 def test_open_ontology_store_rejects_legacy_shard_router_surface(tmp_path: Path):
     _write_document_fixture(
@@ -552,7 +565,9 @@ def test_index_inspect_and_explain_last_build_cli(tmp_path: Path):
     assert build_result.exit_code == 0, build_result.output
 
     inspect_result = runner.invoke(app, ["index", "inspect", "--root", str(tmp_path), "--json"])
-    explain_result = runner.invoke(app, ["index", "explain-last-build", "--root", str(tmp_path), "--json"])
+    explain_result = runner.invoke(
+        app, ["index", "explain-last-build", "--root", str(tmp_path), "--json"]
+    )
 
     assert inspect_result.exit_code == 0, inspect_result.output
     inspect_payload = json.loads(inspect_result.output)
@@ -591,7 +606,10 @@ def test_plan_agent_index_uses_content_addressed_fragment_keys(tmp_path: Path):
     assert first.layout == "monolith-and-shards"
     assert first.dirty_tickers == ("VG",)
     assert first_item.cache_key.startswith("sha256:")
-    assert first_item.fragment_path.parent == cache_root / "fragments" / first_item.cache_key.split(":", 1)[1][:2]
+    assert (
+        first_item.fragment_path.parent
+        == cache_root / "fragments" / first_item.cache_key.split(":", 1)[1][:2]
+    )
     assert first_item.cache_hit is False
     assert first_item.cache_errors == ("fragment_missing",)
     assert first_item.estimated_bytes > 0
@@ -604,7 +622,9 @@ def test_plan_agent_index_uses_content_addressed_fragment_keys(tmp_path: Path):
     assert any(error.startswith("sqlite_error:") for error in corrupt.items[0].cache_errors)
 
     agent_index_builder.write_index_fragment_metadata(first_item.fragment_path, first_item)
-    verification = agent_index_builder.verify_index_fragment(first_item.fragment_path, expected=first_item)
+    verification = agent_index_builder.verify_index_fragment(
+        first_item.fragment_path, expected=first_item
+    )
     assert verification["ok"] is True
     mismatch = agent_index_builder.verify_index_fragment(
         first_item.fragment_path,
@@ -663,7 +683,89 @@ def test_source_manifest_only_discovery_and_build_graph(tmp_path: Path):
     spans_path.write_text(spans_path.read_text(encoding="utf-8") + "\n", encoding="utf-8")
     changed_verification = verify_source_artifact_manifest(tmp_path, manifest_path=manifest_path)
     assert changed_verification["ok"] is False
-    assert any(error.startswith("source_manifest_content_hash_mismatch:") for error in changed_verification["errors"])
+    assert any(
+        error.startswith("source_manifest_content_hash_mismatch:")
+        for error in changed_verification["errors"]
+    )
+
+
+def test_in_process_source_manifest_plan_does_not_rehash_artifact_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_document_fixture(
+        tmp_path,
+        ticker="FAST",
+        document_type="10-K",
+        doc_type_key="10K",
+        period="FY2025",
+        section_quality={"status": "pass", "missing_core_sections": [], "fail_reasons": []},
+        topic_text="Fast manifest planning.",
+        metric_name="revenue",
+        metric_value=1.0,
+    )
+    manifest_path = tmp_path / "source_manifest.json"
+    manifest = agent_index_builder.write_source_artifact_manifest(
+        tmp_path,
+        manifest_path=manifest_path,
+    )
+
+    def reject_rehash(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("artifact bytes were rehashed after manifest generation")
+
+    monkeypatch.setattr(agent_index_builder, "_artifact_content_hash", reject_rehash)
+    plan = agent_index_builder.plan_agent_index(
+        tmp_path,
+        source_manifest_path=manifest_path,
+        source_manifest_payload=manifest,
+        workers=2,
+        allow_internal_legacy_builder=True,
+    )
+
+    assert plan.discovery_mode == "trusted-in-process-source-manifest"
+    assert plan.source_manifest_hash == manifest["manifest_hash"]
+    assert len(plan.items) == manifest["artifact_count"]
+
+
+def test_artifact_fragment_immutable_seal_skips_repeated_integrity_scan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fragment_path = tmp_path / "cache" / "fragment.sqlite"
+    item = agent_index_builder.ArtifactPlanItem(
+        artifact_index_path=tmp_path / "artifact_index.json",
+        relative_path="artifact_index.json",
+        ticker="FAST",
+        document_type="COMPANY",
+        doc_type_key="COMPANY",
+        period="ALL",
+        content_hash="sha256:source",
+        cache_key="sha256:cache",
+        fragment_path=fragment_path,
+        cache_hit=False,
+        estimated_bytes=0,
+        estimated_rows=0,
+        input_paths=(),
+        missing_inputs=(),
+        cache_errors=(),
+    )
+    agent_index_builder.write_index_fragment_metadata(fragment_path, item)
+    first = agent_index_builder.verify_index_fragment(
+        fragment_path,
+        expected=item,
+        seal_on_success=True,
+    )
+    assert first["ok"] is True
+
+    def reject_connect(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("sealed cache attempted to reopen SQLite")
+
+    monkeypatch.setattr(agent_index_builder.sqlite3, "connect", reject_connect)
+    second = agent_index_builder.verify_index_fragment(fragment_path, expected=item)
+
+    assert second["ok"] is True
+    assert second["integrity_source"] == "immutable_cache_seal"
+    assert second["seal_trusted"] is True
 
 
 def test_build_agent_index_reuses_company_shard_cache(tmp_path: Path):
@@ -770,7 +872,9 @@ def test_build_agent_index_reuses_verified_fragment_cache(tmp_path: Path):
         "workers": second["build_plan_summary"]["workers"],
     }
     with sqlite3.connect(second["index_path"]) as conn:
-        raw_build_metadata = conn.execute("SELECT value FROM metadata WHERE key = 'build'").fetchone()[0]
+        raw_build_metadata = conn.execute(
+            "SELECT value FROM metadata WHERE key = 'build'"
+        ).fetchone()[0]
     build_metadata = json.loads(raw_build_metadata)
     assert build_metadata["fragment_cache_hits"] == 1
     assert build_metadata["fragment_cache_misses"] == 0
@@ -822,7 +926,9 @@ def test_index_cache_status_reports_referenced_v3_entries(tmp_path: Path):
         metric_name="capex",
         metric_value=125.0,
     )
-    build = runner.invoke(app, ["index", "build", "--root", str(tmp_path), "--cache-root", str(cache_root)])
+    build = runner.invoke(
+        app, ["index", "build", "--root", str(tmp_path), "--cache-root", str(cache_root)]
+    )
     assert build.exit_code == 0, build.output
 
     result = runner.invoke(
@@ -840,10 +946,11 @@ def test_index_cache_status_reports_referenced_v3_entries(tmp_path: Path):
 
     assert result.exit_code == 0, result.output
     assert "V3 index cache: ok" in result.output
-    assert "Entries: total=3 referenced=3 missing_referenced=0 unreferenced=0" in result.output
+    assert "Entries: total=4 referenced=4 missing_referenced=0 unreferenced=0" in result.output
     assert "Artifact fragment cache: referenced=1" in result.output
     assert "Company cache: referenced=1" in result.output
     assert "Spine cache: referenced=1" in result.output
+    assert "Router cache: referenced=1" in result.output
     assert "Tickers: VG" in result.output
 
 
@@ -860,11 +967,14 @@ def test_index_cache_gc_removes_unreferenced_v3_entries_only_with_yes(tmp_path: 
         metric_name="capex",
         metric_value=125.0,
     )
-    build = runner.invoke(app, ["index", "build", "--root", str(tmp_path), "--cache-root", str(cache_root)])
+    build = runner.invoke(
+        app, ["index", "build", "--root", str(tmp_path), "--cache-root", str(cache_root)]
+    )
     assert build.exit_code == 0, build.output
     referenced_company = next((cache_root / "v3" / "company_shards").rglob("*.sqlite"))
     referenced_fragment = next((cache_root / "v3" / "spine_fragments").rglob("*.sqlite"))
     referenced_artifact = next((cache_root / "fragments").rglob("*.sqlite"))
+    referenced_router = next((cache_root / "v3" / "router_sidecars").rglob("*.sqlite"))
     stale_company = cache_root / "v3" / "company_shards" / "ff" / "stale-company.sqlite"
     stale_company.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(referenced_company, stale_company)
@@ -874,6 +984,11 @@ def test_index_cache_gc_removes_unreferenced_v3_entries_only_with_yes(tmp_path: 
     stale_artifact = cache_root / "fragments" / "dd" / "stale-artifact.sqlite"
     stale_artifact.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(referenced_artifact, stale_artifact)
+    stale_router = cache_root / "v3" / "router_sidecars" / "cc" / "stale-router.sqlite"
+    stale_router.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(referenced_router, stale_router)
+    stale_router_seal = stale_router.with_name(stale_router.name + ".seal.json")
+    stale_router_seal.write_text("{}", encoding="utf-8")
 
     dry_run = runner.invoke(
         app,
@@ -890,10 +1005,12 @@ def test_index_cache_gc_removes_unreferenced_v3_entries_only_with_yes(tmp_path: 
 
     assert dry_run.exit_code == 0, dry_run.output
     assert "V3 index cache GC: dry-run" in dry_run.output
-    assert "Candidates: 3" in dry_run.output
+    assert "Candidates: 4" in dry_run.output
     assert stale_company.exists()
     assert stale_fragment.exists()
     assert stale_artifact.exists()
+    assert stale_router.exists()
+    assert stale_router_seal.exists()
     assert referenced_company.exists()
     assert referenced_fragment.exists()
 
@@ -913,13 +1030,16 @@ def test_index_cache_gc_removes_unreferenced_v3_entries_only_with_yes(tmp_path: 
 
     assert deleted.exit_code == 0, deleted.output
     assert "V3 index cache GC: deleted" in deleted.output
-    assert "Deleted: 3" in deleted.output
+    assert "Deleted: 4" in deleted.output
     assert not stale_company.exists()
     assert not stale_fragment.exists()
     assert not stale_artifact.exists()
+    assert not stale_router.exists()
+    assert not stale_router_seal.exists()
     assert referenced_artifact.exists()
     assert referenced_company.exists()
     assert referenced_fragment.exists()
+    assert referenced_router.exists()
 
     status = runner.invoke(
         app,
@@ -929,7 +1049,9 @@ def test_index_cache_gc_removes_unreferenced_v3_entries_only_with_yes(tmp_path: 
     assert "unreferenced=0" in status.output
 
 
-def test_build_agent_index_resource_env_and_progress_log(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_build_agent_index_resource_env_and_progress_log(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
     _write_document_fixture(
         tmp_path,
         ticker="VG",
@@ -970,8 +1092,14 @@ def test_build_agent_index_resource_env_and_progress_log(tmp_path: Path, monkeyp
             "SELECT value FROM metadata WHERE key = 'build'"
         ).fetchone()[0]
     build_metadata = json.loads(raw_build_metadata)
-    assert build_metadata["source_artifact_sqlite_schema_version"] == agent_index_builder.AGENT_INDEX_SCHEMA_VERSION
-    assert build_metadata["source_artifact_sqlite_builder_version"] == agent_index_builder.AGENT_INDEX_BUILDER_VERSION
+    assert (
+        build_metadata["source_artifact_sqlite_schema_version"]
+        == agent_index_builder.AGENT_INDEX_SCHEMA_VERSION
+    )
+    assert (
+        build_metadata["source_artifact_sqlite_builder_version"]
+        == agent_index_builder.AGENT_INDEX_BUILDER_VERSION
+    )
     assert build_metadata["build_settings"]["sqlite_synchronous"] == "OFF"
     assert build_metadata["build_settings"]["build_stage"] == "source_artifact_sqlite"
     assert build_metadata["build_settings"]["sqlite_cache_mib"] == 64
@@ -1001,7 +1129,9 @@ def test_build_agent_index_resource_env_and_progress_log(tmp_path: Path, monkeyp
     assert "wal_size_mb" in log_rows[0]
 
 
-def test_build_agent_index_failure_preserves_existing_index(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_build_agent_index_failure_preserves_existing_index(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
     _write_document_fixture(
         tmp_path,
         ticker="VG",
@@ -1235,7 +1365,9 @@ def test_parallel_fragment_failure_preserves_existing_index(tmp_path: Path):
         assert store.list_companies() == ["VG"]
 
 
-def test_build_resource_settings_default_to_off_and_max_local_profile(monkeypatch: pytest.MonkeyPatch):
+def test_build_resource_settings_default_to_off_and_max_local_profile(
+    monkeypatch: pytest.MonkeyPatch,
+):
     for name in (
         "KRW_BUILD_RESOURCE_PROFILE",
         "KRW_SQLITE_SYNCHRONOUS",
@@ -1455,7 +1587,10 @@ def test_agent_retriever_plans_and_retrieves_latest_10q(tmp_path: Path):
 
     assert "answerable" not in result
     assert "results" not in result
-    assert result["answerability"]["recommended_answer_mode"] in {"direct_evidence", "related_context"}
+    assert result["answerability"]["recommended_answer_mode"] in {
+        "direct_evidence",
+        "related_context",
+    }
     assert result["plan"]["tickers"] == ["VG"]
     assert result["plan"]["document_types"] == ["10-Q"]
     assert result["resolved_periods"] == ["FY2025Q3"]
@@ -1824,14 +1959,12 @@ def test_metric_observation_context_distinguishes_quarter_ytd_and_long_duration(
         },
         "FY2024",
     )
-    annual_boundary_without_duration = (
-        agent_index_builder._metric_lookup_observation_context(
-            {
-                "fiscal_year": 2024,
-                "period_end": "2024-12-31",
-            },
-            "CY2025",
-        )
+    annual_boundary_without_duration = agent_index_builder._metric_lookup_observation_context(
+        {
+            "fiscal_year": 2024,
+            "period_end": "2024-12-31",
+        },
+        "CY2025",
     )
 
     assert quarter["observation_period"] == ytd["observation_period"] == "CY2026Q1"
@@ -1855,9 +1988,7 @@ def test_metric_dictionary_round_trips_every_canonical_alias_and_xbrl_tag() -> N
             assert catalog.canonicalize_xbrl_tag(tag) == canonical
             assert catalog.canonicalize_xbrl_tag(tag.replace(":", "_")) == canonical
             assert (
-                agent_index_builder._metric_lookup_xbrl_metric_name(
-                    {"taxonomy_tag": tag}
-                )
+                agent_index_builder._metric_lookup_xbrl_metric_name({"taxonomy_tag": tag})
                 == canonical
             )
 
@@ -1889,9 +2020,7 @@ def test_metric_lookup_materializes_dictionary_canonical_and_aliases(tmp_path: P
             """
         ).fetchone()
         build_metadata = json.loads(
-            conn.execute(
-                "SELECT value FROM metadata WHERE key = 'build'"
-            ).fetchone()[0]
+            conn.execute("SELECT value FROM metadata WHERE key = 'build'").fetchone()[0]
         )
     with OntologyStore(index["index_path"]) as store:
         canonical_rows = store._query_metrics(
@@ -1940,9 +2069,7 @@ def test_agent_index_verification_rejects_metric_dictionary_mismatch(
     index = build_agent_index(tmp_path)
     with sqlite3.connect(index["index_path"]) as conn:
         metadata = json.loads(
-            conn.execute(
-                "SELECT value FROM metadata WHERE key = 'build'"
-            ).fetchone()[0]
+            conn.execute("SELECT value FROM metadata WHERE key = 'build'").fetchone()[0]
         )
         metadata["metric_dictionary"]["sha256"] = "0" * 64
         conn.execute(
@@ -2072,12 +2199,19 @@ def test_agent_retriever_key_risk_question_uses_latest_10k_and_broad_risk_topic(
 
     assert "answerable" not in result
     assert "results" not in result
-    assert result["answerability"]["recommended_answer_mode"] in {"direct_evidence", "related_context"}
+    assert result["answerability"]["recommended_answer_mode"] in {
+        "direct_evidence",
+        "related_context",
+    }
     assert result["plan"]["tickers"] == ["VG"]
     assert result["plan"]["document_types"] == ["10-K"]
     assert result["plan"]["period_policy"] == "latest"
     assert result["plan"]["topics"] == ["risk"]
-    assert result["plan"]["object_types"] == ["BusinessFactor", "ExternalFactorExposure", "ResearchClaim"]
+    assert result["plan"]["object_types"] == [
+        "BusinessFactor",
+        "ExternalFactorExposure",
+        "ResearchClaim",
+    ]
     assert result["resolved_periods"] == ["FY2025"]
     bundles = result["direct_evidence"] + result["related_context"]
     assert {bundle["period"] for bundle in bundles} == {"FY2025"}
@@ -2090,7 +2224,12 @@ def test_agent_retriever_korean_intent_narrows_default_object_types():
     from krw_ontology.agent_index.retriever import DefaultQueryPlanner
 
     event_plan = DefaultQueryPlanner().plan("NVDA 최근 중요한 이벤트는?", catalog)
-    assert event_plan.object_types == ["BusinessEvent", "ChangeEvent", "ResearchClaim", "EvidenceQuote"]
+    assert event_plan.object_types == [
+        "BusinessEvent",
+        "ChangeEvent",
+        "ResearchClaim",
+        "EvidenceQuote",
+    ]
 
     metric_plan = DefaultQueryPlanner().plan("NVDA의 주요 지표는?", catalog)
     assert "MetricObservation" in metric_plan.object_types
@@ -2280,7 +2419,10 @@ def test_live_claude_sdk_planner_retrieves_fixture(tmp_path: Path):
 
     assert "answerable" not in result
     assert "results" not in result
-    assert result["answerability"]["recommended_answer_mode"] in {"direct_evidence", "related_context"}
+    assert result["answerability"]["recommended_answer_mode"] in {
+        "direct_evidence",
+        "related_context",
+    }
     assert result["plan"]["tickers"] == ["VG"]
     assert result["plan"]["document_types"] == ["10-Q"]
     bundles = result["direct_evidence"] + result["related_context"]

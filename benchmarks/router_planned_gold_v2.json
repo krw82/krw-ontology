@@ -1,0 +1,130 @@
+{
+  "format": "krw-ontology-router-planned-gold/v2",
+  "contract": "validated-search-plan-retrieval-query-routing",
+  "source_release": {
+    "release_id": "20260711_121636",
+    "source_manifest_hash": "sha256:61846e490ade39983384a10a48c250b4fcffe6696deea05c6192da0409c3c22e"
+  },
+  "plans": [
+    {
+      "id": "router_plan_aapl_regulation_supply",
+      "expected_tickers": ["AAPL"],
+      "distractor_tickers": ["GOOGL", "AMZN", "TSLA"],
+      "max_candidate_count": 20,
+      "provenance": {
+        "ticker": "AAPL",
+        "document_types": ["10-K", "10-Q"],
+        "periods": ["CY2021", "CY2022", "CY2023", "CY2024", "CY2025", "CY2026Q1"],
+        "source_note": "Two required Apple clauses covering App Store regulation and supply interruption."
+      },
+      "plan": {
+        "question": "Which company discloses both App Store regulation risk and outsourcing delivery risk?",
+        "intent": "risk_discovery",
+        "universe": "covered",
+        "uncertainty": "low",
+        "limit_tickers": 20,
+        "limit_results": 12,
+        "clauses": [
+          {"clause_id": "regulation", "retrieval_query": "App Store regulatory changes sales revenue", "required_concepts": ["App Store regulatory changes sales revenue"], "required": true},
+          {"clause_id": "supply", "retrieval_query": "outsourcing shipment delays product delivery", "required_concepts": ["outsourcing shipment delays product delivery"], "required": true}
+        ]
+      }
+    },
+    {
+      "id": "router_plan_nvda_geopolitics_regulators",
+      "expected_tickers": ["NVDA"],
+      "distractor_tickers": ["AMD", "INTC"],
+      "max_candidate_count": 20,
+      "provenance": {
+        "ticker": "NVDA",
+        "document_types": ["10-K", "10-Q"],
+        "periods": ["CY2024", "CY2025", "CY2026", "CY2026Q2"],
+        "source_note": "Two required NVIDIA clauses covering Chinese regulators and Taiwan exposure."
+      },
+      "plan": {
+        "question": "Which company has both China regulatory commitments and Taiwan manufacturing exposure?",
+        "intent": "risk_discovery",
+        "universe": "covered",
+        "uncertainty": "low",
+        "limit_tickers": 20,
+        "limit_results": 12,
+        "clauses": [
+          {"clause_id": "china", "retrieval_query": "Chinese regulators Mellanox commitments", "required_concepts": ["Chinese regulators Mellanox commitments"], "required": true},
+          {"clause_id": "taiwan", "retrieval_query": "Taiwan China geopolitical manufacturing exposure", "required_concepts": ["Taiwan China geopolitical manufacturing exposure"], "required": true}
+        ]
+      }
+    },
+    {
+      "id": "router_plan_meta_privacy_energy",
+      "expected_tickers": ["META"],
+      "distractor_tickers": ["GOOGL", "AMZN"],
+      "max_candidate_count": 20,
+      "provenance": {
+        "ticker": "META",
+        "document_types": ["10-K", "10-Q"],
+        "periods": ["CY2024", "CY2025", "CY2026Q1"],
+        "source_note": "Required Meta privacy clause with optional renewable-energy context."
+      },
+      "plan": {
+        "question": "Which company has the Irish DPC decision and renewable energy commitments?",
+        "intent": "risk_context_discovery",
+        "universe": "covered",
+        "uncertainty": "low",
+        "limit_tickers": 20,
+        "limit_results": 12,
+        "clauses": [
+          {"clause_id": "privacy", "retrieval_query": "Irish Data Protection Commission final decision", "required_concepts": ["Irish Data Protection Commission final decision"], "required": true},
+          {"clause_id": "energy", "retrieval_query": "renewable energy purchase agreements volume commitments", "required_concepts": ["renewable energy purchase agreements volume commitments"], "required": false}
+        ]
+      }
+    },
+    {
+      "id": "router_plan_wmt_cost_pharmacy",
+      "expected_tickers": ["WMT"],
+      "distractor_tickers": ["COST", "TGT", "CVS"],
+      "max_candidate_count": 20,
+      "provenance": {
+        "ticker": "WMT",
+        "document_types": ["10-K", "10-Q"],
+        "periods": ["CY2024", "CY2025", "CY2026", "CY2026Q2"],
+        "source_note": "Two required Walmart clauses covering EDLC and pharmacy reimbursement."
+      },
+      "plan": {
+        "question": "Which retailer discloses both everyday low cost strategy and pharmacy reimbursement?",
+        "intent": "strategy_discovery",
+        "universe": "covered",
+        "uncertainty": "low",
+        "limit_tickers": 20,
+        "limit_results": 12,
+        "clauses": [
+          {"clause_id": "cost", "retrieval_query": "everyday low cost savings passed to customers", "required_concepts": ["everyday low cost savings passed to customers"], "required": true},
+          {"clause_id": "pharmacy", "retrieval_query": "pharmacy prescriptions third-party reimbursement", "required_concepts": ["pharmacy prescriptions third-party reimbursement"], "required": true}
+        ]
+      }
+    },
+    {
+      "id": "router_plan_jpm_rates_loans",
+      "expected_tickers": ["JPM"],
+      "distractor_tickers": ["BAC", "C", "WFC"],
+      "max_candidate_count": 20,
+      "provenance": {
+        "ticker": "JPM",
+        "document_types": ["10-K", "10-Q"],
+        "periods": ["CY2025", "CY2026Q1"],
+        "source_note": "Two required JPMorgan clauses covering rate-sensitive loan demand and funding ratio."
+      },
+      "plan": {
+        "question": "Which bank discloses both rate-sensitive real-estate loan demand and a 56 to 58 percent loans-to-deposits ratio?",
+        "intent": "risk_metric_discovery",
+        "universe": "covered",
+        "uncertainty": "low",
+        "limit_tickers": 20,
+        "limit_results": 12,
+        "clauses": [
+          {"clause_id": "rates", "retrieval_query": "higher interest rates real estate loan demand", "required_concepts": ["higher interest rates real estate loan demand"], "required": true},
+          {"clause_id": "funding", "retrieval_query": "loans to deposits ratio 56 58 percent", "required_concepts": ["loans to deposits ratio 56 58 percent"], "required": true}
+        ]
+      }
+    }
+  ]
+}

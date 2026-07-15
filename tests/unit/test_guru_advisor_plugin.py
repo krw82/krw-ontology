@@ -43,10 +43,10 @@ def test_guru_advisor_plugin_is_separate_and_has_dedicated_mcp_server() -> None:
     )
     assert "KRW_GURU_ROOT" not in guru_env
     assert "KRW_GURU_RUNNING_ROOT" not in guru_env
-    assert mcp_config["mcpServers"]["krw-ontology-company"] == {
-        "type": "http",
-        "url": "http://127.0.0.1:8765/mcp",
-    }
+    # The main Guru plugin owns only its read-only philosophy MCP. Company
+    # filing evidence is delegated by the app-configured evidence Agent, not
+    # through a second direct plugin MCP connection.
+    assert set(mcp_config["mcpServers"]) == {"krw-guru-advisor"}
     assert "brief-first consultation skills" in codex_plugin["interface"]["longDescription"]
     assert "shard-aware read-only Guru MCP" in codex_plugin["interface"]["longDescription"]
     assert "not added to the KRW Ontology router" in codex_plugin["interface"]["longDescription"]
@@ -58,60 +58,46 @@ def test_guru_advisor_skill_is_explicit_and_read_only() -> None:
     mcp_policy = (REFERENCE_DIR / "mcp-tool-policy.md").read_text()
     research_pack_contract = (REFERENCE_DIR / "research-pack-contract.md").read_text()
     skill_contract = (REFERENCE_DIR / "guru-skill-contract.md").read_text()
+    normalized_skill_contract = " ".join(skill_contract.split())
     answer_style_contract = (REFERENCE_DIR / "answer-style-adapters.md").read_text()
     guru_brief_policy = (REFERENCE_DIR / "guru-brief-policy.md").read_text()
 
     assert "Do not give personalized buy, sell, hold" in output_contract
-    assert "internal guru consultation brief" in output_contract
-    assert "Do not narrate execution" in output_contract
-    assert "tool arguments or raw tool results" in output_contract
-    assert "Do not add footer disclaimers" in output_contract
-    assert "AI 렌즈 해석" in output_contract
-    assert "Do not create report-style data limitation sections" in output_contract
-    assert "데이터 한계" in output_contract
-    assert "first-person simulated guru voice is the default" in output_contract
-    assert "Do not write about the selected author in third person" in output_contract
-    assert "주의:" in output_contract
-    assert "not a required final-answer section" in research_pack_contract
-    assert "one concise next check" in research_pack_contract
-    assert "generic safety template" in output_contract
-    assert "must not modify the existing KRW company ontology schema" in company_contract
-    assert "Bridge Workflow" in company_contract
-    assert "Company Context Prepass" in company_contract
-    assert "krw_ontology_topic_map" in company_contract
-    assert "company_context_json" in company_contract
-    assert "never hard-coded ticker mappings" in company_contract
-    assert "GuruCompanyFilingBrief" in company_contract
-    assert "GuruCompanyResearchPack" in company_contract
+    assert "Never expose skills, plugins, tools, internal briefs" in output_contract
+    assert "Do not present the selected author as speaking" in output_contract
+    assert "conditional interpretation must retain the material assumption" in output_contract
+    assert "strongest supported qualitative view" in output_contract
+    assert "when they appear in the runtime filing context" in output_contract
+    assert "Do not create a separate no-tools rewrite pass" in output_contract
+    assert "not a real-person identity simulation" in answer_style_contract
+    assert "distinct author-inspired virtual\nadvisor" in answer_style_contract
+    assert "not a neutral expert voice" in answer_style_contract
+    assert "GuruLightCompanyContext" in company_contract
+    assert "not a thesis and cannot be used as evidence" in company_contract
+    assert "sealed question ID" in company_contract
+    assert "brief_hash" in company_contract
+    assert "legacy dynamic plan is a feature-flag rollback path" in company_contract
     assert "krw_guru_query_context" in mcp_policy
     assert "krw_guru_company_brief" in mcp_policy
-    assert "krw_guru_company_pack" in mcp_policy
-    assert "company_context_json" in mcp_policy
-    assert "orientation only, not evidence" in mcp_policy
-    assert "All MCP usage is silent" in mcp_policy
-    assert "krw_guru_index_context" in mcp_policy
-    assert "author SQLite shards" in mcp_policy
-    assert "krw_guru_context" not in mcp_policy
-    assert "Skills must not hard-code guru principles" in research_pack_contract
-    assert "GuruAnswerRenderPlan" in research_pack_contract
-    assert "company ontology orientation" in research_pack_contract
-    assert "must not be created from ticker hard-coding" in research_pack_contract
-    assert "private internal guru consultation brief" in research_pack_contract
-    assert "The application code owns guru selection" in skill_contract
-    assert "guru-brief-policy.md" in skill_contract
-    assert "narrate workflow" in skill_contract
-    assert "Never print the brief" in skill_contract
-    assert "do not describe the author from the outside" in skill_contract
-    assert "Mandatory Composition" in answer_style_contract
-    assert "Do not turn missing company evidence into a separate analyst-report section" in answer_style_contract
-    assert "First-person simulated guru voice is the default" in answer_style_contract
-    assert "Do not write the final answer as a third-person report" in answer_style_contract
-    assert "private internal guru consultation brief" in answer_style_contract
-    assert "footer disclaimers" in answer_style_contract
-    assert "Author-Specific Style" in answer_style_contract
-    assert "primary_intent" in guru_brief_policy
-    assert "secondary_intents" in guru_brief_policy
-    assert "Use `krw_guru_index_context` only for debug" in guru_brief_policy
+    assert "exactly one company-specific key question" in mcp_policy
+    assert "exactly_one_key_question_required" in mcp_policy
+    assert "company_evidence_researcher" in mcp_policy
+    assert "does not call `krw_ontology_verify_evidence`" in mcp_policy
+    assert "krw-guru-company-research-context/v1" in mcp_policy
+    assert "krw_guru_review_company_evidence" in mcp_policy
+    assert "main Guru does not call the\nKRW filing tools directly" in mcp_policy
+    assert "philosophy_context" in research_pack_contract
+    assert "must not add a remembered\nprinciple" in research_pack_contract
+    assert "private agent_analysis" in research_pack_contract
+    assert "must not be rendered as the\nreal author speaking" in research_pack_contract
+    assert "The application owns selection" in normalized_skill_contract
+    assert "must not route to another author" in normalized_skill_contract
+    assert "It must not use a generic company checklist" in normalized_skill_contract
+    assert "facts tied to validated evidence" in normalized_skill_contract
+    assert "strongest supported reading" in normalized_skill_contract
+    assert "decision_role" in normalized_skill_contract
+    assert "English-first" in guru_brief_policy
+    assert "does not create a philosophy" in guru_brief_policy
 
     assert not (SKILLS_DIR / "krw-guru-advisor" / "SKILL.md").exists()
     assert GURU_SKILL_MAP == GURU_SKILLS
@@ -119,62 +105,55 @@ def test_guru_advisor_skill_is_explicit_and_read_only() -> None:
         skill_text = (SKILLS_DIR / skill_name / "SKILL.md").read_text()
         agent_text = (SKILLS_DIR / skill_name / "agents" / "openai.yaml").read_text()
         local_style_text = (SKILLS_DIR / skill_name / "references" / "answer-style.md").read_text()
+        normalized_skill_text = " ".join(skill_text.split())
 
         assert guru_skill_name(author_key) == skill_name
         assert f"name: {skill_name}" in skill_text
-        assert f'Fixed `author_key`: `{author_key}`.' in skill_text
+        assert f"Fixed `author_key`: `{author_key}`." in skill_text
         assert "This is not a router" in skill_text
         assert "must not hard-code" in skill_text
         assert "User-facing output is final-answer only" in skill_text
-        assert "first-person simulated advisor voice" in skill_text
-        assert "Do not print a report-style data limitation section" in skill_text
-        assert "speak directly from the selected advisor posture" in skill_text
-        assert "raw tool output" in skill_text
-        assert "private internal guru consultation brief" in skill_text
-        assert "guru-brief-policy.md" in skill_text
+        assert "not a generic analyst" in normalized_skill_text
+        assert "first-person simulation" in skill_text
+        assert "light company context" in skill_text
+        assert "investigation_questions" in skill_text
+        assert "exactly one philosophy-shaped company key question" in skill_text
+        assert "one to three complementary atomic SearchPlan v2 clauses" in skill_text
+        assert "investigation_brief" in skill_text
+        assert "company_evidence_researcher" in skill_text
+        assert "does not call krw_ontology_verify_evidence or create a pack" in skill_text
+        assert "krw-guru-company-research-context/v1" in skill_text
+        assert "agent_analysis" in skill_text
+        assert "Internal quantitative reasoning is allowed" in skill_text
+        assert "documented historical episode or prior cycle" in skill_text
         assert "references/answer-style.md" in skill_text
         assert "answer-style-adapters.md" in skill_text
         assert "krw_guru_query_context" in skill_text
         assert "krw_guru_company_brief" in skill_text
-        assert "krw_guru_company_pack" in skill_text
-        assert "krw_ontology_topic_map" in skill_text
-        assert "company_context_json" in skill_text
-        assert "Do not infer company context from memory" in skill_text
+        assert "krw_guru_review_company_evidence" in skill_text
+        assert "does not call krw_ontology_* tools directly" in skill_text
         assert "Read before answering" not in skill_text
-        assert "Reference files for maintainers only" in skill_text
+        assert "Reference files for maintainers/debug only" in skill_text
         assert f'author_keys=["{author_key}"]' in skill_text
         assert "ResearchPack" in skill_text
-        assert "GuruCompanyResearchPack" in skill_text
-        assert "private internal guru consultation brief" in agent_text
+        assert "Use only the returned Guru ResearchPack" in agent_text
         assert "Work silently" in agent_text
         assert "return final Korean investor-facing prose only" in agent_text
-        assert "raw tool results" in agent_text
-        assert "brief-optimized question" in agent_text
-        assert "company_context_json" in agent_text
-        assert "Do not hard-code" in agent_text
-        assert "ticker context" in agent_text
+        assert "exactly one philosophy-shaped company key question" in agent_text
+        assert "company_evidence_researcher" in agent_text
         assert "krw_guru_company_brief" in agent_text
-        assert "krw_guru_company_pack" in agent_text
-        assert "skill-local references/answer-style.md" in agent_text
-        assert "voice, texture, and analogy rendering" in agent_text
-        assert "immersive first-person advisor voice" in agent_text
-        assert "report footer disclaimers" in agent_text
-        assert "krw_guru_query_context" in agent_text
+        assert "krw_guru_review_company_evidence" in agent_text
+        assert "not a generic analyst summary" in agent_text
+        assert "first-person simulation" in agent_text
+        assert "runtime builds company research context" in agent_text
+        assert "documented historical episode or prior cycle" in agent_text
+        assert "Do not expose process narration or internal tool, brief, payload, retry, or status terms" in agent_text
         assert f"Fixed `author_key`: `{author_key}`." in local_style_text
-        assert "This file controls rendering only" in local_style_text
-        assert "## Rendering Boundary" in local_style_text
-        assert "## Voice" in local_style_text
-        assert "## Consultation Persona" in local_style_text
-        assert "Default to direct first-person consultation" in local_style_text
-        assert "## Texture" in local_style_text
-        assert "## Allowed Analogies" in local_style_text
-        assert "## Identity Boundary" in local_style_text
-        assert "## Style Transformations" in local_style_text
-        assert "ResearchPack decides what to say" in local_style_text
-        assert "Do not write:" in local_style_text
-        assert "Prefer:" in local_style_text
-        assert "말투로 바꾸면" not in local_style_text
-        assert "현재 온톨로지" not in local_style_text
+        assert "It controls readability only" in local_style_text
+        assert "controls readability only" in local_style_text
+        assert "Do not write in the author's first" in local_style_text
+        assert "imply identity" in local_style_text
+        assert "only material validated quantitative evidence" in local_style_text
 
     with pytest.raises(ValueError, match="Unknown guru author_key"):
         guru_skill_name("unknown")
@@ -182,9 +161,9 @@ def test_guru_advisor_skill_is_explicit_and_read_only() -> None:
 
 def test_guru_advisor_is_not_registered_in_existing_router() -> None:
     router_text = Path("plugins/krw-ontology/skills/krw-ontology-router/SKILL.md").read_text()
-    router_agent_text = (
-        Path("plugins/krw-ontology/skills/krw-ontology-router/agents/openai.yaml").read_text()
-    )
+    router_agent_text = Path(
+        "plugins/krw-ontology/skills/krw-ontology-router/agents/openai.yaml"
+    ).read_text()
 
     assert "guru" not in router_text.lower()
     assert "krw-guru-advisor" not in router_text
@@ -244,9 +223,7 @@ def test_guru_advisor_gold_eval_covers_research_pack_quality_contract() -> None:
 
 
 def test_existing_krw_ontology_plugin_metadata_is_not_repointed() -> None:
-    existing_codex = json.loads(
-        Path("plugins/krw-ontology/.codex-plugin/plugin.json").read_text()
-    )
+    existing_codex = json.loads(Path("plugins/krw-ontology/.codex-plugin/plugin.json").read_text())
     existing_claude = json.loads(
         Path("plugins/krw-ontology/.claude-plugin/plugin.json").read_text()
     )

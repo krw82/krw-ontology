@@ -15,7 +15,7 @@ from typing import Any
 from claude_agent_sdk import ClaudeAgentOptions
 from claude_agent_sdk._internal.transport.subprocess_cli import SubprocessCLITransport
 
-from krw_ontology.errors import ExtractionError, RateLimitError
+from krw_ontology.errors import ExtractionError, ProviderOverloadError, RateLimitError
 from krw_ontology.extraction.schemas import STAGE_OUTPUT_MODELS
 
 logger = logging.getLogger("krw_ontology")
@@ -85,6 +85,11 @@ class ExtractionWorker:
                     call_metadata=call_metadata,
                     attempt=attempt + 1,
                 )
+            except ProviderOverloadError:
+                # Batch schedulers pause the whole stage and put this exact
+                # batch back at the front of their queue. Do not convert a
+                # gateway overload into the normal short retry loop here.
+                raise
             except RateLimitError as e:
                 if attempt < self.max_retries - 1:
                     sleep_for = min(delay, _MAX_DELAY) + random.uniform(0, min(delay, _MAX_DELAY))
@@ -221,6 +226,10 @@ class ExtractionWorker:
                     returncode=proc.returncode,
                 ),
             )
+            if _is_provider_overload_message(message):
+                raise ProviderOverloadError(
+                    f"{stage_name}: Claude CLI provider overloaded: {message}"
+                )
             if _is_rate_limit_message(message):
                 raise RateLimitError(
                     f"{stage_name}: Claude CLI rate limited: {message}"
@@ -267,7 +276,11 @@ class ExtractionWorker:
             ) from e
 
         if data.get("is_error"):
-            message = str(data.get("subtype") or data)
+            message = str(data.get("result") or data.get("subtype") or data)
+            provider_status = data.get("api_error_status")
+            is_provider_overload = (
+                provider_status == 529 or _is_provider_overload_message(message)
+            )
             status = "rate_limited" if _is_rate_limit_message(message) else "error"
             self._write_agent_call_log(
                 log_path,
@@ -282,6 +295,10 @@ class ExtractionWorker:
                     returncode=proc.returncode,
                 ),
             )
+            if is_provider_overload:
+                raise ProviderOverloadError(
+                    f"{stage_name}: Claude CLI provider overloaded: {message}"
+                )
             if _is_rate_limit_message(message):
                 raise RateLimitError(f"{stage_name}: Claude CLI rate limited: {message}")
             raise ExtractionError(f"{stage_name}: Claude CLI result error: {data.get('subtype')}")
@@ -391,6 +408,21 @@ def _is_rate_limit_message(message: str) -> bool:
             "rate_limit",
             "too many requests",
             "overloaded",
+        )
+    )
+
+
+def _is_provider_overload_message(message: str) -> bool:
+    text = str(message or "").lower()
+    return any(
+        token in text
+        for token in (
+            "api_error_status\\\":529",
+            "api_error_status:529",
+            "http 529",
+            "[1305]",
+            "temporarily overloaded",
+            "service may be temporarily overloaded",
         )
     )
 

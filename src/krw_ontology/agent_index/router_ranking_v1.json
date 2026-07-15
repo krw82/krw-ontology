@@ -50,6 +50,9 @@
   },
   "default_limit": 20,
   "format": "krw-ontology-router-ranking-profile/v1",
+  "fusion": {
+    "primary_rrf_scale": 1.0
+  },
   "fts_field_weights": {
     "company_text": 6.0,
     "entity_text": 1.5,
@@ -97,7 +100,7 @@
     "units_per_ticker": 2
   },
   "max_query_terms": 24,
-  "profile_id": "router-source-coherent-v4",
+  "profile_id": "router-candidate-restricted-v5",
   "rrf_k": 60,
-  "version": 4
+  "version": 5
 }

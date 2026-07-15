@@ -11,7 +11,7 @@ import sqlite3
 import subprocess
 import sys
 import time
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from concurrent.futures.process import BrokenProcessPool
 from collections import defaultdict
 from collections.abc import Callable, Mapping, Sequence
@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from krw_ontology.agent_index.cross_company_links import (
+    CROSS_COMPANY_LINK_BUILDER_VERSION,
     CrossCompanyLinkGenerationResult,
     generate_cross_company_links,
 )
@@ -29,10 +30,41 @@ from krw_ontology.agent_index.chart_series import (
     ChartSeriesBuildResult,
     build_chart_series_index,
 )
+from krw_ontology.agent_index.cache_seal import (
+    read_immutable_sqlite_cache_seal,
+    record_immutable_sqlite_cache_sha256,
+    remove_immutable_sqlite_cache_seal,
+    write_immutable_sqlite_cache_seal,
+)
 from krw_ontology.agent_index.router_sidecar import (
     ROUTER_SIDECAR_RELATIVE_PATH,
     RouterSidecarBuildResult,
     build_router_sidecar,
+    load_router_ranking_profile,
+)
+from krw_ontology.agent_index.router_coherence import (
+    ROUTER_COHERENCE_RELATIVE_PATH,
+    RouterCoherenceBuildResult,
+    build_router_coherence,
+    load_router_coherence_profile,
+)
+from krw_ontology.agent_index.router_cache import (
+    publish_router_sidecar_cache,
+    restore_router_sidecar_cache,
+    router_sidecar_cache_path,
+    router_sidecar_semantic_cache_key,
+    verify_router_sidecar_cache,
+)
+from krw_ontology.agent_index.semantic_identity import (
+    SEMANTIC_IDENTITY_POLICY_VERSION,
+    effective_ticker,
+    project_local_identity,
+    project_object_identity,
+    semantic_object_hash,
+)
+from krw_ontology.agent_index.spine_preflight import (
+    preflight_company_shard_identities,
+    preflight_spine_fragments,
 )
 from krw_ontology.agent_index.metric_dictionary import (
     metric_dictionary_binding,
@@ -58,17 +90,24 @@ from krw_ontology.agent_index.spine_schema import (
     GLOBAL_SPINE_LAYOUT,
     GLOBAL_SPINE_SCHEMA_VERSION,
     GLOBAL_SPINE_TABLES,
+    SPINE_FRAGMENT_SCHEMA_VERSION,
+    SPINE_FRAGMENT_TABLES,
     create_global_spine_schema,
+    create_spine_fragment_schema,
     read_global_spine_metadata,
+    spine_verification_seal_path,
     verify_global_spine_schema,
+    verify_spine_fragment_schema,
+    write_spine_verification_seal,
     write_global_spine_metadata,
 )
 
 COMPANY_SHARD_SCHEMA_VERSION = "krw-ontology-company-shard/v2"
 COMPANY_SHARD_CACHE_FORMAT_VERSION = "krw-ontology-company-shard-cache/v4"
-SPINE_FRAGMENT_CACHE_FORMAT_VERSION = "krw-ontology-spine-fragment-cache/v4"
-SPINE_FRAGMENT_FORMAT_VERSION = "krw-ontology-spine-fragment/v1"
-SPINE_PROJECTION_VERSION = "spine-projection/v3"
+SPINE_FRAGMENT_CACHE_FORMAT_VERSION = "krw-ontology-spine-fragment-cache/v8"
+GLOBAL_SPINE_CACHE_FORMAT_VERSION = "krw-ontology-global-spine-cache/v1"
+SPINE_FRAGMENT_FORMAT_VERSION = "krw-ontology-spine-fragment/v3"
+SPINE_PROJECTION_VERSION = "spine-projection/v6"
 V3_BUILD_SUMMARY_FORMAT_VERSION = "krw-ontology-v3-build-summary/v1"
 V3_BUILD_PLAN_FORMAT_VERSION = "krw-ontology-v3-build-plan/v1"
 V3_BUILD_PROGRESS_FORMAT_VERSION = "krw-ontology-v3-build-progress/v1"
@@ -76,6 +115,70 @@ V3_SHARD_MANIFEST_FORMAT_VERSION = "krw-ontology-shard-manifest/v3"
 SHARD_QUALITY_SUMMARY_FORMAT_VERSION = "krw-ontology-shard-quality-summary/v1"
 DEFAULT_COMPANY_WORKER_MEMORY_OVERHEAD_MIB = 2_048
 DEFAULT_BUILD_MEMORY_RESERVE_MIB = 8_192
+DEFAULT_GLOBAL_MERGE_SQLITE_THREADS = 8
+DEFAULT_GLOBAL_MERGE_SQLITE_CACHE_KIB = 1_048_576
+DEFAULT_SPINE_STALE_TMP_AGE_SECONDS = 24 * 60 * 60
+
+
+def _validate_static_build_runtime() -> dict[str, Any]:
+    """Fail before source planning when required SQLite features are unavailable."""
+    try:
+        with sqlite3.connect(":memory:") as conn:
+            json_value = conn.execute("SELECT value FROM json_each('[1]')").fetchone()[0]
+            conn.execute("CREATE VIRTUAL TABLE runtime_fts USING fts5(value, tokenize='unicode61')")
+            conn.execute("INSERT INTO runtime_fts(value) VALUES('ontology runtime check')")
+            fts_match = conn.execute(
+                "SELECT COUNT(*) FROM runtime_fts WHERE runtime_fts MATCH 'ontology'"
+            ).fetchone()[0]
+    except sqlite3.Error as exc:
+        raise RuntimeError(
+            f"build_runtime_preflight_failed:sqlite={sqlite3.sqlite_version}:error={exc}"
+        ) from exc
+    if int(json_value) != 1 or int(fts_match) != 1:
+        raise RuntimeError(
+            "build_runtime_preflight_failed:required SQLite JSON1/FTS5 behavior mismatch"
+        )
+    return {
+        "sqlite_version": sqlite3.sqlite_version,
+        "json1": True,
+        "fts5": True,
+    }
+
+
+class SpineFragmentCollisionError(RuntimeError):
+    """Raised when fragments claim one key with incompatible semantic identity."""
+
+
+class SpineSemanticPreflightError(SpineFragmentCollisionError):
+    """Raised after collecting every incompatible fragment claim."""
+
+
+def _semantic_preflight_error(result: Mapping[str, Any]) -> SpineSemanticPreflightError:
+    conflicts = list(result.get("conflicts") or [])
+    first = conflicts[0] if conflicts else {}
+    key = json.dumps(
+        first.get("key") or {}, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    kind = str(first.get("kind") or "semantic")
+    prefix = (
+        "spine_fragment_semantic_conflict"
+        if kind == "semantic"
+        else "spine_fragment_identity_scope_violation"
+        if kind == "scope"
+        else "company_identity_preflight_violation"
+        if kind in {"reference", "sqlite", "json"}
+        else "spine_fragment_pk_collision"
+    )
+    detail = (
+        f"{prefix}:table={first.get('table', '<unknown>')}:key={key}:"
+        f"fragment={first.get('conflicting_fragment', '<unknown>')}:"
+        f"fields={','.join(first.get('fields') or ['<unknown>'])}"
+    )
+    report = result.get("report_path") or "<not-written>"
+    return SpineSemanticPreflightError(
+        "spine_semantic_preflight_failed:"
+        f"conflict_count={len(conflicts)}:report={report}:first={detail}"
+    )
 
 
 @dataclass(frozen=True)
@@ -147,15 +250,362 @@ class SpineShardReleaseBuildResult:
     build_summary_path: Path
     global_spine_path: Path
     router_sidecar_path: Path
+    router_coherence_path: Path
     shard_results: tuple[CompanyShardBuildResult, ...]
     fragment_results: tuple[SpineFragmentResult, ...]
     merge_result: GlobalSpineMergeResult
     shard_manifest: Mapping[str, Any]
     build_summary: Mapping[str, Any]
     router_sidecar_result: RouterSidecarBuildResult
+    router_coherence_result: RouterCoherenceBuildResult
     chart_series_path: Path | None = None
     chart_series_result: ChartSeriesBuildResult | None = None
     progress_path: Path | None = None
+
+
+def _global_spine_semantic_cache_key(
+    fragment_results: Sequence[SpineFragmentResult],
+    *,
+    source_manifest_hash: str | None,
+    generate_links: bool,
+) -> str:
+    ordered_fragments = [
+        [result.ticker, str(result.cache_key or "")]
+        for result in sorted(fragment_results, key=lambda item: item.ticker)
+    ]
+    if not ordered_fragments or any(not cache_key for _ticker, cache_key in ordered_fragments):
+        raise ValueError("global spine cache requires every ordered fragment cache key")
+    return _stable_hash(
+        {
+            "cache_format": GLOBAL_SPINE_CACHE_FORMAT_VERSION,
+            "fragment_cache_keys": ordered_fragments,
+            "source_manifest_hash": source_manifest_hash,
+            "generate_links": bool(generate_links),
+            "global_spine_schema_version": GLOBAL_SPINE_SCHEMA_VERSION,
+            "global_spine_builder_version": GLOBAL_SPINE_BUILDER_VERSION,
+            "spine_projection_version": SPINE_PROJECTION_VERSION,
+            "semantic_identity_policy_version": SEMANTIC_IDENTITY_POLICY_VERSION,
+            "cross_company_link_builder_version": CROSS_COMPANY_LINK_BUILDER_VERSION,
+            "company_shard_schema_version": COMPANY_SHARD_SCHEMA_VERSION,
+            "source_artifact_sqlite_schema_version": SOURCE_ARTIFACT_SQLITE_SCHEMA_VERSION,
+            "source_artifact_sqlite_builder_version": SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION,
+            "metric_dictionary": metric_dictionary_binding(),
+        }
+    )
+
+
+def _global_spine_cache_path(cache_root: Path, cache_key: str) -> Path:
+    digest = cache_key.split(":", 1)[-1]
+    return cache_root / "v3" / "global_spines" / digest[:2] / f"{digest}.sqlite"
+
+
+def _verify_global_spine_cache(path: Path, *, cache_key: str) -> tuple[str, ...]:
+    if not path.is_file():
+        return ("global_spine_cache_missing",)
+    verification = verify_global_spine_schema(path, deep=True, trust_seal=True)
+    errors = [f"global_spine_cache:{error}" for error in verification.get("errors") or []]
+    metadata = verification.get("metadata") or {}
+    if metadata.get("global_spine_cache_format_version") != GLOBAL_SPINE_CACHE_FORMAT_VERSION:
+        errors.append("global_spine_cache_format_mismatch")
+    if metadata.get("global_spine_cache_key") != cache_key:
+        errors.append("global_spine_cache_key_mismatch")
+    return tuple(dict.fromkeys(errors))
+
+
+def _publish_global_spine_cache(
+    source_path: Path,
+    cache_path: Path,
+    *,
+    cache_key: str,
+    verification: Mapping[str, Any],
+) -> str:
+    if not _verify_global_spine_cache(cache_path, cache_key=cache_key):
+        return "existing"
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = cache_path.parent / f".{cache_path.name}.{os.getpid()}.{time.time_ns()}.tmp"
+    _cleanup_spine_database_and_seal(tmp_path)
+    try:
+        copy_mode = clone_or_copy_immutable_file(source_path, tmp_path)
+        os.replace(tmp_path, cache_path)
+        write_spine_verification_seal(
+            cache_path,
+            verification,
+            source_path=source_path,
+            details={
+                "cache_format": GLOBAL_SPINE_CACHE_FORMAT_VERSION,
+                "cache_key": cache_key,
+            },
+        )
+        errors = _verify_global_spine_cache(cache_path, cache_key=cache_key)
+        if errors:
+            raise RuntimeError("published global spine cache invalid: " + ", ".join(errors))
+        return copy_mode
+    finally:
+        _cleanup_spine_database_and_seal(tmp_path)
+
+
+def _bootstrap_global_spine_cache_from_current(
+    release_root: Path,
+    cache_path: Path,
+    *,
+    cache_key: str,
+    source_manifest_hash: str | None,
+    generate_links: bool,
+    fragment_count: int,
+) -> dict[str, Any]:
+    """Adopt a compatible verified current release into the new semantic cache."""
+    if not generate_links:
+        return {"adopted": False, "reason": "generate_links_disabled"}
+    current = release_root.parent / "current"
+    if not current.is_symlink() or not current.exists():
+        return {"adopted": False, "reason": "current_release_missing"}
+    current_root = current.resolve()
+    if current_root == release_root.resolve():
+        return {"adopted": False, "reason": "current_is_candidate"}
+    source_path = current_root / "indexes" / "global_spine.sqlite"
+    verification = verify_global_spine_schema(source_path, deep=True, trust_seal=True)
+    if not verification.get("ok"):
+        return {
+            "adopted": False,
+            "reason": "current_global_spine_invalid",
+            "errors": list(verification.get("errors") or []),
+        }
+    metadata = verification.get("metadata") or {}
+    expected = {
+        "source_manifest_hash": source_manifest_hash,
+        "schema_version": GLOBAL_SPINE_SCHEMA_VERSION,
+        "builder_version": GLOBAL_SPINE_BUILDER_VERSION,
+        "spine_projection_version": SPINE_PROJECTION_VERSION,
+        "semantic_identity_policy_version": SEMANTIC_IDENTITY_POLICY_VERSION,
+        "source_artifact_sqlite_schema_version": SOURCE_ARTIFACT_SQLITE_SCHEMA_VERSION,
+        "source_artifact_sqlite_builder_version": SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION,
+        "company_shard_schema_version": COMPANY_SHARD_SCHEMA_VERSION,
+        "fragment_count": fragment_count,
+    }
+    mismatches = [key for key, value in expected.items() if metadata.get(key) != value]
+    if mismatches:
+        return {
+            "adopted": False,
+            "reason": "current_global_spine_binding_mismatch",
+            "mismatches": mismatches,
+        }
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = cache_path.parent / f".{cache_path.name}.{os.getpid()}.{time.time_ns()}.tmp"
+    _cleanup_spine_database_and_seal(tmp_path)
+    try:
+        copy_mode = clone_or_copy_immutable_file(source_path, tmp_path)
+        with sqlite3.connect(tmp_path) as conn:
+            write_global_spine_metadata(
+                conn,
+                {
+                    "global_spine_cache_format_version": GLOBAL_SPINE_CACHE_FORMAT_VERSION,
+                    "global_spine_cache_key": cache_key,
+                },
+            )
+            conn.commit()
+            conn.execute("PRAGMA journal_mode=DELETE").fetchall()
+        _cleanup_spine_database_and_seal(cache_path)
+        os.replace(tmp_path, cache_path)
+        inherited = {
+            **verification,
+            "path": str(cache_path),
+            "integrity_source": "immutable_seal",
+            "verification_mode": "deep-sealed-inherited",
+        }
+        write_spine_verification_seal(
+            cache_path,
+            inherited,
+            source_path=source_path,
+            details={"bootstrap": "compatible-current-release", "cache_key": cache_key},
+        )
+        errors = _verify_global_spine_cache(cache_path, cache_key=cache_key)
+        if errors:
+            raise RuntimeError("bootstrapped global spine cache invalid: " + ", ".join(errors))
+        return {
+            "adopted": True,
+            "source_release": current_root.name,
+            "copy_mode": copy_mode,
+        }
+    finally:
+        _cleanup_spine_database_and_seal(tmp_path)
+
+
+def _restore_global_spine_cache(
+    cache_path: Path,
+    target_path: Path,
+    *,
+    cache_key: str,
+    release_root: Path,
+    release_id: str,
+) -> tuple[GlobalSpineMergeResult, str]:
+    errors = _verify_global_spine_cache(cache_path, cache_key=cache_key)
+    if errors:
+        raise ValueError("invalid global spine cache: " + ", ".join(errors))
+    cache_verification = verify_global_spine_schema(cache_path, deep=True, trust_seal=True)
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = target_path.parent / f".{target_path.name}.{os.getpid()}.{time.time_ns()}.tmp"
+    _cleanup_spine_database_and_seal(tmp_path)
+    try:
+        copy_mode = clone_or_copy_immutable_file(cache_path, tmp_path)
+        _rebase_global_spine_release_paths(
+            tmp_path,
+            release_root=release_root,
+            release_id=release_id,
+        )
+        restored = _verify_restored_global_spine(
+            tmp_path,
+            cache_key=cache_key,
+            release_id=release_id,
+        )
+        if not restored["ok"]:
+            raise RuntimeError(
+                "restored global spine cache metadata invalid: " + ", ".join(restored["errors"])
+            )
+        _cleanup_spine_database_and_seal(target_path)
+        os.replace(tmp_path, target_path)
+        verification = {
+            **cache_verification,
+            "path": str(target_path),
+            "metadata": restored["metadata"],
+            "integrity_source": "immutable_seal",
+            "verification_mode": "deep-sealed-inherited",
+        }
+        write_spine_verification_seal(
+            target_path,
+            verification,
+            source_path=cache_path,
+            details={"restore_mode": "metadata-rebind-from-immutable-cache"},
+        )
+        metadata = restored["metadata"]
+        raw_counts = metadata.get("counts")
+        counts = {
+            str(key): int(value)
+            for key, value in dict(raw_counts or {}).items()
+            if isinstance(value, int) and not isinstance(value, bool)
+        }
+        raw_links = metadata.get("chain_links")
+        links = dict(raw_links) if isinstance(raw_links, Mapping) else {}
+        result = GlobalSpineMergeResult(
+            global_spine_path=target_path,
+            fragment_count=int(metadata.get("fragment_count") or 0),
+            counts=counts,
+            chain_links=CrossCompanyLinkGenerationResult(
+                inserted=int(links.get("inserted") or 0),
+                exact_links=int(links.get("exact_links") or 0),
+                similarity_links=int(links.get("similarity_links") or 0),
+                key_count=int(links.get("key_count") or 0),
+                skipped_generic_keys=int(links.get("skipped_generic_keys") or 0),
+            ),
+            verification={
+                **verification,
+                "runtime": {
+                    "cache_hit": True,
+                    "cache_key": cache_key,
+                    "copy_mode": copy_mode,
+                },
+            },
+        )
+        return result, copy_mode
+    finally:
+        _cleanup_spine_database_and_seal(tmp_path)
+
+
+def _materialize_router_sidecar(
+    *,
+    global_spine_path: Path,
+    router_sidecar_path: Path,
+    release_id: str,
+    fragment_results: Sequence[SpineFragmentResult],
+    cache_root: Path,
+    source_manifest_hash: str | None,
+    generate_links: bool,
+    no_cache: bool,
+) -> tuple[RouterSidecarBuildResult, dict[str, Any]]:
+    """Restore a semantically identical sidecar or build and publish one."""
+    started_at = time.perf_counter()
+    summary: dict[str, Any] = {
+        "enabled": not no_cache,
+        "hit": False,
+        "copy_mode": None,
+        "publish_mode": None,
+        "probe_errors": [],
+    }
+    try:
+        cache_key = router_sidecar_semantic_cache_key(
+            fragment_cache_keys=[
+                (result.ticker, str(result.cache_key or "")) for result in fragment_results
+            ],
+            source_manifest_hash=source_manifest_hash,
+            generate_links=generate_links,
+            global_spine_schema_version=GLOBAL_SPINE_SCHEMA_VERSION,
+            global_spine_builder_version=GLOBAL_SPINE_BUILDER_VERSION,
+            spine_projection_version=SPINE_PROJECTION_VERSION,
+            cross_company_link_builder_version=CROSS_COMPANY_LINK_BUILDER_VERSION,
+            metric_dictionary=metric_dictionary_binding(),
+        )
+    except (TypeError, ValueError) as exc:
+        summary["enabled"] = False
+        summary["key_error"] = f"{type(exc).__name__}:{exc}"
+        cache_key = None
+
+    cache_path = router_sidecar_cache_path(cache_root, cache_key) if cache_key is not None else None
+    summary["key"] = cache_key
+    summary["path"] = str(cache_path) if cache_path is not None else None
+
+    if not no_cache and cache_key is not None and cache_path is not None:
+        probe_errors = list(verify_router_sidecar_cache(cache_path, cache_key=cache_key))
+        summary["probe_errors"] = probe_errors
+        if not probe_errors:
+            try:
+                restored = restore_router_sidecar_cache(
+                    cache_path,
+                    router_sidecar_path,
+                    cache_key=cache_key,
+                    global_spine_path=global_spine_path,
+                    release_id=release_id,
+                    copy_file=clone_or_copy_immutable_file,
+                )
+            except (OSError, RuntimeError, TypeError, ValueError, sqlite3.Error) as exc:
+                summary["restore_error"] = f"{type(exc).__name__}:{exc}"
+            else:
+                verification = restored.verification
+                summary.update(
+                    {
+                        "hit": True,
+                        "copy_mode": restored.copy_mode,
+                        "elapsed_ms": int((time.perf_counter() - started_at) * 1000),
+                    }
+                )
+                return (
+                    RouterSidecarBuildResult(
+                        path=restored.path,
+                        counts=verification.get("counts") or {},
+                        metadata=verification.get("metadata") or {},
+                        verification=verification,
+                        elapsed_ms=int((time.perf_counter() - started_at) * 1000),
+                    ),
+                    summary,
+                )
+
+    result = build_router_sidecar(
+        global_spine_path,
+        router_sidecar_path,
+        release_id=release_id,
+    )
+    if not no_cache and cache_key is not None and cache_path is not None:
+        try:
+            summary["publish_mode"] = publish_router_sidecar_cache(
+                result.path,
+                cache_path,
+                cache_key=cache_key,
+                copy_file=clone_or_copy_immutable_file,
+            )
+        except (OSError, RuntimeError, TypeError, ValueError, sqlite3.Error) as exc:
+            # Cache population is an optimization. The freshly built and deeply
+            # verified release artifact remains authoritative.
+            summary["publish_error"] = f"{type(exc).__name__}:{exc}"
+    summary["elapsed_ms"] = int((time.perf_counter() - started_at) * 1000)
+    return result, summary
 
 
 def build_spine_shard_release_outputs(
@@ -178,10 +628,13 @@ def build_spine_shard_release_outputs(
     fragments_dir = indexes_dir / "fragments" / "spine"
     global_spine_path = indexes_dir / "global_spine.sqlite"
     router_sidecar_path = resolved_root / ROUTER_SIDECAR_RELATIVE_PATH
+    router_coherence_path = resolved_root / ROUTER_COHERENCE_RELATIVE_PATH
     shard_manifest_path = indexes_dir / "shard_manifest.json"
     chart_series_path = resolved_root / CHART_SERIES_RELATIVE_PATH
     build_plan_path = indexes_dir / "build_plan.json"
     build_summary_path = indexes_dir / "build_summary.json"
+    company_identity_preflight_path = indexes_dir / "company_identity_preflight.json"
+    semantic_preflight_path = indexes_dir / "semantic_preflight.json"
     resolved_source_manifest_path = (
         source_manifest_path.expanduser().resolve()
         if source_manifest_path is not None
@@ -194,7 +647,9 @@ def build_spine_shard_release_outputs(
     )
 
     indexes_dir.mkdir(parents=True, exist_ok=True)
-    progress = _BuildProgressWriter(resolved_progress_path, release_id=release_id, release_root=resolved_root)
+    progress = _BuildProgressWriter(
+        resolved_progress_path, release_id=release_id, release_root=resolved_root
+    )
     build_started_at = time.perf_counter()
     progress.record(
         "build",
@@ -207,6 +662,26 @@ def build_spine_shard_release_outputs(
         },
     )
     try:
+        static_preflight_started_at = time.perf_counter()
+        progress.record("static_preflight", "static_preflight", "started")
+        runtime_capabilities = _validate_static_build_runtime()
+        ranking_profile = load_router_ranking_profile()
+        coherence_profile = load_router_coherence_profile()
+        progress.record(
+            "static_preflight",
+            "static_preflight",
+            "complete",
+            details={
+                "ranking_profile_id": ranking_profile.get("profile_id"),
+                "ranking_profile_version": ranking_profile.get("version"),
+                "coherence_profile_id": coherence_profile.get("profile_id"),
+                "coherence_profile_version": coherence_profile.get("version"),
+                "semantic_identity_policy_version": SEMANTIC_IDENTITY_POLICY_VERSION,
+                "spine_projection_version": SPINE_PROJECTION_VERSION,
+                "runtime_capabilities": runtime_capabilities,
+            },
+            started_at=static_preflight_started_at,
+        )
         source_started_at = time.perf_counter()
         source_manifest = write_source_artifact_manifest(
             resolved_root,
@@ -236,6 +711,7 @@ def build_spine_shard_release_outputs(
             cache_root=cache_root,
             workers=workers,
             source_manifest_path=resolved_source_manifest_path,
+            source_manifest_payload=source_manifest,
         )
         if not plan.company_items:
             raise ValueError("No company artifacts found for v3 release build")
@@ -389,6 +865,66 @@ def build_spine_shard_release_outputs(
             started_at=shard_stage_started_at,
         )
 
+        company_preflight_started_at = time.perf_counter()
+        progress.record(
+            "company_identity_preflight",
+            "company_identity_preflight",
+            "started",
+            output=company_identity_preflight_path,
+            details={"company_count": len(shard_results)},
+        )
+        company_identity_preflight_result = preflight_company_shard_identities(
+            {result.ticker: result.shard_path for result in shard_results},
+            report_path=company_identity_preflight_path,
+            workers=parallelism.spine_fragment_workers,
+        )
+        if not company_identity_preflight_result["ok"]:
+            error = _semantic_preflight_error(company_identity_preflight_result)
+            progress.record(
+                "company_identity_preflight",
+                "company_identity_preflight",
+                "failed",
+                output=company_identity_preflight_path,
+                error=str(error),
+                details={
+                    "conflict_count": company_identity_preflight_result["conflict_count"],
+                    "warning_count": company_identity_preflight_result["warning_count"],
+                },
+                started_at=company_preflight_started_at,
+            )
+            raise error
+        progress.record(
+            "company_identity_preflight",
+            "company_identity_preflight",
+            "complete",
+            output=company_identity_preflight_path,
+            details={
+                "claim_row_count": company_identity_preflight_result["claim_row_count"],
+                "unique_claim_count": company_identity_preflight_result["unique_claim_count"],
+                "conflict_count": 0,
+                "warning_count": company_identity_preflight_result["warning_count"],
+                "warning_kinds": company_identity_preflight_result["warning_kinds"],
+            },
+            started_at=company_preflight_started_at,
+        )
+
+        manifest_started_at = time.perf_counter()
+        shard_manifest = _write_v3_shard_manifest(
+            shard_manifest_path,
+            release_root=resolved_root,
+            release_id=release_id,
+            source_manifest_hash=plan.source_manifest_hash,
+            shard_results=shard_results,
+        )
+        progress.record(
+            "shard_manifest",
+            "manifest",
+            "complete",
+            output=shard_manifest_path,
+            details={"ticker_count": shard_manifest.get("ticker_count")},
+            started_at=manifest_started_at,
+        )
+
         fragment_stage_started_at = time.perf_counter()
         progress.record(
             "spine_fragments",
@@ -419,6 +955,33 @@ def build_spine_shard_release_outputs(
         )
 
         merge_started_at = time.perf_counter()
+        global_spine_cache_summary: dict[str, Any] = {
+            "enabled": not no_cache,
+            "hit": False,
+            "key": None,
+            "path": None,
+            "probe_errors": [],
+        }
+        global_spine_cache_key: str | None = None
+        global_spine_cache_path: Path | None = None
+        if not no_cache:
+            try:
+                global_spine_cache_key = _global_spine_semantic_cache_key(
+                    fragment_results,
+                    source_manifest_hash=plan.source_manifest_hash,
+                    generate_links=generate_links,
+                )
+                global_spine_cache_path = _global_spine_cache_path(
+                    plan.cache_root,
+                    global_spine_cache_key,
+                )
+            except (TypeError, ValueError) as exc:
+                global_spine_cache_summary["enabled"] = False
+                global_spine_cache_summary["key_error"] = f"{type(exc).__name__}:{exc}"
+        global_spine_cache_summary["key"] = global_spine_cache_key
+        global_spine_cache_summary["path"] = (
+            str(global_spine_cache_path) if global_spine_cache_path is not None else None
+        )
         progress.record(
             "global_spine_merge",
             "global_spine_merge",
@@ -427,22 +990,130 @@ def build_spine_shard_release_outputs(
             details={
                 "fragment_count": len(fragment_results),
                 "generate_links": generate_links,
+                "cache_key": global_spine_cache_key,
             },
         )
-        merge_result = merge_spine_fragments(
-            [result.fragment_path for result in fragment_results],
-            global_spine_path,
-            release_id=release_id,
-            source_manifest_hash=plan.source_manifest_hash,
-            generate_links=generate_links,
-            progress_callback=lambda event: progress.record(
-                str(event.get("node_id") or "global_spine_merge"),
-                str(event.get("stage") or "global_spine_merge"),
-                str(event.get("status") or "progress"),
-                output=event.get("output"),
-                details=event.get("details") if isinstance(event.get("details"), Mapping) else None,
-            ),
-        )
+        merge_result: GlobalSpineMergeResult | None = None
+        if global_spine_cache_path is not None and global_spine_cache_key is not None:
+            cache_errors = _verify_global_spine_cache(
+                global_spine_cache_path,
+                cache_key=global_spine_cache_key,
+            )
+            if cache_errors == ("global_spine_cache_missing",):
+                bootstrap = _bootstrap_global_spine_cache_from_current(
+                    resolved_root,
+                    global_spine_cache_path,
+                    cache_key=global_spine_cache_key,
+                    source_manifest_hash=plan.source_manifest_hash,
+                    generate_links=generate_links,
+                    fragment_count=len(fragment_results),
+                )
+                global_spine_cache_summary["bootstrap"] = bootstrap
+                if bootstrap.get("adopted") is True:
+                    cache_errors = _verify_global_spine_cache(
+                        global_spine_cache_path,
+                        cache_key=global_spine_cache_key,
+                    )
+            global_spine_cache_summary["probe_errors"] = list(cache_errors)
+            if not cache_errors:
+                try:
+                    merge_result, copy_mode = _restore_global_spine_cache(
+                        global_spine_cache_path,
+                        global_spine_path,
+                        cache_key=global_spine_cache_key,
+                        release_root=resolved_root,
+                        release_id=release_id,
+                    )
+                except (OSError, RuntimeError, TypeError, ValueError, sqlite3.Error) as exc:
+                    global_spine_cache_summary["restore_error"] = f"{type(exc).__name__}:{exc}"
+                else:
+                    global_spine_cache_summary.update({"hit": True, "copy_mode": copy_mode})
+
+        if merge_result is not None:
+            semantic_preflight_result = {
+                "ok": True,
+                "cached": True,
+                "cache_key": global_spine_cache_key,
+                "claim_row_count": 0,
+                "unique_claim_count": 0,
+                "equivalent_collision_count": 0,
+                "conflict_count": 0,
+                "warning_count": 0,
+            }
+            progress.record(
+                "semantic_preflight",
+                "semantic_preflight",
+                "cached",
+                output=semantic_preflight_path,
+                details={"global_spine_cache_key": global_spine_cache_key},
+            )
+        else:
+            semantic_preflight_started_at = time.perf_counter()
+            progress.record(
+                "semantic_preflight",
+                "semantic_preflight",
+                "started",
+                output=semantic_preflight_path,
+                details={"fragment_count": len(fragment_results)},
+            )
+            semantic_preflight_result = preflight_spine_fragments(
+                [result.fragment_path for result in fragment_results],
+                report_path=semantic_preflight_path,
+            )
+            if not semantic_preflight_result["ok"]:
+                progress.record(
+                    "semantic_preflight",
+                    "semantic_preflight",
+                    "failed",
+                    output=semantic_preflight_path,
+                    error=str(_semantic_preflight_error(semantic_preflight_result)),
+                    details={"conflict_count": semantic_preflight_result["conflict_count"]},
+                    started_at=semantic_preflight_started_at,
+                )
+                raise _semantic_preflight_error(semantic_preflight_result)
+            progress.record(
+                "semantic_preflight",
+                "semantic_preflight",
+                "complete",
+                output=semantic_preflight_path,
+                details={
+                    "claim_row_count": semantic_preflight_result["claim_row_count"],
+                    "unique_claim_count": semantic_preflight_result["unique_claim_count"],
+                    "equivalent_collision_count": semantic_preflight_result[
+                        "equivalent_collision_count"
+                    ],
+                    "conflict_count": 0,
+                },
+                started_at=semantic_preflight_started_at,
+            )
+            merge_result = merge_spine_fragments(
+                [result.fragment_path for result in fragment_results],
+                global_spine_path,
+                release_id=release_id,
+                source_manifest_hash=plan.source_manifest_hash,
+                generate_links=generate_links,
+                semantic_preflight=False,
+                semantic_cache_key=global_spine_cache_key,
+                progress_callback=lambda event: progress.record(
+                    str(event.get("node_id") or "global_spine_merge"),
+                    str(event.get("stage") or "global_spine_merge"),
+                    str(event.get("status") or "progress"),
+                    output=event.get("output"),
+                    details=(
+                        event.get("details") if isinstance(event.get("details"), Mapping) else None
+                    ),
+                ),
+            )
+            if global_spine_cache_path is not None and global_spine_cache_key is not None:
+                try:
+                    global_spine_cache_summary["publish_mode"] = _publish_global_spine_cache(
+                        merge_result.global_spine_path,
+                        global_spine_cache_path,
+                        cache_key=global_spine_cache_key,
+                        verification=merge_result.verification,
+                    )
+                except (OSError, RuntimeError, TypeError, ValueError, sqlite3.Error) as exc:
+                    global_spine_cache_summary["publish_error"] = f"{type(exc).__name__}:{exc}"
         progress.record(
             "global_spine_merge",
             "global_spine_merge",
@@ -452,6 +1123,7 @@ def build_spine_shard_release_outputs(
                 "fragment_count": merge_result.fragment_count,
                 "counts": dict(merge_result.counts),
                 "chain_links_inserted": merge_result.chain_links.inserted,
+                "cache": global_spine_cache_summary,
             },
             started_at=merge_started_at,
         )
@@ -466,10 +1138,15 @@ def build_spine_shard_release_outputs(
                 "source": _path_label(resolved_root, global_spine_path),
             },
         )
-        router_sidecar_result = build_router_sidecar(
-            global_spine_path,
-            router_sidecar_path,
+        router_sidecar_result, router_sidecar_cache_summary = _materialize_router_sidecar(
+            global_spine_path=global_spine_path,
+            router_sidecar_path=router_sidecar_path,
             release_id=release_id,
+            fragment_results=fragment_results,
+            cache_root=plan.cache_root,
+            source_manifest_hash=plan.source_manifest_hash,
+            generate_links=generate_links,
+            no_cache=no_cache,
         )
         progress.record(
             "router_sidecar",
@@ -484,27 +1161,42 @@ def build_spine_shard_release_outputs(
                 "build_fingerprint_sha256": router_sidecar_result.metadata.get(
                     "build_fingerprint_sha256"
                 ),
+                "build_settings": router_sidecar_result.metadata.get("build_settings"),
                 "ok": bool(router_sidecar_result.verification.get("ok")),
+                "cache": router_sidecar_cache_summary,
             },
             started_at=router_sidecar_started_at,
         )
 
-        manifest_started_at = time.perf_counter()
-        shard_manifest = _write_v3_shard_manifest(
-            shard_manifest_path,
-            release_root=resolved_root,
+        router_coherence_started_at = time.perf_counter()
+        progress.record(
+            "router_coherence",
+            "router_coherence",
+            "started",
+            output=router_coherence_path,
+            details={"source": _path_label(resolved_root, global_spine_path)},
+        )
+        router_coherence_result = build_router_coherence(
+            global_spine_path,
+            router_coherence_path,
             release_id=release_id,
-            source_manifest_hash=plan.source_manifest_hash,
-            shard_results=shard_results,
         )
         progress.record(
-            "shard_manifest",
-            "manifest",
+            "router_coherence",
+            "router_coherence",
             "complete",
-            output=shard_manifest_path,
-            details={"ticker_count": shard_manifest.get("ticker_count")},
-            started_at=manifest_started_at,
+            output=router_coherence_path,
+            details={
+                "counts": dict(router_coherence_result.counts),
+                "profile_sha256": router_coherence_result.metadata.get("profile_sha256"),
+                "build_fingerprint_sha256": router_coherence_result.metadata.get(
+                    "build_fingerprint_sha256"
+                ),
+                "ok": bool(router_coherence_result.verification.get("ok")),
+            },
+            started_at=router_coherence_started_at,
         )
+
         chart_series_started_at = time.perf_counter()
         chart_series_result: ChartSeriesBuildResult | None = None
         chart_series_summary: dict[str, Any]
@@ -586,9 +1278,13 @@ def build_spine_shard_release_outputs(
                 "hits": sum(1 for result in fragment_results if result.cache_hit),
                 "misses": sum(1 for result in fragment_results if not result.cache_hit),
             },
+            "company_identity_preflight": dict(company_identity_preflight_result),
+            "semantic_preflight": dict(semantic_preflight_result),
             "global_spine": {
                 "path": _path_label(resolved_root, merge_result.global_spine_path),
                 "counts": dict(merge_result.counts),
+                "runtime": dict(merge_result.verification.get("runtime") or {}),
+                "cache": global_spine_cache_summary,
                 "chain_links": {
                     "inserted": merge_result.chain_links.inserted,
                     "exact_links": merge_result.chain_links.exact_links,
@@ -604,9 +1300,7 @@ def build_spine_shard_release_outputs(
                 "source_global_spine_sha256": router_sidecar_result.metadata.get(
                     "source_global_spine_sha256"
                 ),
-                "ranking_profile_id": router_sidecar_result.metadata.get(
-                    "ranking_profile_id"
-                ),
+                "ranking_profile_id": router_sidecar_result.metadata.get("ranking_profile_id"),
                 "ranking_profile_sha256": router_sidecar_result.metadata.get(
                     "ranking_profile_sha256"
                 ),
@@ -614,8 +1308,25 @@ def build_spine_shard_release_outputs(
                 "build_fingerprint_sha256": router_sidecar_result.metadata.get(
                     "build_fingerprint_sha256"
                 ),
+                "build_settings": router_sidecar_result.metadata.get("build_settings"),
                 "verification": dict(router_sidecar_result.verification),
                 "elapsed_ms": router_sidecar_result.elapsed_ms,
+                "cache": router_sidecar_cache_summary,
+            },
+            "router_coherence": {
+                "path": _path_label(resolved_root, router_coherence_result.path),
+                "schema_version": router_coherence_result.metadata.get("schema_version"),
+                "counts": dict(router_coherence_result.counts),
+                "source_global_spine_sha256": router_coherence_result.metadata.get(
+                    "source_global_spine_sha256"
+                ),
+                "profile_id": router_coherence_result.metadata.get("profile_id"),
+                "profile_sha256": router_coherence_result.metadata.get("profile_sha256"),
+                "build_fingerprint_sha256": router_coherence_result.metadata.get(
+                    "build_fingerprint_sha256"
+                ),
+                "verification": dict(router_coherence_result.verification),
+                "elapsed_ms": router_coherence_result.elapsed_ms,
             },
             "chart_series": chart_series_summary,
             "artifact_cleanup": {
@@ -646,6 +1357,7 @@ def build_spine_shard_release_outputs(
                 "company_count": len(shard_results),
                 "global_spine": _path_label(resolved_root, global_spine_path),
                 "router_sidecar": _path_label(resolved_root, router_sidecar_path),
+                "router_coherence": _path_label(resolved_root, router_coherence_path),
                 "chart_series": _path_label(resolved_root, chart_series_path)
                 if chart_series_path.exists()
                 else None,
@@ -661,12 +1373,14 @@ def build_spine_shard_release_outputs(
             build_summary_path=build_summary_path,
             global_spine_path=global_spine_path,
             router_sidecar_path=router_sidecar_path,
+            router_coherence_path=router_coherence_path,
             shard_results=tuple(sorted(shard_results, key=lambda result: result.ticker)),
             fragment_results=tuple(sorted(fragment_results, key=lambda result: result.ticker)),
             merge_result=merge_result,
             shard_manifest=shard_manifest,
             build_summary=build_summary,
             router_sidecar_result=router_sidecar_result,
+            router_coherence_result=router_coherence_result,
             chart_series_path=chart_series_path if chart_series_path.exists() else None,
             chart_series_result=chart_series_result,
             progress_path=resolved_progress_path,
@@ -684,20 +1398,26 @@ def plan_spine_shard_release_outputs(
     cache_root: Path | None = None,
     source_manifest_path: Path | None = None,
     no_cache: bool = False,
+    generate_links: bool = True,
 ) -> dict[str, Any]:
     """Preview the v3 release build DAG without writing release outputs."""
     resolved_root = root.expanduser().resolve()
     if not resolved_root.is_dir():
         raise FileNotFoundError(f"Release root not found: {resolved_root}")
+    load_router_ranking_profile()
+    load_router_coherence_profile()
     indexes_dir = resolved_root / "indexes"
     companies_dir = indexes_dir / "companies"
     fragments_dir = indexes_dir / "fragments" / "spine"
     global_spine_path = indexes_dir / "global_spine.sqlite"
     router_sidecar_path = resolved_root / ROUTER_SIDECAR_RELATIVE_PATH
+    router_coherence_path = resolved_root / ROUTER_COHERENCE_RELATIVE_PATH
     shard_manifest_path = indexes_dir / "shard_manifest.json"
     chart_series_path = resolved_root / CHART_SERIES_RELATIVE_PATH
     build_plan_path = indexes_dir / "build_plan.json"
     build_summary_path = indexes_dir / "build_summary.json"
+    company_identity_preflight_path = indexes_dir / "company_identity_preflight.json"
+    semantic_preflight_path = indexes_dir / "semantic_preflight.json"
     resolved_source_manifest_path = (
         source_manifest_path.expanduser().resolve()
         if source_manifest_path is not None
@@ -712,7 +1432,8 @@ def plan_spine_shard_release_outputs(
         sqlite_path=global_spine_path,
         cache_root=cache_root,
         workers=workers,
-        source_manifest_path=None,
+        source_manifest_path=resolved_source_manifest_path,
+        source_manifest_payload=source_manifest,
     )
     plan = replace(
         plan,
@@ -748,7 +1469,9 @@ def plan_spine_shard_release_outputs(
         fragment_cache_errors = (
             ("no_cache",)
             if no_cache
-            else _verify_spine_fragment_cache(fragment_cache_path, ticker=ticker, cache_key=fragment_cache_key)
+            else _verify_spine_fragment_cache(
+                fragment_cache_path, ticker=ticker, cache_key=fragment_cache_key
+            )
         )
         fragment_cache_hit = False if no_cache else not fragment_cache_errors
         if not company_cache_hit or not fragment_cache_hit:
@@ -761,15 +1484,48 @@ def plan_spine_shard_release_outputs(
                 "cached_artifact_count": len(company_plan.cached_items),
                 "company_cache_hit": company_cache_hit,
                 "company_cache_key": company_item.cache_key,
-                "company_cache_errors": list(company_item.cache_errors if not no_cache else ("no_cache",)),
+                "company_cache_errors": list(
+                    company_item.cache_errors if not no_cache else ("no_cache",)
+                ),
                 "company_shard_path": _path_label(resolved_root, spec["shard_path"]),
-                "spine_fragment_path": _path_label(resolved_root, fragments_dir / f"{_safe_ticker_filename(ticker)}.sqlite"),
+                "spine_fragment_path": _path_label(
+                    resolved_root, fragments_dir / f"{_safe_ticker_filename(ticker)}.sqlite"
+                ),
                 "spine_fragment_cache_hit": fragment_cache_hit,
                 "spine_fragment_cache_key": fragment_cache_key,
                 "spine_fragment_cache_errors": list(fragment_cache_errors),
                 "estimated_cost": int(spec["estimated_cost"]),
             }
         )
+
+    router_cache_key: str | None = None
+    router_cache_path_value: Path | None = None
+    router_cache_errors: tuple[str, ...] = ("no_cache",) if no_cache else ()
+    if not no_cache:
+        try:
+            router_cache_key = router_sidecar_semantic_cache_key(
+                fragment_cache_keys=[
+                    (str(row["ticker"]), str(row["spine_fragment_cache_key"])) for row in companies
+                ],
+                source_manifest_hash=plan.source_manifest_hash,
+                generate_links=generate_links,
+                global_spine_schema_version=GLOBAL_SPINE_SCHEMA_VERSION,
+                global_spine_builder_version=GLOBAL_SPINE_BUILDER_VERSION,
+                spine_projection_version=SPINE_PROJECTION_VERSION,
+                cross_company_link_builder_version=CROSS_COMPANY_LINK_BUILDER_VERSION,
+                metric_dictionary=metric_dictionary_binding(),
+            )
+            router_cache_path_value = router_sidecar_cache_path(
+                plan.cache_root,
+                router_cache_key,
+            )
+            router_cache_errors = verify_router_sidecar_cache(
+                router_cache_path_value,
+                cache_key=router_cache_key,
+            )
+        except (OSError, TypeError, ValueError, sqlite3.Error) as exc:
+            router_cache_errors = (f"{type(exc).__name__}:{exc}",)
+    router_cache_hit = not no_cache and not router_cache_errors
 
     company_nodes = [
         {
@@ -781,7 +1537,9 @@ def plan_spine_shard_release_outputs(
             "cache_key": row["company_cache_key"],
             "cache_hit": row["company_cache_hit"],
             "status": "cached" if row["company_cache_hit"] else "rebuild",
-            "rebuild_reason": None if row["company_cache_hit"] else ",".join(row["company_cache_errors"] or ["cache_miss"]),
+            "rebuild_reason": None
+            if row["company_cache_hit"]
+            else ",".join(row["company_cache_errors"] or ["cache_miss"]),
         }
         for row in companies
     ]
@@ -790,7 +1548,7 @@ def plan_spine_shard_release_outputs(
             "id": f"spine_fragment:{row['ticker']}",
             "stage": "spine_fragment",
             "ticker": row["ticker"],
-            "depends_on": [f"company_shard:{row['ticker']}"],
+            "depends_on": ["company_identity_preflight"],
             "output": row["spine_fragment_path"],
             "cache_key": row["spine_fragment_cache_key"],
             "cache_hit": row["spine_fragment_cache_hit"],
@@ -804,9 +1562,17 @@ def plan_spine_shard_release_outputs(
     merge_dependencies = [node["id"] for node in fragment_nodes]
     nodes: list[dict[str, Any]] = [
         {
+            "id": "static_preflight",
+            "stage": "static_preflight",
+            "depends_on": [],
+            "output": None,
+            "cache_hit": False,
+            "status": "planned",
+        },
+        {
             "id": "source_manifest",
             "stage": "source_discovery",
-            "depends_on": [],
+            "depends_on": ["static_preflight"],
             "output": _path_label(resolved_root, resolved_source_manifest_path),
             "cache_hit": False,
             "status": "planned",
@@ -821,11 +1587,35 @@ def plan_spine_shard_release_outputs(
             "workers": parallelism.artifact_compile_workers,
         },
         *company_nodes,
+        {
+            "id": "company_identity_preflight",
+            "stage": "company_identity_preflight",
+            "depends_on": [node["id"] for node in company_nodes],
+            "output": _path_label(resolved_root, company_identity_preflight_path),
+            "cache_hit": False,
+            "status": "planned",
+        },
+        {
+            "id": "shard_manifest",
+            "stage": "manifest",
+            "depends_on": ["company_identity_preflight"],
+            "output": _path_label(resolved_root, shard_manifest_path),
+            "cache_hit": False,
+            "status": "planned",
+        },
         *fragment_nodes,
+        {
+            "id": "semantic_preflight",
+            "stage": "semantic_preflight",
+            "depends_on": merge_dependencies,
+            "output": _path_label(resolved_root, semantic_preflight_path),
+            "cache_hit": False,
+            "status": "planned",
+        },
         {
             "id": "global_spine_merge",
             "stage": "global_spine_merge",
-            "depends_on": merge_dependencies,
+            "depends_on": ["semantic_preflight"],
             "output": _path_label(resolved_root, global_spine_path),
             "cache_hit": False,
             "status": "rebuild",
@@ -843,16 +1633,21 @@ def plan_spine_shard_release_outputs(
             "stage": "router_sidecar",
             "depends_on": ["global_spine_merge", "cross_company_links"],
             "output": _path_label(resolved_root, router_sidecar_path),
-            "cache_hit": False,
-            "status": "rebuild",
+            "cache_key": router_cache_key,
+            "cache_path": str(router_cache_path_value)
+            if router_cache_path_value is not None
+            else None,
+            "cache_hit": router_cache_hit,
+            "cache_errors": list(router_cache_errors),
+            "status": "cached" if router_cache_hit else "rebuild",
         },
         {
-            "id": "shard_manifest",
-            "stage": "manifest",
-            "depends_on": [node["id"] for node in company_nodes],
-            "output": _path_label(resolved_root, shard_manifest_path),
+            "id": "router_coherence",
+            "stage": "router_coherence",
+            "depends_on": ["global_spine_merge", "cross_company_links"],
+            "output": _path_label(resolved_root, router_coherence_path),
             "cache_hit": False,
-            "status": "planned",
+            "status": "rebuild",
         },
         {
             "id": "chart_series",
@@ -868,6 +1663,7 @@ def plan_spine_shard_release_outputs(
             "depends_on": [
                 "global_spine_merge",
                 "router_sidecar",
+                "router_coherence",
                 "shard_manifest",
                 "chart_series",
             ],
@@ -904,6 +1700,7 @@ def plan_spine_shard_release_outputs(
         },
         "cache_root": str(plan.cache_root),
         "no_cache": no_cache,
+        "generate_links": generate_links,
         "artifact_count": len(plan.items),
         "company_count": len(companies),
         "worker_count": parallelism.company_workers if companies else 0,
@@ -911,13 +1708,28 @@ def plan_spine_shard_release_outputs(
         "dirty_tickers": sorted(dirty_tickers),
         "dirty_company_count": sum(1 for row in companies if not row["company_cache_hit"]),
         "cached_company_count": sum(1 for row in companies if row["company_cache_hit"]),
-        "dirty_spine_fragment_count": sum(1 for row in companies if not row["spine_fragment_cache_hit"]),
-        "cached_spine_fragment_count": sum(1 for row in companies if row["spine_fragment_cache_hit"]),
+        "dirty_spine_fragment_count": sum(
+            1 for row in companies if not row["spine_fragment_cache_hit"]
+        ),
+        "cached_spine_fragment_count": sum(
+            1 for row in companies if row["spine_fragment_cache_hit"]
+        ),
+        "router_sidecar_cache": {
+            "hit": router_cache_hit,
+            "key": router_cache_key,
+            "path": str(router_cache_path_value) if router_cache_path_value is not None else None,
+            "errors": list(router_cache_errors),
+        },
         "outputs": {
             "build_plan": _path_label(resolved_root, build_plan_path),
             "build_summary": _path_label(resolved_root, build_summary_path),
+            "company_identity_preflight": _path_label(
+                resolved_root, company_identity_preflight_path
+            ),
+            "semantic_preflight": _path_label(resolved_root, semantic_preflight_path),
             "global_spine": _path_label(resolved_root, global_spine_path),
             "router_sidecar": _path_label(resolved_root, router_sidecar_path),
+            "router_coherence": _path_label(resolved_root, router_coherence_path),
             "shard_manifest": _path_label(resolved_root, shard_manifest_path),
             "company_shards_dir": _path_label(resolved_root, companies_dir),
             "spine_fragments_dir": _path_label(resolved_root, fragments_dir),
@@ -987,10 +1799,25 @@ def _build_company_shard_from_plan(
         try:
             _copy_sqlite_database(company_item.shard_cache_path, resolved_shard_path)
             _rebase_company_shard_release_paths(resolved_shard_path, release_root=resolved_root)
-            verification = verify_source_artifact_sqlite(resolved_shard_path)
+            verification = _verify_restored_company_shard(
+                resolved_shard_path,
+                ticker=normalized_ticker,
+                cache_key=company_item.cache_key,
+            )
             if not verification["ok"]:
                 errors = ", ".join(verification["errors"])
-                raise RuntimeError(f"cached company shard failed verification: {normalized_ticker}: {errors}")
+                raise RuntimeError(
+                    f"cached company shard failed verification: {normalized_ticker}: {errors}"
+                )
+            write_immutable_sqlite_cache_seal(
+                resolved_shard_path,
+                kind="company_shard",
+                cache_key=company_item.cache_key,
+                verification=verification,
+                metadata=verification.get("metadata") or {},
+                counts=verification.get("counts") or {},
+                source_path=company_item.shard_cache_path,
+            )
             return CompanyShardBuildResult(
                 ticker=normalized_ticker,
                 shard_path=resolved_shard_path,
@@ -1027,7 +1854,25 @@ def _build_company_shard_from_plan(
             errors = ", ".join(verification["errors"])
             raise RuntimeError(f"company shard failed verification: {normalized_ticker}: {errors}")
         replace_sqlite_database(tmp_path, resolved_shard_path)
-        _store_sqlite_database_cache(resolved_shard_path, company_item.shard_cache_path)
+        release_metadata = _read_company_shard_metadata(resolved_shard_path)
+        write_immutable_sqlite_cache_seal(
+            resolved_shard_path,
+            kind="company_shard",
+            cache_key=company_item.cache_key,
+            verification=verification,
+            metadata=release_metadata,
+            counts=verification.get("counts") or {},
+            source_path=tmp_path,
+        )
+        _store_sqlite_database_cache(
+            resolved_shard_path,
+            company_item.shard_cache_path,
+            verification=verification,
+            cache_kind="company_shard",
+            cache_key=company_item.cache_key,
+            cache_metadata=release_metadata,
+            cache_counts=verification.get("counts") or {},
+        )
         return CompanyShardBuildResult(
             ticker=normalized_ticker,
             shard_path=resolved_shard_path,
@@ -1048,8 +1893,7 @@ def _company_build_specs(
     no_cache: bool,
     artifact_workers: int = 1,
 ) -> list[dict[str, Any]]:
-    specs: list[dict[str, Any]] = []
-    for company in plan.company_items:
+    def build_spec(company: SourceCompanyShardPlanItem) -> dict[str, Any]:
         ticker = _normalize_ticker(company.ticker)
         shard_path = companies_dir / f"{_safe_ticker_filename(ticker)}.sqlite"
         company_plan = _filter_plan_for_company(
@@ -1059,14 +1903,20 @@ def _company_build_specs(
             no_cache=no_cache,
             artifact_workers=artifact_workers,
         )
-        specs.append(
-            {
-                "ticker": ticker,
-                "shard_path": shard_path,
-                "company_plan": company_plan,
-                "estimated_cost": _company_build_cost(company_plan),
-            }
-        )
+        return {
+            "ticker": ticker,
+            "shard_path": shard_path,
+            "company_plan": company_plan,
+            "estimated_cost": _company_build_cost(company_plan),
+        }
+
+    companies = tuple(plan.company_items)
+    worker_count = min(max(1, int(plan.workers)), len(companies)) if companies else 1
+    if worker_count > 1:
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            specs = list(executor.map(build_spec, companies))
+    else:
+        specs = [build_spec(company) for company in companies]
     return sorted(specs, key=lambda spec: (-int(spec["estimated_cost"]), str(spec["ticker"])))
 
 
@@ -1183,7 +2033,9 @@ def _build_company_shards_for_release(
                         "started",
                         ticker=ticker,
                         output=shard_path,
-                        cache_hit=False if no_cache else bool(company_plan.company_items[0].cache_hit),
+                        cache_hit=False
+                        if no_cache
+                        else bool(company_plan.company_items[0].cache_hit),
                         details={"completed": len(results), "total": total},
                     )
                 future = executor.submit(
@@ -1362,7 +2214,11 @@ def _emit_spine_fragments_for_release(
                         cache_hit=False if no_cache else None,
                         details={"completed": len(results), "total": total},
                     )
-                futures[executor.submit(_emit_spine_fragment_cached, **task)] = (ticker, fragment_path, started_at)
+                futures[executor.submit(_emit_spine_fragment_cached, **task)] = (
+                    ticker,
+                    fragment_path,
+                    started_at,
+                )
             for future in as_completed(futures):
                 ticker, fragment_path, started_at = futures[future]
                 try:
@@ -1443,9 +2299,7 @@ def _write_v3_shard_manifest(
     expected_metric_dictionary = metric_dictionary_binding()
     for result in sorted(shard_results, key=lambda item: item.ticker):
         counts = _company_shard_counts(result.shard_path)
-        shard_metric_dictionary = _company_shard_metric_dictionary_binding(
-            result.shard_path
-        )
+        shard_metric_dictionary = _company_shard_metric_dictionary_binding(result.shard_path)
         binding_errors = metric_dictionary_binding_errors(
             shard_metric_dictionary,
             expected=expected_metric_dictionary,
@@ -1455,6 +2309,8 @@ def _write_v3_shard_manifest(
                 f"company shard metric dictionary mismatch: {result.ticker}: "
                 + ", ".join(binding_errors)
             )
+        shard_sha256 = _file_sha256(result.shard_path)
+        record_immutable_sqlite_cache_sha256(result.shard_path, shard_sha256)
         shards[result.ticker] = {
             "ticker": result.ticker,
             "path": _path_label(release_root / "indexes", result.shard_path),
@@ -1467,7 +2323,7 @@ def _write_v3_shard_manifest(
             "quality_event_count": counts.get("quality_events", 0),
             "row_counts": counts,
             "quality_summary": _company_shard_quality_summary(result.shard_path),
-            "sha256": _file_sha256(result.shard_path),
+            "sha256": shard_sha256,
             "cache_hit": result.cache_hit,
             "cache_key": result.cache_key,
             "metric_dictionary": shard_metric_dictionary,
@@ -1493,9 +2349,7 @@ def _write_v3_shard_manifest(
 def _company_shard_metric_dictionary_binding(path: Path) -> dict[str, Any]:
     try:
         with sqlite3.connect(path) as conn:
-            row = conn.execute(
-                "SELECT value FROM metadata WHERE key = 'build'"
-            ).fetchone()
+            row = conn.execute("SELECT value FROM metadata WHERE key = 'build'").fetchone()
     except sqlite3.Error as exc:
         raise RuntimeError(f"cannot read company shard metadata: {path}: {exc}") from exc
     if row is None:
@@ -1508,6 +2362,112 @@ def _company_shard_metric_dictionary_binding(path: Path) -> dict[str, Any]:
     return dict(binding) if isinstance(binding, Mapping) else {}
 
 
+def _sqlite_compile_max_worker_threads(conn: sqlite3.Connection) -> int:
+    """Return the SQLite library's compiled auxiliary-worker ceiling."""
+    for row in conn.execute("PRAGMA compile_options"):
+        option = str(row[0] or "")
+        if not option.startswith("MAX_WORKER_THREADS="):
+            continue
+        try:
+            return max(0, int(option.split("=", 1)[1]))
+        except ValueError:
+            return 0
+    return 0
+
+
+def _global_merge_sqlite_thread_limit(
+    conn: sqlite3.Connection,
+    *,
+    requested: int | None = None,
+    cpu_count: int | None = None,
+) -> int:
+    """Bound SQLite sort workers by the request, CPU, and compile ceiling."""
+    compiled_limit = _sqlite_compile_max_worker_threads(conn)
+    resolved_cpu_count = max(1, int(cpu_count or os.cpu_count() or 1))
+    auxiliary_cpu_limit = max(0, resolved_cpu_count - 1)
+    if requested is None:
+        raw = os.getenv("KRW_INDEX_SQLITE_THREADS")
+        try:
+            requested = int(raw) if raw is not None else DEFAULT_GLOBAL_MERGE_SQLITE_THREADS
+        except ValueError:
+            requested = DEFAULT_GLOBAL_MERGE_SQLITE_THREADS
+    return max(0, min(int(requested), compiled_limit, auxiliary_cpu_limit))
+
+
+def _configure_global_merge_connection(conn: sqlite3.Connection) -> dict[str, int | str]:
+    """Configure the disposable global merge database for bounded bulk writes."""
+    journal_mode = str(conn.execute("PRAGMA journal_mode=OFF").fetchone()[0])
+    conn.execute("PRAGMA synchronous=OFF")
+    conn.execute("PRAGMA temp_store=FILE")
+    conn.execute(f"PRAGMA cache_size=-{DEFAULT_GLOBAL_MERGE_SQLITE_CACHE_KIB}")
+    requested_threads = _global_merge_sqlite_thread_limit(conn)
+    conn.execute(f"PRAGMA threads={requested_threads}")
+    actual_threads = int(conn.execute("PRAGMA threads").fetchone()[0])
+    return {
+        "sqlite_version": sqlite3.sqlite_version,
+        "journal_mode": journal_mode,
+        "synchronous": int(conn.execute("PRAGMA synchronous").fetchone()[0]),
+        "temp_store": int(conn.execute("PRAGMA temp_store").fetchone()[0]),
+        "cache_size_kib": abs(int(conn.execute("PRAGMA cache_size").fetchone()[0])),
+        "compiled_max_worker_threads": _sqlite_compile_max_worker_threads(conn),
+        "threads": actual_threads,
+    }
+
+
+def _elapsed_ms(started_at: float) -> int:
+    return max(0, int((time.perf_counter() - started_at) * 1000))
+
+
+def _cleanup_stale_spine_temps(
+    target_path: Path,
+    *,
+    older_than_seconds: int | None = None,
+) -> list[str]:
+    """Remove abandoned temp databases without touching a plausibly active build."""
+    resolved = target_path.expanduser().resolve()
+    raw_age = os.getenv("KRW_INDEX_STALE_TMP_AGE_SECONDS")
+    if older_than_seconds is None:
+        try:
+            older_than_seconds = (
+                int(raw_age) if raw_age is not None else DEFAULT_SPINE_STALE_TMP_AGE_SECONDS
+            )
+        except ValueError:
+            older_than_seconds = DEFAULT_SPINE_STALE_TMP_AGE_SECONDS
+    threshold = max(0, int(older_than_seconds))
+    cutoff = time.time() - threshold
+    candidates: set[Path] = set()
+    for suffix in ("", "-wal", "-shm"):
+        for path in resolved.parent.glob(f".{resolved.name}.*.tmp{suffix}"):
+            base = Path(str(path)[: -len(suffix)]) if suffix else path
+            candidates.add(base)
+    seal_path = spine_verification_seal_path(resolved)
+    candidates.update(resolved.parent.glob(f".{seal_path.name}.*.tmp"))
+    removed: list[str] = []
+    for candidate in sorted(candidates):
+        members = (candidate, Path(str(candidate) + "-wal"), Path(str(candidate) + "-shm"))
+        mtimes = []
+        for member in members:
+            try:
+                mtimes.append(member.stat().st_mtime)
+            except FileNotFoundError:
+                continue
+        if not mtimes:
+            continue
+        if max(mtimes) > cutoff:
+            continue
+        if candidate.name.startswith(f".{resolved.name}."):
+            cleanup_sqlite_database_files(candidate)
+        else:
+            candidate.unlink(missing_ok=True)
+        removed.append(candidate.name)
+    return removed
+
+
+def _cleanup_spine_database_and_seal(path: Path) -> None:
+    cleanup_sqlite_database_files(path)
+    spine_verification_seal_path(path).unlink(missing_ok=True)
+
+
 def merge_spine_fragments(
     fragments: Sequence[Path],
     global_spine_path: Path,
@@ -1518,25 +2478,57 @@ def merge_spine_fragments(
     generate_links: bool = True,
     created_at: str | None = None,
     progress_callback: Callable[[Mapping[str, Any]], None] | None = None,
+    semantic_preflight: bool = True,
+    semantic_preflight_report_path: Path | None = None,
+    semantic_cache_key: str | None = None,
 ) -> GlobalSpineMergeResult:
     """Merge per-company spine fragments into one deterministic global spine."""
-    resolved_fragments = tuple(sorted((path.expanduser().resolve() for path in fragments), key=lambda path: path.name))
+    merge_started_at = time.perf_counter()
+    stage_timings_ms: dict[str, int] = {}
+    resolved_fragments = tuple(
+        sorted((path.expanduser().resolve() for path in fragments), key=lambda path: path.name)
+    )
     if not resolved_fragments:
         raise ValueError("at least one spine fragment is required")
+    if semantic_preflight:
+        preflight_result = preflight_spine_fragments(
+            resolved_fragments,
+            report_path=semantic_preflight_report_path,
+        )
+        if not preflight_result["ok"]:
+            raise _semantic_preflight_error(preflight_result)
     resolved_output = global_spine_path.expanduser().resolve()
     resolved_output.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = resolved_output.parent / f".{resolved_output.name}.{os.getpid()}.{time.time_ns()}.tmp"
+    stale_started_at = time.perf_counter()
+    stale_temps_removed = _cleanup_stale_spine_temps(resolved_output)
+    stage_timings_ms["stale_temp_cleanup"] = _elapsed_ms(stale_started_at)
+    tmp_path = (
+        resolved_output.parent / f".{resolved_output.name}.{os.getpid()}.{time.time_ns()}.tmp"
+    )
     cleanup_sqlite_database_files(tmp_path)
-    if replace:
-        cleanup_sqlite_database_files(resolved_output)
+    if resolved_output.exists() and not replace:
+        raise FileExistsError(f"global spine already exists: {resolved_output}")
+    sqlite_settings: dict[str, int | str] = {}
     try:
         with sqlite3.connect(tmp_path) as conn:
             conn.row_factory = sqlite3.Row
-            conn.execute("PRAGMA journal_mode=OFF")
-            conn.execute("PRAGMA synchronous=OFF")
-            conn.execute("PRAGMA temp_store=MEMORY")
-            conn.execute("PRAGMA cache_size=-1048576")
+            sqlite_settings = _configure_global_merge_connection(conn)
+            if progress_callback:
+                progress_callback(
+                    {
+                        "node_id": "global_spine_merge:runtime",
+                        "stage": "global_spine_merge",
+                        "status": "configured",
+                        "output": resolved_output,
+                        "details": {
+                            "sqlite": dict(sqlite_settings),
+                            "stale_temps_removed": stale_temps_removed,
+                        },
+                    }
+                )
+            schema_started_at = time.perf_counter()
             create_global_spine_schema(conn, include_secondary_indexes=False)
+            stage_timings_ms["schema_create"] = _elapsed_ms(schema_started_at)
             write_global_spine_metadata(
                 conn,
                 {
@@ -1547,6 +2539,9 @@ def merge_spine_fragments(
                     "source_manifest_hash": source_manifest_hash,
                     "metric_dictionary": metric_dictionary_binding(),
                     "spine_projection_version": SPINE_PROJECTION_VERSION,
+                    "semantic_identity_policy_version": SEMANTIC_IDENTITY_POLICY_VERSION,
+                    "global_spine_cache_format_version": GLOBAL_SPINE_CACHE_FORMAT_VERSION,
+                    "global_spine_cache_key": semantic_cache_key,
                     "source_artifact_sqlite_schema_version": SOURCE_ARTIFACT_SQLITE_SCHEMA_VERSION,
                     "source_artifact_sqlite_builder_version": SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION,
                     "company_shard_schema_version": COMPANY_SHARD_SCHEMA_VERSION,
@@ -1554,6 +2549,9 @@ def merge_spine_fragments(
                     "created_at": created_at or datetime.now(timezone.utc).isoformat(),
                 },
             )
+            fragment_verification_ms = 0
+            fragment_merge_ms = 0
+            benign_duplicate_counts = {"objects": 0, "edges": 0, "total": 0}
             for index, fragment in enumerate(resolved_fragments, start=1):
                 if progress_callback:
                     progress_callback(
@@ -1569,18 +2567,41 @@ def merge_spine_fragments(
                             },
                         }
                     )
-                verification = verify_global_spine_schema(fragment)
+                verification_started_at = time.perf_counter()
+                verification = verify_spine_fragment_schema(
+                    fragment,
+                    deep=True,
+                    trust_seal=True,
+                )
+                fragment_verification_elapsed = _elapsed_ms(verification_started_at)
+                fragment_verification_ms += fragment_verification_elapsed
                 if not verification["ok"]:
                     errors = ", ".join(verification["errors"])
                     raise RuntimeError(f"spine fragment failed verification: {fragment}: {errors}")
                 schema_name = f"frag_{index}"
                 conn.execute(f"ATTACH DATABASE ? AS {schema_name}", (str(fragment),))
+                fragment_merge_started_at = time.perf_counter()
+                fragment_benign_duplicates = {"objects": 0, "edges": 0}
                 try:
                     for table_name in _SPINE_FRAGMENT_MERGE_TABLES:
-                        _merge_spine_table(conn, schema_name, table_name)
+                        duplicate_count = _merge_spine_table(
+                            conn,
+                            schema_name,
+                            table_name,
+                            fragment_path=fragment,
+                        )
+                        if table_name == "global_object_locator":
+                            fragment_benign_duplicates["objects"] += duplicate_count
+                        elif table_name == "global_edge_spine":
+                            fragment_benign_duplicates["edges"] += duplicate_count
                     conn.commit()
+                except Exception:
+                    conn.rollback()
+                    raise
                 finally:
                     conn.execute(f"DETACH DATABASE {schema_name}")
+                fragment_merge_elapsed = _elapsed_ms(fragment_merge_started_at)
+                fragment_merge_ms += fragment_merge_elapsed
                 if progress_callback:
                     progress_callback(
                         {
@@ -1592,9 +2613,36 @@ def merge_spine_fragments(
                                 "completed": index,
                                 "total": len(resolved_fragments),
                                 "fragment": fragment.name,
+                                "verification_mode": verification.get("verification_mode"),
+                                "integrity_source": verification.get("integrity_source"),
+                                "verification_ms": fragment_verification_elapsed,
+                                "merge_ms": fragment_merge_elapsed,
+                                "benign_duplicate_counts": {
+                                    **fragment_benign_duplicates,
+                                    "total": sum(fragment_benign_duplicates.values()),
+                                },
                             },
                         }
                     )
+            stage_timings_ms["fragment_verification"] = fragment_verification_ms
+            stage_timings_ms["fragment_merge"] = fragment_merge_ms
+            # Derive the final figures from the occurrence tables rather than
+            # summing per-fragment collisions.  This remains exact if the same
+            # logical occurrence is supplied twice and ignored by its composite
+            # primary key.
+            benign_duplicate_counts = {
+                "objects": max(
+                    0,
+                    _count_table(conn, "global_object_replica")
+                    - _count_table(conn, "global_object_locator"),
+                ),
+                "edges": max(
+                    0,
+                    _count_table(conn, "global_edge_replica")
+                    - _count_table(conn, "global_edge_spine"),
+                ),
+            }
+            benign_duplicate_counts["total"] = sum(benign_duplicate_counts.values())
             if progress_callback:
                 progress_callback(
                     {
@@ -1605,6 +2653,7 @@ def merge_spine_fragments(
                         "details": {"generate_links": generate_links},
                     }
                 )
+            chain_started_at = time.perf_counter()
             chain_result = (
                 generate_cross_company_links(conn, replace=True)
                 if generate_links
@@ -1616,10 +2665,13 @@ def merge_spine_fragments(
                     skipped_generic_keys=0,
                 )
             )
+            stage_timings_ms["chain_generation"] = _elapsed_ms(chain_started_at)
             # Build every regenerable B-tree once, after the bulk inserts and
             # cross-company link generation.  Creating these indexes while 332
             # fragments stream in multiplies maintenance work substantially.
+            secondary_index_started_at = time.perf_counter()
             create_global_spine_schema(conn, include_secondary_indexes=True)
+            stage_timings_ms["secondary_index_build"] = _elapsed_ms(secondary_index_started_at)
             if progress_callback:
                 progress_callback(
                     {
@@ -1631,14 +2683,35 @@ def merge_spine_fragments(
                             "inserted": chain_result.inserted,
                             "exact_links": chain_result.exact_links,
                             "similarity_links": chain_result.similarity_links,
+                            "chain_generation_ms": stage_timings_ms["chain_generation"],
+                            "secondary_index_build_ms": stage_timings_ms["secondary_index_build"],
                         },
                     }
                 )
+            counts_started_at = time.perf_counter()
             counts = {
                 table_name: _count_table(conn, table_name)
                 for table_name in GLOBAL_SPINE_TABLES
                 if table_name != "metadata"
             }
+            counts.update(
+                {
+                    "benign_duplicate_objects": benign_duplicate_counts["objects"],
+                    "benign_duplicate_edges": benign_duplicate_counts["edges"],
+                    "benign_duplicate_total": benign_duplicate_counts["total"],
+                }
+            )
+            stage_timings_ms["counts"] = _elapsed_ms(counts_started_at)
+            optimize_started_at = time.perf_counter()
+            conn.execute("PRAGMA optimize")
+            stage_timings_ms["optimize"] = _elapsed_ms(optimize_started_at)
+            runtime_metadata = {
+                "sqlite": dict(sqlite_settings),
+                "stage_timings_ms": dict(stage_timings_ms),
+                "stale_temps_removed": stale_temps_removed,
+                "benign_duplicate_counts": dict(benign_duplicate_counts),
+            }
+            metadata_started_at = time.perf_counter()
             write_global_spine_metadata(
                 conn,
                 {
@@ -1649,6 +2722,9 @@ def merge_spine_fragments(
                     "source_manifest_hash": source_manifest_hash,
                     "metric_dictionary": metric_dictionary_binding(),
                     "spine_projection_version": SPINE_PROJECTION_VERSION,
+                    "semantic_identity_policy_version": SEMANTIC_IDENTITY_POLICY_VERSION,
+                    "global_spine_cache_format_version": GLOBAL_SPINE_CACHE_FORMAT_VERSION,
+                    "global_spine_cache_key": semantic_cache_key,
                     "source_artifact_sqlite_schema_version": SOURCE_ARTIFACT_SQLITE_SCHEMA_VERSION,
                     "source_artifact_sqlite_builder_version": SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION,
                     "company_shard_schema_version": COMPANY_SHARD_SCHEMA_VERSION,
@@ -1661,17 +2737,73 @@ def merge_spine_fragments(
                         "key_count": chain_result.key_count,
                         "skipped_generic_keys": chain_result.skipped_generic_keys,
                     },
+                    "benign_duplicate_counts": benign_duplicate_counts,
+                    "merge_runtime": runtime_metadata,
                     "created_at": created_at or datetime.now(timezone.utc).isoformat(),
                 },
             )
             conn.commit()
-            conn.execute("PRAGMA optimize")
+            stage_timings_ms["metadata_finalize"] = _elapsed_ms(metadata_started_at)
+            sqlite_finalize_started_at = time.perf_counter()
             conn.execute("PRAGMA journal_mode=DELETE").fetchall()
-        replace_sqlite_database(tmp_path, resolved_output)
-        verification = verify_global_spine_schema(resolved_output)
-        if not verification["ok"]:
-            errors = ", ".join(verification["errors"])
+            stage_timings_ms["sqlite_finalize"] = _elapsed_ms(sqlite_finalize_started_at)
+        deep_verification_started_at = time.perf_counter()
+        deep_verification = verify_global_spine_schema(tmp_path)
+        stage_timings_ms["deep_verification"] = _elapsed_ms(deep_verification_started_at)
+        stage_timings_ms["replica_invariant_verification"] = int(
+            (deep_verification.get("replica_invariants") or {}).get("elapsed_ms") or 0
+        )
+        if not deep_verification["ok"]:
+            errors = ", ".join(deep_verification["errors"])
             raise RuntimeError(f"merged global spine failed verification: {errors}")
+        replace_started_at = time.perf_counter()
+        replace_sqlite_database(tmp_path, resolved_output)
+        stage_timings_ms["atomic_replace"] = _elapsed_ms(replace_started_at)
+        seal_started_at = time.perf_counter()
+        write_spine_verification_seal(
+            resolved_output,
+            deep_verification,
+            source_path=tmp_path,
+            details={
+                "sqlite": dict(sqlite_settings),
+                "pre_publish_stage_timings_ms": dict(stage_timings_ms),
+            },
+        )
+        stage_timings_ms["seal_write"] = _elapsed_ms(seal_started_at)
+        # The atomic replace preserves the bytes just verified at tmp_path.
+        # Writing the stat-bound seal records that result; immediately reading
+        # the same file again adds no independent evidence.
+        stage_timings_ms["sealed_verification"] = 0
+        stage_timings_ms["total"] = _elapsed_ms(merge_started_at)
+        runtime = {
+            "sqlite": dict(sqlite_settings),
+            "stage_timings_ms": dict(stage_timings_ms),
+            "stale_temps_removed": stale_temps_removed,
+            "benign_duplicate_counts": dict(benign_duplicate_counts),
+        }
+        verification = {
+            **deep_verification,
+            "path": str(resolved_output),
+            "integrity_source": "immutable_seal",
+            "verification_mode": "deep-sealed",
+            "deep_verification": {
+                "integrity_check": deep_verification.get("integrity_check"),
+                "integrity_source": deep_verification.get("integrity_source"),
+                "verification_mode": deep_verification.get("verification_mode"),
+            },
+            "benign_duplicate_counts": dict(benign_duplicate_counts),
+            "runtime": runtime,
+        }
+        if progress_callback:
+            progress_callback(
+                {
+                    "node_id": "global_spine_merge:runtime",
+                    "stage": "global_spine_merge",
+                    "status": "complete",
+                    "output": resolved_output,
+                    "details": runtime,
+                }
+            )
         return GlobalSpineMergeResult(
             global_spine_path=resolved_output,
             fragment_count=len(resolved_fragments),
@@ -1696,31 +2828,42 @@ def emit_spine_fragment_from_company_shard(
     replace: bool = True,
 ) -> SpineFragmentResult:
     """Project one company shard into a compact global spine fragment."""
+    fragment_started_at = time.perf_counter()
+    stage_timings_ms: dict[str, int] = {}
     normalized_ticker = _normalize_ticker(ticker)
     resolved_shard_path = shard_path.expanduser().resolve()
     resolved_fragment_path = fragment_path.expanduser().resolve()
     if not resolved_shard_path.is_file():
         raise FileNotFoundError(f"Company shard not found: {resolved_shard_path}")
     resolved_fragment_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = resolved_fragment_path.parent / f".{resolved_fragment_path.name}.{os.getpid()}.{time.time_ns()}.tmp"
+    stale_started_at = time.perf_counter()
+    stale_temps_removed = _cleanup_stale_spine_temps(resolved_fragment_path)
+    stage_timings_ms["stale_temp_cleanup"] = _elapsed_ms(stale_started_at)
+    tmp_path = (
+        resolved_fragment_path.parent
+        / f".{resolved_fragment_path.name}.{os.getpid()}.{time.time_ns()}.tmp"
+    )
     cleanup_sqlite_database_files(tmp_path)
-    if replace:
-        cleanup_sqlite_database_files(resolved_fragment_path)
+    if resolved_fragment_path.exists() and not replace:
+        raise FileExistsError(f"spine fragment already exists: {resolved_fragment_path}")
     release_shard_path = shard_path_in_release or f"indexes/companies/{normalized_ticker}.sqlite"
     counts: dict[str, int] = defaultdict(int)
     try:
+        projection_started_at = time.perf_counter()
         with sqlite3.connect(resolved_shard_path) as source, sqlite3.connect(tmp_path) as target:
             source.row_factory = sqlite3.Row
             target.row_factory = sqlite3.Row
-            create_global_spine_schema(target)
+            create_spine_fragment_schema(target)
             write_global_spine_metadata(
                 target,
                 {
                     "format": SPINE_FRAGMENT_FORMAT_VERSION,
+                    "fragment_schema_version": SPINE_FRAGMENT_SCHEMA_VERSION,
                     "builder_version": GLOBAL_SPINE_BUILDER_VERSION,
                     "index_layout": GLOBAL_SPINE_LAYOUT,
                     "schema_version": GLOBAL_SPINE_SCHEMA_VERSION,
                     "spine_projection_version": SPINE_PROJECTION_VERSION,
+                    "semantic_identity_policy_version": SEMANTIC_IDENTITY_POLICY_VERSION,
                     "source_artifact_sqlite_schema_version": SOURCE_ARTIFACT_SQLITE_SCHEMA_VERSION,
                     "source_artifact_sqlite_builder_version": SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION,
                     "company_shard_schema_version": COMPANY_SHARD_SCHEMA_VERSION,
@@ -1737,8 +2880,25 @@ def emit_spine_fragment_from_company_shard(
                 },
             )
             object_rows = _source_rows(source, "objects")
-            object_ticker = {str(row["id"]): str(row["ticker"] or normalized_ticker).upper() for row in object_rows}
+            object_payload = {str(row["id"]): _json_loads(row["json"]) for row in object_rows}
+            object_ticker = {
+                str(row["id"]): effective_ticker(row["ticker"], fallback=normalized_ticker)
+                for row in object_rows
+            }
             object_type = {str(row["id"]): str(row["type"] or "") for row in object_rows}
+            object_id_map = {
+                raw_id: project_object_identity(
+                    raw_id,
+                    object_type.get(raw_id),
+                    ticker=normalized_ticker,
+                    payload=object_payload.get(raw_id),
+                )
+                for raw_id in object_type
+            }
+            projection_quality: dict[str, int] = {
+                "dangling_edges_skipped": 0,
+                "topic_source_refs_skipped": 0,
+            }
             search_rows = _rows_by_key(_source_rows(source, "object_search_text"), "object_id")
             document_rows = _source_rows(source, "documents")
             counts["global_document_catalog"] = _emit_document_catalog(
@@ -1751,6 +2911,8 @@ def emit_spine_fragment_from_company_shard(
                 target,
                 object_rows,
                 search_rows=search_rows,
+                object_id_map=object_id_map,
+                object_payload=object_payload,
                 ticker=normalized_ticker,
                 shard_path=release_shard_path,
             )
@@ -1759,23 +2921,83 @@ def emit_spine_fragment_from_company_shard(
                 _source_rows(source, "edges"),
                 object_ticker=object_ticker,
                 object_type=object_type,
+                object_id_map=object_id_map,
                 ticker=normalized_ticker,
+                projection_quality=projection_quality,
                 shard_path=release_shard_path,
             )
-            counts["global_factor_spine"] = _emit_factor_spine(target, _source_rows(source, "factor_lookup"))
-            counts["global_topic_spine"] = _emit_topic_spine(target, _source_rows(source, "company_topic_index"))
-            counts["global_metric_spine"] = _emit_metric_spine(target, _source_rows(source, "metric_lookup"))
+            counts["global_factor_spine"] = _emit_factor_spine(
+                target,
+                _source_rows(source, "factor_lookup"),
+                object_id_map=object_id_map,
+                ticker=normalized_ticker,
+            )
+            counts["global_topic_spine"] = _emit_topic_spine(
+                target,
+                _source_rows(source, "company_topic_index"),
+                object_id_map=object_id_map,
+                ticker=normalized_ticker,
+                projection_quality=projection_quality,
+            )
+            counts["global_metric_spine"] = _emit_metric_spine(
+                target,
+                _source_rows(source, "metric_lookup"),
+                object_id_map=object_id_map,
+                ticker=normalized_ticker,
+            )
             counts["global_counterparty_spine"] = _emit_counterparty_spine(
                 target,
                 _source_rows(source, "agreement_lookup"),
+                object_id_map=object_id_map,
+                ticker=normalized_ticker,
             )
             counts["global_entity_spine"] = _emit_entity_spine_from_topics(
                 target,
                 _source_rows(source, "company_topic_index"),
+                object_id_map=object_id_map,
+                ticker=normalized_ticker,
             )
-            counts["global_key_stats"] = _refresh_key_stats(target)
-            target.execute("PRAGMA optimize")
+            write_global_spine_metadata(
+                target,
+                {
+                    "projection_quality": {
+                        **projection_quality,
+                        "status": "degraded" if any(projection_quality.values()) else "ok",
+                    }
+                },
+            )
+        stage_timings_ms["projection"] = _elapsed_ms(projection_started_at)
+        verification_started_at = time.perf_counter()
+        verification = verify_spine_fragment_schema(
+            tmp_path,
+            deep=True,
+            trust_seal=False,
+        )
+        stage_timings_ms["deep_verification"] = _elapsed_ms(verification_started_at)
+        if not verification["ok"]:
+            errors = ", ".join(verification["errors"])
+            raise RuntimeError(
+                f"built spine fragment failed temp verification: {normalized_ticker}: {errors}"
+            )
+        replace_started_at = time.perf_counter()
         replace_sqlite_database(tmp_path, resolved_fragment_path)
+        stage_timings_ms["atomic_replace"] = _elapsed_ms(replace_started_at)
+        seal_started_at = time.perf_counter()
+        write_spine_verification_seal(
+            resolved_fragment_path,
+            verification,
+            source_path=tmp_path,
+            details={
+                "pre_publish_stage_timings_ms": dict(stage_timings_ms),
+                "stale_temps_removed": stale_temps_removed,
+            },
+        )
+        stage_timings_ms["seal_write"] = _elapsed_ms(seal_started_at)
+        # The published file is an atomic replacement of the verified temp DB.
+        # The seal binds that verification to the destination stat, so a second
+        # immediate schema/integrity pass would only repeat the same work.
+        stage_timings_ms["sealed_verification"] = 0
+        stage_timings_ms["total"] = _elapsed_ms(fragment_started_at)
         return SpineFragmentResult(
             ticker=normalized_ticker,
             fragment_path=resolved_fragment_path,
@@ -1811,6 +3033,17 @@ def _emit_spine_fragment_cached(
         cache_key=cache_key,
     ):
         try:
+            cache_verification = verify_spine_fragment_schema(
+                cache_path,
+                deep=True,
+                trust_seal=True,
+            )
+            if not cache_verification["ok"]:
+                raise RuntimeError(
+                    "cached spine fragment seal verification failed: "
+                    + ", ".join(cache_verification["errors"])
+                )
+            spine_verification_seal_path(fragment_path).unlink(missing_ok=True)
             _copy_sqlite_database(cache_path, fragment_path)
             _rebase_spine_fragment_release_paths(
                 fragment_path,
@@ -1819,10 +3052,31 @@ def _emit_spine_fragment_cached(
                 source_shard_path=shard_result.shard_path,
                 shard_path_in_release=shard_path_in_release,
             )
-            verification = verify_global_spine_schema(fragment_path)
-            if not verification["ok"]:
-                errors = ", ".join(verification["errors"])
-                raise RuntimeError(f"cached spine fragment failed verification: {shard_result.ticker}: {errors}")
+            rebased_verification = _verify_restored_spine_fragment(
+                fragment_path,
+                ticker=shard_result.ticker,
+                cache_key=cache_key,
+                release_id=release_id,
+                shard_path_in_release=shard_path_in_release,
+            )
+            if not rebased_verification["ok"]:
+                errors = ", ".join(rebased_verification["errors"])
+                raise RuntimeError(
+                    f"cached spine fragment failed verification: {shard_result.ticker}: {errors}"
+                )
+            verification = {
+                **cache_verification,
+                "path": str(fragment_path.expanduser().resolve()),
+                "metadata": rebased_verification["metadata"],
+                "integrity_source": "immutable_seal",
+                "verification_mode": "deep-sealed-inherited",
+            }
+            write_spine_verification_seal(
+                fragment_path,
+                verification,
+                source_path=cache_path,
+                details={"restore_mode": "metadata-rebind-from-immutable-cache"},
+            )
             counts = _spine_counts(fragment_path)
             return SpineFragmentResult(
                 ticker=shard_result.ticker,
@@ -1834,7 +3088,8 @@ def _emit_spine_fragment_cached(
             )
         except Exception:
             _quarantine_sqlite_cache(cache_path)
-            cleanup_sqlite_database_files(fragment_path)
+            spine_verification_seal_path(cache_path).unlink(missing_ok=True)
+            _cleanup_spine_database_and_seal(fragment_path)
 
     result = emit_spine_fragment_from_company_shard(
         shard_result.shard_path,
@@ -1846,7 +3101,19 @@ def _emit_spine_fragment_cached(
         company_source_hash=shard_result.cache_key,
         source_manifest_hash=source_manifest_hash,
     )
-    _store_sqlite_database_cache(result.fragment_path, cache_path)
+    verification = verify_spine_fragment_schema(
+        result.fragment_path,
+        deep=True,
+        trust_seal=True,
+    )
+    if not verification["ok"]:
+        errors = ", ".join(verification["errors"])
+        raise RuntimeError(f"built spine fragment failed verification: {result.ticker}: {errors}")
+    _store_sqlite_database_cache(
+        result.fragment_path,
+        cache_path,
+        verification=verification,
+    )
     return result
 
 
@@ -1859,7 +3126,9 @@ def _spine_fragment_cache_key(
     return _stable_hash(
         {
             "spine_fragment_cache_format_version": SPINE_FRAGMENT_CACHE_FORMAT_VERSION,
+            "spine_fragment_schema_version": SPINE_FRAGMENT_SCHEMA_VERSION,
             "spine_projection_version": SPINE_PROJECTION_VERSION,
+            "semantic_identity_policy_version": SEMANTIC_IDENTITY_POLICY_VERSION,
             "global_spine_schema_version": GLOBAL_SPINE_SCHEMA_VERSION,
             "global_spine_builder_version": GLOBAL_SPINE_BUILDER_VERSION,
             "ticker": ticker,
@@ -1877,7 +3146,7 @@ def _spine_fragment_cache_path(cache_root: Path, cache_key: str) -> Path:
 def _verify_spine_fragment_cache(path: Path, *, ticker: str, cache_key: str) -> tuple[str, ...]:
     if not path.exists():
         return ("spine_fragment_cache_missing",)
-    verification = verify_global_spine_schema(path)
+    verification = verify_spine_fragment_schema(path)
     errors = [f"spine_fragment_cache:{error}" for error in verification.get("errors") or []]
     try:
         with sqlite3.connect(path) as conn:
@@ -1893,6 +3162,11 @@ def _verify_spine_fragment_cache(path: Path, *, ticker: str, cache_key: str) -> 
         errors.append("spine_fragment_cache_metadata_format_mismatch")
     if metadata.get("spine_fragment_cache_key") != cache_key:
         errors.append("spine_fragment_cache_key_mismatch")
+    if not errors and verification.get("integrity_source") == "sqlite_integrity_check":
+        try:
+            write_spine_verification_seal(path, verification)
+        except OSError:
+            pass
     return tuple(errors)
 
 
@@ -1900,38 +3174,316 @@ def _spine_counts(path: Path) -> dict[str, int]:
     with sqlite3.connect(path) as conn:
         return {
             table_name: _count_table(conn, table_name)
-            for table_name in GLOBAL_SPINE_TABLES
+            for table_name in SPINE_FRAGMENT_TABLES
             if table_name != "metadata"
         }
 
 
 _SPINE_FRAGMENT_MERGE_TABLES = tuple(
-    table
-    for table in GLOBAL_SPINE_TABLES
-    if table not in {"metadata", "global_key_stats", "global_chain_index"}
+    table_name for table_name in SPINE_FRAGMENT_TABLES if table_name != "metadata"
 )
 
-_SPINE_REPLACE_TABLES = frozenset(
-    {
-        "global_object_locator",
-        "global_document_catalog",
-        "global_edge_spine",
-        "global_topic_spine",
-    }
-)
+_SPINE_PRIMARY_KEY_COLUMNS: Mapping[str, tuple[str, ...]] = {
+    "global_object_locator": ("object_id",),
+    "global_document_catalog": ("document_id",),
+    "global_edge_spine": ("edge_id",),
+    "global_topic_spine": ("topic_id",),
+}
+
+_SPINE_SHARED_SEMANTIC_COLUMNS: Mapping[str, tuple[str, ...]] = {
+    "global_object_locator": (
+        "semantic_hash",
+        "object_type",
+        "local_object_key",
+    ),
+    "global_edge_spine": (
+        "semantic_hash",
+        "from_object_id",
+        "to_object_id",
+        "relation_type",
+        "edge_scope",
+        "source_object_type",
+        "target_object_type",
+    ),
+}
 
 
-def _merge_spine_table(conn: sqlite3.Connection, schema_name: str, table_name: str) -> None:
+def _merge_spine_table(
+    conn: sqlite3.Connection,
+    schema_name: str,
+    table_name: str,
+    *,
+    fragment_path: Path,
+) -> int:
+    """Merge one table and return the number of equivalent shared-ID rows."""
     columns = _spine_table_columns(conn, "main", table_name)
     if not columns:
-        return
+        return 0
+    key_columns = _SPINE_PRIMARY_KEY_COLUMNS.get(table_name, ())
+    semantic_columns = _SPINE_SHARED_SEMANTIC_COLUMNS.get(table_name)
+    if semantic_columns:
+        equivalent_collision_count = _assert_equivalent_spine_collisions(
+            conn,
+            schema_name,
+            table_name,
+            key_columns=key_columns,
+            semantic_columns=semantic_columns,
+            fragment_path=fragment_path,
+        )
+        _insert_spine_replicas(conn, schema_name, table_name)
+        _upsert_deterministic_spine_canonical(
+            conn,
+            schema_name,
+            table_name,
+            columns=columns,
+            key_columns=key_columns,
+        )
+        _synchronize_spine_occurrence_counts(
+            conn,
+            schema_name,
+            table_name,
+            key_columns=key_columns,
+        )
+        return equivalent_collision_count
+
+    if key_columns:
+        collision = _first_spine_collision(
+            conn,
+            schema_name,
+            table_name,
+            key_columns=key_columns,
+        )
+        if collision is not None:
+            raise SpineFragmentCollisionError(
+                "spine_fragment_pk_collision:"
+                f"table={table_name}:key={_spine_collision_key_json(collision, key_columns)}:"
+                f"fragment={fragment_path}"
+            )
     column_sql = ", ".join(columns)
-    verb = "INSERT OR REPLACE" if table_name in _SPINE_REPLACE_TABLES else "INSERT"
+    try:
+        conn.execute(
+            f"""
+            INSERT INTO {table_name}({column_sql})
+            SELECT {column_sql}
+            FROM {schema_name}.{table_name}
+            """
+        )
+    except sqlite3.IntegrityError as exc:
+        raise SpineFragmentCollisionError(
+            "spine_fragment_insert_integrity_error:"
+            f"table={table_name}:key=<unknown>:fragment={fragment_path}:sqlite={exc}"
+        ) from exc
+    return 0
+
+
+def _first_spine_collision(
+    conn: sqlite3.Connection,
+    schema_name: str,
+    table_name: str,
+    *,
+    key_columns: tuple[str, ...],
+) -> sqlite3.Row | tuple[Any, ...] | None:
+    join_sql = " AND ".join(
+        f"main_table.{column_name} = fragment_table.{column_name}" for column_name in key_columns
+    )
+    key_sql = ", ".join(
+        f"fragment_table.{column_name} AS {column_name}" for column_name in key_columns
+    )
+    return conn.execute(
+        f"""
+        SELECT {key_sql}
+        FROM main.{table_name} AS main_table
+        JOIN {schema_name}.{table_name} AS fragment_table
+          ON {join_sql}
+        ORDER BY {", ".join(f"fragment_table.{column}" for column in key_columns)}
+        LIMIT 1
+        """
+    ).fetchone()
+
+
+def _spine_collision_key_json(
+    collision: sqlite3.Row | tuple[Any, ...],
+    key_columns: tuple[str, ...],
+) -> str:
+    key_payload = {column_name: collision[index] for index, column_name in enumerate(key_columns)}
+    return json.dumps(
+        key_payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _assert_equivalent_spine_collisions(
+    conn: sqlite3.Connection,
+    schema_name: str,
+    table_name: str,
+    *,
+    key_columns: tuple[str, ...],
+    semantic_columns: tuple[str, ...],
+    fragment_path: Path,
+) -> int:
+    join_sql = " AND ".join(
+        f"main_table.{column_name} = fragment_table.{column_name}" for column_name in key_columns
+    )
+    mismatch_sql = " OR ".join(
+        f"main_table.{column_name} IS NOT fragment_table.{column_name}"
+        for column_name in semantic_columns
+    )
+    select_columns = [
+        *(f"fragment_table.{column_name} AS key_{column_name}" for column_name in key_columns),
+        *(f"main_table.{column_name} AS main_{column_name}" for column_name in semantic_columns),
+        *(
+            f"fragment_table.{column_name} AS fragment_{column_name}"
+            for column_name in semantic_columns
+        ),
+    ]
+    collision_summary = conn.execute(
+        f"""
+        SELECT
+            COUNT(*) AS collision_count,
+            COALESCE(SUM(CASE WHEN {mismatch_sql} THEN 1 ELSE 0 END), 0)
+                AS conflict_count
+        FROM main.{table_name} AS main_table
+        JOIN {schema_name}.{table_name} AS fragment_table
+          ON {join_sql}
+        """
+    ).fetchone()
+    collision_count = int(collision_summary["collision_count"])
+    conflict_count = int(collision_summary["conflict_count"])
+    if conflict_count:
+        conflict = conn.execute(
+            f"""
+            SELECT {", ".join(select_columns)}
+            FROM main.{table_name} AS main_table
+            JOIN {schema_name}.{table_name} AS fragment_table
+              ON {join_sql}
+            WHERE {mismatch_sql}
+            ORDER BY {", ".join(f"fragment_table.{column}" for column in key_columns)}
+            LIMIT 1
+            """
+        ).fetchone()
+        if conflict is None:
+            raise SpineFragmentCollisionError(
+                "spine_fragment_semantic_conflict:"
+                f"table={table_name}:key=<unknown>:fragment={fragment_path}:"
+                "fields=<unknown>"
+            )
+        key_values = tuple(conflict[f"key_{column}"] for column in key_columns)
+        conflicting_fields = [
+            column
+            for column in semantic_columns
+            if conflict[f"main_{column}"] != conflict[f"fragment_{column}"]
+        ]
+        raise SpineFragmentCollisionError(
+            "spine_fragment_semantic_conflict:"
+            f"table={table_name}:key={_spine_collision_key_json(key_values, key_columns)}:"
+            f"fragment={fragment_path}:fields={','.join(conflicting_fields)}"
+        )
+    return collision_count
+
+
+def _insert_spine_replicas(
+    conn: sqlite3.Connection,
+    schema_name: str,
+    table_name: str,
+) -> None:
+    if table_name == "global_object_locator":
+        conn.execute(
+            f"""
+            INSERT OR IGNORE INTO global_object_replica(
+                object_id, ticker, document_id, document_type, period,
+                shard_id, shard_path, object_type, local_object_key,
+                object_hash, semantic_hash, quality_status
+            )
+            SELECT
+                object_id, ticker, COALESCE(document_id, ''),
+                COALESCE(document_type, ''), COALESCE(period, ''),
+                shard_id, shard_path, object_type, local_object_key,
+                object_hash, semantic_hash, quality_status
+            FROM {schema_name}.global_object_locator
+            """
+        )
+        return
+    if table_name == "global_edge_spine":
+        conn.execute(
+            f"""
+            INSERT OR IGNORE INTO global_edge_replica(
+                edge_id, ticker, document_id, document_type, period,
+                shard_id, shard_path, from_object_id, to_object_id,
+                relation_type, semantic_hash, confidence, evidence_grade
+            )
+            SELECT
+                edge_id, ticker, COALESCE(document_id, ''),
+                COALESCE(document_type, ''), COALESCE(period, ''),
+                shard_id, shard_path, from_object_id, to_object_id,
+                relation_type, semantic_hash, confidence, evidence_grade
+            FROM {schema_name}.global_edge_spine
+            """
+        )
+        return
+    raise ValueError(f"unsupported spine replica table: {table_name}")
+
+
+def _upsert_deterministic_spine_canonical(
+    conn: sqlite3.Connection,
+    schema_name: str,
+    table_name: str,
+    *,
+    columns: Sequence[str],
+    key_columns: tuple[str, ...],
+) -> None:
+    merge_columns = [column for column in columns if column != "occurrence_count"]
+    update_columns = [column for column in merge_columns if column not in key_columns]
+    rank_columns = tuple(update_columns)
+    column_sql = ", ".join(merge_columns)
+    update_sql = ", ".join(f"{column}=excluded.{column}" for column in update_columns)
+    excluded_rank = ", ".join(
+        f"COALESCE(quote(excluded.{column}), 'NULL')" for column in rank_columns
+    )
+    current_rank = ", ".join(
+        f"COALESCE(quote({table_name}.{column}), 'NULL')" for column in rank_columns
+    )
     conn.execute(
         f"""
-        {verb} INTO {table_name}({column_sql})
+        INSERT INTO {table_name}({column_sql})
         SELECT {column_sql}
         FROM {schema_name}.{table_name}
+        WHERE 1
+        ON CONFLICT({", ".join(key_columns)}) DO UPDATE SET
+            {update_sql}
+        WHERE ({excluded_rank}) < ({current_rank})
+        """
+    )
+
+
+def _synchronize_spine_occurrence_counts(
+    conn: sqlite3.Connection,
+    schema_name: str,
+    table_name: str,
+    *,
+    key_columns: tuple[str, ...],
+) -> None:
+    key_column = key_columns[0]
+    replica_table = (
+        "global_object_replica" if table_name == "global_object_locator" else "global_edge_replica"
+    )
+    conn.execute(
+        f"""
+        UPDATE {table_name}
+        SET occurrence_count = (
+            SELECT COUNT(*)
+            FROM {replica_table} AS replica
+            WHERE replica.{key_column} = {table_name}.{key_column}
+        )
+        WHERE {key_column} IN (
+            SELECT fragment.{key_column}
+            FROM {schema_name}.{table_name} AS fragment
+            JOIN {replica_table} AS replica
+              ON replica.{key_column} = fragment.{key_column}
+            GROUP BY fragment.{key_column}
+            HAVING COUNT(*) > 1
+        )
         """
     )
 
@@ -1954,6 +3506,7 @@ def _plan_v3_artifact_inputs(
     cache_root: Path | None,
     workers: int | None,
     source_manifest_path: Path | None,
+    source_manifest_payload: Mapping[str, Any] | None = None,
 ) -> SourceArtifactSqlitePlan:
     """Build the source-artifact plan used to materialize v3 shards.
 
@@ -1968,6 +3521,7 @@ def _plan_v3_artifact_inputs(
         cache_root=cache_root,
         workers=workers,
         source_manifest_path=source_manifest_path,
+        source_manifest_payload=source_manifest_payload,
     )
 
 
@@ -1983,7 +3537,8 @@ def _filter_plan_for_company(
     dirty_items = items if no_cache else tuple(item for item in items if not item.cache_hit)
     cached_items = () if no_cache else tuple(item for item in items if item.cache_hit)
     artifact_cache_keys = tuple(
-        f"{item.relative_path}={item.cache_key}" for item in sorted(items, key=lambda item: item.relative_path)
+        f"{item.relative_path}={item.cache_key}"
+        for item in sorted(items, key=lambda item: item.relative_path)
     )
     input_hash = _stable_hash(
         {
@@ -2044,7 +3599,9 @@ def _filter_plan_for_company(
     )
 
 
-def _write_company_shard_metadata(path: Path, *, ticker: str, plan: SourceArtifactSqlitePlan) -> None:
+def _write_company_shard_metadata(
+    path: Path, *, ticker: str, plan: SourceArtifactSqlitePlan
+) -> None:
     with sqlite3.connect(path) as conn:
         row = conn.execute("SELECT value FROM metadata WHERE key = 'build'").fetchone()
         metadata: dict[str, Any] = {}
@@ -2064,7 +3621,9 @@ def _write_company_shard_metadata(path: Path, *, ticker: str, plan: SourceArtifa
                 "index_role": "company_shard",
                 "shard_ticker": ticker,
                 "company_cache_format_version": COMPANY_SHARD_CACHE_FORMAT_VERSION,
-                "company_cache_key": plan.company_items[0].cache_key if plan.company_items else None,
+                "company_cache_key": plan.company_items[0].cache_key
+                if plan.company_items
+                else None,
                 "company_source_hash": _stable_hash(
                     {
                         "ticker": ticker,
@@ -2099,15 +3658,23 @@ def _verify_company_shard_cache_v3(
 ) -> tuple[str, ...]:
     if not shard_path.exists():
         return ("company_cache_missing",)
-    verification = verify_source_artifact_sqlite(shard_path)
-    errors = [f"company_cache:{error}" for error in verification.get("errors") or []]
-    try:
-        with sqlite3.connect(shard_path) as conn:
-            row = conn.execute("SELECT value FROM metadata WHERE key = 'build'").fetchone()
-            metadata = json.loads(str(row[0])) if row is not None else {}
-    except (sqlite3.Error, json.JSONDecodeError) as exc:
-        errors.append(f"company_cache_metadata_error:{exc}")
-        metadata = {}
+    seal, seal_status = read_immutable_sqlite_cache_seal(
+        shard_path,
+        kind="company_shard",
+        cache_key=cache_key,
+    )
+    errors: list[str] = []
+    if seal_status == "valid":
+        raw_metadata = seal.get("metadata")
+        metadata = dict(raw_metadata) if isinstance(raw_metadata, Mapping) else {}
+    else:
+        verification = verify_source_artifact_sqlite(shard_path)
+        errors.extend(f"company_cache:{error}" for error in verification.get("errors") or [])
+        try:
+            metadata = _read_company_shard_metadata(shard_path)
+        except (sqlite3.Error, json.JSONDecodeError) as exc:
+            errors.append(f"company_cache_metadata_error:{exc}")
+            metadata = {}
     if metadata.get("index_role") != "company_shard":
         errors.append("company_cache_metadata_role_mismatch")
     if str(metadata.get("shard_ticker") or "") != ticker:
@@ -2120,7 +3687,74 @@ def _verify_company_shard_cache_v3(
         errors.append("company_cache_metadata_format_mismatch")
     if metadata.get("company_cache_key") != cache_key:
         errors.append("company_cache_metadata_key_mismatch")
+    if not errors and seal_status != "valid":
+        write_immutable_sqlite_cache_seal(
+            shard_path,
+            kind="company_shard",
+            cache_key=cache_key,
+            verification=verification,
+            metadata=metadata,
+            counts=verification.get("counts") or {},
+        )
     return tuple(errors)
+
+
+def _read_company_shard_metadata(path: Path) -> dict[str, Any]:
+    with sqlite3.connect(path) as conn:
+        row = conn.execute("SELECT value FROM metadata WHERE key = 'build'").fetchone()
+    if row is None:
+        return {}
+    payload = json.loads(str(row[0]))
+    return dict(payload) if isinstance(payload, Mapping) else {}
+
+
+def _verify_restored_company_shard(
+    path: Path,
+    *,
+    ticker: str,
+    cache_key: str,
+) -> dict[str, Any]:
+    """Check a cache clone structurally; final release verification owns the deep pass."""
+    errors: list[str] = []
+    counts: dict[str, int] = {}
+    metadata: dict[str, Any] = {}
+    required_tables = {"metadata", "documents", "objects", "edges", "quality_events"}
+    try:
+        with sqlite3.connect(path) as conn:
+            tables = {
+                str(row[0])
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type IN ('table', 'view')"
+                )
+            }
+            errors.extend(f"table_missing:{table}" for table in sorted(required_tables - tables))
+            row = conn.execute("SELECT value FROM metadata WHERE key = 'build'").fetchone()
+            metadata = json.loads(str(row[0])) if row is not None else {}
+            for table in ("documents", "objects", "edges", "quality_events"):
+                if table in tables:
+                    counts[table] = int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+    except (sqlite3.Error, json.JSONDecodeError) as exc:
+        errors.append(f"sqlite_error:{exc}")
+    expected = {
+        "index_role": "company_shard",
+        "shard_ticker": ticker,
+        "index_layout": GLOBAL_SPINE_LAYOUT,
+        "company_shard_schema_version": COMPANY_SHARD_SCHEMA_VERSION,
+        "company_cache_format_version": COMPANY_SHARD_CACHE_FORMAT_VERSION,
+        "company_cache_key": cache_key,
+    }
+    errors.extend(
+        f"metadata_mismatch:{key}" for key, value in expected.items() if metadata.get(key) != value
+    )
+    return {
+        "ok": not errors,
+        "errors": errors,
+        "index_path": str(path),
+        "integrity_check": "ok" if not errors else None,
+        "integrity_source": "inherited_immutable_cache_seal",
+        "counts": counts,
+        "metadata": metadata,
+    }
 
 
 def _copy_sqlite_database(source_path: Path, target_path: Path) -> None:
@@ -2172,9 +3806,7 @@ def _clone_or_copy_file(source_path: Path, target_path: Path) -> str:
         else:
             return "reflink"
     if configured_mode in {"clone", "reflink", "reflink-required", "cow-required"}:
-        raise RuntimeError(
-            f"reflink_required_but_unavailable:{source_path}:{target_path}"
-        )
+        raise RuntimeError(f"reflink_required_but_unavailable:{source_path}:{target_path}")
     shutil.copy2(source_path, target_path)
     return "copy"
 
@@ -2308,6 +3940,122 @@ def _rebase_spine_fragment_release_paths(
         conn.execute("PRAGMA journal_mode=DELETE").fetchall()
 
 
+def _rebase_global_spine_release_paths(
+    sqlite_path: Path,
+    *,
+    release_root: Path,
+    release_id: str,
+) -> None:
+    resolved_root = release_root.expanduser().resolve()
+    with sqlite3.connect(sqlite_path) as conn:
+        _rebase_table_path_columns(
+            conn,
+            resolved_root,
+            {"global_document_catalog": ("source_path",)},
+        )
+        _rebase_metadata_json_values(
+            conn,
+            resolved_root,
+            overrides={
+                "release_id": release_id,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+        conn.commit()
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
+        conn.execute("PRAGMA journal_mode=DELETE").fetchall()
+
+
+def _verify_restored_global_spine(
+    sqlite_path: Path,
+    *,
+    cache_key: str,
+    release_id: str,
+) -> dict[str, Any]:
+    errors: list[str] = []
+    metadata: dict[str, Any] = {}
+    try:
+        with sqlite3.connect(sqlite_path) as conn:
+            tables = {
+                str(row[0])
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type IN ('table', 'view')"
+                )
+            }
+            errors.extend(
+                f"global_spine_table_missing:{table}"
+                for table in sorted(set(GLOBAL_SPINE_TABLES) - tables)
+            )
+            metadata = read_global_spine_metadata(conn)
+    except sqlite3.Error as exc:
+        errors.append(f"sqlite_error:{exc}")
+    expected = {
+        "schema_version": GLOBAL_SPINE_SCHEMA_VERSION,
+        "builder_version": GLOBAL_SPINE_BUILDER_VERSION,
+        "index_layout": GLOBAL_SPINE_LAYOUT,
+        "release_id": release_id,
+        "global_spine_cache_format_version": GLOBAL_SPINE_CACHE_FORMAT_VERSION,
+        "global_spine_cache_key": cache_key,
+    }
+    errors.extend(
+        f"global_spine_metadata_mismatch:{key}"
+        for key, value in expected.items()
+        if metadata.get(key) != value
+    )
+    return {"ok": not errors, "errors": errors, "metadata": metadata}
+
+
+def _verify_restored_spine_fragment(
+    sqlite_path: Path,
+    *,
+    ticker: str,
+    cache_key: str,
+    release_id: str,
+    shard_path_in_release: str,
+) -> dict[str, Any]:
+    """Validate only the metadata mutation applied to a deeply sealed cache clone."""
+    errors: list[str] = []
+    metadata: dict[str, Any] = {}
+    try:
+        with sqlite3.connect(sqlite_path) as conn:
+            tables = {
+                str(row[0])
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type IN ('table', 'view')"
+                )
+            }
+            errors.extend(
+                f"spine_fragment_table_missing:{table}"
+                for table in sorted(set(SPINE_FRAGMENT_TABLES) - tables)
+            )
+            metadata = read_global_spine_metadata(conn)
+    except sqlite3.Error as exc:
+        errors.append(f"sqlite_error:{exc}")
+    expected = {
+        "format": SPINE_FRAGMENT_FORMAT_VERSION,
+        "fragment_schema_version": SPINE_FRAGMENT_SCHEMA_VERSION,
+        "schema_version": GLOBAL_SPINE_SCHEMA_VERSION,
+        "builder_version": GLOBAL_SPINE_BUILDER_VERSION,
+        "index_layout": GLOBAL_SPINE_LAYOUT,
+        "ticker": ticker,
+        "spine_fragment_cache_format_version": SPINE_FRAGMENT_CACHE_FORMAT_VERSION,
+        "spine_fragment_cache_key": cache_key,
+        "release_id": release_id,
+        "shard_path": shard_path_in_release,
+    }
+    errors.extend(
+        f"spine_fragment_metadata_mismatch:{key}"
+        for key, value in expected.items()
+        if metadata.get(key) != value
+    )
+    return {
+        "ok": not errors,
+        "errors": errors,
+        "metadata": metadata,
+        "integrity_source": "inherited_immutable_seal",
+    }
+
+
 def _rebase_table_path_columns(
     conn: sqlite3.Connection,
     release_root: Path,
@@ -2348,13 +4096,18 @@ def _rebase_metadata_json_values(
     if not _table_exists(conn, "metadata"):
         return
     columns = _table_columns(conn, "metadata")
-    value_column = "value_json" if "value_json" in columns else "value" if "value" in columns else None
+    value_column = (
+        "value_json" if "value_json" in columns else "value" if "value" in columns else None
+    )
     if value_column is None:
         return
     key_column = "key" if "key" in columns else None
     quoted_value_column = _quote_identifier(value_column)
     if key_column is None:
-        rows = [(row[0], None, row[1]) for row in conn.execute(f"SELECT rowid, {quoted_value_column} FROM metadata")]
+        rows = [
+            (row[0], None, row[1])
+            for row in conn.execute(f"SELECT rowid, {quoted_value_column} FROM metadata")
+        ]
     else:
         quoted_key_column = _quote_identifier(key_column)
         rows = conn.execute(
@@ -2418,20 +4171,48 @@ def _rebase_release_path_string(value: str, release_root: Path) -> str:
 
 
 def _table_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:
-    return {str(row[1]) for row in conn.execute(f"PRAGMA table_info({_quote_identifier(table_name)})").fetchall()}
+    return {
+        str(row[1])
+        for row in conn.execute(f"PRAGMA table_info({_quote_identifier(table_name)})").fetchall()
+    }
 
 
 def _quote_identifier(value: str) -> str:
     return '"' + value.replace('"', '""') + '"'
 
 
-def _store_sqlite_database_cache(source_path: Path, cache_path: Path) -> None:
+def _store_sqlite_database_cache(
+    source_path: Path,
+    cache_path: Path,
+    *,
+    verification: Mapping[str, Any] | None = None,
+    cache_kind: str | None = None,
+    cache_key: str | None = None,
+    cache_metadata: Mapping[str, Any] | None = None,
+    cache_counts: Mapping[str, Any] | None = None,
+) -> None:
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = cache_path.parent / f".{cache_path.name}.{os.getpid()}.{time.time_ns()}.tmp"
     cleanup_sqlite_database_files(tmp_path)
     try:
         _clone_or_copy_file(source_path, tmp_path)
         os.replace(tmp_path, cache_path)
+        if verification is not None and cache_kind is not None and cache_key is not None:
+            write_immutable_sqlite_cache_seal(
+                cache_path,
+                kind=cache_kind,
+                cache_key=cache_key,
+                verification=verification,
+                metadata=cache_metadata,
+                counts=cache_counts,
+                source_path=source_path,
+            )
+        elif verification is not None:
+            write_spine_verification_seal(
+                cache_path,
+                verification,
+                source_path=source_path,
+            )
     finally:
         cleanup_sqlite_database_files(tmp_path)
 
@@ -2445,7 +4226,11 @@ def _quarantine_sqlite_cache(cache_path: Path) -> Path | None:
         os.replace(cache_path, target)
     except OSError:
         cleanup_sqlite_database_files(cache_path)
+        remove_immutable_sqlite_cache_seal(cache_path)
+        spine_verification_seal_path(cache_path).unlink(missing_ok=True)
         return None
+    remove_immutable_sqlite_cache_seal(cache_path)
+    spine_verification_seal_path(cache_path).unlink(missing_ok=True)
     return target
 
 
@@ -2593,7 +4378,9 @@ def _company_shard_ticker_quality_summary(conn: sqlite3.Connection) -> list[dict
 def _count_distinct(conn: sqlite3.Connection, table_name: str, column_name: str) -> int:
     if not _table_exists(conn, table_name):
         return 0
-    return int(conn.execute(f"SELECT COUNT(DISTINCT {column_name}) FROM {table_name}").fetchone()[0])
+    return int(
+        conn.execute(f"SELECT COUNT(DISTINCT {column_name}) FROM {table_name}").fetchone()[0]
+    )
 
 
 def _company_build_cost(plan: SourceArtifactSqlitePlan) -> int:
@@ -2750,7 +4537,9 @@ class _BuildProgressWriter:
         if started_at is not None:
             payload["duration_ms"] = max(0, int((time.perf_counter() - started_at) * 1000))
         with self.path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str) + "\n")
+            handle.write(
+                json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str) + "\n"
+            )
 
 
 def _progress_output_label(root: Path, output: Path | str) -> str:
@@ -2782,7 +4571,9 @@ def _cleanup_release_spine_fragments(fragments_dir: Path, *, release_root: Path)
     try:
         resolved_fragments.relative_to(resolved_root)
     except ValueError as exc:
-        raise ValueError(f"Refusing to clean spine fragments outside release root: {resolved_fragments}") from exc
+        raise ValueError(
+            f"Refusing to clean spine fragments outside release root: {resolved_fragments}"
+        ) from exc
 
     details: dict[str, Any] = {
         "path": _path_label(resolved_root, resolved_fragments),
@@ -2868,7 +4659,7 @@ def _emit_document_catalog(
         payload.append(
             (
                 document_id,
-                str(row["ticker"] or ticker).upper(),
+                effective_ticker(row["ticker"], fallback=ticker),
                 None,
                 row["document_type"],
                 row["period"],
@@ -2893,7 +4684,7 @@ def _emit_document_catalog(
         )
     conn.executemany(
         """
-        INSERT OR REPLACE INTO global_document_catalog(
+        INSERT INTO global_document_catalog(
             document_id, ticker, company_name, document_type, period,
             fiscal_year, fiscal_quarter, filing_date, source_path, shard_id,
             shard_path, document_hash, object_count, edge_count,
@@ -2924,7 +4715,9 @@ def _document_source_metadata(row: sqlite3.Row) -> dict[str, Any]:
     ]
     if len(doc_root.parents) >= 3:
         company_root = doc_root.parents[2]
-        candidates.append((company_root / "sources" / doc_type_key / period / "metadata.json", "json"))
+        candidates.append(
+            (company_root / "sources" / doc_type_key / period / "metadata.json", "json")
+        )
 
     metadata: dict[str, Any] = {}
     for path, file_type in candidates:
@@ -2958,21 +4751,24 @@ def _emit_object_locator_and_search(
     rows: Sequence[sqlite3.Row],
     *,
     search_rows: Mapping[str, sqlite3.Row],
+    object_id_map: Mapping[str, str],
+    object_payload: Mapping[str, Mapping[str, Any]],
     ticker: str,
     shard_path: str,
 ) -> int:
     locator_rows: list[tuple[Any, ...]] = []
-    search_payload: list[tuple[Any, ...]] = []
     for row in rows:
-        object_id = str(row["id"])
-        search = search_rows.get(object_id)
-        obj = _json_loads(row["json"])
+        local_object_id = str(row["id"])
+        object_id = object_id_map[local_object_id]
+        search = search_rows.get(local_object_id)
+        obj = object_payload.get(local_object_id) or _json_loads(row["json"])
         compact_text = _row_value(search, "compact_text") or row["text"]
         compact_label = _compact_label(row, obj)
+        semantic_hash = _semantic_object_hash(row, obj)
         locator_rows.append(
             (
                 object_id,
-                str(row["ticker"] or ticker).upper(),
+                effective_ticker(row["ticker"], fallback=ticker),
                 None,
                 _object_document_id(row, ticker=ticker),
                 row["document_type"],
@@ -2981,45 +4777,25 @@ def _emit_object_locator_and_search(
                 row["type"],
                 ticker,
                 shard_path,
-                object_id,
+                local_object_id,
                 _stable_hash(row["json"]),
+                semantic_hash,
                 compact_label,
                 _truncate(compact_text, 700),
                 row["review_status"] or row["confidence"],
             )
         )
-        search_payload.append(
-            (
-                object_id,
-                str(row["ticker"] or ticker).upper(),
-                row["type"],
-                _truncate(compact_text, 1200),
-                _row_value(search, "text_related") or "",
-                _row_value(search, "text_support") or "",
-                _row_value(search, "text_self") or "",
-                _row_value(search, "text_entities") or "",
-            )
-        )
     conn.executemany(
         """
-        INSERT OR REPLACE INTO global_object_locator(
+        INSERT INTO global_object_locator(
             object_id, ticker, company_name, document_id, document_type, period,
             filing_date, object_type, shard_id, shard_path, local_object_key,
-            object_hash, compact_label, compact_summary, quality_status
+            object_hash, semantic_hash, compact_label, compact_summary,
+            quality_status
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         locator_rows,
-    )
-    conn.executemany(
-        """
-        INSERT INTO global_search_fts(
-            object_id, ticker, object_type, compact_text, topic_terms,
-            factor_terms, metric_terms, entity_terms
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        search_payload,
     )
     return len(locator_rows)
 
@@ -3030,56 +4806,94 @@ def _emit_edge_spine(
     *,
     object_ticker: Mapping[str, str],
     object_type: Mapping[str, str],
+    object_id_map: Mapping[str, str],
+    projection_quality: dict[str, int],
     ticker: str,
     shard_path: str,
 ) -> int:
     payload: list[tuple[Any, ...]] = []
     for row in rows:
-        from_id = str(row["from_id"])
-        to_id = str(row["to_id"])
-        if from_id not in object_ticker or to_id not in object_ticker:
+        local_from_id = str(row["from_id"])
+        local_to_id = str(row["to_id"])
+        if local_from_id not in object_ticker or local_to_id not in object_ticker:
+            projection_quality["dangling_edges_skipped"] += 1
             continue
-        from_ticker = object_ticker.get(from_id, str(row["ticker"] or ticker).upper())
-        to_ticker = object_ticker.get(to_id, str(row["ticker"] or ticker).upper())
+        from_id = object_id_map[local_from_id]
+        to_id = object_id_map[local_to_id]
+        occurrence_ticker = effective_ticker(row["ticker"], fallback=ticker)
+        from_ticker = object_ticker.get(local_from_id, occurrence_ticker)
+        to_ticker = object_ticker.get(local_to_id, occurrence_ticker)
         edge = _json_loads(row["json"])
+        relation_type = row["relation_name"] or row["relation_id"]
+        edge_scope = "intra_company" if from_ticker == to_ticker else "cross_company"
+        source_object_type = object_type.get(local_from_id) or None
+        target_object_type = object_type.get(local_to_id) or None
+        edge_id = project_local_identity(row["id"], ticker=ticker)
+        semantic_hash = _semantic_edge_hash(
+            row,
+            edge,
+            edge_id=edge_id,
+            from_id=from_id,
+            to_id=to_id,
+            relation_type=relation_type,
+            edge_scope=edge_scope,
+            source_object_type=source_object_type,
+            target_object_type=target_object_type,
+        )
         payload.append(
             (
-                row["id"],
+                edge_id,
+                occurrence_ticker,
+                _object_document_id(row, ticker=ticker),
+                row["document_type"],
+                row["period"],
+                ticker,
+                shard_path,
                 from_id,
                 to_id,
                 from_ticker,
                 to_ticker,
-                row["relation_name"] or row["relation_id"],
-                "intra_company" if from_ticker == to_ticker else "cross_company",
-                object_type.get(from_id) or None,
-                object_type.get(to_id) or None,
+                relation_type,
+                edge_scope,
+                source_object_type,
+                target_object_type,
                 _confidence_score(row["confidence"]),
                 edge.get("evidence_level") or edge.get("evidence_grade"),
                 _parse_float(edge.get("materiality")),
                 _parse_float(edge.get("recency_score")),
                 shard_path,
                 edge.get("rationale") or row["relation_name"],
+                semantic_hash,
             )
         )
     conn.executemany(
         """
-        INSERT OR REPLACE INTO global_edge_spine(
-            edge_id, from_object_id, to_object_id, from_ticker, to_ticker,
+        INSERT INTO global_edge_spine(
+            edge_id, ticker, document_id, document_type, period, shard_id,
+            shard_path, from_object_id, to_object_id, from_ticker, to_ticker,
             relation_type, edge_scope, source_object_type, target_object_type,
-            confidence, evidence_grade, materiality, recency_score,
-            shard_hint, compact_reason
+            confidence, evidence_grade, materiality, recency_score, shard_hint,
+            compact_reason, semantic_hash
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         payload,
     )
     return len(payload)
 
 
-def _emit_factor_spine(conn: sqlite3.Connection, rows: Sequence[sqlite3.Row]) -> int:
+def _emit_factor_spine(
+    conn: sqlite3.Connection,
+    rows: Sequence[sqlite3.Row],
+    *,
+    object_id_map: Mapping[str, str],
+    ticker: str,
+) -> int:
     payload: list[tuple[Any, ...]] = []
     for row in rows:
-        factor_key = _normalize_key(row["risk_or_driver"] or row["topic_label"] or row["factor_type"])
+        factor_key = _normalize_key(
+            row["risk_or_driver"] or row["topic_label"] or row["factor_type"]
+        )
         if not factor_key:
             continue
         payload.append(
@@ -3088,14 +4902,14 @@ def _emit_factor_spine(conn: sqlite3.Connection, rows: Sequence[sqlite3.Row]) ->
                 row["topic_label"] or row["risk_or_driver"] or row["factor_type"],
                 row["topic_family"] or row["factor_type"],
                 None,
-                row["ticker"],
-                row["object_id"],
-                _lookup_document_id(row),
+                effective_ticker(row["ticker"], fallback=ticker),
+                _mapped_object_id(row["object_id"], object_id_map, ticker=ticker),
+                _lookup_document_id(row, ticker=ticker),
                 row["impact_channel"],
                 None,
                 row["specificity_score"],
                 row["evidence_strength"],
-                row["ticker"],
+                ticker,
             )
         )
     conn.executemany(
@@ -3112,19 +4926,30 @@ def _emit_factor_spine(conn: sqlite3.Connection, rows: Sequence[sqlite3.Row]) ->
     return len(payload)
 
 
-def _emit_topic_spine(conn: sqlite3.Connection, rows: Sequence[sqlite3.Row]) -> int:
+def _emit_topic_spine(
+    conn: sqlite3.Connection,
+    rows: Sequence[sqlite3.Row],
+    *,
+    object_id_map: Mapping[str, str],
+    ticker: str,
+    projection_quality: dict[str, int],
+) -> int:
     payload: list[tuple[Any, ...]] = []
     for row in rows:
         topic_key = _normalize_key(row["topic_label"] or row["topic_family"] or row["topic_id"])
         payload.append(
             (
-                row["topic_id"],
+                project_local_identity(row["topic_id"], ticker=ticker),
                 topic_key,
                 row["topic_label"],
                 row["topic_family"],
                 row["topic_summary"],
-                row["ticker"],
-                row["source_object_ids"],
+                effective_ticker(row["ticker"], fallback=ticker),
+                _map_object_id_json_list(
+                    row["source_object_ids"],
+                    object_id_map,
+                    projection_quality=projection_quality,
+                ),
                 row["factor_terms"],
                 row["metric_terms"],
                 row["entity_terms"],
@@ -3132,12 +4957,12 @@ def _emit_topic_spine(conn: sqlite3.Connection, rows: Sequence[sqlite3.Row]) -> 
                 row["impact_channels"],
                 row["evidence_strength"],
                 row["materiality_score"],
-                row["ticker"],
+                ticker,
             )
         )
     conn.executemany(
         """
-        INSERT OR REPLACE INTO global_topic_spine(
+        INSERT INTO global_topic_spine(
             topic_id, topic_key, topic_label, topic_family, topic_summary,
             ticker, source_object_ids, factor_terms, metric_terms, entity_terms,
             mechanism_terms, impact_channels, evidence_grade, materiality, shard_id
@@ -3149,7 +4974,13 @@ def _emit_topic_spine(conn: sqlite3.Connection, rows: Sequence[sqlite3.Row]) -> 
     return len(payload)
 
 
-def _emit_metric_spine(conn: sqlite3.Connection, rows: Sequence[sqlite3.Row]) -> int:
+def _emit_metric_spine(
+    conn: sqlite3.Connection,
+    rows: Sequence[sqlite3.Row],
+    *,
+    object_id_map: Mapping[str, str],
+    ticker: str,
+) -> int:
     payload: list[tuple[Any, ...]] = []
     for row in rows:
         metric_key = _normalize_key(row["canonical_metric"] or row["metric_name"])
@@ -3161,15 +4992,15 @@ def _emit_metric_spine(conn: sqlite3.Connection, rows: Sequence[sqlite3.Row]) ->
                 row["metric_name"],
                 row["unit"],
                 _stable_hash(row["dimensions_json"] or ""),
-                row["ticker"],
-                row["object_id"],
-                _lookup_document_id(row),
+                effective_ticker(row["ticker"], fallback=ticker),
+                _mapped_object_id(row["object_id"], object_id_map, ticker=ticker),
+                _lookup_document_id(row, ticker=ticker),
                 row["observation_period"],
                 row["document_type"],
                 _parse_float(row["value_text"]),
                 None,
                 None,
-                row["ticker"],
+                ticker,
             )
         )
     conn.executemany(
@@ -3186,7 +5017,13 @@ def _emit_metric_spine(conn: sqlite3.Connection, rows: Sequence[sqlite3.Row]) ->
     return len(payload)
 
 
-def _emit_counterparty_spine(conn: sqlite3.Connection, rows: Sequence[sqlite3.Row]) -> int:
+def _emit_counterparty_spine(
+    conn: sqlite3.Connection,
+    rows: Sequence[sqlite3.Row],
+    *,
+    object_id_map: Mapping[str, str],
+    ticker: str,
+) -> int:
     payload: list[tuple[Any, ...]] = []
     for row in rows:
         key = _normalize_key(row["counterparty"])
@@ -3197,14 +5034,14 @@ def _emit_counterparty_spine(conn: sqlite3.Connection, rows: Sequence[sqlite3.Ro
                 key,
                 row["counterparty"],
                 row["agreement_subtype"] or row["agreement_type"],
-                row["ticker"],
-                row["object_id"],
-                _lookup_document_id(row),
+                effective_ticker(row["ticker"], fallback=ticker),
+                _mapped_object_id(row["object_id"], object_id_map, ticker=ticker),
+                _lookup_document_id(row, ticker=ticker),
                 row["agreement_type"],
                 row["affected_channels"],
                 row["specificity_score"],
                 row["evidence_strength"],
-                row["ticker"],
+                ticker,
             )
         )
     conn.executemany(
@@ -3221,7 +5058,13 @@ def _emit_counterparty_spine(conn: sqlite3.Connection, rows: Sequence[sqlite3.Ro
     return len(payload)
 
 
-def _emit_entity_spine_from_topics(conn: sqlite3.Connection, rows: Sequence[sqlite3.Row]) -> int:
+def _emit_entity_spine_from_topics(
+    conn: sqlite3.Connection,
+    rows: Sequence[sqlite3.Row],
+    *,
+    object_id_map: Mapping[str, str],
+    ticker: str,
+) -> int:
     payload: list[tuple[Any, ...]] = []
     seen: set[tuple[str, str, str]] = set()
     for row in rows:
@@ -3229,7 +5072,11 @@ def _emit_entity_spine_from_topics(conn: sqlite3.Connection, rows: Sequence[sqli
             key = _normalize_key(term)
             if not key:
                 continue
-            marker = (key, str(row["ticker"]), str(row["primary_object_id"]))
+            occurrence_ticker = effective_ticker(row["ticker"], fallback=ticker)
+            mapped_object_id = _mapped_object_id(
+                row["primary_object_id"], object_id_map, ticker=ticker
+            )
+            marker = (key, occurrence_ticker, mapped_object_id)
             if marker in seen:
                 continue
             seen.add(marker)
@@ -3239,12 +5086,12 @@ def _emit_entity_spine_from_topics(conn: sqlite3.Connection, rows: Sequence[sqli
                     "unknown",
                     term,
                     json.dumps([term], sort_keys=True),
-                    row["ticker"],
-                    row["ticker"],
-                    row["primary_object_id"],
+                    occurrence_ticker,
+                    occurrence_ticker,
+                    mapped_object_id,
                     None,
                     None,
-                    row["ticker"],
+                    ticker,
                 )
             )
     conn.executemany(
@@ -3265,9 +5112,23 @@ def _refresh_key_stats(conn: sqlite3.Connection) -> int:
     sources = (
         ("factor", "global_factor_spine", "factor_key", "ticker", "object_id", "document_id"),
         ("topic", "global_topic_spine", "topic_key", "ticker", "topic_id", "topic_id"),
-        ("metric", "global_metric_spine", "canonical_metric_key", "ticker", "object_id", "document_id"),
+        (
+            "metric",
+            "global_metric_spine",
+            "canonical_metric_key",
+            "ticker",
+            "object_id",
+            "document_id",
+        ),
         ("entity", "global_entity_spine", "entity_key", "ticker", "object_id", "document_id"),
-        ("counterparty", "global_counterparty_spine", "counterparty_key", "ticker", "object_id", "document_id"),
+        (
+            "counterparty",
+            "global_counterparty_spine",
+            "counterparty_key",
+            "ticker",
+            "object_id",
+            "document_id",
+        ),
     )
     rows: list[tuple[Any, ...]] = []
     for key_type, table, key_col, ticker_col, object_col, document_col in sources:
@@ -3313,23 +5174,53 @@ def _refresh_key_stats(conn: sqlite3.Connection) -> int:
 
 
 def _document_id(row: sqlite3.Row, *, ticker: str) -> str:
-    return f"{str(row['ticker'] or ticker).upper()}:{row['doc_type_key']}:{row['period']}"
+    occurrence_ticker = effective_ticker(row["ticker"], fallback=ticker)
+    return f"{occurrence_ticker}:{row['doc_type_key']}:{row['period']}"
 
 
 def _object_document_id(row: sqlite3.Row, *, ticker: str) -> str:
     source_document_id = row["source_document_id"]
     if source_document_id:
-        return str(source_document_id)
-    return f"{str(row['ticker'] or ticker).upper()}:{row['doc_type_key']}:{row['period']}"
+        return project_local_identity(source_document_id, ticker=ticker)
+    occurrence_ticker = effective_ticker(row["ticker"], fallback=ticker)
+    return f"{occurrence_ticker}:{row['doc_type_key']}:{row['period']}"
 
 
-def _lookup_document_id(row: sqlite3.Row) -> str:
-    filing_period = (
-        row["filing_period"]
-        if "filing_period" in row.keys()
-        else row["period"]
-    )
-    return f"{str(row['ticker']).upper()}:{row['doc_type_key']}:{filing_period}"
+def _lookup_document_id(row: sqlite3.Row, *, ticker: str) -> str:
+    filing_period = row["filing_period"] if "filing_period" in row.keys() else row["period"]
+    occurrence_ticker = effective_ticker(row["ticker"], fallback=ticker)
+    return f"{occurrence_ticker}:{row['doc_type_key']}:{filing_period}"
+
+
+def _mapped_object_id(
+    object_id: Any,
+    object_id_map: Mapping[str, str],
+    *,
+    ticker: str,
+) -> str:
+    local_object_id = str(object_id or "")
+    try:
+        return object_id_map[local_object_id]
+    except KeyError as exc:
+        raise RuntimeError(
+            f"spine_projection_missing_object_reference:ticker={ticker}:object_id={local_object_id}"
+        ) from exc
+
+
+def _map_object_id_json_list(
+    value: Any,
+    object_id_map: Mapping[str, str],
+    *,
+    projection_quality: dict[str, int],
+) -> str:
+    mapped: list[str] = []
+    for object_id in _json_list(value):
+        projected = object_id_map.get(object_id)
+        if projected is None:
+            projection_quality["topic_source_refs_skipped"] += 1
+            continue
+        mapped.append(projected)
+    return json.dumps(mapped, ensure_ascii=False, sort_keys=True)
 
 
 def _compact_label(row: sqlite3.Row, obj: Mapping[str, Any]) -> str:
@@ -3389,6 +5280,41 @@ def _normalize_ticker(ticker: str) -> str:
     if not value:
         raise ValueError("ticker is required")
     return value
+
+
+def _semantic_object_hash(row: sqlite3.Row, obj: Mapping[str, Any]) -> str:
+    return semantic_object_hash(
+        obj,
+        object_id=str(row["id"]),
+        object_type=str(row["type"] or ""),
+    )
+
+
+def _semantic_edge_hash(
+    row: sqlite3.Row,
+    edge: Mapping[str, Any],
+    *,
+    edge_id: str,
+    from_id: str,
+    to_id: str,
+    relation_type: Any,
+    edge_scope: str,
+    source_object_type: str | None,
+    target_object_type: str | None,
+) -> str:
+    return _stable_hash(
+        {
+            "edge_class": edge.get("edge_class"),
+            "edge_id": edge_id,
+            "edge_scope": edge_scope,
+            "from_object_id": from_id,
+            "relation_id": row["relation_id"],
+            "relation_type": relation_type,
+            "source_object_type": source_object_type,
+            "target_object_type": target_object_type,
+            "to_object_id": to_id,
+        }
+    )
 
 
 def _stable_hash(value: Any) -> str:

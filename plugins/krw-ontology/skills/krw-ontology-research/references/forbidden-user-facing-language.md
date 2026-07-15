@@ -35,6 +35,21 @@ verified by trace
 verified from trace
 ```
 
+Do not make any of these a whole-answer ending when evidence is only partial:
+
+```text
+찾지 못했습니다
+모르겠습니다
+알 수 없습니다
+could not find it
+I do not know
+not enough information
+```
+
+These phrases may appear only when they accurately bound one specific claim,
+and then pair them with the strongest supported conclusion, the closest
+alternative signal, and the next investor monitor.
+
 ## Forbidden internal terms
 
 Do not write:

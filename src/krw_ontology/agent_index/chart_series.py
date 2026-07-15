@@ -14,8 +14,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from krw_ontology.agent_index.semantic_identity import (
+    project_local_identity,
+    project_object_identity,
+)
+
 CHART_SERIES_SCHEMA_VERSION = "krw-ontology-chart-series/v1"
-CHART_SERIES_BUILDER_VERSION = "chart-series-builder/v1"
+CHART_SERIES_BUILDER_VERSION = "chart-series-builder/v2"
 CHART_SERIES_RELATIVE_PATH = Path("indexes") / "chart_series.sqlite"
 CHART_SERIES_TABLES = (
     "chart_series_metadata",
@@ -94,7 +99,9 @@ def build_chart_series_index(
         else root / CHART_SERIES_RELATIVE_PATH
     )
     shard_manifest = _read_json(manifest_path)
-    shards = shard_manifest.get("shards") if isinstance(shard_manifest.get("shards"), Mapping) else {}
+    shards = (
+        shard_manifest.get("shards") if isinstance(shard_manifest.get("shards"), Mapping) else {}
+    )
 
     target_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = _temporary_sqlite_path(target_path)
@@ -146,6 +153,12 @@ def build_chart_series_index(
         _cleanup_sqlite_sidecars(tmp_path)
 
     verification = verify_chart_series_index(target_path)
+    if not verification.get("ok"):
+        target_path.unlink(missing_ok=True)
+        raise RuntimeError(
+            "chart series failed verification: "
+            + ", ".join(str(error) for error in verification.get("errors") or [])
+        )
     return ChartSeriesBuildResult(
         path=target_path,
         counts=verification.get("counts") or {},
@@ -269,7 +282,9 @@ def verify_chart_series_index(path: Path | str, *, deep: bool = True) -> dict[st
                     "series": _count(conn, "chart_series"),
                     "points": _count(conn, "chart_series_points"),
                     "tickers": int(
-                        conn.execute("SELECT COUNT(DISTINCT ticker) FROM chart_series").fetchone()[0]
+                        conn.execute("SELECT COUNT(DISTINCT ticker) FROM chart_series").fetchone()[
+                            0
+                        ]
                     ),
                 }
                 if deep:
@@ -352,7 +367,9 @@ def query_chart_series_pack(
             where = ["ticker IN (" + ",".join("?" for _ in ticker_values) + ")"]
             params: list[Any] = list(ticker_values)
             if metric_candidates:
-                where.append("canonical_metric IN (" + ",".join("?" for _ in metric_candidates) + ")")
+                where.append(
+                    "canonical_metric IN (" + ",".join("?" for _ in metric_candidates) + ")"
+                )
                 params.extend(metric_candidates)
             rows = conn.execute(
                 f"""
@@ -553,11 +570,20 @@ def _chart_point_from_row(row: sqlite3.Row, *, ticker: str) -> dict[str, Any] | 
         "period_sort_key": period_info["sort_key"],
         "document_type": row["document_type"],
         "document_period": document_period,
-        "source_document_id": obj.get("source_document_id"),
+        "source_document_id": (
+            project_local_identity(obj["source_document_id"], ticker=ticker)
+            if obj.get("source_document_id")
+            else None
+        ),
         "source_sort_key": _period_sort_key(document_period),
         "value": value,
         "formatted_value": _format_value(value, unit),
-        "object_id": row["object_id"],
+        "object_id": project_object_identity(
+            row["object_id"],
+            row["object_type"],
+            ticker=ticker,
+            payload=obj,
+        ),
         "trace_status": row["trace_status"],
         "metric_lineage_status": row["metric_lineage_status"],
         "series": {
@@ -673,7 +699,9 @@ def _write_metadata(conn: sqlite3.Connection, metadata: Mapping[str, Any]) -> No
         )
 
 
-def _chart_series_points(conn: sqlite3.Connection, series_key: str, *, limit: int) -> list[dict[str, Any]]:
+def _chart_series_points(
+    conn: sqlite3.Connection, series_key: str, *, limit: int
+) -> list[dict[str, Any]]:
     rows = conn.execute(
         """
         SELECT *
@@ -704,7 +732,10 @@ def _classify_metric(raw_metric: Any, *, metric_name: Any, text: str) -> dict[st
     if "business_combination_and_other_related_cost" in haystack or (
         "business combination" in haystack and "related cost" in haystack
     ):
-        return {"canonical_metric": "ma_related_costs", "quality_flags": ["ma_costs_not_cash_acquisition"]}
+        return {
+            "canonical_metric": "ma_related_costs",
+            "quality_flags": ["ma_costs_not_cash_acquisition"],
+        }
     if (
         "business_combination" in haystack
         or "business combinations" in haystack
@@ -717,7 +748,10 @@ def _classify_metric(raw_metric: Any, *, metric_name: Any, text: str) -> dict[st
         return {"canonical_metric": "adjusted_free_cash_flow", "quality_flags": ["non_gaap"]}
     aliases = (
         ("research_and_development", ("research_and_development", "r_d", "research_development")),
-        ("stock_based_compensation", ("stock_based_compensation", "share_based_compensation", "sbc")),
+        (
+            "stock_based_compensation",
+            ("stock_based_compensation", "share_based_compensation", "sbc"),
+        ),
         ("share_repurchase", ("share_repurchase", "stock_repurchase", "repurchase", "buyback")),
         ("capital_expenditures", ("capital_expenditure", "capital_expenditures", "capex")),
         ("operating_cash_flow", ("operating_cash_flow", "net_cash_provided_by_operating")),
@@ -779,7 +813,11 @@ def _period_info(row: sqlite3.Row, obj: Mapping[str, Any]) -> dict[str, Any] | N
 
 
 def _scope(row: sqlite3.Row) -> tuple[str, str, str]:
-    for kind, column in (("segment", "segment_name"), ("product", "product_name"), ("geography", "geography_name")):
+    for kind, column in (
+        ("segment", "segment_name"),
+        ("product", "product_name"),
+        ("geography", "geography_name"),
+    ):
         value = str(row[column] or "").strip()
         if value:
             key = _slug(value) or _short_hash(value)
@@ -799,8 +837,16 @@ def _scope(row: sqlite3.Row) -> tuple[str, str, str]:
 
 
 def _basis(metric: str, row: sqlite3.Row, obj: Mapping[str, Any]) -> str:
-    text = " ".join(str(part or "").lower() for part in (metric, row["metric_name"], row["text"], row["object_text"]))
-    if "non-gaap" in text or "non gaap" in text or "adjusted" in text or metric == "adjusted_free_cash_flow":
+    text = " ".join(
+        str(part or "").lower()
+        for part in (metric, row["metric_name"], row["text"], row["object_text"])
+    )
+    if (
+        "non-gaap" in text
+        or "non gaap" in text
+        or "adjusted" in text
+        or metric == "adjusted_free_cash_flow"
+    ):
         return "non_gaap_adjusted"
     if obj.get("type") == "XBRLFact" or "(xbrl)" in text or "xbrl" in text:
         return "gaap_xbrl"
@@ -812,7 +858,9 @@ def _basis(metric: str, row: sqlite3.Row, obj: Mapping[str, Any]) -> str:
 def _duration(metric: str, row: sqlite3.Row, obj: Mapping[str, Any]) -> str:
     context = obj.get("context") if isinstance(obj.get("context"), Mapping) else {}
     raw_period_type = str(obj.get("period_type") or context.get("period_type") or "").lower()
-    text = " ".join(str(part or "").lower() for part in (row["metric_name"], row["text"], row["object_text"]))
+    text = " ".join(
+        str(part or "").lower() for part in (row["metric_name"], row["text"], row["object_text"])
+    )
     if "ttm" in text or "trailing twelve" in text:
         return "ttm"
     if "ytd" in text or "year to date" in text:
@@ -823,7 +871,10 @@ def _duration(metric: str, row: sqlite3.Row, obj: Mapping[str, Any]) -> str:
 
 
 def _source_class(metric: str, basis: str, row: sqlite3.Row) -> str:
-    text = " ".join(str(part or "").lower() for part in (metric, row["metric_name"], row["text"], row["object_text"]))
+    text = " ".join(
+        str(part or "").lower()
+        for part in (metric, row["metric_name"], row["text"], row["object_text"])
+    )
     if metric == "ma_related_costs":
         return "fcf_reconciliation"
     if metric == "ma_cash_outflow":
@@ -832,7 +883,12 @@ def _source_class(metric: str, basis: str, row: sqlite3.Row) -> str:
         return "company_non_gaap_metric"
     if basis == "gaap_xbrl":
         return "xbrl"
-    if "cash flow" in text or metric in {"operating_cash_flow", "free_cash_flow", "capital_expenditures", "share_repurchase"}:
+    if "cash flow" in text or metric in {
+        "operating_cash_flow",
+        "free_cash_flow",
+        "capital_expenditures",
+        "share_repurchase",
+    }:
         return "cash_flow_statement"
     if metric in _POINT_IN_TIME_METRICS:
         return "balance_sheet"
@@ -867,9 +923,15 @@ def _metric_candidates_for_question(question: str) -> list[str]:
         (("마진", "margin"), ("gross_margin", "operating_margin")),
         (("자사주", "repurchase", "buyback"), ("share_repurchase",)),
         (("r&d", "연구개발", "research and development"), ("research_and_development",)),
-        (("sg&a", "sga", "판관비", "selling general", "administrative"), ("selling_general_and_admin",)),
+        (
+            ("sg&a", "sga", "판관비", "selling general", "administrative"),
+            ("selling_general_and_admin",),
+        ),
         (("sbc", "주식보상", "stock based", "share based"), ("stock_based_compensation",)),
-        (("m&a", "인수", "합병", "acquisition", "business combination"), ("ma_cash_outflow", "ma_related_costs")),
+        (
+            ("m&a", "인수", "합병", "acquisition", "business combination"),
+            ("ma_cash_outflow", "ma_related_costs"),
+        ),
         (("adjusted", "조정"), ("adjusted_free_cash_flow",)),
     )
     for needles, metrics in rules:
@@ -890,20 +952,29 @@ def _scope_candidates_for_question(question: str) -> list[str]:
         (("ipad", "i pad", "아이패드"), ("i_pad",)),
         (("mac", "맥"), ("mac",)),
         (("wearables", "wearable", "웨어러블"), ("wearables_homeand_accessories",)),
-        (("product", "products", "제품"), ("product", "i_phone", "service", "mac", "i_pad", "wearables_homeand_accessories")),
+        (
+            ("product", "products", "제품"),
+            ("product", "i_phone", "service", "mac", "i_pad", "wearables_homeand_accessories"),
+        ),
         (("americas", "america", "미주"), ("americas_segment",)),
         (("europe", "유럽"), ("europe_segment",)),
         (("greater china", "china", "중국"), ("greater_china_segment", "cn")),
         (("japan", "일본"), ("japan_segment",)),
-        (("rest of asia pacific", "asia pacific", "asia", "아시아", "아태"), ("rest_of_asia_pacific_segment",)),
+        (
+            ("rest of asia pacific", "asia pacific", "asia", "아시아", "아태"),
+            ("rest_of_asia_pacific_segment",),
+        ),
         (("us", "united states", "미국"), ("us",)),
-        (("region", "regional", "geographic", "geography", "지역"), (
-            "americas_segment",
-            "europe_segment",
-            "greater_china_segment",
-            "japan_segment",
-            "rest_of_asia_pacific_segment",
-        )),
+        (
+            ("region", "regional", "geographic", "geography", "지역"),
+            (
+                "americas_segment",
+                "europe_segment",
+                "greater_china_segment",
+                "japan_segment",
+                "rest_of_asia_pacific_segment",
+            ),
+        ),
     )
     for needles, scopes in rules:
         if any(needle in text or _slug(needle) in slug_text for needle in needles):
@@ -1118,7 +1189,12 @@ def _point_quality_score(point: Mapping[str, Any]) -> tuple[int, int, int, int, 
     if point.get("trace_status") in {"traceable", "traceable_metric_lineage"}:
         trace_score += 10
     document_score = 5 if point.get("document_type") in {"10-K", "10-Q"} else 0
-    exact_period_score = 5 if _period_sort_key(str(point.get("document_period") or "")) == int(point.get("period_sort_key") or 0) else 0
+    exact_period_score = (
+        5
+        if _period_sort_key(str(point.get("document_period") or ""))
+        == int(point.get("period_sort_key") or 0)
+        else 0
+    )
     return (
         source_sort,
         trace_score,
@@ -1264,7 +1340,11 @@ def _temporary_sqlite_path(path: Path) -> Path:
 
 
 def _cleanup_sqlite_sidecars(path: Path) -> None:
-    for candidate in (path, path.with_suffix(path.suffix + "-wal"), path.with_suffix(path.suffix + "-shm")):
+    for candidate in (
+        path,
+        path.with_suffix(path.suffix + "-wal"),
+        path.with_suffix(path.suffix + "-shm"),
+    ):
         try:
             if candidate.exists():
                 candidate.unlink()

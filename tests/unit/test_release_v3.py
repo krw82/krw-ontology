@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from krw_ontology.agent_index.router_sidecar import build_router_sidecar
+from krw_ontology.agent_index.router_coherence import build_router_coherence
 from krw_ontology.agent_index.metric_dictionary import metric_dictionary_binding
 from krw_ontology.agent_index import spine_builder
 from krw_ontology.agent_index.source_artifact_sqlite import (
@@ -14,7 +15,11 @@ from krw_ontology.agent_index.source_artifact_sqlite import (
     SOURCE_ARTIFACT_SQLITE_SCHEMA_VERSION,
 )
 from krw_ontology.agent_index.spine_schema import (
+    GLOBAL_SPINE_TABLES,
     initialize_global_spine_database,
+    verify_global_spine_schema,
+    write_global_spine_metadata,
+    write_spine_verification_seal,
 )
 from krw_ontology.release import (
     RELEASE_FORMAT_V3,
@@ -46,6 +51,34 @@ def _write_v3_release_files(root: Path) -> None:
             VALUES('obj:AAPL:1', 'AAPL', 'AAPL', 'indexes/companies/AAPL.sqlite')
             """
         )
+        conn.execute(
+            """
+            INSERT INTO global_object_replica(
+                object_id, ticker, document_id, document_type, period,
+                shard_id, shard_path
+            )
+            VALUES(
+                'obj:AAPL:1', 'AAPL', '', '', '',
+                'AAPL', 'indexes/companies/AAPL.sqlite'
+            )
+            """
+        )
+        write_global_spine_metadata(
+            conn,
+            {
+                "counts": {
+                    table: int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+                    for table in GLOBAL_SPINE_TABLES
+                    if table != "metadata"
+                }
+            },
+        )
+    spine_verification = verify_global_spine_schema(
+        spine_path,
+        deep=True,
+        trust_seal=False,
+    )
+    write_spine_verification_seal(spine_path, spine_verification)
     shard_path = root / "indexes" / "companies" / "AAPL.sqlite"
     shard_path.parent.mkdir(parents=True, exist_ok=True)
     shard_path.write_text("placeholder shard", encoding="utf-8")
@@ -74,6 +107,7 @@ def _write_v3_release_files(root: Path) -> None:
         encoding="utf-8",
     )
     build_router_sidecar(spine_path, release_id=root.name)
+    build_router_coherence(spine_path, release_id=root.name)
 
 
 def test_write_release_manifest_v3_uses_global_spine_without_monolith(tmp_path: Path) -> None:
@@ -87,6 +121,8 @@ def test_write_release_manifest_v3_uses_global_spine_without_monolith(tmp_path: 
     assert manifest["monolith_required"] is False
     assert manifest["indexes"]["global_spine"]["required"] is True
     assert manifest["indexes"]["router_sidecar"]["required"] is True
+    assert manifest["indexes"]["router_coherence"]["required"] is True
+    assert manifest["indexes"]["router_coherence"]["verification_ok"] is True
     assert manifest["indexes"]["router_sidecar"]["verification_ok"] is True
     assert manifest["indexes"]["router_sidecar"]["ranking_profile_sha256"]
     assert manifest["indexes"]["router_sidecar"]["build_fingerprint_sha256"]
@@ -95,21 +131,49 @@ def test_write_release_manifest_v3_uses_global_spine_without_monolith(tmp_path: 
         manifest["builder"]["source_artifact_sqlite_builder_version"]
         == SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION
     )
-    assert (
-        manifest["builder"]["spine_projection_version"]
-        == spine_builder.SPINE_PROJECTION_VERSION
-    )
+    assert manifest["builder"]["spine_projection_version"] == spine_builder.SPINE_PROJECTION_VERSION
     assert (
         manifest["indexes"]["company_shards"]["schema_version"]
         == spine_builder.COMPANY_SHARD_SCHEMA_VERSION
     )
     assert manifest["metric_dictionary"] == metric_dictionary_binding()
-    assert (
-        manifest["indexes"]["company_shards"]["metric_dictionary"]
-        == metric_dictionary_binding()
-    )
+    assert manifest["indexes"]["company_shards"]["metric_dictionary"] == metric_dictionary_binding()
     assert "debug_monolith" not in manifest["indexes"]
     assert "monolith" not in manifest["indexes"]
+
+
+def test_write_release_manifest_rejects_missing_replica_table(tmp_path: Path) -> None:
+    release_root = tmp_path / "dev" / "20260612_000001"
+    _write_v3_release_files(release_root)
+    with sqlite3.connect(release_root / "indexes" / "global_spine.sqlite") as conn:
+        conn.execute("DROP TABLE global_object_replica")
+
+    with pytest.raises(ValueError, match="global_spine_table_missing:global_object_replica"):
+        write_release_manifest_v3(
+            release_root,
+            release_id=release_root.name,
+            env="dev",
+        )
+
+
+def test_release_startup_rejects_missing_required_replica_index(tmp_path: Path) -> None:
+    release_root = tmp_path / "dev" / "20260612_000002"
+    _write_v3_release_files(release_root)
+    write_release_manifest_v3(release_root, release_id=release_root.name, env="dev")
+    with sqlite3.connect(release_root / "indexes" / "global_spine.sqlite") as conn:
+        conn.execute("DROP INDEX idx_global_object_replica_ticker_doc")
+
+    verification = verify_release_startup_v3(
+        release_root,
+        env="dev",
+        check_sqlite=True,
+    )
+
+    assert verification["ok"] is False
+    assert (
+        "global_spine_index_missing:idx_global_object_replica_ticker_doc"
+        in (verification["errors"])
+    )
 
 
 def test_verify_release_startup_v3_accepts_v3_release_without_monolith(tmp_path: Path) -> None:
@@ -173,31 +237,23 @@ def test_verify_release_startup_v3_rejects_stale_serving_bindings(
         env="dev",
     )
     if stale_kind == "global_v1":
-        manifest["builder"]["spine_schema_version"] = (
-            "krw-ontology-global-spine/v1"
-        )
-        manifest["indexes"]["global_spine"]["schema_version"] = (
-            "krw-ontology-global-spine/v1"
-        )
-        with sqlite3.connect(
-            release_root / "indexes" / "global_spine.sqlite"
-        ) as conn:
+        manifest["builder"]["spine_schema_version"] = "krw-ontology-global-spine/v1"
+        manifest["indexes"]["global_spine"]["schema_version"] = "krw-ontology-global-spine/v1"
+        with sqlite3.connect(release_root / "indexes" / "global_spine.sqlite") as conn:
             conn.execute(
                 "UPDATE metadata SET value_json = ? WHERE key = 'schema_version'",
                 (json.dumps("krw-ontology-global-spine/v1"),),
             )
     elif stale_kind == "projection_v1":
         manifest["builder"]["spine_projection_version"] = "spine-projection/v1"
-        manifest["indexes"]["global_spine"]["spine_projection_version"] = (
-            "spine-projection/v1"
-        )
+        manifest["indexes"]["global_spine"]["spine_projection_version"] = "spine-projection/v1"
     else:
         manifest["builder"]["source_artifact_sqlite_builder_version"] = (
             "source-artifact-sqlite-builder/v1"
         )
-        manifest["indexes"]["company_shards"][
-            "source_artifact_sqlite_builder_version"
-        ] = "source-artifact-sqlite-builder/v1"
+        manifest["indexes"]["company_shards"]["source_artifact_sqlite_builder_version"] = (
+            "source-artifact-sqlite-builder/v1"
+        )
     (release_root / "manifest.json").write_text(
         json.dumps(manifest, sort_keys=True),
         encoding="utf-8",
@@ -270,11 +326,14 @@ def test_verify_release_startup_v3_rejects_appended_router_sidecar_bytes(
     release_root = tmp_path / "dev" / "20260612_router_tampered"
     _write_v3_release_files(release_root)
     write_release_manifest_v3(release_root, release_id=release_root.name, env="dev")
-    assert verify_release_startup_v3(
-        release_root,
-        env="dev",
-        check_sqlite=False,
-    )["ok"] is True
+    assert (
+        verify_release_startup_v3(
+            release_root,
+            env="dev",
+            check_sqlite=False,
+        )["ok"]
+        is True
+    )
 
     with (release_root / "indexes" / "router_sidecar.sqlite").open("ab") as handle:
         handle.write(b"tampered")
@@ -285,4 +344,7 @@ def test_verify_release_startup_v3_rejects_appended_router_sidecar_bytes(
         check_sqlite=False,
     )
     assert result["ok"] is False
-    assert "router_sidecar:router_sidecar_manifest_sha256_mismatch" in result["errors"]
+    assert (
+        "router_sidecar:router_sidecar_verification_seal_required:identity_mismatch"
+        in result["errors"]
+    )

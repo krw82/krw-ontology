@@ -13,6 +13,8 @@ import json
 import re
 from typing import Any
 
+from pydantic import ValidationError
+
 from krw_ontology.guru.context_taxonomy import (
     context_tags_for_text,
     filing_topic_filter_reason,
@@ -23,6 +25,8 @@ from krw_ontology.guru.company_context import (
 )
 from krw_ontology.guru.models import (
     AUTHOR_KEYS,
+    GURU_INVESTIGATION_BRIEF_FORMAT,
+    GuruAgentEvidenceAnalysis,
     GuruDynamicQuestionPlan,
     GuruDynamicQuestionPlanItem,
     GuruCompanyEvidenceAlignment,
@@ -30,8 +34,33 @@ from krw_ontology.guru.models import (
     GuruCompanyFilingBrief,
     GuruCompanyIdentity,
     GuruCompanyOntologyContext,
+    GuruCompanyResearchContext,
     GuruCompanyResearchPack,
+    GuruInvestigationBrief,
+    GuruInvestigationQuestion,
+    GuruInvestigationQuestionDraft,
+    GuruLightCompanyContext,
+    GuruValidatedEvidenceAnalysis,
 )
+
+
+class GuruEvidenceAnalysisValidationError(ValueError):
+    """A precise, model-actionable correction for one Guru review call."""
+
+    def __init__(
+        self,
+        *,
+        code: str,
+        message: str,
+        required_change: str,
+        invalid_fields: list[str],
+        violations: list[dict[str, Any]] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.required_change = required_change
+        self.invalid_fields = invalid_fields
+        self.violations = violations or []
 
 
 TOPIC_QUERY_EXPANSIONS: dict[str, tuple[str, ...]] = {
@@ -237,6 +266,7 @@ def company_filing_brief_from_guru_lens(
     company_context: GuruCompanyOntologyContext | Mapping[str, Any] | None = None,
     author_key: str | None = None,
     question: str | None = None,
+    investigation_questions: Sequence[Mapping[str, Any]] | None = None,
 ) -> GuruCompanyFilingBrief:
     """Translate a Guru ResearchPack or query-context payload into a filing brief."""
 
@@ -335,19 +365,34 @@ def company_filing_brief_from_guru_lens(
         },
         "policy": "Application/orchestrator calls the company MCP; Guru MCP remains read-only lens context.",
     }
-    dynamic_question_plan = _dynamic_question_plan(
-        author_key=selected_author,
-        subject=subject,
-        ticker=resolved_ticker,
-        company_name=resolved_company_name,
-        original_question=original_question,
-        pack=pack,
-        company_context=context_model,
-        required_topics=required_topics if requires_company else [],
-        candidate_topics=candidate_topics if requires_company else [],
-        data_need_keys=data_need_keys,
-        query_terms=query_terms,
-        intent_family=_clean_optional(_get_nested(pack, ("intent", "family"))),
+    investigation_brief = (
+        seal_guru_investigation_brief(
+            guru_payload=payload,
+            investigation_questions=investigation_questions,
+            ticker=resolved_ticker,
+            company_context=company_context,
+            author_key=selected_author,
+        )
+        if investigation_questions is not None
+        else None
+    )
+    dynamic_question_plan = (
+        None
+        if investigation_questions is not None
+        else _dynamic_question_plan(
+            author_key=selected_author,
+            subject=subject,
+            ticker=resolved_ticker,
+            company_name=resolved_company_name,
+            original_question=original_question,
+            pack=pack,
+            company_context=context_model,
+            required_topics=required_topics if requires_company else [],
+            candidate_topics=candidate_topics if requires_company else [],
+            data_need_keys=data_need_keys,
+            query_terms=query_terms,
+            intent_family=_clean_optional(_get_nested(pack, ("intent", "family"))),
+        )
     )
     return GuruCompanyFilingBrief(
         author_key=selected_author,
@@ -375,9 +420,528 @@ def company_filing_brief_from_guru_lens(
         generic_filing_requirements=generic_requirements,
         data_need_keys=data_need_keys,
         dynamic_question_plan=dynamic_question_plan if requires_company else None,
+        investigation_brief=investigation_brief if requires_company else None,
         missing_inputs=missing_inputs,
         recommended_company_mcp_call=recommended_call,
     )
+
+
+def seal_guru_investigation_brief(
+    *,
+    guru_payload: Mapping[str, Any],
+    investigation_questions: Sequence[Mapping[str, Any]],
+    ticker: str | None,
+    company_context: GuruCompanyOntologyContext | Mapping[str, Any] | None,
+    author_key: str | None = None,
+) -> GuruInvestigationBrief:
+    """Validate and seal one main-agent key question without authoring it.
+
+    The server owns identity, source binding, deterministic ids, and hashes.
+    The main Guru owns its central question selection and later interpretation.
+    """
+
+    payload = _mapping(guru_payload)
+    pack = _research_pack(payload)
+    selected_author = _author_key(author_key, pack)
+    research_pack_id = _clean_optional(_get_nested(pack, ("pack_meta", "pack_id")))
+    normalized_ticker = _clean_optional(ticker)
+    if not research_pack_id:
+        raise ValueError("Guru ResearchPack must contain pack_meta.pack_id")
+    if not normalized_ticker:
+        raise ValueError("ticker is required to seal a Guru investigation brief")
+    if len(investigation_questions) != 1:
+        raise ValueError("investigation_questions must contain exactly one key question")
+
+    context = _coerce_light_company_context(
+        company_context,
+        ticker=normalized_ticker,
+    )
+    if context.ticker.upper() != normalized_ticker.upper():
+        raise ValueError("company_context ticker does not match the requested ticker")
+    context_anchor_ids = {anchor.anchor_id for anchor in context.context_anchors}
+    if not context_anchor_ids:
+        raise ValueError("company_context must include trusted context_anchors")
+
+    selected_lenses = _list_of_mappings(pack.get("selected_lenses"))
+    allowed_principle_ids = {
+        str(lens.get("reviewed_id"))
+        for lens in selected_lenses
+        if lens.get("reviewed_id") and lens.get("author_key", selected_author) == selected_author
+    }
+    if not allowed_principle_ids:
+        raise ValueError("Guru ResearchPack contains no selectable principle ids for the author")
+
+    normalized_drafts = [
+        _normalize_investigation_draft(raw_draft)
+        for raw_draft in investigation_questions
+    ]
+    if not normalized_drafts[0].get("decision_role"):
+        # The one-question investigation is necessarily the central tension.
+        # This is a structural default, not a server-authored investment question.
+        normalized_drafts[0]["decision_role"] = "main_tension"
+    if normalized_drafts[0].get("decision_role") != "main_tension":
+        raise ValueError(
+            "the sole investigation question must declare decision_role=main_tension"
+        )
+
+    sealed_questions: list[GuruInvestigationQuestion] = []
+    normalized_question_texts: set[str] = set()
+    for raw_draft in normalized_drafts:
+        draft = GuruInvestigationQuestionDraft.model_validate(
+            raw_draft
+        )
+        _require_investigation_draft_fields(draft)
+        unknown_principles = set(draft.guru_principle_ids) - allowed_principle_ids
+        if unknown_principles:
+            raise ValueError(
+                "investigation question references a principle outside the selected "
+                f"Guru ResearchPack: {sorted(unknown_principles)}"
+            )
+        unknown_anchors = set(draft.company_context_anchor_ids) - context_anchor_ids
+        if unknown_anchors:
+            raise ValueError(
+                "investigation question references an unknown company context anchor: "
+                f"{sorted(unknown_anchors)}"
+            )
+        normalized_question = _normalize_question_text(draft.question)
+        if normalized_question in normalized_question_texts:
+            raise ValueError("investigation_questions must not contain duplicate questions")
+        normalized_question_texts.add(normalized_question)
+        question_id = _sealed_question_id(
+            author_key=selected_author,
+            ticker=normalized_ticker,
+            question=draft,
+        )
+        sealed_questions.append(
+            GuruInvestigationQuestion(
+                **draft.model_dump(mode="python"),
+                question_id=question_id,
+            )
+        )
+
+    context_hash = _canonical_hash(context.model_dump(mode="json"))
+    unsigned = {
+        "format": GURU_INVESTIGATION_BRIEF_FORMAT,
+        "research_pack_id": research_pack_id,
+        "author_key": selected_author,
+        "ticker": normalized_ticker.upper(),
+        "company_context_hash": context_hash,
+        "questions": [question.model_dump(mode="json") for question in sealed_questions],
+    }
+    return GuruInvestigationBrief(
+        **unsigned,
+        brief_hash=_canonical_hash(unsigned),
+    )
+
+
+def validate_guru_agent_evidence_analysis(
+    *,
+    investigation_brief: GuruInvestigationBrief | Mapping[str, Any],
+    company_research_context: GuruCompanyResearchContext | Mapping[str, Any],
+    agent_analysis: GuruAgentEvidenceAnalysis | Mapping[str, Any],
+) -> GuruValidatedEvidenceAnalysis:
+    """Validate that a Guru analysis stays inside sealed research-context bounds."""
+
+    brief = (
+        investigation_brief
+        if isinstance(investigation_brief, GuruInvestigationBrief)
+        else GuruInvestigationBrief.model_validate(_normalize_investigation_brief(investigation_brief))
+    )
+    try:
+        research_context = (
+            company_research_context
+            if isinstance(company_research_context, GuruCompanyResearchContext)
+            else GuruCompanyResearchContext.model_validate(dict(company_research_context))
+        )
+    except ValidationError as exc:
+        raise GuruEvidenceAnalysisValidationError(
+            code="invalid_company_research_context",
+            message="company_research_context is not a valid runtime-built context.",
+            required_change=(
+                "Attach the exact krw-guru-company-research-context/v1 payload "
+                "created from this run's filing-tool results. Do not create, edit, "
+                "or omit its format, ticker, brief_hash, question_ids, evidence_units, "
+                "or source_object_ids."
+            ),
+            invalid_fields=["company_research_context"],
+            violations=[{"validation_errors": exc.errors()}],
+        ) from exc
+    if research_context.brief_hash != brief.brief_hash:
+        raise ValueError("company research context brief_hash does not match the sealed investigation brief")
+    if research_context.ticker.upper() != brief.ticker.upper():
+        raise ValueError("company research context ticker does not match the sealed investigation brief")
+
+    analysis = (
+        agent_analysis
+        if isinstance(agent_analysis, GuruAgentEvidenceAnalysis)
+        else GuruAgentEvidenceAnalysis.model_validate(
+            _normalize_agent_evidence_analysis(agent_analysis)
+        )
+    )
+    questions_by_id = {question.question_id: question for question in brief.questions}
+    if set(research_context.question_ids) != set(questions_by_id):
+        raise GuruEvidenceAnalysisValidationError(
+            code="sealed_question_context_required",
+            message="company_research_context must cover the sealed investigation question exactly.",
+            required_change=(
+                "Attach the runtime-built company_research_context for the current "
+                "sealed brief without adding or removing question_ids."
+            ),
+            invalid_fields=["company_research_context.question_ids"],
+            violations=[
+                {
+                    "allowed_question_ids": sorted(questions_by_id),
+                    "received_question_ids": sorted(research_context.question_ids),
+                }
+            ],
+        )
+    permitted_ids = set(research_context.source_object_ids)
+    assessment_ids = [assessment.question_id for assessment in analysis.assessments]
+    if set(assessment_ids) != set(questions_by_id) or len(assessment_ids) != len(set(assessment_ids)):
+        missing = sorted(set(questions_by_id) - set(assessment_ids))
+        unexpected = sorted(set(assessment_ids) - set(questions_by_id))
+        raise GuruEvidenceAnalysisValidationError(
+            code="sealed_question_coverage_required",
+            message="agent_analysis must assess every sealed investigation question exactly once.",
+            required_change=(
+                "Use exactly these sealed question_id values once each: "
+                f"{sorted(questions_by_id)}."
+            ),
+            invalid_fields=["agent_analysis.assessments"],
+            violations=[
+                {
+                    "missing_question_ids": missing,
+                    "unexpected_question_ids": unexpected,
+                    "allowed_question_ids": sorted(questions_by_id),
+                }
+            ],
+        )
+
+    for assessment_index, assessment in enumerate(analysis.assessments):
+        question = questions_by_id[assessment.question_id]
+        _require_nonempty_text(assessment.reasoning, "assessment.reasoning")
+        if not set(assessment.evidence_object_ids).issubset(permitted_ids):
+            raise GuruEvidenceAnalysisValidationError(
+                code="question_scoped_evidence_required",
+                message=(
+                    f"Question {assessment.question_id} cites evidence outside its "
+                    "runtime-built company research context."
+                ),
+                required_change=(
+                    "Use only the allowed evidence_object_ids for this question, or "
+                    "remove the citation and choose mixed or unresolved."
+                ),
+                invalid_fields=[
+                    f"agent_analysis.assessments[{assessment_index}].evidence_object_ids"
+                ],
+                violations=[
+                    {
+                        "question_id": assessment.question_id,
+                        "allowed_evidence_object_ids": sorted(permitted_ids),
+                    }
+                ],
+            )
+
+        allowed_verdicts = ["mixed", "unresolved"]
+        if assessment.verdict not in allowed_verdicts:
+            raise GuruEvidenceAnalysisValidationError(
+                code="contextual_evidence_cannot_support",
+                message=(
+                    f"Question {assessment.question_id} cannot use verdict "
+                    f"'{assessment.verdict}' with contextual company research."
+                ),
+                required_change=(
+                    "Choose mixed or unresolved. Contextual research may inform an "
+                    "interpretation but cannot establish a supported verdict."
+                ),
+                invalid_fields=[
+                    f"agent_analysis.assessments[{assessment_index}].verdict"
+                ],
+                violations=[
+                    {
+                        "question_id": assessment.question_id,
+                        "allowed_verdicts": allowed_verdicts,
+                        "allowed_evidence_object_ids": sorted(permitted_ids),
+                    }
+                ],
+            )
+        if assessment.verdict == "unresolved" and assessment.evidence_object_ids:
+            raise GuruEvidenceAnalysisValidationError(
+                code="unresolved_verdict_must_not_cite_evidence",
+                message=(
+                    f"Question {assessment.question_id} uses verdict 'unresolved' but "
+                    "also cites evidence."
+                ),
+                required_change=(
+                    "Remove evidence_object_ids for an unresolved verdict, or change "
+                    "the verdict to mixed."
+                ),
+                invalid_fields=[
+                    f"agent_analysis.assessments[{assessment_index}].evidence_object_ids",
+                    f"agent_analysis.assessments[{assessment_index}].verdict",
+                ],
+                violations=[
+                    {
+                        "question_id": assessment.question_id,
+                        "allowed_verdicts": allowed_verdicts,
+                        "allowed_evidence_object_ids": sorted(permitted_ids),
+                    }
+                ],
+            )
+
+    _require_nonempty_text(analysis.overall_judgment, "overall_judgment")
+    decision_frame = {
+        "main_tension_question_id": next(
+            question.question_id
+            for question in brief.questions
+            if question.decision_role == "main_tension"
+        ),
+        "questions": [
+            {
+                "question_id": question.question_id,
+                "decision_role": question.decision_role,
+                "question": question.question,
+                "hypothesis": question.hypothesis,
+                "counter_hypothesis": question.counter_hypothesis,
+                "why_material": question.why_material,
+                "change_condition": question.weakens_if,
+                "verdict": next(
+                    assessment.verdict
+                    for assessment in analysis.assessments
+                    if assessment.question_id == question.question_id
+                ),
+            }
+            for question in brief.questions
+        ],
+    }
+
+    return GuruValidatedEvidenceAnalysis(
+        brief_hash=brief.brief_hash,
+        research_context_hash=_canonical_hash(research_context.model_dump(mode="json")),
+        author_key=brief.author_key,
+        ticker=brief.ticker.upper(),
+        agent_analysis=analysis,
+        decision_frame=decision_frame,
+        validation={
+            "all_questions_assessed": True,
+            "evidence_is_question_scoped": True,
+            "evidence_mode": "contextual",
+            "allowed_verdicts": ["mixed", "unresolved"],
+        },
+    )
+
+
+def _coerce_light_company_context(
+    value: GuruCompanyOntologyContext | Mapping[str, Any] | None,
+    *,
+    ticker: str,
+) -> GuruLightCompanyContext:
+    if value is None:
+        raise ValueError("company_context is required for an agent-generated investigation brief")
+    if isinstance(value, GuruCompanyOntologyContext):
+        raise ValueError(
+            "agent-generated investigation briefs require GuruLightCompanyContext "
+            "with trusted context_anchors"
+        )
+    payload = dict(value)
+    aliases = {
+        "companyName": "company_name",
+        "businessDescription": "business_description",
+        "primaryActivities": "primary_activities",
+        "productsOrSegments": "products_or_segments",
+        "revenueLogic": "revenue_logic",
+        "contextAnchors": "context_anchors",
+        "filingAvailability": "filing_availability",
+    }
+    normalized = {
+        aliases.get(key, key): value
+        for key, value in payload.items()
+    }
+    normalized_anchors: list[dict[str, Any]] = []
+    for raw_anchor in normalized.get("context_anchors") or []:
+        if not isinstance(raw_anchor, Mapping):
+            continue
+        normalized_anchors.append(
+            {
+                "anchor_id": raw_anchor.get("anchor_id") or raw_anchor.get("anchorId"),
+                "kind": raw_anchor.get("kind"),
+                "text": raw_anchor.get("text"),
+            }
+        )
+    normalized["context_anchors"] = normalized_anchors
+    normalized["ticker"] = normalized.get("ticker") or ticker
+    context = GuruLightCompanyContext.model_validate(normalized)
+    _require_nonempty_text(context.company_name, "company_context.company_name")
+    _require_nonempty_text(context.business_description, "company_context.business_description")
+    anchor_ids = [anchor.anchor_id.strip() for anchor in context.context_anchors]
+    if len(anchor_ids) != len(set(anchor_ids)) or not all(anchor_ids):
+        raise ValueError("company_context context_anchors must have unique non-empty anchor_id values")
+    return context
+
+
+def _normalize_investigation_draft(raw: Mapping[str, Any]) -> dict[str, Any]:
+    aliases = {
+        "guruPrincipleIds": "guru_principle_ids",
+        "companyContextAnchorIds": "company_context_anchor_ids",
+        "counterHypothesis": "counter_hypothesis",
+        "evidenceNeeded": "evidence_needed",
+        "strengthensIf": "strengthens_if",
+        "weakensIf": "weakens_if",
+        "whyMaterial": "why_material",
+        "decisionRole": "decision_role",
+    }
+    return {aliases.get(key, key): value for key, value in dict(raw).items()}
+
+
+def _normalize_investigation_brief(raw: Mapping[str, Any]) -> dict[str, Any]:
+    aliases = {
+        "briefHash": "brief_hash",
+        "researchPackId": "research_pack_id",
+        "authorKey": "author_key",
+        "companyContextHash": "company_context_hash",
+    }
+    normalized = {aliases.get(key, key): value for key, value in dict(raw).items()}
+    questions = normalized.get("questions")
+    if isinstance(questions, Sequence) and not isinstance(questions, (str, bytes)):
+        normalized["questions"] = [
+            {
+                **_normalize_investigation_draft(item),
+                "question_id": item.get("question_id") or item.get("questionId"),
+            }
+            for item in questions
+            if isinstance(item, Mapping)
+        ]
+    return normalized
+
+
+def _normalize_agent_evidence_analysis(raw: Mapping[str, Any]) -> dict[str, Any]:
+    aliases = {
+        "overallJudgment": "overall_judgment",
+    }
+    normalized = {aliases.get(key, key): value for key, value in dict(raw).items()}
+    assessments = normalized.get("assessments")
+    if isinstance(assessments, Sequence) and not isinstance(assessments, (str, bytes)):
+        normalized["assessments"] = [
+            {
+                "question_id": item.get("question_id") or item.get("questionId"),
+                "evidence_object_ids": item.get("evidence_object_ids") or item.get("evidenceObjectIds") or [],
+                "verdict": _normalize_evidence_verdict(item.get("verdict") or item.get("effect")),
+                "reasoning": item.get("reasoning"),
+            }
+            for item in assessments
+            if isinstance(item, Mapping)
+        ]
+    return {
+        "assessments": normalized.get("assessments"),
+        "overall_judgment": normalized.get("overall_judgment"),
+    }
+
+
+def _normalize_evidence_verdict(value: Any) -> Any:
+    aliases = {
+        "strengthens": "supported",
+        "weakens": "mixed",
+    }
+    return aliases.get(value, value)
+
+
+def _require_investigation_draft_fields(draft: GuruInvestigationQuestionDraft) -> None:
+    for field_name, value in (
+        ("question", draft.question),
+        ("hypothesis", draft.hypothesis),
+        ("counter_hypothesis", draft.counter_hypothesis),
+        ("strengthens_if", draft.strengthens_if),
+        ("weakens_if", draft.weakens_if),
+        ("why_material", draft.why_material),
+    ):
+        _require_nonempty_text(value, f"investigation_questions.{field_name}")
+    if draft.decision_role is None:
+        raise ValueError(
+            "investigation_questions.decision_role must be main_tension for the sole key question"
+        )
+    for field_name, values in (
+        ("guru_principle_ids", draft.guru_principle_ids),
+        ("company_context_anchor_ids", draft.company_context_anchor_ids),
+        ("evidence_needed", draft.evidence_needed),
+    ):
+        if not values or any(not str(value).strip() for value in values):
+            raise ValueError(f"investigation_questions.{field_name} must contain non-empty values")
+        if len(values) != len(set(values)):
+            raise ValueError(f"investigation_questions.{field_name} must not contain duplicates")
+
+
+def _require_nonempty_text(value: Any, field_name: str) -> None:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field_name} must be a non-empty string")
+
+
+def _normalize_question_text(value: str) -> str:
+    return " ".join(value.casefold().split())
+
+
+def _sealed_question_id(
+    *,
+    author_key: str,
+    ticker: str,
+    question: GuruInvestigationQuestionDraft,
+) -> str:
+    payload = {
+        "author_key": author_key,
+        "ticker": ticker.upper(),
+        "guru_principle_ids": sorted(question.guru_principle_ids),
+        "company_context_anchor_ids": sorted(question.company_context_anchor_ids),
+        "decision_role": question.decision_role,
+        "question": _normalize_question_text(question.question),
+    }
+    return f"q_{_canonical_hash(payload)[:16]}"
+
+
+def _canonical_hash(value: Mapping[str, Any]) -> str:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _verified_evidence_ids_by_question(
+    payload: Mapping[str, Any],
+) -> dict[str, dict[str, Any]]:
+    evidence_by_question = payload.get("evidence_by_question")
+    if not isinstance(evidence_by_question, Sequence) or isinstance(
+        evidence_by_question,
+        (str, bytes),
+    ):
+        raise ValueError("company evidence payload is missing evidence_by_question")
+    result: dict[str, dict[str, Any]] = {}
+    for item in evidence_by_question:
+        if not isinstance(item, Mapping):
+            raise ValueError("company evidence contains an invalid question entry")
+        question_id = _clean_optional(item.get("question_id"))
+        answerability = _clean_optional(item.get("answerability"))
+        evidence = item.get("evidence")
+        if not question_id or answerability not in {
+            "verified",
+            "interpretation_only",
+            "not_verified",
+        }:
+            raise ValueError("company evidence contains an invalid question status")
+        if not isinstance(evidence, Sequence) or isinstance(evidence, (str, bytes)):
+            raise ValueError("company evidence contains an invalid evidence list")
+        object_ids = {
+            str(entry.get("source_object_id"))
+            for entry in evidence
+            if isinstance(entry, Mapping) and entry.get("source_object_id")
+        }
+        if question_id in result:
+            raise ValueError("company evidence contains duplicate question ids")
+        result[question_id] = {
+            "answerability": answerability,
+            "object_ids": object_ids,
+        }
+    return result
 
 
 def build_guru_company_research_pack(

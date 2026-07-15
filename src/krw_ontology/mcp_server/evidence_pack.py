@@ -25,9 +25,27 @@ MAX_VERIFICATION_OBJECTS = 8
 MAX_OBJECTS_PER_QUESTION = 4
 MAX_VERIFIED_EXCERPT_CHARS = 520
 _QUESTION_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]{1,80}$")
+_BRIEF_HASH_PATTERN = re.compile(r"^[a-f0-9]{64}$")
 _FILING_DOCUMENT_TYPES = {"10-K", "10-Q"}
 _DIRECT_OBJECT_TYPES = {"ResearchClaim", "EvidenceQuote", "SourceSpan"}
 _METRIC_OBJECT_TYPES = {"MetricObservation", "XBRLFact", "Calculation"}
+
+
+class EvidencePackInputError(ValueError):
+    """A correctable public MCP input error for evidence-pack construction."""
+
+    def __init__(
+        self,
+        *,
+        code: str,
+        message: str,
+        required_change: str,
+        invalid_fields: list[str],
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.required_change = required_change
+        self.invalid_fields = invalid_fields
 
 
 def build_verified_company_evidence_pack(
@@ -36,6 +54,7 @@ def build_verified_company_evidence_pack(
     ticker: str,
     questions: Sequence[Mapping[str, Any]],
     release_id: str | None = None,
+    brief_hash: str | None = None,
 ) -> dict[str, Any]:
     """Resolve exact object ids into a bounded, source-backed evidence pack."""
 
@@ -43,6 +62,7 @@ def build_verified_company_evidence_pack(
     if not normalized_ticker:
         raise ValueError("ticker is required")
     normalized_questions = _normalize_questions(questions)
+    normalized_brief_hash = _normalize_brief_hash(brief_hash)
     documents = store.list_documents(
         ticker=normalized_ticker,
         document_types=sorted(_FILING_DOCUMENT_TYPES),
@@ -115,6 +135,7 @@ def build_verified_company_evidence_pack(
         "format": VERIFIED_COMPANY_EVIDENCE_FORMAT,
         "release_id": release_id,
         "ticker": normalized_ticker,
+        **({"brief_hash": normalized_brief_hash} if normalized_brief_hash else {}),
         "current_driver": current_driver,
         "annual_baseline": annual_baseline,
         "evidence_by_question": evidence_by_question,
@@ -204,16 +225,43 @@ def _normalize_questions(
             if object_id and object_id not in object_ids:
                 object_ids.append(object_id)
         if len(object_ids) > MAX_OBJECTS_PER_QUESTION:
-            raise ValueError(
-                f"{question_id} supports at most {MAX_OBJECTS_PER_QUESTION} object ids"
+            raise EvidencePackInputError(
+                code="too_many_object_ids_for_question",
+                message=(
+                    f"Question '{question_id}' supports at most "
+                    f"{MAX_OBJECTS_PER_QUESTION} object ids; received {len(object_ids)}."
+                ),
+                required_change=(
+                    f"Keep only the {MAX_OBJECTS_PER_QUESTION} most decision-relevant "
+                    "object ids for this question and omit lower-priority evidence."
+                ),
+                invalid_fields=[f"questions[{len(normalized)}].object_ids"],
             )
         all_object_ids.update(object_ids)
         normalized.append({"question_id": question_id, "object_ids": object_ids})
 
     if len(all_object_ids) > MAX_VERIFICATION_OBJECTS:
-        raise ValueError(
-            f"verification supports at most {MAX_VERIFICATION_OBJECTS} unique object ids"
+        raise EvidencePackInputError(
+            code="too_many_unique_object_ids",
+            message=(
+                f"The verification request has {len(all_object_ids)} unique object ids; "
+                f"the maximum is {MAX_VERIFICATION_OBJECTS}."
+            ),
+            required_change=(
+                f"Keep no more than {MAX_VERIFICATION_OBJECTS} unique object ids across "
+                "all questions, prioritizing the direct evidence for the main tension."
+            ),
+            invalid_fields=["questions"],
         )
+    return normalized
+
+
+def _normalize_brief_hash(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip().lower()
+    if not _BRIEF_HASH_PATTERN.fullmatch(normalized):
+        raise ValueError("brief_hash must be a lowercase SHA-256 hex digest")
     return normalized
 
 

@@ -12,12 +12,13 @@ from typing import Any, Callable, Iterable, Mapping
 
 from krw_ontology.config.constants import normalize_doc_type
 from krw_ontology.config.settings import PipelineConfig
+from krw_ontology.agent_index.spine_schema import verify_global_spine_schema
+from krw_ontology.agent_index.spine_verify import global_replica_consistency_errors
 from krw_ontology.pipeline.queue import FAILED as QUEUE_FAILED
 from krw_ontology.pipeline.queue import PipelineQueue
 from krw_ontology.pipeline.research_plan import discover_research_filing_targets
 from krw_ontology.quality.models import (
     BATCH_FAILURE,
-    COVERAGE_GAP,
     DOCS_MISSING,
     NORMALIZE_NUMERIC,
     REPAIR_REFERENCE,
@@ -44,7 +45,9 @@ DOCS_MISSING_FALLBACK_ACTION = "full_refresh_fallback"
 DOCS_MISSING_NO_REPAIR_ACTION = "expected_filing_coverage_complete"
 DOCS_MISSING_REPAIRABILITY = "source_repair"
 DOCS_MISSING_DISCOVERY_YEARS = 3
-_PERIOD_RE = re.compile(r"^(?P<prefix>CY|FY)?(?P<year>\d{4})(?:Q(?P<quarter>[1-4]))?$", re.IGNORECASE)
+_PERIOD_RE = re.compile(
+    r"^(?P<prefix>CY|FY)?(?P<year>\d{4})(?:Q(?P<quarter>[1-4]))?$", re.IGNORECASE
+)
 _QUEUE_FINAL_SPLIT_FAILURE_RE = re.compile(
     r"(?P<stage>extract_evidence_quotes|extract_research_claims|extract_assumption_candidates):\s*"
     r"(?P<failed>\d+)\s*/\s*(?P<total>\d+)\s+"
@@ -160,9 +163,7 @@ class QualityShardScanner:
             ]
             tickers = self.ticker_quality(min_docs=min_docs)
             problem_tickers = [
-                ticker
-                for ticker in tickers
-                if ticker.problem_kinds(min_docs=min_docs)
+                ticker for ticker in tickers if ticker.problem_kinds(min_docs=min_docs)
             ]
             severity_counts = Counter(
                 ticker.severity(min_docs=min_docs)
@@ -170,9 +171,7 @@ class QualityShardScanner:
                 if ticker.problem_kinds(min_docs=min_docs)
             )
             kind_counts = Counter(
-                kind
-                for ticker in tickers
-                for kind in ticker.problem_kinds(min_docs=min_docs)
+                kind for ticker in tickers for kind in ticker.problem_kinds(min_docs=min_docs)
             )
             rejected_reasons = self.rejected_reason_summary(limit=20)
         return {
@@ -398,7 +397,9 @@ class QualityShardScanner:
                     expected_discovery_error: str | None = None
                     if expected_filing_provider is not None:
                         try:
-                            expected_documents, expected_discovery_error = expected_filing_provider(ticker)
+                            expected_documents, expected_discovery_error = expected_filing_provider(
+                                ticker
+                            )
                         except Exception as exc:
                             expected_documents = []
                             expected_discovery_error = str(exc)
@@ -417,7 +418,10 @@ class QualityShardScanner:
                             plan_id=plan_id,
                             kind=DOCS_MISSING,
                             ticker=ticker,
-                            reason=str(payload.get("reason") or f"ticker has {docs} documents; expected at least {min_docs}"),
+                            reason=str(
+                                payload.get("reason")
+                                or f"ticker has {docs} documents; expected at least {min_docs}"
+                            ),
                             count=max(1, min_docs - docs),
                             payload=payload,
                         )
@@ -453,7 +457,9 @@ class QualityShardScanner:
                             period=row["period"],
                             ontology_dir=row["ontology_dir"],
                             artifact_index_path=row["artifact_index_path"],
-                            reason=", ".join(quality.get("fail_reasons") or quality.get("warn_reasons") or []),
+                            reason=", ".join(
+                                quality.get("fail_reasons") or quality.get("warn_reasons") or []
+                            ),
                             payload={
                                 "section_quality": quality,
                                 "suggested_executor": "resection_document",
@@ -515,17 +521,23 @@ class QualityShardScanner:
                         if payload.get("batch_index") is not None:
                             grouped_payload["batch_indices"].append(payload.get("batch_index"))
                         grouped_payload["source_event_ids"].append(row["id"])
-                        grouped_payload["input_span_ids"].extend(payload.get("input_span_ids") or [])
+                        grouped_payload["input_span_ids"].extend(
+                            payload.get("input_span_ids") or []
+                        )
                         failed_unit_ids = self._batch_failure_failed_unit_ids(payload)
                         grouped_payload["failed_unit_ids"].extend(failed_unit_ids)
                         if not failed_unit_ids:
-                            grouped["failed_count_without_ids"] += self._batch_failure_failed_unit_count(payload)
+                            grouped["failed_count_without_ids"] += (
+                                self._batch_failure_failed_unit_count(payload)
+                            )
                         if payload.get("error_message"):
                             grouped_payload["error_messages"].append(payload.get("error_message"))
                         if payload.get("error_type"):
                             grouped_payload["error_types"].append(payload.get("error_type"))
                         if payload.get("provider_error_status") is not None:
-                            grouped_payload["provider_error_statuses"].append(payload.get("provider_error_status"))
+                            grouped_payload["provider_error_statuses"].append(
+                                payload.get("provider_error_status")
+                            )
                         continue
                     jobs.append(
                         self._job(
@@ -557,34 +569,69 @@ class QualityShardScanner:
                         row["doc_type_key"],
                         row["period"],
                     )
-                    payload["batch_indices"] = sorted({int(value) for value in payload["batch_indices"]})
-                    payload["source_event_ids"] = sorted({str(value) for value in payload["source_event_ids"] if value})
-                    payload["input_span_ids"] = sorted({str(value) for value in payload["input_span_ids"] if value})
-                    payload["failed_unit_ids"] = sorted({str(value) for value in payload["failed_unit_ids"] if value})
-                    payload["error_messages"] = [str(value) for value in payload["error_messages"][:5]]
-                    payload["error_types"] = sorted({str(value) for value in payload["error_types"] if value})
-                    payload["provider_error_statuses"] = sorted({int(value) for value in payload["provider_error_statuses"] if value is not None})
+                    payload["batch_indices"] = sorted(
+                        {int(value) for value in payload["batch_indices"]}
+                    )
+                    payload["source_event_ids"] = sorted(
+                        {str(value) for value in payload["source_event_ids"] if value}
+                    )
+                    payload["input_span_ids"] = sorted(
+                        {str(value) for value in payload["input_span_ids"] if value}
+                    )
+                    payload["failed_unit_ids"] = sorted(
+                        {str(value) for value in payload["failed_unit_ids"] if value}
+                    )
+                    payload["error_messages"] = [
+                        str(value) for value in payload["error_messages"][:5]
+                    ]
+                    payload["error_types"] = sorted(
+                        {str(value) for value in payload["error_types"] if value}
+                    )
+                    payload["provider_error_statuses"] = sorted(
+                        {
+                            int(value)
+                            for value in payload["provider_error_statuses"]
+                            if value is not None
+                        }
+                    )
                     payload["source_batch_failure_count"] = int(grouped["count"])
-                    failed_count = len(payload["failed_unit_ids"]) + int(grouped["failed_count_without_ids"])
+                    failed_count = len(payload["failed_unit_ids"]) + int(
+                        grouped["failed_count_without_ids"]
+                    )
                     total_count, denominator_source = self._document_clean_rerun_denominator(
                         ontology_dir,
                         str(row["stage"] or ""),
                     )
                     failure_rate = (failed_count / total_count) if total_count else None
-                    payload["document_clean_rerun_threshold"] = DOCUMENT_CLEAN_RERUN_FAILURE_RATE_THRESHOLD
+                    payload["document_clean_rerun_threshold"] = (
+                        DOCUMENT_CLEAN_RERUN_FAILURE_RATE_THRESHOLD
+                    )
                     payload["document_clean_rerun_failed_unit_count"] = failed_count
                     payload["document_clean_rerun_total_unit_count"] = total_count
                     payload["document_clean_rerun_failure_rate"] = failure_rate
                     payload["document_clean_rerun_denominator_source"] = denominator_source
-                    if failure_rate is None or failure_rate < DOCUMENT_CLEAN_RERUN_FAILURE_RATE_THRESHOLD:
-                        for fallback_row, fallback_payload, fallback_ontology_dir in grouped["fallback_rows"]:
+                    if (
+                        failure_rate is None
+                        or failure_rate < DOCUMENT_CLEAN_RERUN_FAILURE_RATE_THRESHOLD
+                    ):
+                        for fallback_row, fallback_payload, fallback_ontology_dir in grouped[
+                            "fallback_rows"
+                        ]:
                             fallback_payload["document_clean_rerun_skipped"] = True
-                            fallback_payload["document_clean_rerun_skip_reason"] = "failure_rate_below_threshold"
-                            fallback_payload["document_clean_rerun_threshold"] = DOCUMENT_CLEAN_RERUN_FAILURE_RATE_THRESHOLD
-                            fallback_payload["document_clean_rerun_failed_unit_count"] = failed_count
+                            fallback_payload["document_clean_rerun_skip_reason"] = (
+                                "failure_rate_below_threshold"
+                            )
+                            fallback_payload["document_clean_rerun_threshold"] = (
+                                DOCUMENT_CLEAN_RERUN_FAILURE_RATE_THRESHOLD
+                            )
+                            fallback_payload["document_clean_rerun_failed_unit_count"] = (
+                                failed_count
+                            )
                             fallback_payload["document_clean_rerun_total_unit_count"] = total_count
                             fallback_payload["document_clean_rerun_failure_rate"] = failure_rate
-                            fallback_payload["document_clean_rerun_denominator_source"] = denominator_source
+                            fallback_payload["document_clean_rerun_denominator_source"] = (
+                                denominator_source
+                            )
                             jobs.append(
                                 self._job(
                                     plan_id=plan_id,
@@ -614,7 +661,9 @@ class QualityShardScanner:
                             stage=row["stage"],
                             source_event_id=None,
                             ontology_dir=ontology_dir,
-                            reason=payload["error_messages"][0] if payload["error_messages"] else "Document clean rerun for transient batch failures",
+                            reason=payload["error_messages"][0]
+                            if payload["error_messages"]
+                            else "Document clean rerun for transient batch failures",
                             count=int(grouped["count"]),
                             payload=payload,
                         )
@@ -779,7 +828,9 @@ class QualityShardScanner:
             )
             base_payload["targeted_candidate_documents"] = missing_from_expected
             if missing_from_expected:
-                label = ", ".join(f"{doc['document_type']} {doc['period']}" for doc in missing_from_expected)
+                label = ", ".join(
+                    f"{doc['document_type']} {doc['period']}" for doc in missing_from_expected
+                )
                 return {
                     **base_payload,
                     "action": DOCS_MISSING_TARGETED_ACTION,
@@ -856,10 +907,14 @@ class QualityShardScanner:
         )
 
     @classmethod
-    def _infer_missing_documents(cls, actual_documents: list[dict[str, str]]) -> list[dict[str, str]]:
+    def _infer_missing_documents(
+        cls, actual_documents: list[dict[str, str]]
+    ) -> list[dict[str, str]]:
         grouped: dict[tuple[str, str], list[dict[str, str]]] = {}
         for document in actual_documents:
-            document_type = document.get("document_type") or _document_type_from_key(document.get("doc_type_key") or "")
+            document_type = document.get("document_type") or _document_type_from_key(
+                document.get("doc_type_key") or ""
+            )
             doc_type_key = document.get("doc_type_key") or document_type.replace("-", "")
             if not document_type or not doc_type_key or not document.get("period"):
                 continue
@@ -874,10 +929,15 @@ class QualityShardScanner:
                     documents=documents,
                 )
             )
-        return sorted(missing, key=lambda doc: (_period_sort_key(doc.get("period")), doc.get("document_type") or ""))
+        return sorted(
+            missing,
+            key=lambda doc: (_period_sort_key(doc.get("period")), doc.get("document_type") or ""),
+        )
 
     @classmethod
-    def _normalize_filing_documents(cls, documents: list[dict[str, str]] | None) -> list[dict[str, str]]:
+    def _normalize_filing_documents(
+        cls, documents: list[dict[str, str]] | None
+    ) -> list[dict[str, str]]:
         normalized: list[dict[str, str]] = []
         seen: set[tuple[str, str]] = set()
         for document in documents or []:
@@ -891,7 +951,10 @@ class QualityShardScanner:
                 continue
             seen.add(key)
             normalized.append(payload)
-        return sorted(normalized, key=lambda doc: (_period_sort_key(doc.get("period")), doc.get("document_type") or ""))
+        return sorted(
+            normalized,
+            key=lambda doc: (_period_sort_key(doc.get("period")), doc.get("document_type") or ""),
+        )
 
     @staticmethod
     def _normalize_filing_document(document: Mapping[str, Any]) -> dict[str, str] | None:
@@ -929,8 +992,7 @@ class QualityShardScanner:
         actual_documents: list[dict[str, str]],
     ) -> list[dict[str, str]]:
         actual_keys = {
-            (document["document_type"], document["period"])
-            for document in actual_documents
+            (document["document_type"], document["period"]) for document in actual_documents
         }
         return [
             {
@@ -948,10 +1010,7 @@ class QualityShardScanner:
         doc_type_key: str,
         documents: list[dict[str, str]],
     ) -> list[dict[str, str]]:
-        parsed = [
-            _parse_period(document.get("period"))
-            for document in documents
-        ]
+        parsed = [_parse_period(document.get("period")) for document in documents]
         parsed = [period for period in parsed if period is not None]
         if len(parsed) < 2:
             return []
@@ -1113,13 +1172,15 @@ class QualityShardScanner:
             return len(QualityShardScanner._read_jsonl(path / "spans.jsonl")), "spans.jsonl"
         if stage == "extract_research_claims":
             quotes = [
-                row for row in QualityShardScanner._read_jsonl(path / "evidence_quotes.jsonl")
+                row
+                for row in QualityShardScanner._read_jsonl(path / "evidence_quotes.jsonl")
                 if row.get("id") and row.get("quote_text")
             ]
             return len(quotes), "evidence_quotes.jsonl"
         if stage == "extract_assumption_candidates":
             claims = [
-                row for row in QualityShardScanner._read_jsonl(path / "claims.jsonl")
+                row
+                for row in QualityShardScanner._read_jsonl(path / "claims.jsonl")
                 if row.get("id")
             ]
             return len(claims), "claims.jsonl.all_claims"
@@ -1158,14 +1219,20 @@ class QualityReleaseScanner:
         manifest = self._load_manifest(allow_missing=True)
         raw_path = ((manifest.get("indexes") or {}).get("global_spine") or {}).get("path")
         if not isinstance(raw_path, str) or not raw_path:
-            raw_path = manifest.get("global_spine_path") if isinstance(manifest.get("global_spine_path"), str) else ""
+            raw_path = (
+                manifest.get("global_spine_path")
+                if isinstance(manifest.get("global_spine_path"), str)
+                else ""
+            )
         return self._resolve_release_path(raw_path or "indexes/global_spine.sqlite")
 
     @property
     def shard_manifest_path(self) -> Path:
         manifest = self._load_manifest(allow_missing=True)
         raw_path = ((manifest.get("indexes") or {}).get("shard_manifest") or {}).get("path")
-        return self._resolve_release_path(raw_path if isinstance(raw_path, str) and raw_path else "indexes/shard_manifest.json")
+        return self._resolve_release_path(
+            raw_path if isinstance(raw_path, str) and raw_path else "indexes/shard_manifest.json"
+        )
 
     def scan(
         self,
@@ -1212,7 +1279,12 @@ class QualityReleaseScanner:
             totals["tickers"] += int(shard_totals.get("tickers") or 0)
             totals["objects"] += int(shard_totals.get("objects") or 0)
             totals["quality_events"] += int(shard_totals.get("quality_events") or 0)
-            section_status.update({str(key): int(value) for key, value in dict(report.get("section_status") or {}).items()})
+            section_status.update(
+                {
+                    str(key): int(value)
+                    for key, value in dict(report.get("section_status") or {}).items()
+                }
+            )
             for event in report.get("event_counts") or []:
                 if not isinstance(event, Mapping):
                     continue
@@ -1242,9 +1314,7 @@ class QualityReleaseScanner:
             if ticker.problem_kinds(min_docs=min_docs)
         )
         kind_counts = Counter(
-            kind
-            for ticker in tickers
-            for kind in ticker.problem_kinds(min_docs=min_docs)
+            kind for ticker in tickers for kind in ticker.problem_kinds(min_docs=min_docs)
         )
         consistency = self.consistency_report(sample_limit=sample_limit, mode=resolved_mode)
         consistency_errors = list(consistency["errors"]) + scan_errors
@@ -1314,7 +1384,11 @@ class QualityReleaseScanner:
                 if ticker_payloads:
                     rows.extend(ticker_payloads)
                     continue
-                rows.append(_ticker_quality_from_rollup(ticker, rollup, rollup.get("totals") or self._manifest_entry_totals(entry)))
+                rows.append(
+                    _ticker_quality_from_rollup(
+                        ticker, rollup, rollup.get("totals") or self._manifest_entry_totals(entry)
+                    )
+                )
                 continue
             rows.extend(QualityShardScanner(shard_path).ticker_quality())
         return sorted(rows, key=lambda item: item.ticker)
@@ -1332,7 +1406,9 @@ class QualityReleaseScanner:
                 "rejected_reasons": [],
                 "min_docs": min_docs,
             }
-        payload = QualityShardScanner(shard_path).explain_ticker(normalized, min_docs=min_docs, limit=limit)
+        payload = QualityShardScanner(shard_path).explain_ticker(
+            normalized, min_docs=min_docs, limit=limit
+        )
         payload["release_root"] = str(self.release_root)
         payload["shard_path"] = str(shard_path)
         return payload
@@ -1576,7 +1652,9 @@ class QualityReleaseScanner:
         ticker_root = running_root / "companies" / ticker.upper() / "ontology"
         if not ticker_root.exists():
             return None
-        preferred_doc_type_key = normalize_doc_type(queue_job_document_type) if queue_job_document_type else None
+        preferred_doc_type_key = (
+            normalize_doc_type(queue_job_document_type) if queue_job_document_type else None
+        )
         preferred_periods = {str(period) for period in queue_job_periods if period}
         candidates: list[dict[str, Any]] = []
         for failures_path in ticker_root.glob("*/*/batch_failures.jsonl"):
@@ -1588,7 +1666,8 @@ class QualityReleaseScanner:
             if preferred_periods and period not in preferred_periods:
                 continue
             rows = [
-                row for row in QualityShardScanner._read_jsonl(failures_path)
+                row
+                for row in QualityShardScanner._read_jsonl(failures_path)
                 if str(row.get("stage") or "") == stage
             ]
             if not rows:
@@ -1602,7 +1681,9 @@ class QualityReleaseScanner:
                 if failed_unit_ids:
                     failed_ids.update(failed_unit_ids)
                 else:
-                    failed_count_without_ids += QualityShardScanner._batch_failure_failed_unit_count(row)
+                    failed_count_without_ids += (
+                        QualityShardScanner._batch_failure_failed_unit_count(row)
+                    )
                 if row.get("batch_index") is not None:
                     try:
                         batch_indices.append(int(row.get("batch_index")))
@@ -1698,9 +1779,15 @@ class QualityReleaseScanner:
             "release_id": manifest.get("release_id"),
             "release_format": manifest.get("format"),
             "release_manifest_sha256": _file_sha256(self.manifest_path),
-            "source_manifest_sha256": _file_sha256(source_manifest_path) if source_manifest_path.is_file() else None,
-            "global_spine_sha256": _file_sha256(self.global_spine_path) if self.global_spine_path.is_file() else None,
-            "shard_manifest_sha256": _file_sha256(self.shard_manifest_path) if self.shard_manifest_path.is_file() else None,
+            "source_manifest_sha256": _file_sha256(source_manifest_path)
+            if source_manifest_path.is_file()
+            else None,
+            "global_spine_sha256": _file_sha256(self.global_spine_path)
+            if self.global_spine_path.is_file()
+            else None,
+            "shard_manifest_sha256": _file_sha256(self.shard_manifest_path)
+            if self.shard_manifest_path.is_file()
+            else None,
         }
 
     def shard_topology(self) -> dict[str, Any]:
@@ -1745,8 +1832,12 @@ class QualityReleaseScanner:
             errors.append("shard_manifest_missing")
         if not shard_entries:
             errors.append("shard_manifest_empty")
-        errors.extend(self._manifest_file_digest_errors(manifest, "global_spine", self.global_spine_path))
-        errors.extend(self._manifest_file_digest_errors(manifest, "shard_manifest", self.shard_manifest_path))
+        errors.extend(
+            self._manifest_file_digest_errors(manifest, "global_spine", self.global_spine_path)
+        )
+        errors.extend(
+            self._manifest_file_digest_errors(manifest, "shard_manifest", self.shard_manifest_path)
+        )
         if not self.global_spine_path.is_file():
             return {
                 "ok": not errors,
@@ -1763,17 +1854,51 @@ class QualityReleaseScanner:
                 "missing_shards": shard_topology["missing"],
             }
 
+        schema_verification = verify_global_spine_schema(
+            self.global_spine_path,
+            deep=False,
+            trust_seal=True,
+        )
+        if not schema_verification.get("ok"):
+            errors.extend(
+                f"global_spine:{error}" for error in schema_verification.get("errors") or []
+            )
         with sqlite3.connect(self.global_spine_path) as spine_conn:
             spine_conn.row_factory = sqlite3.Row
-            counts.update(
-                {
-                    "global_object_locator": self._safe_count(spine_conn, "global_object_locator"),
-                    "global_document_catalog": self._safe_count(spine_conn, "global_document_catalog"),
-                    "global_edge_spine": self._safe_count(spine_conn, "global_edge_spine"),
-                    "global_chain_index": self._safe_count(spine_conn, "global_chain_index"),
-                }
+            count_tables = (
+                "global_object_locator",
+                "global_object_replica",
+                "global_document_catalog",
+                "global_edge_spine",
+                "global_edge_replica",
+                "global_chain_index",
             )
-            errors.extend(self._global_endpoint_errors(spine_conn, sample_limit=sample_limit))
+            if resolved_mode == "full":
+                counts.update(
+                    {table: self._safe_count(spine_conn, table) for table in count_tables}
+                )
+                errors.extend(
+                    self._global_endpoint_errors(
+                        spine_conn,
+                        sample_limit=sample_limit,
+                    )
+                )
+                errors.extend(
+                    global_replica_consistency_errors(
+                        spine_conn,
+                        sample_limit=sample_limit,
+                    )
+                )
+            else:
+                metadata_counts = (schema_verification.get("metadata") or {}).get("counts")
+                if isinstance(metadata_counts, Mapping):
+                    counts.update(
+                        {
+                            table: int(metadata_counts[table])
+                            for table in count_tables
+                            if isinstance(metadata_counts.get(table), int)
+                        }
+                    )
             if resolved_mode == "bounded":
                 for ticker, shard_path, _entry in shard_entries:
                     if not shard_path.is_file():
@@ -1805,7 +1930,9 @@ class QualityReleaseScanner:
                 ):
                     expected = entry.get(key)
                     if expected is not None and int(expected) != shard_counts[count_key]:
-                        errors.append(f"shard_manifest_{count_key}_mismatch:{ticker}:{expected}!={shard_counts[count_key]}")
+                        errors.append(
+                            f"shard_manifest_{count_key}_mismatch:{ticker}:{expected}!={shard_counts[count_key]}"
+                        )
                 counts[f"{ticker}.documents"] = shard_counts["documents"]
                 counts[f"{ticker}.objects"] = shard_counts["objects"]
                 errors.extend(
@@ -1917,7 +2044,9 @@ class QualityReleaseScanner:
             return QualityReleaseScanner._safe_count(conn, "edges")
 
     @staticmethod
-    def _manifest_file_digest_errors(manifest: Mapping[str, Any], role: str, path: Path) -> list[str]:
+    def _manifest_file_digest_errors(
+        manifest: Mapping[str, Any], role: str, path: Path
+    ) -> list[str]:
         output = ((manifest.get("indexes") or {}).get(role) or {}) if manifest else {}
         expected = output.get("sha256") if isinstance(output, Mapping) else None
         if not isinstance(expected, str) or not expected:
@@ -1965,7 +2094,9 @@ class QualityReleaseScanner:
             raw_path = raw_entry.get("path") or raw_entry.get("shard_path")
             if not isinstance(raw_path, str) or not raw_path:
                 continue
-            entries.append((str(ticker).upper(), self._resolve_shard_path(raw_path), dict(raw_entry)))
+            entries.append(
+                (str(ticker).upper(), self._resolve_shard_path(raw_path), dict(raw_entry))
+            )
         return entries
 
     def _shard_path_for_ticker(self, ticker: str) -> Path | None:
@@ -1977,7 +2108,11 @@ class QualityReleaseScanner:
 
     def _resolve_release_path(self, raw_path: str) -> Path:
         candidate = Path(raw_path).expanduser()
-        resolved = candidate.resolve() if candidate.is_absolute() else (self.release_root / candidate).resolve()
+        resolved = (
+            candidate.resolve()
+            if candidate.is_absolute()
+            else (self.release_root / candidate).resolve()
+        )
         try:
             resolved.relative_to(self.release_root)
         except ValueError as exc:
@@ -2106,28 +2241,82 @@ class QualityReleaseScanner:
         try:
             checks = (
                 (
-                    "object_missing_locator",
+                    "object_missing_replica",
                     f"""
                     SELECT objects.id
                     FROM {schema_name}.objects AS objects
-                    LEFT JOIN global_object_locator AS locator
-                      ON locator.object_id = objects.id
+                    LEFT JOIN global_object_replica AS replica
+                      ON replica.object_id = objects.id
+                     AND replica.ticker = objects.ticker
+                     AND replica.document_id = COALESCE(
+                            NULLIF(objects.source_document_id, ''),
+                            UPPER(objects.ticker) || ':' || objects.doc_type_key || ':' || objects.period
+                         )
+                     AND replica.document_type = objects.document_type
+                     AND replica.period = objects.period
                     WHERE objects.ticker = ?
-                      AND locator.object_id IS NULL
+                      AND replica.object_id IS NULL
                     ORDER BY objects.id
                     LIMIT ?
                     """,
                 ),
                 (
-                    "locator_missing_object",
+                    "replica_missing_object",
                     f"""
-                    SELECT locator.object_id
-                    FROM global_object_locator AS locator
+                    SELECT replica.object_id
+                    FROM global_object_replica AS replica
                     LEFT JOIN {schema_name}.objects AS objects
-                      ON objects.id = locator.object_id
-                    WHERE locator.ticker = ?
+                      ON objects.id = replica.object_id
+                     AND objects.ticker = replica.ticker
+                     AND COALESCE(
+                            NULLIF(objects.source_document_id, ''),
+                            UPPER(objects.ticker) || ':' || objects.doc_type_key || ':' || objects.period
+                         ) = replica.document_id
+                     AND objects.document_type = replica.document_type
+                     AND objects.period = replica.period
+                    WHERE replica.ticker = ?
                       AND objects.id IS NULL
-                    ORDER BY locator.object_id
+                    ORDER BY replica.object_id
+                    LIMIT ?
+                    """,
+                ),
+                (
+                    "edge_missing_replica",
+                    f"""
+                    SELECT edges.id
+                    FROM {schema_name}.edges AS edges
+                    LEFT JOIN global_edge_replica AS replica
+                      ON replica.edge_id = edges.id
+                     AND replica.ticker = edges.ticker
+                     AND replica.document_id = COALESCE(
+                            NULLIF(edges.source_document_id, ''),
+                            UPPER(edges.ticker) || ':' || edges.doc_type_key || ':' || edges.period
+                         )
+                     AND replica.document_type = edges.document_type
+                     AND replica.period = edges.period
+                    WHERE edges.ticker = ?
+                      AND replica.edge_id IS NULL
+                    ORDER BY edges.id
+                    LIMIT ?
+                    """,
+                ),
+                (
+                    "replica_missing_edge",
+                    f"""
+                    SELECT replica.edge_id
+                    FROM global_edge_replica AS replica
+                    LEFT JOIN {schema_name}.edges AS edges
+                      ON edges.id = replica.edge_id
+                     AND edges.ticker = replica.ticker
+                     AND COALESCE(
+                            NULLIF(edges.source_document_id, ''),
+                            UPPER(edges.ticker) || ':' || edges.doc_type_key || ':' || edges.period
+                         ) = replica.document_id
+                     AND edges.document_type = replica.document_type
+                     AND edges.period = replica.period
+                    WHERE replica.ticker = ?
+                      AND edges.id IS NULL
+                    ORDER BY replica.edge_id
                     LIMIT ?
                     """,
                 ),
@@ -2149,7 +2338,9 @@ class QualityReleaseScanner:
             )
             for label, sql in checks:
                 try:
-                    rows = [str(row[0]) for row in conn.execute(sql, (ticker, sample_limit)).fetchall()]
+                    rows = [
+                        str(row[0]) for row in conn.execute(sql, (ticker, sample_limit)).fetchall()
+                    ]
                 except sqlite3.Error as exc:
                     errors.append(f"{label}:{ticker}:query_failed:{exc}")
                     continue

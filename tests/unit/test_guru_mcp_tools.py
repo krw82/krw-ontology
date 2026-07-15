@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
+import sqlite3
 
 import pytest
+from mcp.types import CallToolResult, TextContent
 
+from krw_ontology.guru import index as guru_index
 from krw_ontology.guru import mcp_server
 from krw_ontology.guru import mcp_tools
 from krw_ontology.guru import lens_selector
@@ -53,9 +57,7 @@ def _verified_company_payload(
             company_context_json=company_context,
         )
     )
-    plan_questions = (
-        brief_payload["company_filing_brief"]["dynamic_question_plan"]["questions"]
-    )
+    plan_questions = brief_payload["company_filing_brief"]["dynamic_question_plan"]["questions"]
     payload = {
         "format": "krw-verified-company-evidence/v1",
         "release_id": "guru-unit-test",
@@ -140,6 +142,33 @@ def test_guru_mcp_server_registers_read_only_tool_names() -> None:
     } <= tool_names
 
 
+def test_guru_company_brief_mcp_returns_structured_one_key_question_correction() -> None:
+    result = asyncio.run(
+        mcp_server.krw_guru_company_brief(
+            question="Assess AAPL through a durable-earnings lens.",
+            investigation_questions=[{}, {}],
+        )
+    )
+
+    assert isinstance(result, CallToolResult)
+    assert result.isError is True
+    assert isinstance(result.content[0], TextContent)
+    payload = json.loads(result.content[0].text)
+    assert payload == {
+        "status": "input_correction_required",
+        "code": "exactly_one_key_question_required",
+        "message": "The Guru company workflow accepts exactly one philosophy-shaped key question.",
+        "required_change": (
+            "Provide investigation_questions as an array with exactly one draft. "
+            "Keep separate filing proof needs in that draft's evidence_needed field, "
+            "not as additional questions."
+        ),
+        "invalid_fields": ["investigation_questions"],
+        "allowed_next_tools": ["krw_guru_company_brief"],
+    }
+    assert result.structuredContent == payload
+
+
 def test_guru_company_brief_tool_translates_lenses_to_filing_research(
     tmp_path: Path,
 ) -> None:
@@ -216,10 +245,7 @@ def test_company_brief_filters_credit_hooks_from_general_monopoly_risk() -> None
     assert "전환사채 전환가격 및 만기" not in brief["required_filing_topics"]
     assert "쿠폰 금리 및 풋/콜 옵션 조건" not in brief["required_filing_topics"]
     assert "전환사채 전환가격 및 만기" not in brief["query_terms"]
-    assert {
-        item["topic"]
-        for item in brief["filtered_out_topics"]
-    } >= {
+    assert {item["topic"] for item in brief["filtered_out_topics"]} >= {
         "전환사채 전환가격 및 만기",
         "쿠폰 금리 및 풋/콜 옵션 조건",
         "발행 목적(자사주 매입, 부채 재편, 신규 투자)",
@@ -258,10 +284,7 @@ def test_company_brief_filters_insurance_float_hooks_for_non_insurance_company()
     assert "pricing_power" in brief["required_filing_topics"]
     assert "사업별 플로트 규모 및 증감" not in brief["required_filing_topics"]
     assert "평균 플로트 비용(연간 인수손익/평균 플로트)" not in brief["required_filing_topics"]
-    assert {
-        item["topic"]
-        for item in brief["filtered_out_topics"]
-    } >= {
+    assert {item["topic"] for item in brief["filtered_out_topics"]} >= {
         "사업별 플로트 규모 및 증감",
         "평균 플로트 비용(연간 인수손익/평균 플로트)",
     }
@@ -300,10 +323,7 @@ def test_company_brief_filters_sector_specific_hooks_without_matching_context() 
     assert "quarterly_gross_carried_interest" not in brief["required_filing_topics"]
     assert "fee_related_revenue_share" not in brief["required_filing_topics"]
     assert "target_return_assumptions_per_fund" not in brief["required_filing_topics"]
-    assert {
-        item["topic"]
-        for item in brief["filtered_out_topics"]
-    } >= {
+    assert {item["topic"] for item in brief["filtered_out_topics"]} >= {
         "fuel_surcharge_mechanism",
         "carry_realization_track_record",
         "quarterly_gross_carried_interest",
@@ -367,7 +387,9 @@ def test_guru_company_pack_tool_returns_company_pack_and_render_plan(
     assert company_pack["format"] == "krw-guru-company-research-pack/v1"
     assert company_pack["company_identity"]["subject"] == "OXY"
     assert company_pack["company_context"]["source"] == "company_mcp_topic_map"
-    assert "commodity_price_exposure" in company_pack["company_filing_brief"]["required_filing_topics"]
+    assert (
+        "commodity_price_exposure" in company_pack["company_filing_brief"]["required_filing_topics"]
+    )
     assert company_pack["company_evidence_pack"] == company_payload
     assert company_pack["evidence_alignment"]
     assert company_pack["answer_contract"]["must_not_include"] == [
@@ -426,7 +448,61 @@ def test_guru_review_company_evidence_tool_returns_interpretation_guidance(
     assert review["what_not_to_overstate"]
     assert review["answer_contract"]["purpose"] == "final_answer_guidance_only"
     assert "fixed_report_template" in review["answer_contract"]["must_not_include"]
-    assert "ResearchPack_or_CompanyEvidencePack_terms" in review["answer_contract"]["must_not_include"]
+    assert (
+        "ResearchPack_or_CompanyEvidencePack_terms" in review["answer_contract"]["must_not_include"]
+    )
+
+
+def test_guru_mcp_returns_structured_correction_for_missing_agent_analysis() -> None:
+    result = asyncio.run(
+        mcp_server.krw_guru_review_company_evidence(
+            question="Review the company through the selected lens.",
+            investigation_brief={"format": "krw-guru-investigation-brief/v1"},
+        )
+    )
+
+    assert isinstance(result, CallToolResult)
+    assert result.isError is True
+    assert isinstance(result.content[0], TextContent)
+    payload = json.loads(result.content[0].text)
+    assert payload == result.structuredContent
+    assert payload == {
+        "status": "input_correction_required",
+        "code": "missing_agent_analysis",
+        "message": "agent_analysis is required for the sealed key question.",
+        "required_change": (
+            "Provide one assessment for the sealed key question and a complete "
+            "overall_judgment."
+        ),
+        "invalid_fields": ["agent_analysis"],
+        "allowed_next_tools": ["krw_guru_review_company_evidence"],
+    }
+
+
+def test_guru_input_correction_survives_fastmcp_result_conversion() -> None:
+    result = asyncio.run(
+        mcp_server.mcp.call_tool(
+            "krw_guru_review_company_evidence",
+            {
+                "question": "Review the company through the selected lens.",
+                "investigation_brief": {"format": "krw-guru-investigation-brief/v1"},
+            },
+        )
+    )
+
+    assert isinstance(result, CallToolResult)
+    assert result.isError is True
+    assert result.structuredContent == {
+        "status": "input_correction_required",
+        "code": "missing_agent_analysis",
+        "message": "agent_analysis is required for the sealed key question.",
+        "required_change": (
+            "Provide one assessment for the sealed key question and a complete "
+            "overall_judgment."
+        ),
+        "invalid_fields": ["agent_analysis"],
+        "allowed_next_tools": ["krw_guru_review_company_evidence"],
+    }
 
 
 def test_guru_review_company_evidence_tool_accepts_dict_payloads(
@@ -550,10 +626,7 @@ def test_guru_review_company_evidence_uses_question_driven_memo(
     )
 
     review = payload["company_evidence_review"]
-    assert any(
-        "commodity prices" in item
-        for item in review["what_to_emphasize"]
-    )
+    assert any("commodity prices" in item for item in review["what_to_emphasize"])
     assert review["what_not_to_overstate"]
     assert "dynamic question answers when available" in review["answer_contract"]["must_use"]
 
@@ -585,10 +658,7 @@ def test_guru_review_company_evidence_accepts_question_evidence_object(
     )
 
     review = payload["company_evidence_review"]
-    assert any(
-        "upstream capital spending" in item
-        for item in review["what_to_emphasize"]
-    )
+    assert any("upstream capital spending" in item for item in review["what_to_emphasize"])
     assert review["what_not_to_overstate"]
 
 
@@ -748,15 +818,14 @@ def test_company_context_guides_lens_selection_without_ticker_hardcoding(
     assert payload["company_context"]["source"] == "company_mcp_topic_map"
     assert "commodity_price_exposure" in payload["filing_evidence_requirements"]
     assert "rate_case_filings" not in payload["filing_evidence_requirements"]
-    assert "rate_case_filings" not in (
-        payload["research_pack"]["company_bridge"]["filing_evidence_requirements"]
+    assert (
+        "rate_case_filings"
+        not in (payload["research_pack"]["company_bridge"]["filing_evidence_requirements"])
     )
     assert payload["research_pack"]["selected_lenses"][0]["label_ko"] == (
         "원자재 가격 의존도가 만드는 잔존가치 소멸 리스크"
     )
-    selected_labels = [
-        item["label_ko"] for item in payload["research_pack"]["selected_lenses"]
-    ]
+    selected_labels = [item["label_ko"] for item in payload["research_pack"]["selected_lenses"]]
     assert "고객과 규제기관의 상호 호혜 원칙" not in selected_labels
 
 
@@ -789,8 +858,7 @@ def test_company_context_flows_into_dynamic_question_plan(tmp_path: Path) -> Non
 
     plan = payload["company_filing_brief"]["dynamic_question_plan"]
     question_text = " ".join(
-        item["question_en"] + " " + item["retrieval_query_en"]
-        for item in plan["questions"]
+        item["question_en"] + " " + item["retrieval_query_en"] for item in plan["questions"]
     )
     assert "commodity_price_exposure" in payload["company_filing_brief"]["required_filing_topics"]
     assert "commodity price exposure" in question_text
@@ -828,7 +896,7 @@ def test_guru_shard_index_is_used_for_query_context(tmp_path: Path, monkeypatch)
     root = _write_reviewed_fixture(tmp_path)
     manifest = build_guru_shard_index(root)
 
-    assert manifest["schema_version"] == "krw-guru-shard-index/v1"
+    assert manifest["schema_version"] == "krw-guru-shard-index/v2"
     assert (root / "indexes" / "guru_shard_manifest.json").is_file()
     assert (root / "indexes" / "shards" / "buffett.sqlite").is_file()
     assert manifest["authors"]["buffett"]["counts"]["guru_objects"] == 1
@@ -886,6 +954,592 @@ def test_guru_shard_index_is_used_for_query_context(tmp_path: Path, monkeypatch)
     assert selection["runtime"]["mode"] == "author_shard"
 
 
+def test_guru_fts_search_preserves_jsonl_scores_order_and_relationship_contract(
+    tmp_path: Path,
+) -> None:
+    root = _write_reviewed_fixture(tmp_path)
+    arguments = {
+        "root": root,
+        "query": "버핏 현금흐름 자본배분",
+        "author_keys": ["buffett"],
+        "include_relationships": True,
+        "limit": 10,
+    }
+    jsonl_payload = json.loads(guru_search_tool(**arguments))
+
+    build_guru_shard_index(root)
+    indexed_payload = json.loads(guru_search_tool(**arguments))
+
+    assert indexed_payload["results"] == jsonl_payload["results"]
+    assert indexed_payload["total"] == jsonl_payload["total"]
+    assert indexed_payload["count"] == jsonl_payload["count"]
+    diagnostics = indexed_payload["runtime"]["candidate_generation"]
+    assert diagnostics["fts_shadow_count"] > 0
+    assert diagnostics["candidate_exhaustive"] is True
+    assert indexed_payload["runtime"]["payload_scope"] == "selected_payloads"
+    assert indexed_payload["runtime"]["payload_object_count"] == indexed_payload["count"]
+    assert indexed_payload["runtime"]["relationships_scope"] == "selected_results"
+
+
+def test_guru_exact_compact_scan_does_not_read_full_payloads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _write_reviewed_fixture(tmp_path)
+    guru_objects_path = root / "reviewed" / "guru_objects.jsonl"
+    rows = [
+        json.loads(line)
+        for line in guru_objects_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    rows.extend(
+        {
+            "reviewed_id": f"guru:buffett:principle:filler:{index:03d}",
+            "author_key": "buffett",
+            "object_type": "principle",
+            "object_origin": "source_grounded",
+            "label_ko": f"채우기 원칙 {index:03d}",
+            "summary_ko": "일반적인 장기 투자 원칙이다.",
+            "intent_family": "learn_guru_view",
+            "status": "reviewed",
+        }
+        for index in range(20)
+    )
+    rows.append(
+        {
+            "reviewed_id": "guru:buffett:principle:needle:test",
+            "author_key": "buffett",
+            "object_type": "principle",
+            "object_origin": "source_grounded",
+            "label_ko": "유일한 카노프스 단서",
+            "summary_ko": "needle_canopus를 포함한 유일한 후보다.",
+            "intent_family": "learn_guru_view",
+            "status": "reviewed",
+        }
+    )
+    _write_jsonl(guru_objects_path, rows)
+    build_guru_shard_index(root)
+
+    loaded_id_batches: list[list[str]] = []
+
+    def capture_loader(_conn, reviewed_ids):
+        loaded_id_batches.append(list(reviewed_ids))
+        raise AssertionError("exact compact scan must not read payload_json")
+
+    monkeypatch.setattr(guru_index, "_load_payloads_by_id", capture_loader)
+    result = guru_index.scan_guru_index_compact_rows(
+        root,
+        query="needle_canopus",
+        author_keys=["buffett"],
+        object_families=["guru_object"],
+        fts_shadow_limit=2,
+    )
+
+    assert result is not None
+    assert len(result["rows"]) == 22
+    assert "guru:buffett:principle:needle:test" in {row["reviewed_id"] for row in result["rows"]}
+    assert loaded_id_batches == []
+    diagnostics = result["_index"]["candidate_generation"]
+    assert diagnostics["mode"] == "exact_compact_scan"
+    assert diagnostics["fts_shadow_count"] == 1
+    assert diagnostics["structural_total"] == 22
+    assert diagnostics["candidate_exhaustive"] is True
+    assert diagnostics["payload_json_row_count"] == 0
+
+
+def test_guru_search_pushes_structural_filters_and_loads_page_relationships_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _write_reviewed_fixture(tmp_path)
+    build_guru_shard_index(root)
+    relationship_requests: list[list[str]] = []
+    original_loader = mcp_tools.load_guru_index_relationships_by_id
+
+    def capture_relationships(root, *, reviewed_ids, author_keys=None):
+        relationship_requests.append(list(reviewed_ids))
+        return original_loader(
+            root,
+            reviewed_ids=reviewed_ids,
+            author_keys=author_keys,
+        )
+
+    monkeypatch.setattr(
+        mcp_tools,
+        "load_guru_index_relationships_by_id",
+        capture_relationships,
+    )
+    payload = json.loads(
+        guru_search_tool(
+            root=root,
+            query="현금흐름 점검",
+            author_keys=["buffett"],
+            object_types=["question_template"],
+            intent_family="holding_review",
+            decision_stage="holding",
+            requires_company_data=True,
+            limit=1,
+        )
+    )
+
+    assert [row["reviewed_id"] for row in payload["results"]] == [
+        "guru:buffett:question_template:holding-review:test"
+    ]
+    assert relationship_requests == [["guru:buffett:question_template:holding-review:test"]]
+    diagnostics = payload["runtime"]["candidate_generation"]
+    assert diagnostics["structural_total"] == 1
+
+
+def test_guru_search_uses_safe_structured_fallback_when_fts_is_unavailable(
+    tmp_path: Path,
+) -> None:
+    root = _write_reviewed_fixture(tmp_path)
+    baseline = json.loads(
+        guru_search_tool(
+            root=root,
+            query="현금흐름 자본배분",
+            author_keys=["buffett"],
+        )
+    )
+    manifest = build_guru_shard_index(root)
+    manifest["authors"]["buffett"]["fts_enabled"] = False
+    (root / "indexes" / "guru_shard_manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, sort_keys=True),
+        encoding="utf-8",
+    )
+
+    fallback = json.loads(
+        guru_search_tool(
+            root=root,
+            query="현금흐름 자본배분",
+            author_keys=["buffett"],
+        )
+    )
+
+    assert fallback["results"] == baseline["results"]
+    diagnostics = fallback["runtime"]["candidate_generation"]
+    assert diagnostics["mode"] == "exact_compact_scan"
+    assert "fts_unavailable" in diagnostics["fallback_reasons"]
+
+
+def test_guru_search_uses_safe_structured_fallback_on_fts_runtime_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _write_reviewed_fixture(tmp_path)
+    build_guru_shard_index(root)
+
+    def fail_fts(*_args, **_kwargs):
+        raise sqlite3.OperationalError("forced fts failure")
+
+    monkeypatch.setattr(guru_index, "_query_fts_candidate_ids", fail_fts)
+    payload = json.loads(
+        guru_search_tool(
+            root=root,
+            query="현금흐름 자본배분",
+            author_keys=["buffett"],
+        )
+    )
+
+    assert payload["results"]
+    reasons = payload["runtime"]["candidate_generation"]["fallback_reasons"]
+    assert "fts_runtime_error:forced_fts_failure" in reasons
+
+
+def test_guru_query_context_and_lens_selector_preserve_small_corpus_parity_with_fts(
+    tmp_path: Path,
+) -> None:
+    root = _write_reviewed_fixture(tmp_path)
+    question = "AAPL을 버핏 관점에서 장기 보유해도 되는지 봐줘"
+    jsonl_context = json.loads(
+        guru_query_context_tool(
+            root=root,
+            question=question,
+            ticker="AAPL",
+            author_keys=["buffett"],
+        )
+    )
+    jsonl_selection = select_guru_lenses(
+        root=root,
+        question=question,
+        ticker="AAPL",
+        author_keys=["buffett"],
+    )
+
+    build_guru_shard_index(root)
+    indexed_context = json.loads(
+        guru_query_context_tool(
+            root=root,
+            question=question,
+            ticker="AAPL",
+            author_keys=["buffett"],
+        )
+    )
+    indexed_selection = select_guru_lenses(
+        root=root,
+        question=question,
+        ticker="AAPL",
+        author_keys=["buffett"],
+    )
+
+    for key in ("selected_lenses", "consultation_moves", "data_needs"):
+        assert indexed_context["research_pack"][key] == jsonl_context["research_pack"][key]
+    assert indexed_selection["selected_lenses"] == jsonl_selection["selected_lenses"]
+    assert indexed_selection["data_needs"] == jsonl_selection["data_needs"]
+    context_diagnostics = indexed_context["runtime"]["candidate_generation"]
+    selector_diagnostics = indexed_selection["runtime"]["candidate_generation"]
+    assert context_diagnostics["fts_shadow_count"] > 0
+    assert context_diagnostics["candidate_exhaustive"] is True
+    assert selector_diagnostics["fts_shadow_count"] > 0
+    assert selector_diagnostics["candidate_exhaustive"] is True
+
+
+def test_guru_exact_compact_search_preserves_601_row_adversarial_rank_and_total(
+    tmp_path: Path,
+) -> None:
+    root = _write_reviewed_fixture(tmp_path)
+    _write_adversarial_rank_rows(root, count=601)
+    arguments = {
+        "root": root,
+        "query": "버핏",
+        "author_keys": ["buffett"],
+        "object_types": ["principle", "question_route"],
+        "limit": 10,
+    }
+    baseline = json.loads(guru_search_tool(**arguments))
+
+    build_guru_shard_index(root)
+    indexed = json.loads(guru_search_tool(**arguments))
+
+    assert baseline["total"] == 601
+    assert baseline["results"][0]["reviewed_id"] == ("guru:buffett:question_route:zzzz-special")
+    assert indexed["total"] == baseline["total"]
+    assert indexed["results"] == baseline["results"]
+    diagnostics = indexed["runtime"]["candidate_generation"]
+    assert diagnostics["mode"] == "exact_compact_scan"
+    assert diagnostics["exact_compact_row_count"] == 601
+    assert diagnostics["candidate_exhaustive"] is True
+
+
+def test_guru_exact_compact_search_preserves_large_parity_when_fts_is_unavailable(
+    tmp_path: Path,
+) -> None:
+    root = _write_reviewed_fixture(tmp_path)
+    _write_adversarial_rank_rows(root, count=601)
+    arguments = {
+        "root": root,
+        "query": "버핏",
+        "author_keys": ["buffett"],
+        "object_types": ["principle", "question_route"],
+        "limit": 10,
+    }
+    baseline = json.loads(guru_search_tool(**arguments))
+    manifest = build_guru_shard_index(root)
+    manifest["authors"]["buffett"]["fts_enabled"] = False
+    (root / "indexes" / "guru_shard_manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, sort_keys=True),
+        encoding="utf-8",
+    )
+
+    indexed = json.loads(guru_search_tool(**arguments))
+
+    assert indexed["total"] == baseline["total"] == 601
+    assert indexed["results"] == baseline["results"]
+    diagnostics = indexed["runtime"]["candidate_generation"]
+    assert diagnostics["mode"] == "exact_compact_scan"
+    assert diagnostics["candidate_exhaustive"] is True
+    assert "fts_unavailable" in diagnostics["fallback_reasons"]
+
+
+def test_guru_exact_compact_search_preserves_korean_compound_substring_match(
+    tmp_path: Path,
+) -> None:
+    root = _write_reviewed_fixture(tmp_path)
+    rows = [
+        {
+            "reviewed_id": f"guru:buffett:principle:compound-filler:{index:03d}",
+            "author_key": "buffett",
+            "object_type": "principle",
+            "object_origin": "source_grounded",
+            "label_ko": f"일반 장기 원칙 {index:03d}",
+            "summary_ko": "사업의 장기 경쟁력을 점검한다.",
+            "status": "reviewed",
+        }
+        for index in range(100)
+    ]
+    rows.append(
+        {
+            "reviewed_id": "guru:buffett:question_route:korean-compound",
+            "author_key": "buffett",
+            "object_type": "question_route",
+            "object_origin": "source_grounded",
+            "label_ko": "잉여현금흐름 점검",
+            "summary_ko": "현금 창출력을 점검한다.",
+            "status": "reviewed",
+        }
+    )
+    _write_jsonl(root / "reviewed" / "guru_objects.jsonl", rows)
+    arguments = {
+        "root": root,
+        "query": "현금흐름",
+        "author_keys": ["buffett"],
+        "object_types": ["principle", "question_route"],
+    }
+    baseline = json.loads(guru_search_tool(**arguments))
+    build_guru_shard_index(root)
+    indexed = json.loads(guru_search_tool(**arguments))
+
+    assert indexed["results"] == baseline["results"]
+    assert indexed["total"] == baseline["total"] == 1
+    assert indexed["results"][0]["reviewed_id"] == ("guru:buffett:question_route:korean-compound")
+    assert indexed["runtime"]["candidate_generation"]["candidate_exhaustive"] is True
+
+
+def test_guru_query_token_normalization_keeps_korean_content_and_drops_question_filler() -> None:
+    question = "복잡한 사업 구조를 볼 때 어떤 문제가 숨어 있을 수 있어?"
+
+    assert mcp_tools._meaningful_query_tokens(question) == (
+        "복잡",
+        "사업",
+        "구조",
+        "문제",
+        "숨어",
+    )
+    relevant = {
+        "label_ko": "복잡성 할인과 사업 구조 문제",
+        "object_type": "principle",
+    }
+    filler = {
+        "label_ko": "기회가 있을 때 활용할 수 있는 원칙",
+        "object_type": "principle",
+    }
+    assert mcp_tools._score_row("복잡", {"label_ko": "복잡성"}) == 2
+    assert mcp_tools._score_row(question, relevant) > mcp_tools._score_row(question, filler)
+
+
+def test_guru_answer_role_is_derived_only_when_source_metadata_is_missing() -> None:
+    cases = (
+        ({"object_family": "data_need", "object_type": "metric"}, "data_need"),
+        ({"object_family": "guru_object", "object_type": "risk_frame"}, "caution"),
+        ({"object_family": "guru_object", "object_type": "anti_pattern"}, "contrast"),
+        ({"object_family": "consultation_object", "object_type": "question_route"}, "checklist"),
+        ({"object_family": "guru_object", "object_type": "principle"}, "core_lens"),
+        ({"object_family": "guru_object", "object_type": "concept"}, "supporting_lens"),
+    )
+    for row, expected in cases:
+        role = mcp_tools._resolved_answer_role(row)
+        assert role == {
+            "default": expected,
+            "derived": True,
+            "provenance": "derived_from_object_family_and_object_type",
+        }
+
+    source_role = {"default": "caution", "possible_roles": ["contrast"]}
+    assert (
+        mcp_tools._resolved_answer_role(
+            {
+                "object_family": "guru_object",
+                "object_type": "principle",
+                "answer_role": source_role,
+            }
+        )
+        == source_role
+    )
+
+    partial_source_role = {
+        "default": "",
+        "possible_roles": ["contrast"],
+    }
+    assert mcp_tools._resolved_answer_role(
+        {
+            "object_family": "guru_object",
+            "object_type": "principle",
+            "answer_role": partial_source_role,
+        }
+    ) == {
+        "default": "core_lens",
+        "possible_roles": ["contrast"],
+        "derived": True,
+        "provenance": "derived_from_object_family_and_object_type",
+    }
+    assert partial_source_role == {
+        "default": "",
+        "possible_roles": ["contrast"],
+    }
+
+
+def test_guru_data_need_theme_penalty_is_capped_without_weakening_lens_penalty() -> None:
+    row = {
+        "author_key": "buffett",
+        "object_type": "concept",
+        "label_ko": "AI 데이터센터 사업 지표",
+    }
+    query = "좋은 사업을 고르는 기준"
+
+    assert mcp_tools._theme_overfit_penalty(query, row) == 24
+    assert (
+        mcp_tools._effective_theme_overfit_penalty(query, row, row_family="data_need")
+        == mcp_tools.DATA_NEED_THEME_PENALTY_CAP
+    )
+    assert mcp_tools._effective_theme_overfit_penalty(query, row, row_family="guru_object") == 24
+
+
+def test_guru_domain_penalty_cap_only_applies_to_unspecified_general_objects() -> None:
+    principle = {"object_type": "principle"}
+
+    assert (
+        mcp_tools._cap_unspecified_general_domain_penalty(
+            -16,
+            principle,
+            row_family="guru_object",
+            specificity={},
+        )
+        == -mcp_tools.UNSPECIFIED_GENERAL_DOMAIN_PENALTY_CAP
+    )
+    assert (
+        mcp_tools._cap_unspecified_general_domain_penalty(
+            -16,
+            principle,
+            row_family="guru_object",
+            specificity={"level": "sector_specific"},
+        )
+        == -16
+    )
+    assert (
+        mcp_tools._cap_unspecified_general_domain_penalty(
+            -16,
+            {"object_type": "concept"},
+            row_family="guru_object",
+            specificity={},
+        )
+        == -16
+    )
+
+
+def test_guru_exact_compact_search_preserves_deep_offset_total_and_page(
+    tmp_path: Path,
+) -> None:
+    root = _write_reviewed_fixture(tmp_path)
+    rows = [
+        {
+            "reviewed_id": f"guru:buffett:principle:deep:{index:04d}",
+            "author_key": "buffett",
+            "object_type": "principle",
+            "object_origin": "source_grounded",
+            "label_ko": f"공통키워드 원칙 {index:04d}",
+            "summary_ko": "동일 점수 deep pagination 검증 행이다.",
+            "status": "reviewed",
+        }
+        for index in range(700)
+    ]
+    _write_jsonl(root / "reviewed" / "guru_objects.jsonl", rows)
+    arguments = {
+        "root": root,
+        "query": "공통키워드",
+        "author_keys": ["buffett"],
+        "object_types": ["principle"],
+        "offset": 500,
+        "limit": 10,
+    }
+    baseline = json.loads(guru_search_tool(**arguments))
+    build_guru_shard_index(root)
+    indexed = json.loads(guru_search_tool(**arguments))
+
+    assert indexed["results"] == baseline["results"]
+    assert indexed["total"] == baseline["total"] == 700
+    assert indexed["has_more"] is baseline["has_more"] is True
+    assert indexed["results"][0]["reviewed_id"] == "guru:buffett:principle:deep:0500"
+
+
+def test_guru_exact_compact_runtime_hydrates_only_final_page_payloads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _write_reviewed_fixture(tmp_path)
+    _write_adversarial_rank_rows(root, count=601)
+    build_guru_shard_index(root)
+    payload_requests: list[list[str]] = []
+    original_loader = mcp_tools.load_guru_index_objects_by_id
+
+    def capture_payloads(root, *, reviewed_ids, author_keys=None):
+        payload_requests.append(list(reviewed_ids))
+        return original_loader(root, reviewed_ids=reviewed_ids, author_keys=author_keys)
+
+    monkeypatch.setattr(mcp_tools, "load_guru_index_objects_by_id", capture_payloads)
+    payload = json.loads(
+        guru_search_tool(
+            root=root,
+            query="버핏",
+            author_keys=["buffett"],
+            object_types=["principle", "question_route"],
+            limit=10,
+        )
+    )
+
+    assert payload_requests == [[row["reviewed_id"] for row in payload["results"]]]
+    assert payload["runtime"]["payload_object_count"] == 10
+    diagnostics = payload["runtime"]["candidate_generation"]
+    assert diagnostics["exact_compact_row_count"] == 601
+    assert diagnostics["payload_json_row_count"] == 0
+
+
+def test_guru_index_admission_rejects_changed_reviewed_source_hash(tmp_path: Path) -> None:
+    root = _write_reviewed_fixture(tmp_path)
+    build_guru_shard_index(root)
+    guru_objects_path = root / "reviewed" / "guru_objects.jsonl"
+    rows = [json.loads(line) for line in guru_objects_path.read_text(encoding="utf-8").splitlines()]
+    rows.append(
+        {
+            "reviewed_id": "guru:buffett:principle:post-index-change",
+            "author_key": "buffett",
+            "object_type": "principle",
+            "object_origin": "source_grounded",
+            "label_ko": "인덱스 이후 추가된 유일키",
+            "summary_ko": "source hash admission 검증용 행",
+            "status": "reviewed",
+        }
+    )
+    _write_jsonl(guru_objects_path, rows)
+
+    status = guru_index.guru_index_status(root)
+    payload = json.loads(
+        guru_search_tool(root=root, query="인덱스 이후 추가된 유일키", author_keys=["buffett"])
+    )
+
+    assert status["usable"] is False
+    assert status["reason"] == "source_hash_mismatch"
+    assert "guru_objects:sha256" in status["source_mismatches"]
+    assert payload["runtime"]["mode"] == "reviewed_jsonl"
+    assert payload["results"][0]["reviewed_id"] == "guru:buffett:principle:post-index-change"
+
+
+def test_guru_chain_uses_point_object_and_relationship_loaders(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _write_reviewed_fixture(tmp_path)
+    build_guru_shard_index(root)
+    reviewed_id = "guru:buffett:principle:cash-owner-earnings:test"
+    object_requests: list[list[str]] = []
+    original_loader = mcp_tools.load_guru_index_objects_by_id
+
+    def capture_objects(root, *, reviewed_ids, author_keys=None):
+        object_requests.append(list(reviewed_ids))
+        return original_loader(root, reviewed_ids=reviewed_ids, author_keys=author_keys)
+
+    def reject_full_bundle(*_args, **_kwargs):
+        raise AssertionError("chain must not load the full author bundle")
+
+    monkeypatch.setattr(mcp_tools, "load_guru_index_objects_by_id", capture_objects)
+    monkeypatch.setattr(mcp_tools, "load_guru_index_bundle", reject_full_bundle)
+    payload = json.loads(guru_chain_tool(root=root, reviewed_id=reviewed_id))
+
+    assert payload["ok"] is True
+    assert object_requests[0] == [reviewed_id]
+    assert all(len(batch) <= 8 for batch in object_requests)
+    assert payload["chain"]["semantic_neighbors"]
+
+
 def test_guru_status_search_context_evidence_and_data_needs(tmp_path: Path) -> None:
     root = _write_reviewed_fixture(tmp_path)
 
@@ -926,7 +1580,10 @@ def test_guru_status_search_context_evidence_and_data_needs(tmp_path: Path) -> N
         "holding_review",
         "business_quality_check",
     ]
-    assert query_context["research_pack"]["selected_lenses"][0]["answer_role"]["default"] == "core_lens"
+    assert (
+        query_context["research_pack"]["selected_lenses"][0]["answer_role"]["default"]
+        == "core_lens"
+    )
     assert query_context["research_pack"]["company_bridge"]["requires_company_evidence"] is True
     assert "krw_guru_search for broad re-ranking" in query_context["do_not_call"]
 
@@ -1117,22 +1774,31 @@ def test_guru_question_parser_does_not_treat_metrics_or_etfs_as_company_tickers(
     assert not mcp_tools._question_mentions_company_need(
         "SPY ETF를 장기 보유하는 건 버핏 관점에서 괜찮을까?"
     )
-    assert mcp_tools._infer_intent_family(
-        "COST가 너무 비싼데 좋은 회사면 그냥 사도 되는지 구루 렌즈로 봐줘"
-    ) == "valuation_check"
+    assert (
+        mcp_tools._infer_intent_family(
+            "COST가 너무 비싼데 좋은 회사면 그냥 사도 되는지 구루 렌즈로 봐줘"
+        )
+        == "valuation_check"
+    )
 
 
 def test_guru_clarifying_questions_respect_resolved_company_context() -> None:
-    assert mcp_tools._clarifying_questions_for_question(
-        "XOM 같은 원유 생산회사를 막스 관점에서 사이클 리스크로 봐줘",
-        needs_company_data=True,
-        ticker="XOM",
-    ) == []
-    assert mcp_tools._clarifying_questions_for_question(
-        "옥시덴탈을 버핏 관점에서 장기 보유해도 되는지 봐줘",
-        needs_company_data=True,
-        ticker="OXY",
-    ) == []
+    assert (
+        mcp_tools._clarifying_questions_for_question(
+            "XOM 같은 원유 생산회사를 막스 관점에서 사이클 리스크로 봐줘",
+            needs_company_data=True,
+            ticker="XOM",
+        )
+        == []
+    )
+    assert (
+        mcp_tools._clarifying_questions_for_question(
+            "옥시덴탈을 버핏 관점에서 장기 보유해도 되는지 봐줘",
+            needs_company_data=True,
+            ticker="OXY",
+        )
+        == []
+    )
     assert mcp_tools._clarifying_questions_for_question(
         "삼성전자라는 종목을 버핏 렌즈로 보면 장기 보유할 수 있는지 어떤 공시 근거가 필요해?",
         needs_company_data=True,
@@ -1826,9 +2492,7 @@ def _write_reviewed_fixture(tmp_path: Path) -> Path:
                 },
                 "confidence": "medium",
                 "status": "reviewed",
-                "related_reviewed_ids": [
-                    "guru:buffett:principle:cash-owner-earnings:test"
-                ],
+                "related_reviewed_ids": ["guru:buffett:principle:cash-owner-earnings:test"],
             }
         ],
     )
@@ -1869,9 +2533,7 @@ def _write_reviewed_fixture(tmp_path: Path) -> Path:
                 },
                 "confidence": "high",
                 "status": "reviewed",
-                "related_reviewed_ids": [
-                    "guru:buffett:principle:cash-owner-earnings:test"
-                ],
+                "related_reviewed_ids": ["guru:buffett:principle:cash-owner-earnings:test"],
             }
         ],
     )
@@ -2082,9 +2744,7 @@ def _write_company_context_ranking_fixture(tmp_path: Path) -> Path:
                 "answer_role": {"default": "core_lens", "possible_roles": ["caution"]},
                 "confidence": "high",
                 "status": "reviewed",
-                "related_reviewed_ids": [
-                    "guru:buffett:data_need:commodity-cash-flow:test"
-                ],
+                "related_reviewed_ids": ["guru:buffett:data_need:commodity-cash-flow:test"],
             },
             {
                 "reviewed_id": "guru:buffett:principle:owner-manager:test",
@@ -2121,9 +2781,7 @@ def _write_company_context_ranking_fixture(tmp_path: Path) -> Path:
                 "answer_role": {"default": "core_lens", "possible_roles": ["checklist"]},
                 "confidence": "high",
                 "status": "reviewed",
-                "related_reviewed_ids": [
-                    "guru:buffett:data_need:regulated-utility:test"
-                ],
+                "related_reviewed_ids": ["guru:buffett:data_need:regulated-utility:test"],
             },
         ],
     )
@@ -2155,9 +2813,7 @@ def _write_company_context_ranking_fixture(tmp_path: Path) -> Path:
                 "answer_role": {"default": "data_need", "possible_roles": ["checklist"]},
                 "confidence": "high",
                 "status": "reviewed",
-                "related_reviewed_ids": [
-                    "guru:buffett:risk:commodity-residual-value:test"
-                ],
+                "related_reviewed_ids": ["guru:buffett:risk:commodity-residual-value:test"],
             },
             {
                 "reviewed_id": "guru:buffett:data_need:regulated-utility:test",
@@ -2183,10 +2839,8 @@ def _write_company_context_ranking_fixture(tmp_path: Path) -> Path:
                 "answer_role": {"default": "data_need", "possible_roles": ["checklist"]},
                 "confidence": "high",
                 "status": "reviewed",
-                "related_reviewed_ids": [
-                    "guru:buffett:principle:regulated-utility:test"
-                ],
-            }
+                "related_reviewed_ids": ["guru:buffett:principle:regulated-utility:test"],
+            },
         ],
     )
     _write_jsonl(reviewed / "corpus_metadata.jsonl", [])
@@ -2207,7 +2861,7 @@ def _write_company_context_ranking_fixture(tmp_path: Path) -> Path:
                 "to_id": "guru:buffett:data_need:regulated-utility:test",
                 "relation_type": "requires_evidence",
                 "explanation_ko": "규제 유틸리티 렌즈는 요금 규제와 허용수익률 근거를 요구한다.",
-            }
+            },
         ],
     )
     (reviewed / "curation_report.json").write_text(
@@ -2225,6 +2879,33 @@ def _write_company_context_ranking_fixture(tmp_path: Path) -> Path:
         encoding="utf-8",
     )
     return root
+
+
+def _write_adversarial_rank_rows(root: Path, *, count: int) -> None:
+    rows = [
+        {
+            "reviewed_id": f"guru:buffett:principle:adversarial:{index:04d}",
+            "author_key": "buffett",
+            "object_type": "principle",
+            "object_origin": "source_grounded",
+            "label_ko": f"일반 원칙 {index:04d}",
+            "summary_ko": "장기 투자 원칙",
+            "status": "reviewed",
+        }
+        for index in range(count - 1)
+    ]
+    rows.append(
+        {
+            "reviewed_id": "guru:buffett:question_route:zzzz-special",
+            "author_key": "buffett",
+            "object_type": "question_route",
+            "object_origin": "source_grounded",
+            "label_ko": "비어휘 보너스 최상위 원칙",
+            "summary_ko": "장기 투자 원칙",
+            "status": "reviewed",
+        }
+    )
+    _write_jsonl(root / "reviewed" / "guru_objects.jsonl", rows)
 
 
 def _write_jsonl(path: Path, rows: list[dict]) -> None:

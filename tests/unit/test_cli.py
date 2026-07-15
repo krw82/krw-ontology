@@ -26,8 +26,15 @@ import krw_ontology.pipeline.stages.build_company_context as company_context_sta
 from krw_ontology.agent_index.builder import AGENT_INDEX_SCHEMA_VERSION
 from krw_ontology.agent_index.metric_dictionary import metric_dictionary_binding
 from krw_ontology.agent_index.router_sidecar import build_router_sidecar
+from krw_ontology.agent_index.router_coherence import build_router_coherence
 from krw_ontology.agent_index.spine_builder import _company_shard_quality_summary
-from krw_ontology.agent_index.spine_schema import initialize_global_spine_database
+from krw_ontology.agent_index.spine_schema import (
+    GLOBAL_SPINE_TABLES,
+    initialize_global_spine_database,
+    verify_global_spine_schema,
+    write_global_spine_metadata,
+    write_spine_verification_seal,
+)
 from krw_ontology.cli.config import load_cli_config
 from krw_ontology.cli.main import app
 from krw_ontology.release import write_release_manifest_v3
@@ -106,6 +113,20 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _write_minimal_global_spine_counts(path: Path) -> None:
+    with sqlite3.connect(path) as conn:
+        write_global_spine_metadata(
+            conn,
+            {
+                "counts": {
+                    table: int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+                    for table in GLOBAL_SPINE_TABLES
+                    if table != "metadata"
+                }
+            },
+        )
 
 
 def _write_minimal_v3_release(
@@ -192,7 +213,15 @@ def _write_minimal_v3_release(
         + "\n",
         encoding="utf-8",
     )
+    _write_minimal_global_spine_counts(global_spine_path)
+    global_verification = verify_global_spine_schema(
+        global_spine_path,
+        deep=True,
+        trust_seal=False,
+    )
+    write_spine_verification_seal(global_spine_path, global_verification)
     build_router_sidecar(global_spine_path, release_id=release_id)
+    build_router_coherence(global_spine_path, release_id=release_id)
     write_release_manifest_v3(root, release_id=release_id, env=env, source_root=root)
     return root
 
@@ -257,7 +286,18 @@ def _write_minimal_v3_index_outputs(
         },
     }
     shard_manifest_path.write_text(json.dumps(shard_manifest, sort_keys=True), encoding="utf-8")
+    _write_minimal_global_spine_counts(global_spine_path)
+    global_verification = verify_global_spine_schema(
+        global_spine_path,
+        deep=True,
+        trust_seal=False,
+    )
+    write_spine_verification_seal(global_spine_path, global_verification)
     router_sidecar_result = build_router_sidecar(
+        global_spine_path,
+        release_id=release_id,
+    )
+    router_coherence_result = build_router_coherence(
         global_spine_path,
         release_id=release_id,
     )
@@ -285,6 +325,8 @@ def _write_minimal_v3_index_outputs(
         release_id=release_id,
         global_spine_path=global_spine_path,
         router_sidecar_path=router_sidecar_result.path,
+        router_coherence_path=router_coherence_result.path,
+        router_coherence_result=router_coherence_result,
         shard_manifest_path=shard_manifest_path,
         build_summary_path=build_summary_path,
         build_summary=build_summary,
@@ -328,9 +370,7 @@ class TestValidateCommand:
 
     def test_validate_with_data(self, tmp_path: Path, monkeypatch):
         """validate should run and report results when data exists."""
-        ontology_dir = (
-            tmp_path / "companies" / "AAPL" / "ontology" / "10K" / "FY2024"
-        )
+        ontology_dir = tmp_path / "companies" / "AAPL" / "ontology" / "10K" / "FY2024"
         ontology_dir.mkdir(parents=True)
         (ontology_dir / "spans.jsonl").write_text("")
         (ontology_dir / "evidence_quotes.jsonl").write_text("")
@@ -351,12 +391,8 @@ class TestBuildReportCommand:
 
     def test_build_report_with_data(self, tmp_path: Path, monkeypatch):
         """build-report should generate report files."""
-        ontology_dir = (
-            tmp_path / "companies" / "AAPL" / "ontology" / "10K" / "FY2024"
-        )
-        sources_dir = (
-            tmp_path / "companies" / "AAPL" / "sources" / "10K" / "FY2024"
-        )
+        ontology_dir = tmp_path / "companies" / "AAPL" / "ontology" / "10K" / "FY2024"
+        sources_dir = tmp_path / "companies" / "AAPL" / "sources" / "10K" / "FY2024"
         ontology_dir.mkdir(parents=True)
         sources_dir.mkdir(parents=True)
         (ontology_dir / "spans.jsonl").write_text("")
@@ -504,8 +540,7 @@ class TestBuildResearchPipelineCommand:
 
         assert result.exit_code == 0
         assert [
-            (call["ticker"], call["document_type"], call["period"])
-            for call in pipeline_calls
+            (call["ticker"], call["document_type"], call["period"]) for call in pipeline_calls
         ] == [
             ("AAPL", "10-Q", "FY2024Q1"),
             ("AAPL", "10-K", "FY2024"),
@@ -596,17 +631,18 @@ class TestBuildResearchPipelineCommand:
         def fake_build_spine(root, *, release_id, no_cache=False, **kwargs):
             events.append(("index", root))
             result = None
-            tickers = sorted(
-                path.name for path in (root / "companies").iterdir()
-                if path.is_dir()
-            )
+            tickers = sorted(path.name for path in (root / "companies").iterdir() if path.is_dir())
             for ticker in tickers:
                 result = _write_minimal_v3_index_outputs(root, release_id=release_id, ticker=ticker)
-            return result or _write_minimal_v3_index_outputs(root, release_id=release_id, ticker="AAPL")
+            return result or _write_minimal_v3_index_outputs(
+                root, release_id=release_id, ticker="AAPL"
+            )
 
         monkeypatch.setattr(research_plan, "discover_research_filing_targets", fake_discover)
         monkeypatch.setattr(orchestrator, "run_pipeline", fake_run_pipeline)
-        monkeypatch.setattr(company_context_stage, "build_company_context", fake_build_company_context)
+        monkeypatch.setattr(
+            company_context_stage, "build_company_context", fake_build_company_context
+        )
         monkeypatch.setattr(agent_index, "build_spine_shard_release_outputs", fake_build_spine)
 
         result = runner.invoke(
@@ -684,17 +720,18 @@ class TestBuildResearchPipelineCommand:
         def fake_build_spine(root, *, release_id, no_cache=False, **kwargs):
             index_calls.append(root)
             result = None
-            tickers = sorted(
-                path.name for path in (root / "companies").iterdir()
-                if path.is_dir()
-            )
+            tickers = sorted(path.name for path in (root / "companies").iterdir() if path.is_dir())
             for ticker in tickers:
                 result = _write_minimal_v3_index_outputs(root, release_id=release_id, ticker=ticker)
-            return result or _write_minimal_v3_index_outputs(root, release_id=release_id, ticker="MSFT")
+            return result or _write_minimal_v3_index_outputs(
+                root, release_id=release_id, ticker="MSFT"
+            )
 
         monkeypatch.setattr(research_plan, "discover_research_filing_targets", fake_discover)
         monkeypatch.setattr(orchestrator, "run_pipeline", fake_run_pipeline)
-        monkeypatch.setattr(company_context_stage, "build_company_context", fake_build_company_context)
+        monkeypatch.setattr(
+            company_context_stage, "build_company_context", fake_build_company_context
+        )
         monkeypatch.setattr(agent_index, "build_spine_shard_release_outputs", fake_build_spine)
 
         result = runner.invoke(
@@ -753,7 +790,9 @@ class TestUpdateTickerCommand:
             return _write_minimal_v3_index_outputs(root, release_id=release_id, ticker="CVX")
 
         monkeypatch.setattr(orchestrator, "run_pipeline", fake_run_pipeline)
-        monkeypatch.setattr(company_context_stage, "build_company_context", fake_build_company_context)
+        monkeypatch.setattr(
+            company_context_stage, "build_company_context", fake_build_company_context
+        )
         monkeypatch.setattr(agent_index, "build_spine_shard_release_outputs", fake_build_spine)
 
         result = runner.invoke(
@@ -822,7 +861,9 @@ class TestUpdateTickerCommand:
             }
 
         monkeypatch.setattr(orchestrator, "run_pipeline", fake_run_pipeline)
-        monkeypatch.setattr(company_context_stage, "build_company_context", fake_build_company_context)
+        monkeypatch.setattr(
+            company_context_stage, "build_company_context", fake_build_company_context
+        )
         monkeypatch.setattr(agent_index_builder, "build_agent_index", fake_build_agent_index)
 
         result = runner.invoke(
@@ -866,7 +907,9 @@ class TestUpdateTickerCommand:
 
         def fake_run_pipeline(**kwargs):
             calls.append(kwargs)
-            (kwargs["output_dir"] / "companies" / kwargs["ticker"]).mkdir(parents=True, exist_ok=True)
+            (kwargs["output_dir"] / "companies" / kwargs["ticker"]).mkdir(
+                parents=True, exist_ok=True
+            )
 
         def fake_build_company_context(root, ticker):
             return {
@@ -875,7 +918,9 @@ class TestUpdateTickerCommand:
             }
 
         monkeypatch.setattr(orchestrator, "run_pipeline", fake_run_pipeline)
-        monkeypatch.setattr(company_context_stage, "build_company_context", fake_build_company_context)
+        monkeypatch.setattr(
+            company_context_stage, "build_company_context", fake_build_company_context
+        )
 
         result = runner.invoke(
             app,
@@ -1024,15 +1069,18 @@ class TestObservabilityCommand:
 
         payload = yaml.safe_load(output_path.read_text(encoding="utf-8"))
         receivers = {receiver["name"]: receiver for receiver in payload["receivers"]}
-        assert receivers["krw-ontology-mcp-default"]["webhook_configs"][0]["url"] == secret_urls[
-            "KRW_ALERTMANAGER_DEFAULT_WEBHOOK_URL"
-        ]
-        assert receivers["krw-ontology-mcp-critical"]["webhook_configs"][0]["url"] == secret_urls[
-            "KRW_ALERTMANAGER_CRITICAL_WEBHOOK_URL"
-        ]
-        assert receivers["krw-ontology-mcp-warning"]["webhook_configs"][0]["url"] == secret_urls[
-            "KRW_ALERTMANAGER_WARNING_WEBHOOK_URL"
-        ]
+        assert (
+            receivers["krw-ontology-mcp-default"]["webhook_configs"][0]["url"]
+            == secret_urls["KRW_ALERTMANAGER_DEFAULT_WEBHOOK_URL"]
+        )
+        assert (
+            receivers["krw-ontology-mcp-critical"]["webhook_configs"][0]["url"]
+            == secret_urls["KRW_ALERTMANAGER_CRITICAL_WEBHOOK_URL"]
+        )
+        assert (
+            receivers["krw-ontology-mcp-warning"]["webhook_configs"][0]["url"]
+            == secret_urls["KRW_ALERTMANAGER_WARNING_WEBHOOK_URL"]
+        )
 
     def test_render_alertmanager_fails_without_receiver_urls(
         self,
@@ -1277,7 +1325,9 @@ class TestProdCommand:
         assert not (remote_root / "releases" / release_id).exists()
         assert (remote_root / "failed" / release_id / "manifest.json").exists()
 
-    def test_prod_activation_rejects_stale_shard_quality_summary_before_current_switch(self, tmp_path: Path):
+    def test_prod_activation_rejects_stale_shard_quality_summary_before_current_switch(
+        self, tmp_path: Path
+    ):
         remote_root = tmp_path / "remote"
         release_id = "bad-quality"
         incoming = remote_root / "incoming"
@@ -1294,7 +1344,9 @@ class TestProdCommand:
         shard_manifest = json.loads(shard_manifest_path.read_text(encoding="utf-8"))
         shard_manifest["shards"]["AAPL"]["quality_summary"]["totals"]["documents"] = 999
         shard_manifest_path.write_text(json.dumps(shard_manifest, sort_keys=True), encoding="utf-8")
-        write_release_manifest_v3(bundle_source, release_id=release_id, env="prod", source_root=stable)
+        write_release_manifest_v3(
+            bundle_source, release_id=release_id, env="prod", source_root=stable
+        )
         with tarfile.open(incoming / f"{release_id}.tar.gz", "w:gz") as archive:
             for child in sorted(bundle_source.iterdir()):
                 archive.add(child, arcname=child.name, recursive=True)
@@ -1358,9 +1410,7 @@ class TestProdCommand:
         manifest_path = bundle_source / "manifest.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         if stale_binding == "global_schema":
-            manifest["indexes"]["global_spine"]["schema_version"] = (
-                "krw-ontology-global-spine/v1"
-            )
+            manifest["indexes"]["global_spine"]["schema_version"] = "krw-ontology-global-spine/v1"
         elif stale_binding == "projection":
             manifest["builder"]["spine_projection_version"] = "spine-projection/v1"
         else:
@@ -1462,7 +1512,10 @@ class TestProdCommand:
         assert "Activated: releases/20260515-000000" in result.output
         assert [call[0][0] for call in run_calls] == ["ssh", "scp", "ssh"]
         assert "/srv/krw-ontology-data/incoming" in run_calls[0][0]
-        assert run_calls[1][0][2] == "ubuntu@prod:/srv/krw-ontology-data/incoming/20260515-000000.tar.gz"
+        assert (
+            run_calls[1][0][2]
+            == "ubuntu@prod:/srv/krw-ontology-data/incoming/20260515-000000.tar.gz"
+        )
         activation_script = run_calls[2][1]
         assert "RELEASE_ID=20260515-000000" in activation_script
         assert "RELOAD_COMMAND='sudo systemctl restart krw-ontology-mcp'" in activation_script
@@ -1474,6 +1527,11 @@ class TestProdCommand:
         assert "python3 missing for remote v3 verification" in activation_script
         assert "remote manifest format is not v3" in activation_script
         assert "remote global_spine sha256 mismatch" in activation_script
+        assert "remote global_spine index missing" in activation_script
+        assert "remote global_spine replica invariant version mismatch" in activation_script
+        assert "remote router_sidecar sha256 mismatch" in activation_script
+        assert "remote router_sidecar global spine binding mismatch" in activation_script
+        assert "remote router_sidecar build fingerprint mismatch" in activation_script
         assert "remote shard_manifest sha256 mismatch" in activation_script
         assert "remote delta changed file sha256 mismatch" in activation_script
         assert "remote manifest company_shards count mismatch" in activation_script
@@ -1487,14 +1545,17 @@ class TestProdCommand:
         assert 'ACTIVATION_LOG="$ROOT/activation_logs/$RELEASE_ID.log"' in activation_script
         assert 'ACTIVATION_EVENTS="$ROOT/activation_events/$RELEASE_ID.jsonl"' in activation_script
         assert 'ACTIVATION_LOG="$ROOT/releases/$RELEASE_ID/' not in activation_script
-        assert "activation_event \"current_switched\" \"ok\"" in activation_script
+        assert 'activation_event "current_switched" "ok"' in activation_script
         assert "rollback reload_failed" in activation_script
         assert "rollback health_failed" in activation_script
         assert "rollback health_not_ok" in activation_script
         assert "rollback health_release_mismatch" in activation_script
         assert "rollback health_layout_mismatch" in activation_script
         assert '"release_id"[[:space:]]*:[[:space:]]*"\'"$RELEASE_ID"\'"' in activation_script
-        assert '"index_layout"[[:space:]]*:[[:space:]]*"global-spine-and-company-shards"' in activation_script
+        assert (
+            '"index_layout"[[:space:]]*:[[:space:]]*"global-spine-and-company-shards"'
+            in activation_script
+        )
         assert "manifest.json" in bundle_members
         assert "release_manifest.json" not in bundle_members
         assert "verify/release_verify.json" in bundle_members
@@ -1513,7 +1574,9 @@ class TestProdCommand:
     def test_prod_delta_activation_reconstructs_release_from_current(self, tmp_path: Path):
         remote_root = tmp_path / "remote"
         old_release = remote_root / "releases" / "old-release"
-        _write_minimal_v3_release(old_release, release_id="old-release", env="prod", ticker="VG", artifact_text="old")
+        _write_minimal_v3_release(
+            old_release, release_id="old-release", env="prod", ticker="VG", artifact_text="old"
+        )
         (old_release / "companies" / "VG" / "artifact.txt").unlink()
         (old_release / "companies" / "VG" / "old.txt").write_text("old", encoding="utf-8")
         (remote_root / "current").symlink_to("releases/old-release")
@@ -1598,6 +1661,11 @@ class TestProdCommand:
         assert "rollback manifest missing global_spine" in rollback_script
         assert "rollback manifest missing company_shards" in rollback_script
         assert "rollback global_spine sha256 mismatch" in rollback_script
+        assert "rollback global_spine index missing" in rollback_script
+        assert "rollback global_spine replica invariant version mismatch" in rollback_script
+        assert "rollback router_sidecar sha256 mismatch" in rollback_script
+        assert "rollback router_sidecar global spine binding mismatch" in rollback_script
+        assert "rollback router_sidecar build fingerprint mismatch" in rollback_script
         assert "rollback shard_manifest sha256 mismatch" in rollback_script
         assert "rollback company shard sha256 mismatch" in rollback_script
         assert "rollback shard quality_summary missing" in rollback_script
@@ -1609,8 +1677,13 @@ class TestProdCommand:
         assert "restore_current health_release_mismatch" in rollback_script
         assert "restore_current health_layout_mismatch" in rollback_script
         assert '"release_id"[[:space:]]*:[[:space:]]*"\'"$TARGET_RELEASE_ID"\'"' in rollback_script
-        assert '"index_layout"[[:space:]]*:[[:space:]]*"global-spine-and-company-shards"' in rollback_script
-        assert rollback_script.index("rollback release_verify.json missing") < rollback_script.index('ln -sfn "$TARGET"')
+        assert (
+            '"index_layout"[[:space:]]*:[[:space:]]*"global-spine-and-company-shards"'
+            in rollback_script
+        )
+        assert rollback_script.index(
+            "rollback release_verify.json missing"
+        ) < rollback_script.index('ln -sfn "$TARGET"')
 
     def test_prod_publish_dry_run_skips_subprocess(self, tmp_path: Path, monkeypatch):
         stable = tmp_path / "stable"
@@ -1632,7 +1705,9 @@ class TestProdCommand:
             "_try_get_prod_status",
             lambda **kwargs: {"current_kind": "missing", "releases": []},
         )
-        monkeypatch.setattr(cli_main.subprocess, "run", lambda *args, **kwargs: run_calls.append(args))
+        monkeypatch.setattr(
+            cli_main.subprocess, "run", lambda *args, **kwargs: run_calls.append(args)
+        )
 
         result = runner.invoke(app, ["prod", "publish", "--root", str(stable), "--dry-run"])
 
@@ -1674,7 +1749,9 @@ class TestProdCommand:
         assert result.exit_code == 1
         assert "prod publish source must be a v3 immutable release" in result.output
 
-    def test_prod_publish_uses_configured_release_current_by_default(self, tmp_path: Path, monkeypatch):
+    def test_prod_publish_uses_configured_release_current_by_default(
+        self, tmp_path: Path, monkeypatch
+    ):
         releases_root = tmp_path / "releases"
         release_root = releases_root / "dev" / "ready"
         _write_minimal_v3_release(release_root, release_id="ready", env="dev")
@@ -1718,7 +1795,9 @@ class TestProdCommand:
         assert result.exit_code == 0, result.output
         assert calls == [release_root.resolve()]
 
-    def test_prod_publish_dev_alias_defaults_to_delta_dev_current(self, tmp_path: Path, monkeypatch):
+    def test_prod_publish_dev_alias_defaults_to_delta_dev_current(
+        self, tmp_path: Path, monkeypatch
+    ):
         releases_root = tmp_path / "releases"
         release_root = releases_root / "dev" / "ready"
         _write_minimal_v3_release(release_root, release_id="ready", env="dev")
@@ -1775,7 +1854,10 @@ class TestProdCommand:
 
         assert result.exit_code == 0, result.output
         assert "Release: dev/current" in result.output
-        assert f"Global spine: {release_root.resolve() / 'indexes' / 'global_spine.sqlite'}" in result.output
+        assert (
+            f"Global spine: {release_root.resolve() / 'indexes' / 'global_spine.sqlite'}"
+            in result.output
+        )
 
     def test_prod_status_shows_current_release(self, monkeypatch):
         runner.invoke(
@@ -1866,7 +1948,10 @@ class TestProdCommand:
         assert result.exit_code == 0
         assert "OK local release format: v3 global-spine-and-company-shards" in result.output
         assert "OK ssh connectivity" in result.output
-        assert "OK remote publish commands: tar ln mv rm mkdir ls readlink xargs grep sed" in result.output
+        assert (
+            "OK remote publish commands: tar ln mv rm mkdir ls readlink xargs grep sed"
+            in result.output
+        )
         assert "OK remote Python sqlite3: /usr/bin/python3" in result.output
         assert "WARN Remote current is a directory" in result.output
         assert "Prod doctor passed." in result.output
@@ -1996,11 +2081,16 @@ class TestReleaseCommand:
 
         release_root = releases_root / "staging" / "deploy-rel"
         assert deploy.exit_code == 0, deploy.output
-        assert "Release deploy completed: env=staging release_id=deploy-rel promoted=True" in deploy.output
+        assert (
+            "Release deploy completed: env=staging release_id=deploy-rel promoted=True"
+            in deploy.output
+        )
         assert (release_root / "indexes" / "source_manifest.json").exists()
         assert os.readlink(releases_root / "staging" / "current") == "deploy-rel"
 
-    def test_release_deploy_and_force_use_configured_roots_and_env(self, tmp_path: Path, monkeypatch):
+    def test_release_deploy_and_force_use_configured_roots_and_env(
+        self, tmp_path: Path, monkeypatch
+    ):
         source_root = tmp_path / "running"
         releases_root = tmp_path / "releases"
         _write_minimal_source_artifact(source_root, "VG")
@@ -2018,10 +2108,14 @@ class TestReleaseCommand:
                 f"env={kwargs['env']} release_id={typer_release} promoted=True"
             )
 
-        monkeypatch.setattr(cli_main, "_run_full_root_release_command", fake_run_full_root_release_command)
+        monkeypatch.setattr(
+            cli_main, "_run_full_root_release_command", fake_run_full_root_release_command
+        )
 
         deploy = runner.invoke(app, ["release", "deploy", "--force", "--release-id", "cfg-deploy"])
-        force = runner.invoke(app, ["release", "force", "--release-id", "cfg-force", "--foreground"])
+        force = runner.invoke(
+            app, ["release", "force", "--release-id", "cfg-force", "--foreground"]
+        )
 
         assert deploy.exit_code == 0, deploy.output
         assert force.exit_code == 0, force.output
@@ -2095,13 +2189,18 @@ class TestReleaseCommand:
         assert json_payload["dag"]["format"] == "krw-ontology-v3-build-plan/v1"
         assert json_payload["dag"]["index_layout"] == "global-spine-and-company-shards"
         assert [node["id"] for node in json_payload["dag"]["nodes"]] == [
+            "static_preflight",
             "source_manifest",
+            "artifact_fragments",
             "company_shard:VG",
+            "company_identity_preflight",
+            "shard_manifest",
             "spine_fragment:VG",
+            "semantic_preflight",
             "global_spine_merge",
             "cross_company_links",
             "router_sidecar",
-            "shard_manifest",
+            "router_coherence",
             "chart_series",
             "release_manifest",
             "verification",
@@ -2127,7 +2226,10 @@ class TestReleaseCommand:
 
         release_root = releases_root / "staging" / "full-root-rel"
         assert publish.exit_code == 0, publish.output
-        assert "Release publish completed: env=staging release_id=full-root-rel promoted=True" in publish.output
+        assert (
+            "Release publish completed: env=staging release_id=full-root-rel promoted=True"
+            in publish.output
+        )
         assert os.readlink(releases_root / "staging" / "current") == "full-root-rel"
         assert (release_root / "manifest.json").exists()
         assert (release_root / "indexes" / "global_spine.sqlite").exists()
@@ -2248,7 +2350,16 @@ class TestReleaseCommand:
 
         listed = runner.invoke(
             app,
-            ["release", "list", "--releases-root", str(releases_root), "--env", "prod", "--include-failed", "--json"],
+            [
+                "release",
+                "list",
+                "--releases-root",
+                str(releases_root),
+                "--env",
+                "prod",
+                "--include-failed",
+                "--json",
+            ],
         )
 
         assert listed.exit_code == 0, listed.output
@@ -2444,7 +2555,9 @@ class TestReleaseCommand:
         } == first_release_bytes
         env_events = [
             json.loads(line)
-            for line in (releases_root / "prod" / "release_events.jsonl").read_text(encoding="utf-8").splitlines()
+            for line in (releases_root / "prod" / "release_events.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
         ]
         assert [event["action"] for event in env_events] == ["promote", "promote", "rollback"]
         assert [event["release_id"] for event in env_events] == [
@@ -2487,7 +2600,10 @@ class TestReleaseCommand:
             ],
         )
         assert inspected.exit_code == 0, inspected.output
-        assert [event["action"] for event in json.loads(inspected.output)["events"]] == ["promote", "rollback"]
+        assert [event["action"] for event in json.loads(inspected.output)["events"]] == [
+            "promote",
+            "rollback",
+        ]
 
     def test_release_promote_event_log_preflight_failure_preserves_current(
         self,
@@ -2540,6 +2656,61 @@ class TestReleaseCommand:
         assert os.readlink(current) == old.name
         assert not (env_root / "release_events.jsonl").exists()
 
+    def test_release_promote_reuses_in_process_verification_without_rechecking(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+    ):
+        releases_root = tmp_path / "releases"
+        target = releases_root / "dev" / "new-release"
+        _write_minimal_v3_release(target, release_id=target.name, env="dev")
+        verification = release_helpers.verify_release_root(target, env="dev", deep=False)
+        report = release_helpers.write_release_verification_report(
+            target,
+            env="dev",
+            verification=verification,
+        )
+
+        def fail_duplicate_verification(*_args, **_kwargs):
+            raise AssertionError("promotion repeated release verification")
+
+        monkeypatch.setattr(
+            release_helpers,
+            "verify_release_root",
+            fail_duplicate_verification,
+        )
+
+        result = release_helpers.promote_local_release(
+            releases_root,
+            env="dev",
+            release_id=target.name,
+            preverified=verification,
+            preverified_report=report,
+        )
+
+        assert os.readlink(releases_root / "dev" / "current") == target.name
+        assert result["verify_report"] == str(target / "verify" / "release_verify.json")
+
+    def test_release_promote_rejects_preverification_for_another_release(
+        self,
+        tmp_path: Path,
+    ):
+        releases_root = tmp_path / "releases"
+        target = releases_root / "dev" / "new-release"
+        _write_minimal_v3_release(target, release_id=target.name, env="dev")
+        verification = release_helpers.verify_release_root(target, env="dev", deep=False)
+        verification["release_id"] = "different-release"
+
+        with pytest.raises(ValueError, match="release_id_mismatch"):
+            release_helpers.promote_local_release(
+                releases_root,
+                env="dev",
+                release_id=target.name,
+                preverified=verification,
+            )
+
+        assert not (releases_root / "dev" / "current").exists()
+
     def test_release_promote_event_log_append_failure_is_reported_after_switch(
         self,
         tmp_path: Path,
@@ -2554,7 +2725,9 @@ class TestReleaseCommand:
 
         monkeypatch.setattr(release_helpers, "_append_release_event", fail_append)
 
-        result = release_helpers.promote_local_release(releases_root, env="prod", release_id=target.name)
+        result = release_helpers.promote_local_release(
+            releases_root, env="prod", release_id=target.name
+        )
 
         assert os.readlink(releases_root / "prod" / "current") == target.name
         assert result["verify_report"] == str(target / "verify" / "release_verify.json")
@@ -2706,7 +2879,11 @@ class TestReleaseCommand:
         current.symlink_to(old.name)
 
         def fail_report(*_args, **_kwargs):
-            return {"ok": False, "errors": ["report_failed"], "path": str(target / "verify" / "release_verify.json")}
+            return {
+                "ok": False,
+                "errors": ["report_failed"],
+                "path": str(target / "verify" / "release_verify.json"),
+            }
 
         monkeypatch.setattr(release_helpers, "write_release_verification_report", fail_report)
 
@@ -2761,7 +2938,7 @@ class TestReleaseCommand:
         def fail_connect(*_args, **_kwargs):
             raise AssertionError("non-v3 release must be rejected before opening SQLite")
 
-        monkeypatch.setattr("krw_ontology.release.sqlite3.connect", fail_connect)
+        monkeypatch.setattr(sqlite3, "connect", fail_connect)
         result = runner.invoke(
             app,
             ["release", "verify", "--root", str(release_root), "--env", "prod"],
@@ -2795,7 +2972,7 @@ class TestReleaseCommand:
         def fail_connect(*_args, **_kwargs):
             raise AssertionError("startup check must reject v1 before opening SQLite")
 
-        monkeypatch.setattr("krw_ontology.release.sqlite3.connect", fail_connect)
+        monkeypatch.setattr(sqlite3, "connect", fail_connect)
 
         result = runner.invoke(
             app,
@@ -2881,7 +3058,7 @@ class TestReleaseCommand:
         def fail_connect(*_args, **_kwargs):
             raise AssertionError("legacy manifest rejection must not open SQLite")
 
-        monkeypatch.setattr("krw_ontology.release.sqlite3.connect", fail_connect)
+        monkeypatch.setattr(sqlite3, "connect", fail_connect)
         result = runner.invoke(
             app,
             ["release", "verify", "--root", str(release_root), "--env", "prod"],
@@ -2898,7 +3075,15 @@ class TestReleaseCommand:
 
         result = runner.invoke(
             app,
-            ["release", "promote", release_root.name, "--releases-root", str(releases_root), "--env", "prod"],
+            [
+                "release",
+                "promote",
+                release_root.name,
+                "--releases-root",
+                str(releases_root),
+                "--env",
+                "prod",
+            ],
         )
 
         report_path = release_root / "verify" / "release_verify.json"
@@ -2968,7 +3153,9 @@ class TestReleaseCommand:
         assert "No such option" in update.output
         assert "--update-smoke-baseline" in update.output
 
-    def test_release_verify_v3_write_report_does_not_emit_legacy_smoke_reports(self, tmp_path: Path):
+    def test_release_verify_v3_write_report_does_not_emit_legacy_smoke_reports(
+        self, tmp_path: Path
+    ):
         release_root = tmp_path / "releases" / "prod" / "rel-mcp-smoke"
         _write_minimal_v3_release(release_root, release_id="rel-mcp-smoke", env="prod")
 
@@ -3025,7 +3212,9 @@ class TestReleaseCommand:
             workers=1,
             no_cache=True,
         )
-        write_release_manifest_v3(tmp_path, release_id="20260528_030000", env="prod", source_root=tmp_path)
+        write_release_manifest_v3(
+            tmp_path, release_id="20260528_030000", env="prod", source_root=tmp_path
+        )
         manifest = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
         assert manifest["format"] == "krw-ontology-release/v3"
         assert manifest["index_layout"] == "global-spine-and-company-shards"
@@ -3066,7 +3255,10 @@ class TestReleaseCommand:
         assert company["ticker"] == "VG"
         assert company["latest_period"] == "FY2025"
         assert company["sector"] == "energy_lng"
-        assert company["description"] == "Primary activities: LNG sales. Key external factors: natural_gas_price."
+        assert (
+            company["description"]
+            == "Primary activities: LNG sales. Key external factors: natural_gas_price."
+        )
         assert company["coverage"]["document_count"] == 1
         assert company["coverage"]["document_types"] == ["10-K"]
         assert company["coverage"]["periods"] == ["FY2025"]
@@ -3083,7 +3275,9 @@ class TestReleaseCommand:
             workers=1,
             no_cache=True,
         )
-        write_release_manifest_v3(tmp_path, release_id="20260528_040000", env="staging", source_root=tmp_path)
+        write_release_manifest_v3(
+            tmp_path, release_id="20260528_040000", env="staging", source_root=tmp_path
+        )
         out_path = tmp_path / "web_catalog.json"
 
         result = runner.invoke(
@@ -3107,7 +3301,9 @@ class TestReleaseCommand:
     def test_release_prepare_dev_sets_config_and_retargets_pending_queue(self, tmp_path: Path):
         releases_root = tmp_path / "releases"
         base = releases_root / "dev" / "base"
-        _write_minimal_v3_release(base, release_id="base", env="dev", ticker="VG", artifact_text="base")
+        _write_minimal_v3_release(
+            base, release_id="base", env="dev", ticker="VG", artifact_text="base"
+        )
         os.symlink("base", releases_root / "dev" / "current")
 
         queue_root = tmp_path / "running"
@@ -3144,7 +3340,9 @@ class TestReleaseCommand:
         assert retargeted.publish_root == str(release_root.resolve())
         assert "queue_jobs_changed: 1" in result.output
 
-    def test_release_prepare_dev_refuses_running_queue_without_override(self, tmp_path: Path, monkeypatch):
+    def test_release_prepare_dev_refuses_running_queue_without_override(
+        self, tmp_path: Path, monkeypatch
+    ):
         releases_root = tmp_path / "releases"
         queue_root = tmp_path / "running"
         store = pipeline_queue.PipelineQueue(queue_root)
@@ -3285,15 +3483,15 @@ class TestReleaseCommand:
         prod = releases_root / "prod" / target_id
         with sqlite3.connect(prod / "indexes" / "router_sidecar.sqlite") as conn:
             sidecar_release_id = json.loads(
-                conn.execute(
-                    "SELECT value_json FROM metadata WHERE key = 'release_id'"
-                ).fetchone()[0]
+                conn.execute("SELECT value_json FROM metadata WHERE key = 'release_id'").fetchone()[
+                    0
+                ]
             )
         with sqlite3.connect(source / "indexes" / "router_sidecar.sqlite") as conn:
             source_sidecar_release_id = json.loads(
-                conn.execute(
-                    "SELECT value_json FROM metadata WHERE key = 'release_id'"
-                ).fetchone()[0]
+                conn.execute("SELECT value_json FROM metadata WHERE key = 'release_id'").fetchone()[
+                    0
+                ]
             )
         manifest = json.loads((prod / "manifest.json").read_text(encoding="utf-8"))
         assert sidecar_release_id == target_id
@@ -3599,7 +3797,9 @@ class TestQueueCommands:
 
         monkeypatch.setattr(research_plan, "discover_research_filing_targets", fake_discover)
         monkeypatch.setattr(orchestrator, "run_pipeline", fake_run_pipeline)
-        monkeypatch.setattr(company_context_stage, "build_company_context", fake_build_company_context)
+        monkeypatch.setattr(
+            company_context_stage, "build_company_context", fake_build_company_context
+        )
 
         result = runner.invoke(
             app,
@@ -3662,7 +3862,9 @@ class TestQueueCommands:
 
         monkeypatch.setattr(research_plan, "discover_research_filing_targets", fake_discover)
         monkeypatch.setattr(orchestrator, "run_pipeline", fake_run_pipeline)
-        monkeypatch.setattr(company_context_stage, "build_company_context", fake_build_company_context)
+        monkeypatch.setattr(
+            company_context_stage, "build_company_context", fake_build_company_context
+        )
         monkeypatch.setattr(agent_index, "build_spine_shard_release_outputs", fake_build_spine)
 
         result = runner.invoke(
@@ -3776,7 +3978,9 @@ class TestQueueCommands:
 
         monkeypatch.setattr(research_plan, "discover_research_filing_targets", fake_discover)
         monkeypatch.setattr(orchestrator, "run_pipeline", fake_run_pipeline)
-        monkeypatch.setattr(company_context_stage, "build_company_context", fake_build_company_context)
+        monkeypatch.setattr(
+            company_context_stage, "build_company_context", fake_build_company_context
+        )
         monkeypatch.setattr(cli_main, "_publish_prod_root", fake_publish_prod_root)
 
         result = runner.invoke(
@@ -3865,7 +4069,9 @@ class TestQueueCommands:
 
         monkeypatch.setattr(research_plan, "discover_research_filing_targets", fake_discover)
         monkeypatch.setattr(orchestrator, "run_pipeline", fake_run_pipeline)
-        monkeypatch.setattr(company_context_stage, "build_company_context", fake_build_company_context)
+        monkeypatch.setattr(
+            company_context_stage, "build_company_context", fake_build_company_context
+        )
 
         result = runner.invoke(
             app,
@@ -4262,7 +4468,9 @@ class TestPublishTickerCommand:
         running = tmp_path / "running"
         releases_root = tmp_path / "releases"
         base = releases_root / "dev" / "base"
-        _write_minimal_v3_release(base, release_id="base", env="dev", ticker="CVX", artifact_text="old")
+        _write_minimal_v3_release(
+            base, release_id="base", env="dev", ticker="CVX", artifact_text="old"
+        )
         (base / "companies" / "CVX" / "old.txt").write_text("old")
         (releases_root / "dev" / "current").symlink_to("base")
         _write_company_context_artifact(running, "CVX")
@@ -4303,10 +4511,14 @@ class TestPublishTickerCommand:
         assert report["reproducibility_hash"]
         progress_events = [
             json.loads(line)
-            for line in (release_root / "indexes" / "build_progress.jsonl").read_text(encoding="utf-8").splitlines()
+            for line in (release_root / "indexes" / "build_progress.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
             if line.strip()
         ]
-        progress_keys = {(event["stage"], event["node_id"], event["status"]) for event in progress_events}
+        progress_keys = {
+            (event["stage"], event["node_id"], event["status"]) for event in progress_events
+        }
         assert ("manifest", "release_manifest", "complete") in progress_keys
         assert ("verification", "verification", "complete") in progress_keys
         assert ("promotion", "promote_current", "complete") in progress_keys
@@ -4336,7 +4548,9 @@ class TestPublishTickerCommand:
             shard_manifest_path=build_result.shard_manifest_path,
         )
         verification = release_helpers.verify_release_root(base, env="dev")
-        release_helpers.write_release_verification_report(base, env="dev", verification=verification)
+        release_helpers.write_release_verification_report(
+            base, env="dev", verification=verification
+        )
         (releases_root / "dev" / "current").symlink_to(base.name)
 
         def fail_if_rebuilt(*_args, **_kwargs):
@@ -4385,7 +4599,9 @@ class TestPublishTickerCommand:
         assert "No such option" in result.output
         assert not (releases_root / "dev" / "current").exists()
 
-    def test_publish_ticker_quarantines_candidate_when_index_build_fails(self, tmp_path: Path, monkeypatch):
+    def test_publish_ticker_quarantines_candidate_when_index_build_fails(
+        self, tmp_path: Path, monkeypatch
+    ):
         running = tmp_path / "running"
         releases_root = tmp_path / "releases"
         source = running / "companies" / "OXY" / "ontology"
@@ -4396,7 +4612,9 @@ class TestPublishTickerCommand:
         def fake_build_spine_outputs(*args, **kwargs):
             raise RuntimeError("v3 index boom")
 
-        monkeypatch.setattr(agent_index, "build_spine_shard_release_outputs", fake_build_spine_outputs)
+        monkeypatch.setattr(
+            agent_index, "build_spine_shard_release_outputs", fake_build_spine_outputs
+        )
 
         result = runner.invoke(
             app,
@@ -4422,7 +4640,9 @@ class TestPublishTickerCommand:
         assert failure["error"] == "v3 index boom"
         assert not (releases_root / "dev" / "current").exists()
 
-    def test_publish_ticker_dry_run_does_not_copy_or_rebuild_index(self, tmp_path: Path, monkeypatch):
+    def test_publish_ticker_dry_run_does_not_copy_or_rebuild_index(
+        self, tmp_path: Path, monkeypatch
+    ):
         running = tmp_path / "running"
         stable = tmp_path / "stable"
         (running / "companies" / "LNG").mkdir(parents=True)
@@ -4524,7 +4744,9 @@ class TestHelpOutput:
         assert "operator summary" in result.output
 
 
-def test_release_finalize_dev_refuses_to_mutate_current_when_publish_root_unset(tmp_path: Path, monkeypatch):
+def test_release_finalize_dev_refuses_to_mutate_current_when_publish_root_unset(
+    tmp_path: Path, monkeypatch
+):
     monkeypatch.setenv("KRW_ONTOLOGY_CLI_CONFIG", str(tmp_path / "config.json"))
     releases_root = tmp_path / "releases"
     release_id = "20260528_090000"
@@ -4562,7 +4784,9 @@ def test_release_finalize_dev_refuses_to_mutate_current_when_publish_root_unset(
     assert calls == []
 
 
-def test_release_finalize_dev_refuses_empty_release_root_before_index_build(tmp_path: Path, monkeypatch):
+def test_release_finalize_dev_refuses_empty_release_root_before_index_build(
+    tmp_path: Path, monkeypatch
+):
     monkeypatch.setenv("KRW_ONTOLOGY_CLI_CONFIG", str(tmp_path / "config.json"))
     releases_root = tmp_path / "releases"
     release_id = "20260528_100000"
@@ -4597,7 +4821,14 @@ def test_release_finalize_dev_rejects_index_build_skip(tmp_path: Path):
 
     result = runner.invoke(
         app,
-        ["release", "finalize-dev", "candidate", "--releases-root", str(releases_root), "--no-build-index"],
+        [
+            "release",
+            "finalize-dev",
+            "candidate",
+            "--releases-root",
+            str(releases_root),
+            "--no-build-index",
+        ],
     )
 
     assert result.exit_code == 1
@@ -4614,12 +4845,16 @@ def test_release_publish_dev_builds_v3_release_from_running_root(tmp_path: Path,
     (running_root / ".krw_pipeline" / "jobs").mkdir(parents=True)
     (running_root / ".krw_pipeline" / "jobs" / "job.json").write_text("{}")
     (running_root / "indexes").mkdir()
-    (running_root / "indexes" / "agent_index.sqlite").write_text("legacy monolith", encoding="utf-8")
+    (running_root / "indexes" / "agent_index.sqlite").write_text(
+        "legacy monolith", encoding="utf-8"
+    )
     (running_root / "indexes" / "agent_index.sqlite-wal").write_text("legacy wal", encoding="utf-8")
     (running_root / "indexes" / "agent_index.sqlite-shm").write_text("legacy shm", encoding="utf-8")
     runner.invoke(app, ["config", "set", "running-root", str(running_root)])
 
-    result = runner.invoke(app, ["release", "publish-dev", "--foreground", "--releases-root", str(releases_root)])
+    result = runner.invoke(
+        app, ["release", "publish-dev", "--foreground", "--releases-root", str(releases_root)]
+    )
 
     release_root = releases_root / "dev" / "20260603_110000"
     assert result.exit_code == 0, result.output
@@ -4642,10 +4877,14 @@ def test_release_publish_dev_builds_v3_release_from_running_root(tmp_path: Path,
     assert any(item["path"] == "indexes/global_spine.sqlite" for item in report["files"])
     progress_events = [
         json.loads(line)
-        for line in (release_root / "indexes" / "build_progress.jsonl").read_text(encoding="utf-8").splitlines()
+        for line in (release_root / "indexes" / "build_progress.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
         if line.strip()
     ]
-    progress_keys = {(event["stage"], event["node_id"], event["status"]) for event in progress_events}
+    progress_keys = {
+        (event["stage"], event["node_id"], event["status"]) for event in progress_events
+    }
     assert ("manifest", "release_manifest", "complete") in progress_keys
     assert ("verification", "verification", "complete") in progress_keys
     assert ("promotion", "promote_current", "complete") in progress_keys
@@ -4700,7 +4939,9 @@ class TestCurrentReleaseImmutability:
     def _active_dev_release(self, tmp_path: Path) -> tuple[Path, Path]:
         env_root = tmp_path / "releases" / "dev"
         release_root = env_root / "active-release"
-        _write_minimal_v3_release(release_root, release_id=release_root.name, env="dev", ticker="VG")
+        _write_minimal_v3_release(
+            release_root, release_id=release_root.name, env="dev", ticker="VG"
+        )
         current = env_root / "current"
         current.symlink_to(release_root.name)
         return current, release_root
@@ -4785,7 +5026,9 @@ class TestCurrentReleaseImmutability:
         assert "current is an immutable release pointer" in result.output
         assert calls == []
 
-    def test_release_verify_is_read_only_on_current_unless_report_write_requested(self, tmp_path: Path):
+    def test_release_verify_is_read_only_on_current_unless_report_write_requested(
+        self, tmp_path: Path
+    ):
         current, release_root = self._active_dev_release(tmp_path)
         report_path = release_root / "verify" / "release_verify.json"
 
@@ -4840,7 +5083,9 @@ class TestCurrentReleaseImmutability:
         assert "already current" in promote.output
         assert not (release_root / "verify" / "release_verify.json").exists()
         with pytest.raises(ValueError, match="already current"):
-            release_helpers.promote_local_release(releases_root, env="dev", release_id=release_root.name)
+            release_helpers.promote_local_release(
+                releases_root, env="dev", release_id=release_root.name
+            )
 
     def test_index_cache_write_paths_reject_current(self, tmp_path: Path):
         current, release_root = self._active_dev_release(tmp_path)
@@ -4857,7 +5102,16 @@ class TestCurrentReleaseImmutability:
         )
         gc = runner.invoke(
             app,
-            ["index", "cache", "gc", "--root", str(running), "--cache-root", str(cache_root), "--yes"],
+            [
+                "index",
+                "cache",
+                "gc",
+                "--root",
+                str(running),
+                "--cache-root",
+                str(cache_root),
+                "--yes",
+            ],
         )
 
         assert build.exit_code == 1
@@ -4867,7 +5121,9 @@ class TestCurrentReleaseImmutability:
         assert marker.read_text(encoding="utf-8") == "keep"
 
 
-def test_release_publish_dev_quarantines_new_release_candidate_when_index_build_fails(tmp_path: Path, monkeypatch):
+def test_release_publish_dev_quarantines_new_release_candidate_when_index_build_fails(
+    tmp_path: Path, monkeypatch
+):
     monkeypatch.setenv("KRW_ONTOLOGY_CLI_CONFIG", str(tmp_path / "config.json"))
     monkeypatch.setattr(cli_main, "_default_release_id", lambda: "20260603_failed")
     running_root = tmp_path / "running"
@@ -4880,7 +5136,9 @@ def test_release_publish_dev_quarantines_new_release_candidate_when_index_build_
 
     monkeypatch.setattr(agent_index, "build_spine_shard_release_outputs", fake_build_spine_outputs)
 
-    result = runner.invoke(app, ["release", "publish-dev", "--foreground", "--releases-root", str(releases_root)])
+    result = runner.invoke(
+        app, ["release", "publish-dev", "--foreground", "--releases-root", str(releases_root)]
+    )
 
     assert result.exit_code == 1
     assert "v3 index boom" in result.output
@@ -4893,7 +5151,9 @@ def test_release_publish_dev_quarantines_new_release_candidate_when_index_build_
     assert not (releases_root / "dev" / "current").exists()
 
 
-def test_release_publish_dev_status_and_watch_use_configured_publish_root(tmp_path: Path, monkeypatch):
+def test_release_publish_dev_status_and_watch_use_configured_publish_root(
+    tmp_path: Path, monkeypatch
+):
     monkeypatch.setenv("KRW_ONTOLOGY_CLI_CONFIG", str(tmp_path / "config.json"))
     releases_root = tmp_path / "releases"
     release_root = releases_root / "dev" / "ready"
@@ -4938,10 +5198,15 @@ def test_release_publish_dev_status_and_watch_use_configured_publish_root(tmp_pa
     assert "worker done" in watch.output
     assert "progress_status: rebuilt stage=company_shard node=company_shard:CVX" in watch.output
     assert release_status.exit_code == 0, release_status.output
-    assert "progress_status: rebuilt stage=company_shard node=company_shard:CVX" in release_status.output
+    assert (
+        "progress_status: rebuilt stage=company_shard node=company_shard:CVX"
+        in release_status.output
+    )
 
 
-def test_release_publish_dev_watch_ignores_cache_dirs_when_selecting_latest(tmp_path: Path, monkeypatch):
+def test_release_publish_dev_watch_ignores_cache_dirs_when_selecting_latest(
+    tmp_path: Path, monkeypatch
+):
     monkeypatch.setenv("KRW_ONTOLOGY_CLI_CONFIG", str(tmp_path / "config.json"))
     releases_root = tmp_path / "releases"
     release_root = releases_root / "dev" / "ready"
@@ -4960,7 +5225,9 @@ def test_release_publish_dev_watch_ignores_cache_dirs_when_selecting_latest(tmp_
     assert ".index_fragment_cache" not in result.output
 
 
-def test_release_cleanup_interrupted_quarantines_stale_worker_candidate(tmp_path: Path, monkeypatch):
+def test_release_cleanup_interrupted_quarantines_stale_worker_candidate(
+    tmp_path: Path, monkeypatch
+):
     monkeypatch.setenv("KRW_ONTOLOGY_CLI_CONFIG", str(tmp_path / "config.json"))
     releases_root = tmp_path / "releases"
     release_root = releases_root / "dev" / "20260611_100844"
@@ -5074,6 +5341,32 @@ def test_release_force_disk_preflight_blocks_low_space(tmp_path: Path, monkeypat
     assert not (releases_root / "dev" / "low-space" / "worker.pid").exists()
 
 
+def test_release_force_rejects_releases_root_nested_inside_source(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("KRW_ONTOLOGY_CLI_CONFIG", str(tmp_path / "config.json"))
+    monkeypatch.setattr(cli_main, "_default_release_id", lambda: "nested-root")
+    source_root = tmp_path / "data"
+    releases_root = source_root / "releases"
+    _write_minimal_source_artifact(source_root, "CVX")
+
+    result = runner.invoke(
+        app,
+        [
+            "release",
+            "force",
+            "--from-root",
+            str(source_root),
+            "--releases-root",
+            str(releases_root),
+            "--env",
+            "dev",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "release_roots_overlap" in result.output
+    assert not (releases_root / "dev" / "nested-root").exists()
+
+
 def test_release_publish_dev_defaults_to_background_worker(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("KRW_ONTOLOGY_CLI_CONFIG", str(tmp_path / "config.json"))
     monkeypatch.setattr(cli_main, "_default_release_id", lambda: "20260603_120000")
@@ -5117,7 +5410,9 @@ def test_release_publish_dev_defaults_to_background_worker(tmp_path: Path, monke
     assert "watch: krw-ontology release publish-dev-watch 20260603_120000" in result.output
 
 
-def test_release_force_defaults_to_background_worker_with_devnull_stdin(tmp_path: Path, monkeypatch):
+def test_release_force_defaults_to_background_worker_with_devnull_stdin(
+    tmp_path: Path, monkeypatch
+):
     monkeypatch.setenv("KRW_ONTOLOGY_CLI_CONFIG", str(tmp_path / "config.json"))
     monkeypatch.setattr(cli_main, "_default_release_id", lambda: "20260603_130000")
     running_root = tmp_path / "running"

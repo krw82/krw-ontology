@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
+import statistics
+import time
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -198,6 +201,9 @@ def run_guru_quality_eval(
     eval_path: Path | str | None = None,
     output_path: Path | str | None = None,
     limit: int | None = None,
+    budget_path: Path | str | None = None,
+    baseline_path: Path | str | None = None,
+    accept_baseline_path: Path | str | None = None,
 ) -> dict[str, Any]:
     """Run gold-set checks against krw_guru_query_context output."""
     root_path = guru_root(root)
@@ -206,7 +212,15 @@ def run_guru_quality_eval(
     if limit is not None:
         cases = cases[: max(0, limit)]
 
-    case_results = [_evaluate_case(root_path, case) for case in cases]
+    case_results: list[dict[str, Any]] = []
+    elapsed_samples: list[float] = []
+    for case in cases:
+        started_at = time.perf_counter()
+        result = _evaluate_case(root_path, case)
+        elapsed_ms = (time.perf_counter() - started_at) * 1_000
+        result["elapsed_ms"] = round(elapsed_ms, 3)
+        case_results.append(result)
+        elapsed_samples.append(elapsed_ms)
     passed = [case for case in case_results if case["passed"]]
     failed = [case for case in case_results if not case["passed"]]
     total_score = sum(float(case["score"]) for case in case_results)
@@ -221,19 +235,45 @@ def run_guru_quality_eval(
         "passed": len(passed),
         "failed": len(failed),
         "mean_score": mean_score,
+        "pass_ratio": round(len(passed) / len(case_results), 4) if case_results else 0.0,
         "quality_grade": _quality_grade(mean_score),
+        "latency": _guru_eval_latency_summary(elapsed_samples),
+        "eval_sha256": hashlib.sha256(gold_path.read_bytes()).hexdigest(),
         "case_results": case_results,
         "failures": [
             {
                 "id": case["id"],
                 "question": case["question"],
-                "failed_checks": [
-                    check for check in case["checks"] if not check.get("passed")
-                ],
+                "failed_checks": [check for check in case["checks"] if not check.get("passed")],
             }
             for case in failed
         ],
     }
+    baseline: Mapping[str, Any] | None = None
+    if baseline_path is not None:
+        resolved_baseline_path = Path(baseline_path).expanduser().resolve()
+        loaded_baseline = json.loads(resolved_baseline_path.read_text(encoding="utf-8"))
+        if not isinstance(loaded_baseline, Mapping):
+            raise ValueError("guru quality baseline must contain a JSON object")
+        baseline = loaded_baseline
+        report["baseline"] = {
+            "path": str(resolved_baseline_path),
+            "sha256": hashlib.sha256(resolved_baseline_path.read_bytes()).hexdigest(),
+        }
+    if budget_path is not None:
+        resolved_budget_path = Path(budget_path).expanduser().resolve()
+        budget = json.loads(resolved_budget_path.read_text(encoding="utf-8"))
+        if not isinstance(budget, Mapping):
+            raise ValueError("guru quality budget must contain a JSON object")
+        report["gate"] = evaluate_guru_quality_gate(
+            report=report,
+            budget=budget,
+            baseline=baseline,
+        )
+        report["gate"]["budget_path"] = str(resolved_budget_path)
+        report["gate"]["budget_sha256"] = hashlib.sha256(
+            resolved_budget_path.read_bytes()
+        ).hexdigest()
     target_path = (
         Path(output_path).expanduser().resolve()
         if output_path is not None
@@ -242,7 +282,118 @@ def run_guru_quality_eval(
     report["output_path"] = str(target_path)
     target_path.parent.mkdir(parents=True, exist_ok=True)
     _write_json_atomic(target_path, report)
+    if accept_baseline_path is not None:
+        if budget_path is not None and not bool(report.get("gate", {}).get("passed")):
+            raise ValueError("refusing to accept a guru baseline that failed its gate")
+        resolved_accept_path = Path(accept_baseline_path).expanduser().resolve()
+        resolved_accept_path.parent.mkdir(parents=True, exist_ok=True)
+        _write_json_atomic(resolved_accept_path, report)
     return report
+
+
+def _guru_eval_latency_summary(values: Sequence[float]) -> dict[str, float | int | None]:
+    warm = [float(value) for value in values[1:]]
+
+    def percentile(samples: Sequence[float], value: float) -> float | None:
+        if not samples:
+            return None
+        index = max(0, math.ceil((value / 100.0) * len(samples)) - 1)
+        return round(sorted(samples)[min(index, len(samples) - 1)], 3)
+
+    return {
+        "sample_count": len(values),
+        "cold_ms": round(float(values[0]), 3) if values else None,
+        "p50_ms": round(statistics.median(values), 3) if values else None,
+        "p95_ms": percentile(values, 95),
+        "warm_p50_ms": round(statistics.median(warm), 3) if warm else None,
+        "warm_p95_ms": percentile(warm, 95),
+    }
+
+
+def evaluate_guru_quality_gate(
+    *,
+    report: Mapping[str, Any],
+    budget: Mapping[str, Any],
+    baseline: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    failures: list[dict[str, Any]] = []
+    checks: list[dict[str, Any]] = []
+
+    def number(payload: Mapping[str, Any], *keys: str) -> float | None:
+        value: Any = payload
+        for key in keys:
+            if not isinstance(value, Mapping):
+                return None
+            value = value.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        return float(value)
+
+    def minimum(name: str, actual: float | None, expected: float | None) -> None:
+        if expected is None:
+            return
+        passed = actual is not None and actual >= expected
+        check = {"name": name, "actual": actual, "minimum": expected, "passed": passed}
+        checks.append(check)
+        if not passed:
+            failures.append(check)
+
+    def maximum(name: str, actual: float | None, expected: float | None) -> None:
+        if expected is None:
+            return
+        passed = actual is not None and actual <= expected
+        check = {"name": name, "actual": actual, "maximum": expected, "passed": passed}
+        checks.append(check)
+        if not passed:
+            failures.append(check)
+
+    minimum("cases", number(report, "cases"), number(budget, "min_cases"))
+    minimum("pass_ratio", number(report, "pass_ratio"), number(budget, "min_pass_ratio"))
+    minimum("mean_score", number(report, "mean_score"), number(budget, "min_mean_score"))
+    maximum(
+        "cold_ms",
+        number(report, "latency", "cold_ms"),
+        number(budget, "max_cold_ms"),
+    )
+    maximum(
+        "warm_p95_ms",
+        number(report, "latency", "warm_p95_ms"),
+        number(budget, "max_warm_p95_ms"),
+    )
+
+    if bool(budget.get("require_baseline")) and baseline is None:
+        check = {"name": "accepted_baseline_present", "passed": False}
+        checks.append(check)
+        failures.append(check)
+    elif baseline is not None:
+        current_score = number(report, "mean_score")
+        baseline_score = number(baseline, "mean_score")
+        if current_score is not None and baseline_score is not None:
+            maximum(
+                "mean_score_drop",
+                baseline_score - current_score,
+                number(budget, "max_mean_score_drop"),
+            )
+        current_p95 = number(report, "latency", "warm_p95_ms")
+        baseline_p95 = number(baseline, "latency", "warm_p95_ms")
+        ratio = (
+            current_p95 / baseline_p95
+            if current_p95 is not None and baseline_p95 not in (None, 0.0)
+            else None
+        )
+        maximum(
+            "warm_p95_regression_ratio",
+            ratio,
+            number(budget, "max_warm_p95_regression_ratio"),
+        )
+
+    return {
+        "passed": not failures,
+        "checks": checks,
+        "failures": failures,
+        "budget": dict(budget),
+        "baseline_used": baseline is not None,
+    }
 
 
 def run_guru_answer_eval(
@@ -555,12 +706,15 @@ def _check_clarification_handling(
     context: Mapping[str, Any],
 ) -> dict[str, Any]:
     status = str(context.get("research_status") or "")
-    needs_clarification = status in {"needs_clarification", "needs_identifier_clarification"} or bool(
-        context.get("requires_identifier_clarification")
-    )
+    needs_clarification = status in {
+        "needs_clarification",
+        "needs_identifier_clarification",
+    } or bool(context.get("requires_identifier_clarification"))
     if not needs_clarification:
         return _weighted_check("clarification_handling", True, "not required", "not required", 2)
-    asks_question = "?" in answer or _contains_any(answer, ("확인", "알려", "구분", "티커", "거래소"))
+    asks_question = "?" in answer or _contains_any(
+        answer, ("확인", "알려", "구분", "티커", "거래소")
+    )
     gives_order = bool(_INVESTMENT_ORDER_RE.search(answer))
     return _weighted_check(
         "clarification_handling",
@@ -676,7 +830,9 @@ def _check_guru_voice_distinctiveness(answer: str, context: Mapping[str, Any]) -
     )
 
 
-def _check_non_ticker_company_data_priority(answer: str, context: Mapping[str, Any]) -> dict[str, Any]:
+def _check_non_ticker_company_data_priority(
+    answer: str, context: Mapping[str, Any]
+) -> dict[str, Any]:
     if context.get("requires_company_evidence") or context.get("ticker"):
         return _weighted_check(
             "non_ticker_company_data_priority",
@@ -737,7 +893,9 @@ def _check_generic_template_escape(answer: str, context: Mapping[str, Any]) -> d
     matched = [
         phrase for phrase in _GENERIC_TEMPLATE_ESCAPE_PHRASES if phrase.lower() in answer.lower()
     ]
-    lens_matches = _matched_material_terms(answer, _list_of_mappings(context.get("selected_lenses"))[:3])
+    lens_matches = _matched_material_terms(
+        answer, _list_of_mappings(context.get("selected_lenses"))[:3]
+    )
     return _weighted_check(
         "generic_template_escape",
         not matched or bool(lens_matches),
@@ -756,9 +914,7 @@ def _check_immersive_voice(answer: str, context: Mapping[str, Any]) -> dict[str,
             "not required",
             8,
         )
-    matched = [
-        phrase for phrase in _IMMERSION_BREAKING_PHRASES if phrase.lower() in answer.lower()
-    ]
+    matched = [phrase for phrase in _IMMERSION_BREAKING_PHRASES if phrase.lower() in answer.lower()]
     return _weighted_check(
         "immersive_voice",
         not matched,
@@ -1142,12 +1298,16 @@ def _check_status(payload: Mapping[str, Any], case: Mapping[str, Any]) -> dict[s
 def _check_intent(payload: Mapping[str, Any], case: Mapping[str, Any]) -> dict[str, Any]:
     expected = str(case.get("expected_intent") or "")
     actual = str(payload.get("intent", {}).get("family") or payload.get("intent_family") or "")
-    return _weighted_check("intent_family", not expected or actual == expected, expected or "any", actual, 1)
+    return _weighted_check(
+        "intent_family", not expected or actual == expected, expected or "any", actual, 1
+    )
 
 
 def _check_company_evidence(payload: Mapping[str, Any], case: Mapping[str, Any]) -> dict[str, Any]:
     if "requires_company_evidence" not in case:
-        return _weighted_check("requires_company_evidence", True, "any", payload.get("requires_company_evidence"), 1)
+        return _weighted_check(
+            "requires_company_evidence", True, "any", payload.get("requires_company_evidence"), 1
+        )
     expected = bool(case.get("requires_company_evidence"))
     actual = bool(payload.get("requires_company_evidence"))
     return _weighted_check("requires_company_evidence", actual == expected, expected, actual, 2)
@@ -1168,7 +1328,9 @@ def _check_author_coverage(
 ) -> dict[str, Any]:
     if not expected_authors:
         return _weighted_check("author_coverage", True, "any", [], 1)
-    actual = sorted({str(row.get("author_key")) for row in selected_lenses if row.get("author_key")})
+    actual = sorted(
+        {str(row.get("author_key")) for row in selected_lenses if row.get("author_key")}
+    )
     missing = [author for author in expected_authors if author not in actual]
     return _weighted_check("author_coverage", not missing, expected_authors, actual, 1)
 
@@ -1180,7 +1342,9 @@ def _check_include_terms(selected_text: str, case: Mapping[str, Any]) -> dict[st
     missing_groups = [
         group for group in groups if not any(term.lower() in selected_text for term in group)
     ]
-    return _weighted_check("must_include_any", not missing_groups, groups, {"missing": missing_groups}, 2)
+    return _weighted_check(
+        "must_include_any", not missing_groups, groups, {"missing": missing_groups}, 2
+    )
 
 
 def _check_excluded_terms(selected_text: str, case: Mapping[str, Any]) -> dict[str, Any]:
@@ -1205,7 +1369,9 @@ def _check_answer_roles(
         if default:
             actual.add(str(default))
         actual.update(_string_list(answer_role.get("possible_roles")))
-    return _weighted_check("answer_roles", bool(expected_roles & actual), sorted(expected_roles), sorted(actual), 1)
+    return _weighted_check(
+        "answer_roles", bool(expected_roles & actual), sorted(expected_roles), sorted(actual), 1
+    )
 
 
 def _check_soft_metadata(

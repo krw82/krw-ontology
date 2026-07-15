@@ -126,8 +126,12 @@ def test_guru_run_background_starts_detached_worker(tmp_path: Path, monkeypatch)
             "started_at": "2026-07-05T00:00:00+00:00",
             "finished_at": None,
             "command": ["krw-ontology", "guru", "run-worker"],
-            "log_path": str(tmp_path / "guru-running" / ".krw_pipeline" / "guru" / "logs" / "worker.log"),
-            "state_path": str(tmp_path / "guru-running" / ".krw_pipeline" / "guru" / "worker_state.json"),
+            "log_path": str(
+                tmp_path / "guru-running" / ".krw_pipeline" / "guru" / "logs" / "worker.log"
+            ),
+            "state_path": str(
+                tmp_path / "guru-running" / ".krw_pipeline" / "guru" / "worker_state.json"
+            ),
             "execute_agent_sdk": False,
         }
 
@@ -216,9 +220,7 @@ def test_guru_start_filters_authors(tmp_path: Path):
     assert result.exit_code == 0
     payload = json.loads(result.output)
     assert payload["author_keys"] == ["buffett", "marks"]
-    source_manifest = yaml.safe_load(
-        (root / "source_manifest.yaml").read_text(encoding="utf-8")
-    )
+    source_manifest = yaml.safe_load((root / "source_manifest.yaml").read_text(encoding="utf-8"))
     assert [author["author_key"] for author in source_manifest["authors"]] == ["buffett", "marks"]
 
 
@@ -289,7 +291,7 @@ def test_guru_build_index_command_outputs_json(tmp_path: Path, monkeypatch):
         captured["root"] = root
         captured.update(kwargs)
         return {
-            "schema_version": "krw-guru-shard-index/v1",
+            "schema_version": "krw-guru-shard-index/v2",
             "manifest_path": str(tmp_path / "guru" / "indexes" / "guru_shard_manifest.json"),
             "authors": {
                 "buffett": {
@@ -322,7 +324,7 @@ def test_guru_build_index_command_outputs_json(tmp_path: Path, monkeypatch):
 
     assert result.exit_code == 0
     payload = json.loads(result.output)
-    assert payload["schema_version"] == "krw-guru-shard-index/v1"
+    assert payload["schema_version"] == "krw-guru-shard-index/v2"
     assert captured == {
         "root": tmp_path / "guru",
         "index_dir": tmp_path / "guru-index",
@@ -624,7 +626,9 @@ def test_guru_eval_quality_command_outputs_report(tmp_path: Path, monkeypatch):
             "mean_score": 1.0,
             "quality_grade": "excellent",
             "output_path": str(tmp_path / "report.json"),
-            "kwargs": {key: str(value) if value is not None else None for key, value in kwargs.items()},
+            "kwargs": {
+                key: str(value) if value is not None else None for key, value in kwargs.items()
+            },
         }
 
     import krw_ontology.guru.cli as guru_cli
@@ -651,3 +655,46 @@ def test_guru_eval_quality_command_outputs_report(tmp_path: Path, monkeypatch):
     assert payload["format"] == "krw-guru-quality-report/v1"
     assert payload["cases"] == 1
     assert payload["kwargs"]["eval_path"] == str(tmp_path / "gold.jsonl")
+
+
+def test_guru_eval_quality_command_exits_two_when_budget_gate_fails(
+    tmp_path: Path,
+    monkeypatch,
+):
+    def fake_run_guru_quality_eval(root=None, **_kwargs):
+        return {
+            "format": "krw-guru-quality-report/v1",
+            "root": str(root),
+            "cases": 1,
+            "passed": 0,
+            "failed": 1,
+            "mean_score": 0.5,
+            "quality_grade": "needs_improvement",
+            "output_path": str(tmp_path / "report.json"),
+            "gate": {
+                "passed": False,
+                "failures": [{"name": "mean_score", "actual": 0.5}],
+            },
+        }
+
+    import krw_ontology.guru.cli as guru_cli
+
+    monkeypatch.setattr(guru_cli, "run_guru_quality_eval", fake_run_guru_quality_eval)
+    budget_path = tmp_path / "budget.json"
+    budget_path.write_text("{}", encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        [
+            "guru",
+            "eval-quality",
+            "--root",
+            str(tmp_path / "guru"),
+            "--budget-path",
+            str(budget_path),
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert json.loads(result.output)["gate"]["passed"] is False

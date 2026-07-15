@@ -5,10 +5,8 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import sqlite3
 import hashlib
 from collections.abc import Mapping, Sequence
-from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -18,6 +16,11 @@ from krw_ontology.agent_index.chart_series import (
     CHART_SERIES_SCHEMA_VERSION,
     verify_chart_series_index,
 )
+from krw_ontology.agent_index.cache_seal import (
+    read_immutable_sqlite_cache_seal,
+    read_immutable_sqlite_cache_sha256,
+    record_immutable_sqlite_cache_sha256,
+)
 from krw_ontology.agent_index.router_sidecar import (
     ROUTER_SIDECAR_BUILDER_VERSION,
     ROUTER_SIDECAR_RELATIVE_PATH,
@@ -25,12 +28,20 @@ from krw_ontology.agent_index.router_sidecar import (
     immutable_file_sha256,
     verify_router_sidecar,
 )
+from krw_ontology.agent_index.router_coherence import (
+    ROUTER_COHERENCE_BUILDER_VERSION,
+    ROUTER_COHERENCE_RELATIVE_PATH,
+    ROUTER_COHERENCE_SCHEMA_VERSION,
+    verify_router_coherence,
+)
 from krw_ontology.agent_index.spine_schema import (
     GLOBAL_SPINE_BUILDER_VERSION,
     GLOBAL_SPINE_LAYOUT,
     GLOBAL_SPINE_RELATIVE_PATH,
     GLOBAL_SPINE_SCHEMA_VERSION,
-    read_global_spine_metadata,
+    GLOBAL_SPINE_TABLES,
+    read_spine_verification_sha256,
+    verify_global_spine_schema,
 )
 from krw_ontology.agent_index.spine_builder import (
     COMPANY_SHARD_SCHEMA_VERSION,
@@ -130,6 +141,7 @@ def build_release_manifest_v3(
     source_root: Path | str | None = None,
     global_spine_path: Path | str | None = None,
     router_sidecar_path: Path | str | None = None,
+    router_coherence_path: Path | str | None = None,
     shard_manifest_path: Path | str | None = None,
 ) -> dict[str, Any]:
     """Build a v3 release manifest for global spine + company shards."""
@@ -150,11 +162,17 @@ def build_release_manifest_v3(
         if router_sidecar_path is not None
         else root_path / ROUTER_SIDECAR_RELATIVE_PATH
     )
+    resolved_router_coherence_path = (
+        Path(router_coherence_path).expanduser().resolve()
+        if router_coherence_path is not None
+        else root_path / ROUTER_COHERENCE_RELATIVE_PATH
+    )
     index_outputs = _build_release_index_outputs_v3(
         root_path,
         release_id=release_id,
         global_spine_path=resolved_spine_path,
         router_sidecar_path=resolved_router_sidecar_path,
+        router_coherence_path=resolved_router_coherence_path,
         shard_manifest_path=resolved_shard_manifest_path,
     )
     spine_counts = index_outputs["global_spine"].get("counts") or {}
@@ -172,7 +190,9 @@ def build_release_manifest_v3(
         "status": "ready",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "root": str(root_path),
-        "source_root": str(Path(source_root).expanduser().resolve()) if source_root else str(root_path),
+        "source_root": str(Path(source_root).expanduser().resolve())
+        if source_root
+        else str(root_path),
         "index_layout": GLOBAL_SPINE_LAYOUT,
         "monolith_required": False,
         "metric_dictionary": dictionary_binding,
@@ -196,6 +216,8 @@ def build_release_manifest_v3(
             "company_shard_schema_version": COMPANY_SHARD_SCHEMA_VERSION,
             "router_sidecar_schema_version": ROUTER_SIDECAR_SCHEMA_VERSION,
             "router_sidecar_builder_version": ROUTER_SIDECAR_BUILDER_VERSION,
+            "router_coherence_schema_version": ROUTER_COHERENCE_SCHEMA_VERSION,
+            "router_coherence_builder_version": ROUTER_COHERENCE_BUILDER_VERSION,
         },
         "global_object_count": spine_counts.get("global_object_locator", 0),
         "global_edge_count": spine_counts.get("global_edge_spine", 0),
@@ -212,6 +234,7 @@ def write_release_manifest_v3(
     source_root: Path | str | None = None,
     global_spine_path: Path | str | None = None,
     router_sidecar_path: Path | str | None = None,
+    router_coherence_path: Path | str | None = None,
     shard_manifest_path: Path | str | None = None,
 ) -> dict[str, Any]:
     """Write a v3 manifest.json for a global spine + company shards release."""
@@ -228,6 +251,11 @@ def write_release_manifest_v3(
         if router_sidecar_path is not None
         else root_path / ROUTER_SIDECAR_RELATIVE_PATH
     )
+    resolved_router_coherence_path = (
+        Path(router_coherence_path).expanduser().resolve()
+        if router_coherence_path is not None
+        else root_path / ROUTER_COHERENCE_RELATIVE_PATH
+    )
     if not resolved_spine_path.is_file():
         raise FileNotFoundError(
             f"Cannot write a ready v3 manifest without the global spine: {resolved_spine_path}"
@@ -237,6 +265,11 @@ def write_release_manifest_v3(
             "Cannot write a ready v3 manifest without the Serving Index V2 sidecar: "
             f"{resolved_router_sidecar_path}. Run build_spine_shard_release_outputs first."
         )
+    if not resolved_router_coherence_path.is_file():
+        raise FileNotFoundError(
+            "Cannot write a ready v3 manifest without the Router coherence index: "
+            f"{resolved_router_coherence_path}. Run build_spine_shard_release_outputs first."
+        )
     manifest = build_release_manifest_v3(
         root_path,
         release_id=release_id,
@@ -244,6 +277,7 @@ def write_release_manifest_v3(
         source_root=source_root,
         global_spine_path=resolved_spine_path,
         router_sidecar_path=resolved_router_sidecar_path,
+        router_coherence_path=resolved_router_coherence_path,
         shard_manifest_path=shard_manifest_path,
     )
     router_output = manifest["indexes"]["router_sidecar"]
@@ -251,6 +285,12 @@ def write_release_manifest_v3(
         raise ValueError(
             "Cannot write a ready v3 manifest with an invalid router sidecar: "
             + ", ".join(router_output.get("verification_errors") or [])
+        )
+    coherence_output = manifest["indexes"]["router_coherence"]
+    if not coherence_output.get("verification_ok"):
+        raise ValueError(
+            "Cannot write a ready v3 manifest with an invalid router coherence index: "
+            + ", ".join(coherence_output.get("verification_errors") or [])
         )
     _write_json_atomic(root_path / RELEASE_MANIFEST_FILENAME, manifest)
     return manifest
@@ -262,24 +302,28 @@ def _build_release_index_outputs_v3(
     release_id: str,
     global_spine_path: Path,
     router_sidecar_path: Path,
+    router_coherence_path: Path,
     shard_manifest_path: Path,
 ) -> dict[str, Any]:
+    global_schema_verification = verify_global_spine_schema(
+        global_spine_path,
+        deep=False,
+        trust_seal=True,
+        require_trusted_seal=True,
+    )
+    if not global_schema_verification.get("ok"):
+        raise ValueError(
+            "Cannot build a ready v3 manifest with an invalid global spine schema: "
+            + ", ".join(global_schema_verification.get("errors") or [])
+        )
+    global_spine_metadata = global_schema_verification.get("metadata") or {}
+    spine_count_tables = tuple(table for table in GLOBAL_SPINE_TABLES if table != "metadata")
+    spine_counts = _required_global_spine_metadata_counts(
+        global_spine_metadata,
+        spine_count_tables,
+    )
     global_spine_sha256 = (
         immutable_file_sha256(global_spine_path) if global_spine_path.is_file() else None
-    )
-    spine_counts = _sqlite_counts_if_present(
-        global_spine_path,
-        (
-            "global_object_locator",
-            "global_document_catalog",
-            "global_edge_spine",
-            "global_factor_spine",
-            "global_topic_spine",
-            "global_metric_spine",
-            "global_entity_spine",
-            "global_counterparty_spine",
-            "global_chain_index",
-        ),
     )
     shard_manifest = _read_v3_shard_manifest(shard_manifest_path)
     shard_entries = _read_v3_shard_entries(
@@ -296,16 +340,7 @@ def _build_release_index_outputs_v3(
             "Cannot build a ready v3 manifest with stale company shard bindings: "
             + ", ".join(shard_binding_errors)
         )
-    try:
-        with closing(sqlite3.connect(global_spine_path)) as conn:
-            global_spine_metadata = read_global_spine_metadata(conn)
-    except sqlite3.Error as exc:
-        raise ValueError(
-            f"Cannot read global spine serving bindings: {exc}"
-        ) from exc
-    global_binding_errors = _global_spine_serving_binding_errors(
-        global_spine_metadata
-    )
+    global_binding_errors = _global_spine_serving_binding_errors(global_spine_metadata)
     if global_binding_errors:
         raise ValueError(
             "Cannot build a ready v3 manifest with stale global spine bindings: "
@@ -328,6 +363,61 @@ def _build_release_index_outputs_v3(
         }
     )
     router_metadata = router_verification.get("metadata") or {}
+    router_sidecar_sha256: str | None = None
+    if router_sidecar_path.is_file():
+        _router_seal, router_seal_status = read_immutable_sqlite_cache_seal(
+            router_sidecar_path,
+            kind="router_sidecar",
+            cache_key=(
+                str(router_metadata.get("build_fingerprint_sha256"))
+                if router_metadata.get("build_fingerprint_sha256")
+                else None
+            ),
+        )
+        if router_seal_status != "valid":
+            raise ValueError(
+                "Cannot build a ready v3 manifest without a matching deep router sidecar seal: "
+                f"{router_seal_status}"
+            )
+        router_sidecar_sha256 = immutable_file_sha256(router_sidecar_path)
+        record_immutable_sqlite_cache_sha256(router_sidecar_path, router_sidecar_sha256)
+    coherence_verification = (
+        verify_router_coherence(
+            router_coherence_path,
+            expected_global_spine_sha256=global_spine_sha256,
+            expected_release_id=release_id,
+            deep=True,
+        )
+        if router_coherence_path.is_file()
+        else {
+            "ok": False,
+            "errors": ["router_coherence_missing"],
+            "counts": {},
+            "metadata": {},
+        }
+    )
+    coherence_metadata = coherence_verification.get("metadata") or {}
+    router_coherence_sha256: str | None = None
+    if router_coherence_path.is_file():
+        _coherence_seal, coherence_seal_status = read_immutable_sqlite_cache_seal(
+            router_coherence_path,
+            kind="router_coherence",
+            cache_key=(
+                str(coherence_metadata.get("semantic_cache_key"))
+                if coherence_metadata.get("semantic_cache_key")
+                else None
+            ),
+        )
+        if coherence_seal_status != "valid":
+            raise ValueError(
+                "Cannot build a ready v3 manifest without a matching deep router coherence seal: "
+                f"{coherence_seal_status}"
+            )
+        router_coherence_sha256 = immutable_file_sha256(router_coherence_path)
+        record_immutable_sqlite_cache_sha256(
+            router_coherence_path,
+            router_coherence_sha256,
+        )
     outputs: dict[str, Any] = {
         "global_spine": {
             "path": _relative_or_absolute(global_spine_path, root_path),
@@ -340,24 +430,33 @@ def _build_release_index_outputs_v3(
         },
         "router_sidecar": {
             "path": _relative_or_absolute(router_sidecar_path, root_path),
-            "sha256": immutable_file_sha256(router_sidecar_path)
-            if router_sidecar_path.is_file()
-            else None,
+            "sha256": router_sidecar_sha256,
             "schema_version": ROUTER_SIDECAR_SCHEMA_VERSION,
             "builder_version": ROUTER_SIDECAR_BUILDER_VERSION,
             "required": True,
             "counts": router_verification.get("counts") or {},
             "ranking_profile_id": router_metadata.get("ranking_profile_id"),
             "ranking_profile_sha256": router_metadata.get("ranking_profile_sha256"),
-            "source_global_spine_sha256": router_metadata.get(
-                "source_global_spine_sha256"
-            ),
+            "source_global_spine_sha256": router_metadata.get("source_global_spine_sha256"),
             "content_sha256": router_metadata.get("content_sha256"),
-            "build_fingerprint_sha256": router_metadata.get(
-                "build_fingerprint_sha256"
-            ),
+            "build_fingerprint_sha256": router_metadata.get("build_fingerprint_sha256"),
             "verification_ok": bool(router_verification.get("ok")),
             "verification_errors": list(router_verification.get("errors") or []),
+        },
+        "router_coherence": {
+            "path": _relative_or_absolute(router_coherence_path, root_path),
+            "sha256": router_coherence_sha256,
+            "schema_version": ROUTER_COHERENCE_SCHEMA_VERSION,
+            "builder_version": ROUTER_COHERENCE_BUILDER_VERSION,
+            "required": True,
+            "counts": coherence_verification.get("counts") or {},
+            "profile_id": coherence_metadata.get("profile_id"),
+            "profile_sha256": coherence_metadata.get("profile_sha256"),
+            "source_global_spine_sha256": coherence_metadata.get("source_global_spine_sha256"),
+            "semantic_cache_key": coherence_metadata.get("semantic_cache_key"),
+            "build_fingerprint_sha256": coherence_metadata.get("build_fingerprint_sha256"),
+            "verification_ok": bool(coherence_verification.get("ok")),
+            "verification_errors": list(coherence_verification.get("errors") or []),
         },
         "company_shards": {
             "dir": _relative_or_absolute(root_path / "indexes" / "companies", root_path),
@@ -425,7 +524,8 @@ def _read_v3_shard_entries(
             shard_path = (root_path / "indexes" / raw_candidate).resolve()
         entries[str(ticker)] = {
             "path": _relative_or_absolute(shard_path, root_path),
-            "sha256": raw_entry.get("sha256") or (_file_sha256(shard_path) if shard_path.is_file() else None),
+            "sha256": raw_entry.get("sha256")
+            or (_file_sha256(shard_path) if shard_path.is_file() else None),
             "schema_version": raw_entry.get("schema_version"),
             "source_artifact_sqlite_schema_version": raw_entry.get(
                 "source_artifact_sqlite_schema_version"
@@ -487,26 +587,26 @@ def _global_spine_serving_binding_errors(
     ]
 
 
-def _sqlite_counts_if_present(path: Path, tables: Sequence[str]) -> dict[str, int]:
-    if not path.is_file():
-        return {table: 0 for table in tables}
-    counts: dict[str, int] = {}
-    try:
-        with closing(sqlite3.connect(path)) as conn:
-            existing = {
-                str(row[0])
-                for row in conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type IN ('table', 'view')"
-                ).fetchall()
-            }
-            for table in tables:
-                if table not in existing:
-                    counts[table] = 0
-                    continue
-                counts[table] = int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
-    except sqlite3.Error:
-        return {table: 0 for table in tables}
-    return counts
+def _required_global_spine_metadata_counts(
+    metadata: Mapping[str, Any],
+    tables: Sequence[str],
+) -> dict[str, int]:
+    raw_counts = metadata.get("counts")
+    counts = raw_counts if isinstance(raw_counts, Mapping) else {}
+    errors: list[str] = []
+    result: dict[str, int] = {}
+    for table in tables:
+        value = counts.get(table)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            errors.append(f"global_spine_metadata_count_invalid:{table}")
+            continue
+        result[table] = value
+    if errors:
+        raise ValueError(
+            "Cannot build a ready v3 manifest without immutable builder counts: "
+            + ", ".join(errors)
+        )
+    return result
 
 
 def verify_release_root(
@@ -522,7 +622,11 @@ def verify_release_root(
     root_path = supplied_root.resolve()
     manifest, found_manifest_path = load_release_manifest(root_path, manifest_path=manifest_path)
     if manifest.get("format") != RELEASE_FORMAT_V3:
-        errors = _release_filesystem_errors(root_path) if deep else _release_filesystem_light_errors(root_path)
+        errors = (
+            _release_filesystem_errors(root_path)
+            if deep
+            else _release_filesystem_light_errors(root_path)
+        )
         if require_current_symlink and not _is_current_symlink_path(supplied_root):
             errors.insert(0, "current_symlink_required")
         errors.append("manifest_missing" if not manifest else "manifest_format_unsupported")
@@ -568,7 +672,11 @@ def _verify_release_root_v3(
     errors: list[str] = []
     if require_current_symlink and not _is_current_symlink_path(supplied_root):
         errors.append("current_symlink_required")
-    errors.extend(_release_filesystem_errors(root_path) if deep else _release_filesystem_light_errors(root_path))
+    errors.extend(
+        _release_filesystem_errors(root_path)
+        if deep
+        else _release_filesystem_light_errors(root_path)
+    )
     errors.extend(_release_manifest_startup_errors_v3(root_path, manifest))
     expected_env = normalize_ontology_env(env) if env is not None else None
     manifest_env = manifest.get("env")
@@ -599,8 +707,14 @@ def _verify_release_root_v3(
             spine_shard_verification.get("router_sidecar_path")
             and Path(str(spine_shard_verification["router_sidecar_path"])).exists()
         ),
-        "router_sidecar_verification": spine_shard_verification.get(
-            "router_sidecar_verification"
+        "router_sidecar_verification": spine_shard_verification.get("router_sidecar_verification"),
+        "router_coherence_path": spine_shard_verification.get("router_coherence_path"),
+        "router_coherence_present": bool(
+            spine_shard_verification.get("router_coherence_path")
+            and Path(str(spine_shard_verification["router_coherence_path"])).exists()
+        ),
+        "router_coherence_verification": spine_shard_verification.get(
+            "router_coherence_verification"
         ),
         "chart_series_verification": spine_shard_verification.get("chart_series_verification"),
         "spine_shard_verification": spine_shard_verification,
@@ -643,14 +757,38 @@ def verify_release_startup_v3(
 
     global_spine_path = _resolve_v3_global_spine_path(root_path, manifest)
     router_sidecar_path = _resolve_v3_router_sidecar_path(root_path, manifest)
+    router_coherence_path = _resolve_optional_router_coherence_path(root_path, manifest)
     chart_series_path = _resolve_optional_chart_series_path(root_path, manifest)
+    index_outputs = manifest.get("indexes") if isinstance(manifest.get("indexes"), Mapping) else {}
+    global_spine_output = (
+        index_outputs.get("global_spine")
+        if isinstance(index_outputs.get("global_spine"), Mapping)
+        else {}
+    )
+    router_sidecar_output = (
+        index_outputs.get("router_sidecar")
+        if isinstance(index_outputs.get("router_sidecar"), Mapping)
+        else {}
+    )
+    router_coherence_output = (
+        index_outputs.get("router_coherence")
+        if isinstance(index_outputs.get("router_coherence"), Mapping)
+        else {}
+    )
     spine_verification: dict[str, Any] | None = None
     if not global_spine_path.exists():
         errors.append("global_spine_missing")
     elif not global_spine_path.is_file():
         errors.append("global_spine_not_file")
     elif check_sqlite:
-        spine_verification = _verify_global_spine_startup(global_spine_path)
+        spine_verification = _verify_global_spine_startup(
+            global_spine_path,
+            expected_sha256=(
+                str(global_spine_output.get("sha256"))
+                if global_spine_output.get("sha256")
+                else None
+            ),
+        )
         errors.extend(spine_verification["errors"])
     else:
         spine_verification = {
@@ -667,32 +805,25 @@ def verify_release_startup_v3(
     elif not router_sidecar_path.is_file():
         errors.append("router_sidecar_not_file")
     else:
-        index_outputs = (
-            manifest.get("indexes")
-            if isinstance(manifest.get("indexes"), Mapping)
-            else {}
-        )
-        global_spine_output = (
-            index_outputs.get("global_spine")
-            if isinstance(index_outputs.get("global_spine"), Mapping)
-            else {}
-        )
-        router_sidecar_output = (
-            index_outputs.get("router_sidecar")
-            if isinstance(index_outputs.get("router_sidecar"), Mapping)
-            else {}
-        )
         expected_global_sha = global_spine_output.get("sha256")
         expected_sidecar_sha = router_sidecar_output.get("sha256")
+        expected_build_fingerprint = router_sidecar_output.get("build_fingerprint_sha256")
         if not isinstance(expected_sidecar_sha, str) or not expected_sidecar_sha:
             errors.append("router_sidecar:router_sidecar_manifest_sha256_missing")
         else:
-            try:
-                actual_sidecar_sha = _cached_file_sha256(router_sidecar_path)
-            except (OSError, RuntimeError) as exc:
-                errors.append(f"router_sidecar:router_sidecar_hash_error:{exc}")
+            _sidecar_seal, sidecar_seal_status = read_immutable_sqlite_cache_seal(
+                router_sidecar_path,
+                kind="router_sidecar",
+                cache_key=(str(expected_build_fingerprint) if expected_build_fingerprint else None),
+            )
+            if sidecar_seal_status != "valid":
+                errors.append(
+                    "router_sidecar:router_sidecar_verification_seal_required:"
+                    f"{sidecar_seal_status}"
+                )
             else:
-                if actual_sidecar_sha != expected_sidecar_sha:
+                sealed_sidecar_sha = read_immutable_sqlite_cache_sha256(router_sidecar_path)
+                if sealed_sidecar_sha is not None and sealed_sidecar_sha != expected_sidecar_sha:
                     errors.append("router_sidecar:router_sidecar_manifest_sha256_mismatch")
         router_sidecar_verification = verify_router_sidecar(
             router_sidecar_path,
@@ -716,13 +847,75 @@ def verify_release_startup_v3(
         )
         router_sidecar_verification["sqlite_checked"] = bool(check_sqlite)
         router_sidecar_verification["binding_checked"] = True
+        router_sidecar_verification["artifact_seal_status"] = (
+            sidecar_seal_status
+            if isinstance(expected_sidecar_sha, str) and expected_sidecar_sha
+            else "manifest_sha256_missing"
+        )
         errors.extend(
-            f"router_sidecar:{error}"
-            for error in router_sidecar_verification.get("errors") or []
+            f"router_sidecar:{error}" for error in router_sidecar_verification.get("errors") or []
         )
 
+    router_coherence_verification: dict[str, Any] | None = None
+    if router_coherence_output:
+        if router_coherence_path is None or not router_coherence_path.exists():
+            errors.append("router_coherence_missing")
+        elif not router_coherence_path.is_file():
+            errors.append("router_coherence_not_file")
+        else:
+            expected_coherence_sha = router_coherence_output.get("sha256")
+            expected_semantic_key = router_coherence_output.get("semantic_cache_key")
+            if not isinstance(expected_coherence_sha, str) or not expected_coherence_sha:
+                errors.append("router_coherence:router_coherence_manifest_sha256_missing")
+                coherence_seal_status = "manifest_sha256_missing"
+            else:
+                _coherence_seal, coherence_seal_status = read_immutable_sqlite_cache_seal(
+                    router_coherence_path,
+                    kind="router_coherence",
+                    cache_key=(str(expected_semantic_key) if expected_semantic_key else None),
+                )
+                if coherence_seal_status != "valid":
+                    errors.append(
+                        "router_coherence:router_coherence_verification_seal_required:"
+                        f"{coherence_seal_status}"
+                    )
+                else:
+                    sealed_coherence_sha = read_immutable_sqlite_cache_sha256(router_coherence_path)
+                    if (
+                        sealed_coherence_sha is not None
+                        and sealed_coherence_sha != expected_coherence_sha
+                    ):
+                        errors.append("router_coherence:router_coherence_manifest_sha256_mismatch")
+            router_coherence_verification = verify_router_coherence(
+                router_coherence_path,
+                expected_global_spine_sha256=(
+                    str(global_spine_output.get("sha256"))
+                    if global_spine_output.get("sha256")
+                    else None
+                ),
+                expected_release_id=(
+                    str(manifest.get("release_id")) if manifest.get("release_id") else None
+                ),
+                expected_profile_sha256=(
+                    str(router_coherence_output.get("profile_sha256"))
+                    if router_coherence_output.get("profile_sha256")
+                    else None
+                ),
+                deep=False,
+                require_trusted_seal=True,
+            )
+            router_coherence_verification["sqlite_checked"] = bool(check_sqlite)
+            router_coherence_verification["binding_checked"] = True
+            router_coherence_verification["artifact_seal_status"] = coherence_seal_status
+            errors.extend(
+                f"router_coherence:{error}"
+                for error in router_coherence_verification.get("errors") or []
+            )
+
     chart_series_verification: dict[str, Any] | None = None
-    chart_series_output = ((manifest.get("indexes") or {}).get("chart_series") or {}) if manifest else {}
+    chart_series_output = (
+        ((manifest.get("indexes") or {}).get("chart_series") or {}) if manifest else {}
+    )
     chart_series_required = bool(
         isinstance(chart_series_output, Mapping) and chart_series_output.get("required") is True
     )
@@ -762,6 +955,13 @@ def verify_release_startup_v3(
         "router_sidecar_path": str(router_sidecar_path),
         "router_sidecar_present": router_sidecar_path.exists(),
         "router_sidecar_verification": router_sidecar_verification,
+        "router_coherence_path": (
+            str(router_coherence_path) if router_coherence_path is not None else None
+        ),
+        "router_coherence_present": bool(
+            router_coherence_path is not None and router_coherence_path.exists()
+        ),
+        "router_coherence_verification": router_coherence_verification,
         "chart_series_path": str(chart_series_path) if chart_series_path is not None else None,
         "chart_series_present": bool(chart_series_path is not None and chart_series_path.exists()),
         "chart_series_verification": chart_series_verification,
@@ -808,7 +1008,9 @@ def _release_manifest_startup_errors_v3(root_path: Path, manifest: Mapping[str, 
         if not isinstance(raw_path, str) or not raw_path:
             errors.append("manifest_indexes_global_spine_path_missing")
         else:
-            errors.extend(_release_manifest_relative_file_startup_errors(root_path, "global_spine", raw_path))
+            errors.extend(
+                _release_manifest_relative_file_startup_errors(root_path, "global_spine", raw_path)
+            )
     router_sidecar = outputs.get("router_sidecar")
     if isinstance(router_sidecar, Mapping):
         raw_path = router_sidecar.get("path")
@@ -832,26 +1034,56 @@ def _release_manifest_startup_errors_v3(root_path: Path, manifest: Mapping[str, 
                 errors.append(f"manifest_indexes_router_sidecar_{field}_missing")
         if router_sidecar.get("verification_ok") is not True:
             errors.append("manifest_indexes_router_sidecar_verification_not_ok")
+    router_coherence = outputs.get("router_coherence")
+    if isinstance(router_coherence, Mapping):
+        if router_coherence.get("required") is not True:
+            errors.append("manifest_indexes_router_coherence_not_required")
+        raw_path = router_coherence.get("path")
+        if not isinstance(raw_path, str) or not raw_path:
+            errors.append("manifest_indexes_router_coherence_path_missing")
+        else:
+            errors.extend(
+                _release_manifest_relative_file_startup_errors(
+                    root_path,
+                    "router_coherence",
+                    raw_path,
+                )
+            )
+        for field in (
+            "sha256",
+            "profile_sha256",
+            "source_global_spine_sha256",
+            "semantic_cache_key",
+            "build_fingerprint_sha256",
+        ):
+            if not isinstance(router_coherence.get(field), str) or not router_coherence.get(field):
+                errors.append(f"manifest_indexes_router_coherence_{field}_missing")
+        if router_coherence.get("verification_ok") is not True:
+            errors.append("manifest_indexes_router_coherence_verification_not_ok")
     company_shards = outputs.get("company_shards")
     if isinstance(company_shards, Mapping):
         errors.extend(
             "manifest_indexes_company_shards_" + error
-            for error in metric_dictionary_binding_errors(
-                company_shards.get("metric_dictionary")
-            )
+            for error in metric_dictionary_binding_errors(company_shards.get("metric_dictionary"))
         )
         raw_dir = company_shards.get("dir")
         if not isinstance(raw_dir, str) or not raw_dir:
             errors.append("manifest_indexes_company_shards_dir_missing")
         else:
-            errors.extend(_release_manifest_relative_directory_errors(root_path, "company_shards", raw_dir))
+            errors.extend(
+                _release_manifest_relative_directory_errors(root_path, "company_shards", raw_dir)
+            )
     shard_manifest = outputs.get("shard_manifest")
     if isinstance(shard_manifest, Mapping):
         raw_path = shard_manifest.get("path")
         if not isinstance(raw_path, str) or not raw_path:
             errors.append("manifest_indexes_shard_manifest_path_missing")
         else:
-            errors.extend(_release_manifest_relative_file_startup_errors(root_path, "shard_manifest", raw_path))
+            errors.extend(
+                _release_manifest_relative_file_startup_errors(
+                    root_path, "shard_manifest", raw_path
+                )
+            )
     chart_series = outputs.get("chart_series")
     if isinstance(chart_series, Mapping):
         raw_path = chart_series.get("path")
@@ -859,9 +1091,15 @@ def _release_manifest_startup_errors_v3(root_path: Path, manifest: Mapping[str, 
             if not isinstance(raw_path, str) or not raw_path:
                 errors.append("manifest_indexes_chart_series_path_missing")
             else:
-                errors.extend(_release_manifest_relative_file_startup_errors(root_path, "chart_series", raw_path))
+                errors.extend(
+                    _release_manifest_relative_file_startup_errors(
+                        root_path, "chart_series", raw_path
+                    )
+                )
         elif isinstance(raw_path, str) and raw_path:
-            errors.extend(_release_manifest_relative_optional_file_errors(root_path, "chart_series", raw_path))
+            errors.extend(
+                _release_manifest_relative_optional_file_errors(root_path, "chart_series", raw_path)
+            )
     debug_monolith = outputs.get("debug_monolith")
     if isinstance(debug_monolith, Mapping) and debug_monolith.get("required") is True:
         errors.append("manifest_debug_monolith_required")
@@ -879,12 +1117,21 @@ def _release_serving_binding_errors(manifest: Mapping[str, Any]) -> list[str]:
         "source_artifact_sqlite_schema_version": SOURCE_ARTIFACT_SQLITE_SCHEMA_VERSION,
         "source_artifact_sqlite_builder_version": SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION,
         "company_shard_schema_version": COMPANY_SHARD_SCHEMA_VERSION,
+        "router_sidecar_schema_version": ROUTER_SIDECAR_SCHEMA_VERSION,
+        "router_sidecar_builder_version": ROUTER_SIDECAR_BUILDER_VERSION,
     }
+    indexes = manifest.get("indexes")
+    indexes = indexes if isinstance(indexes, Mapping) else {}
+    if isinstance(indexes.get("router_coherence"), Mapping):
+        expected_builder.update(
+            {
+                "router_coherence_schema_version": ROUTER_COHERENCE_SCHEMA_VERSION,
+                "router_coherence_builder_version": ROUTER_COHERENCE_BUILDER_VERSION,
+            }
+        )
     for key, value in expected_builder.items():
         if builder.get(key) != value:
             errors.append(f"manifest_builder_binding_mismatch:{key}")
-    indexes = manifest.get("indexes")
-    indexes = indexes if isinstance(indexes, Mapping) else {}
     global_spine = indexes.get("global_spine")
     global_spine = global_spine if isinstance(global_spine, Mapping) else {}
     if global_spine.get("schema_version") != GLOBAL_SPINE_SCHEMA_VERSION:
@@ -893,6 +1140,18 @@ def _release_serving_binding_errors(manifest: Mapping[str, Any]) -> list[str]:
         errors.append("manifest_global_spine_builder_version_mismatch")
     if global_spine.get("spine_projection_version") != SPINE_PROJECTION_VERSION:
         errors.append("manifest_spine_projection_version_mismatch")
+    router_sidecar = indexes.get("router_sidecar")
+    router_sidecar = router_sidecar if isinstance(router_sidecar, Mapping) else {}
+    if router_sidecar.get("schema_version") != ROUTER_SIDECAR_SCHEMA_VERSION:
+        errors.append("manifest_router_sidecar_schema_version_mismatch")
+    if router_sidecar.get("builder_version") != ROUTER_SIDECAR_BUILDER_VERSION:
+        errors.append("manifest_router_sidecar_builder_version_mismatch")
+    router_coherence = indexes.get("router_coherence")
+    if isinstance(router_coherence, Mapping):
+        if router_coherence.get("schema_version") != ROUTER_COHERENCE_SCHEMA_VERSION:
+            errors.append("manifest_router_coherence_schema_version_mismatch")
+        if router_coherence.get("builder_version") != ROUTER_COHERENCE_BUILDER_VERSION:
+            errors.append("manifest_router_coherence_builder_version_mismatch")
     company_shards = indexes.get("company_shards")
     company_shards = company_shards if isinstance(company_shards, Mapping) else {}
     if company_shards.get("schema_version") != COMPANY_SHARD_SCHEMA_VERSION:
@@ -910,7 +1169,9 @@ def _release_serving_binding_errors(manifest: Mapping[str, Any]) -> list[str]:
     return errors
 
 
-def _release_manifest_relative_optional_file_errors(root_path: Path, role: str, raw_path: str) -> list[str]:
+def _release_manifest_relative_optional_file_errors(
+    root_path: Path, role: str, raw_path: str
+) -> list[str]:
     errors: list[str] = []
     candidate = Path(raw_path)
     if candidate.is_absolute():
@@ -927,7 +1188,9 @@ def _release_manifest_relative_optional_file_errors(root_path: Path, role: str, 
     return errors
 
 
-def _release_manifest_relative_file_startup_errors(root_path: Path, role: str, raw_path: str) -> list[str]:
+def _release_manifest_relative_file_startup_errors(
+    root_path: Path, role: str, raw_path: str
+) -> list[str]:
     errors: list[str] = []
     candidate = Path(raw_path)
     if candidate.is_absolute():
@@ -954,11 +1217,19 @@ def _resolve_v3_global_spine_path(root_path: Path, manifest: Mapping[str, Any]) 
             raw_path = global_spine.get("path")
             if isinstance(raw_path, str) and raw_path:
                 candidate = Path(raw_path)
-                return candidate.expanduser().resolve() if candidate.is_absolute() else (root_path / candidate).resolve()
+                return (
+                    candidate.expanduser().resolve()
+                    if candidate.is_absolute()
+                    else (root_path / candidate).resolve()
+                )
     raw_path = manifest.get("global_spine_path")
     if isinstance(raw_path, str) and raw_path:
         candidate = Path(raw_path)
-        return candidate.expanduser().resolve() if candidate.is_absolute() else (root_path / candidate).resolve()
+        return (
+            candidate.expanduser().resolve()
+            if candidate.is_absolute()
+            else (root_path / candidate).resolve()
+        )
     return (root_path / GLOBAL_SPINE_RELATIVE_PATH).resolve()
 
 
@@ -978,7 +1249,30 @@ def _resolve_v3_router_sidecar_path(root_path: Path, manifest: Mapping[str, Any]
     return (root_path / ROUTER_SIDECAR_RELATIVE_PATH).resolve()
 
 
-def _resolve_optional_chart_series_path(root_path: Path, manifest: Mapping[str, Any]) -> Path | None:
+def _resolve_optional_router_coherence_path(
+    root_path: Path,
+    manifest: Mapping[str, Any],
+) -> Path | None:
+    outputs = manifest.get("indexes")
+    if not isinstance(outputs, Mapping):
+        return None
+    router_coherence = outputs.get("router_coherence")
+    if not isinstance(router_coherence, Mapping):
+        return None
+    raw_path = router_coherence.get("path")
+    if not isinstance(raw_path, str) or not raw_path:
+        return None
+    candidate = Path(raw_path)
+    return (
+        candidate.expanduser().resolve()
+        if candidate.is_absolute()
+        else (root_path / candidate).resolve()
+    )
+
+
+def _resolve_optional_chart_series_path(
+    root_path: Path, manifest: Mapping[str, Any]
+) -> Path | None:
     outputs = manifest.get("indexes")
     if not isinstance(outputs, Mapping):
         default_path = root_path / CHART_SERIES_RELATIVE_PATH
@@ -991,24 +1285,33 @@ def _resolve_optional_chart_series_path(root_path: Path, manifest: Mapping[str, 
     if not isinstance(raw_path, str) or not raw_path:
         return None
     candidate = Path(raw_path)
-    return candidate.expanduser().resolve() if candidate.is_absolute() else (root_path / candidate).resolve()
+    return (
+        candidate.expanduser().resolve()
+        if candidate.is_absolute()
+        else (root_path / candidate).resolve()
+    )
 
 
-def _verify_global_spine_startup(path: Path) -> dict[str, Any]:
-    errors: list[str] = []
-    metadata: dict[str, Any] = {}
-    try:
-        with closing(sqlite3.connect(path)) as conn:
-            metadata = read_global_spine_metadata(conn)
-    except sqlite3.Error as exc:
-        return {
-            "ok": False,
-            "errors": [f"global_spine_sqlite_error:{exc}"],
-            "path": str(path),
-            "metadata": metadata,
-            "sqlite_checked": True,
-            "verification_mode": "startup",
-        }
+def _verify_global_spine_startup(
+    path: Path,
+    *,
+    expected_sha256: str | None,
+) -> dict[str, Any]:
+    schema_verification = verify_global_spine_schema(
+        path,
+        deep=False,
+        trust_seal=True,
+        require_trusted_seal=True,
+    )
+    errors = list(schema_verification.get("errors") or [])
+    metadata = dict(schema_verification.get("metadata") or {})
+    sealed_sha256 = read_spine_verification_sha256(path)
+    if not expected_sha256:
+        errors.append("global_spine_manifest_sha256_missing")
+    elif sealed_sha256 is None:
+        errors.append("global_spine_verification_seal_sha256_missing")
+    elif sealed_sha256 != expected_sha256:
+        errors.append("global_spine_manifest_sha256_mismatch")
     if metadata.get("schema_version") != GLOBAL_SPINE_SCHEMA_VERSION:
         errors.append("global_spine_schema_version_mismatch")
     if metadata.get("builder_version") != GLOBAL_SPINE_BUILDER_VERSION:
@@ -1034,8 +1337,9 @@ def _verify_global_spine_startup(path: Path) -> dict[str, Any]:
         "errors": errors,
         "path": str(path),
         "metadata": metadata,
+        "schema_verification": schema_verification,
         "sqlite_checked": True,
-        "verification_mode": "startup",
+        "verification_mode": "startup-quick-schema",
     }
 
 
@@ -1053,7 +1357,9 @@ def _release_filesystem_errors(root_path: Path) -> list[str]:
         errors.append("companies_dir_missing")
     if not (root_path / "indexes").is_dir():
         errors.append("indexes_dir_missing")
-    for path in sorted(root_path.rglob("*"), key=lambda item: item.relative_to(root_path).as_posix()):
+    for path in sorted(
+        root_path.rglob("*"), key=lambda item: item.relative_to(root_path).as_posix()
+    ):
         relative = path.relative_to(root_path).as_posix()
         if path.is_symlink() and not path.exists():
             errors.append(f"broken_symlink:{relative}")
@@ -1234,7 +1540,9 @@ def _release_file_trace(
     return entries
 
 
-def _release_file_trace_light(root: Path, *, manifest: Mapping[str, Any] | None = None) -> list[dict[str, Any]]:
+def _release_file_trace_light(
+    root: Path, *, manifest: Mapping[str, Any] | None = None
+) -> list[dict[str, Any]]:
     entries: list[dict[str, Any]] = []
     seen: set[str] = set()
 
@@ -1273,7 +1581,9 @@ def _release_file_trace_light(root: Path, *, manifest: Mapping[str, Any] | None 
     add(root / RELEASE_MANIFEST_FILENAME)
     global_spine_path = _resolve_v3_global_spine_path(root, manifest or {})
     add(global_spine_path)
-    shard_manifest_path = _manifest_index_file_path(root, manifest, "shard_manifest", default="indexes/shard_manifest.json")
+    shard_manifest_path = _manifest_index_file_path(
+        root, manifest, "shard_manifest", default="indexes/shard_manifest.json"
+    )
     add(shard_manifest_path)
     chart_series_path = _manifest_index_file_path(
         root,
@@ -1286,7 +1596,9 @@ def _release_file_trace_light(root: Path, *, manifest: Mapping[str, Any] | None 
     shard_manifest = _read_json_object(shard_manifest_path)
     shards = shard_manifest.get("shards") if isinstance(shard_manifest, Mapping) else None
     if isinstance(shards, Mapping):
-        company_shards_dir = _manifest_index_dir_path(root, manifest, "company_shards", default="indexes/companies")
+        company_shards_dir = _manifest_index_dir_path(
+            root, manifest, "company_shards", default="indexes/companies"
+        )
         for entry in shards.values():
             if not isinstance(entry, Mapping):
                 continue
@@ -1316,7 +1628,11 @@ def _manifest_index_file_path(
     output = ((manifest or {}).get("indexes") or {}).get(role)
     raw_path = output.get("path") if isinstance(output, Mapping) else None
     candidate = Path(raw_path) if isinstance(raw_path, str) and raw_path else Path(default)
-    return candidate.expanduser().resolve() if candidate.is_absolute() else (root / candidate).resolve()
+    return (
+        candidate.expanduser().resolve()
+        if candidate.is_absolute()
+        else (root / candidate).resolve()
+    )
 
 
 def _manifest_index_dir_path(
@@ -1329,7 +1645,11 @@ def _manifest_index_dir_path(
     output = ((manifest or {}).get("indexes") or {}).get(role)
     raw_path = output.get("dir") if isinstance(output, Mapping) else None
     candidate = Path(raw_path) if isinstance(raw_path, str) and raw_path else Path(default)
-    return candidate.expanduser().resolve() if candidate.is_absolute() else (root / candidate).resolve()
+    return (
+        candidate.expanduser().resolve()
+        if candidate.is_absolute()
+        else (root / candidate).resolve()
+    )
 
 
 def _release_file_role(relative_path: Path) -> str:
@@ -1343,7 +1663,12 @@ def _release_file_role(relative_path: Path) -> str:
         return "shard_manifest"
     if path_text == CHART_SERIES_RELATIVE_PATH.as_posix():
         return "chart_series"
-    if len(parts) >= 3 and parts[0] == "indexes" and parts[1] == "companies" and relative_path.suffix == ".sqlite":
+    if (
+        len(parts) >= 3
+        and parts[0] == "indexes"
+        and parts[1] == "companies"
+        and relative_path.suffix == ".sqlite"
+    ):
         return "company_shard"
     if parts and parts[0] == "indexes":
         return "index_artifact"
@@ -1372,7 +1697,9 @@ def _release_reproducibility_hash(
         "env": str(env or ""),
         "files": deterministic_files,
     }
-    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
+        "utf-8"
+    )
     return hashlib.sha256(encoded).hexdigest()
 
 
@@ -1414,7 +1741,11 @@ def _path_points_at_active_release(path: Path) -> bool:
             continue
         current = env_root / "current"
         try:
-            if current.is_symlink() and candidate.exists() and candidate.resolve() == current.resolve():
+            if (
+                current.is_symlink()
+                and candidate.exists()
+                and candidate.resolve() == current.resolve()
+            ):
                 return True
         except OSError:
             pass
@@ -1484,6 +1815,8 @@ def promote_local_release(
     env: str | None,
     release_id: str,
     action: str = "promote",
+    preverified: Mapping[str, Any] | None = None,
+    preverified_report: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Atomically point an env current symlink to a release id."""
     env_root = release_env_root(releases_root, env)
@@ -1495,10 +1828,20 @@ def promote_local_release(
         raise FileNotFoundError(f"Release directory not found: {release_dir}")
     event_log_paths = _release_event_log_paths(env_root=env_root, release_dir=release_dir)
     activated_before = event_log_paths["release_event_log"].exists()
-    # Promotion is the trust boundary.  A light startup check intentionally
-    # avoids hashing every shard, but activating a candidate must prove every
-    # manifest-bound byte before the current symlink can move.
-    verification = verify_release_root(release_dir, env=env, deep=True)
+    # A release worker verifies the candidate immediately before promotion and
+    # passes that exact result here.  Reuse it so activation does not repeat a
+    # full, sequential scan of every immutable shard.  Standalone promotion
+    # calls still perform their own deep verification because they do not share
+    # the worker's in-process trust boundary.
+    if preverified is None:
+        verification = verify_release_root(release_dir, env=env, deep=True)
+    else:
+        verification = _validated_preverified_release(
+            preverified,
+            release_dir=release_dir,
+            env=env,
+            release_id=release_id,
+        )
     if not verification["ok"]:
         if not activated_before:
             write_release_verification_report(
@@ -1507,17 +1850,28 @@ def promote_local_release(
                 verification=verification,
             )
         raise ValueError(f"Release verification failed: {', '.join(verification['errors'])}")
-    verify_report = (
-        _load_existing_release_verification_report(release_dir)
-        if activated_before
-        else write_release_verification_report(
-            release_dir,
-            env=env,
-            verification=verification,
+    if preverified_report is not None:
+        verify_report = dict(preverified_report)
+        if verify_report.get("ok") is not True:
+            raise ValueError("Preverified release report invalid: verification_not_ok")
+        verify_report.setdefault(
+            "path",
+            str(release_dir / RELEASE_VERIFY_DIRNAME / RELEASE_VERIFY_REPORT_FILENAME),
         )
-    )
+    else:
+        verify_report = (
+            _load_existing_release_verification_report(release_dir)
+            if activated_before
+            else write_release_verification_report(
+                release_dir,
+                env=env,
+                verification=verification,
+            )
+        )
     if not verify_report["ok"]:
-        raise ValueError(f"Release verification report failed: {', '.join(verify_report['errors'])}")
+        raise ValueError(
+            f"Release verification report failed: {', '.join(verify_report['errors'])}"
+        )
     env_root.mkdir(parents=True, exist_ok=True)
     current = env_root / "current"
     _prepare_release_event_log_paths(event_log_paths)
@@ -1550,18 +1904,54 @@ def promote_local_release(
     }
 
 
+def _validated_preverified_release(
+    verification: Mapping[str, Any],
+    *,
+    release_dir: Path,
+    env: str | None,
+    release_id: str,
+) -> dict[str, Any]:
+    """Bind an in-process verification result to the candidate being promoted."""
+    payload = dict(verification)
+    errors = list(payload.get("errors") or [])
+    if payload.get("ok") is not True or errors:
+        raise ValueError(
+            "Preverified release invalid: " + (", ".join(errors) or "verification_not_ok")
+        )
+    if payload.get("release_id") != release_id:
+        raise ValueError("Preverified release invalid: release_id_mismatch")
+    if payload.get("env") != normalize_ontology_env(env):
+        raise ValueError("Preverified release invalid: env_mismatch")
+    try:
+        verified_root = Path(str(payload["root"])).expanduser().resolve()
+    except (KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise ValueError("Preverified release invalid: root_missing") from exc
+    if verified_root != release_dir.resolve():
+        raise ValueError("Preverified release invalid: root_mismatch")
+    payload["errors"] = errors
+    return payload
+
+
 def _load_existing_release_verification_report(release_dir: Path) -> dict[str, Any]:
     verify_report_path = release_dir / RELEASE_VERIFY_DIRNAME / RELEASE_VERIFY_REPORT_FILENAME
     try:
         release_verify = json.loads(verify_report_path.read_text(encoding="utf-8"))
     except FileNotFoundError as exc:
-        raise ValueError("Previously activated release verification artifacts invalid: release_verify_missing") from exc
+        raise ValueError(
+            "Previously activated release verification artifacts invalid: release_verify_missing"
+        ) from exc
     except (json.JSONDecodeError, OSError) as exc:
-        raise ValueError(f"Previously activated release verification artifacts invalid: release_verify_invalid:{exc}") from exc
+        raise ValueError(
+            f"Previously activated release verification artifacts invalid: release_verify_invalid:{exc}"
+        ) from exc
     if not isinstance(release_verify, dict):
-        raise ValueError("Previously activated release verification artifacts invalid: release_verify_not_object")
+        raise ValueError(
+            "Previously activated release verification artifacts invalid: release_verify_not_object"
+        )
     if release_verify.get("ok") is not True:
-        raise ValueError("Previously activated release verification artifacts invalid: release_verify_not_ok")
+        raise ValueError(
+            "Previously activated release verification artifacts invalid: release_verify_not_ok"
+        )
     verification_payload = release_verify.get("verification")
     manifest_payload = release_verify.get("manifest")
     release_format = None
@@ -1578,7 +1968,9 @@ def _load_existing_release_verification_report(release_dir: Path) -> dict[str, A
             "errors": [],
             "ok": True,
         }
-    raise ValueError("Previously activated release verification artifacts invalid: release_format_not_v3")
+    raise ValueError(
+        "Previously activated release verification artifacts invalid: release_format_not_v3"
+    )
 
 
 def _release_event_log_paths(*, env_root: Path, release_dir: Path) -> dict[str, Path]:

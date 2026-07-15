@@ -42,12 +42,76 @@ Do not call it with `question`, `ticker`, `tickers`, `response_detail`,
 `response_format`, or any other legacy top-level argument. There is no v1
 compatibility path.
 
+## MCP Input Corrections
+
+An invalid `krw_ontology_query_context` call is not executed. MCP returns one
+English JSON `isError` result directly to the active SDK run. It batches every
+deterministic input problem the server can identify without guessing the user's
+intent. Repair **every** listed violation, then make the next allowed
+`krw_ontology_query_context` call. MCP never rewrites a plan or starts another
+run; the runner does not insert a semantic repair.
+
+```json
+{
+  "status": "input_correction_required",
+  "code": "search_plan_validation_failed",
+  "message": "The SearchPlan has 2 correctable input error(s). Correct every listed violation before calling krw_ontology_query_context again.",
+  "violations": [
+    {
+      "field": "clauses[0].retrieval_query",
+      "rule": "missing_literal_term",
+      "message": "The metric_dimensions literal(s) 'Home and Accessories' are missing from clauses[0].retrieval_query.",
+      "required_change": "Include every exact phrase in required_literals in clauses[0].retrieval_query, or remove those values from clauses[0].metric_dimensions.",
+      "required_literals": ["Home and Accessories"]
+    },
+    {
+      "field": "clauses[0].calculation_window",
+      "rule": "missing_calculation_window",
+      "message": "A required metric clause needs calculation_window when comparison_axes requests absolute_change or growth_rate.",
+      "required_change": "Set calculation_window to period_over_period or year_over_year for this required metric clause, or remove the temporal comparison axis.",
+      "required_literals": []
+    }
+  ],
+  "allowed_next_tools": ["krw_ontology_query_context"]
+}
+```
+
+`code`, every `violations[*].field`, and every
+`violations[*].required_change` are the repair contract. Do not treat a
+correction as evidence, an answer-quality rating, or a user-visible status.
+Do not repeat unchanged input or ask MCP to guess the intended semantics.
+
+Before the first call, make a literal ledger for each clause:
+
+- List each `required_concepts`, `required_predicates`, and
+  `metric_dimensions` phrase. Copy every one verbatim into that clause's
+  `retrieval_query`, or remove it from the corresponding requirement field.
+- Keep a metric clause pure: use `metrics` and `metric_dimensions` there; move
+  causal, risk, lending, or other qualitative concepts and predicates into a
+  separate qualitative clause.
+- When requesting `absolute_change` or `growth_rate`, set a valid
+  `calculation_window` on every required metric clause before calling MCP.
+
+This checklist avoids avoidable correction turns; it does not let the server
+invent missing requirements or silently alter the authored SearchPlan.
+
 The active DeepSeek agent must author the complete `SearchPlan` before the
 first ontology call. Build it after news discovery so each clause preserves
 the selected event, source timing, company scope, financial channel, and the
 user's original intent. `krw_ontology_plan_query` is validation/debug only: it
 normalizes and validates a plan but performs no retrieval. Do not insert it as
 a mandatory preflight before every normal query.
+
+## Runtime routing boundary
+
+Author the complete event-aware plan and let `query_context` route it through
+the global index into only the required company shards. Do not manually fan
+out the same event company by company or repeat one query per keyword. Use
+explicit `tickers` for known companies and `universe="covered"` for discovery.
+
+Treat router scores, coherence diagnostics, and index locations as retrieval
+control data, never as filing or event evidence. Claims still require
+ResearchState coverage and source-backed evidence units.
 
 ## SearchPlan
 
@@ -122,7 +186,9 @@ filing vocabulary such as `management discussion`, `customer demand`,
 Korean news question as the retrieval query.
 
 Name every required concept, predicate, metric, and dimension in
-`retrieval_query`. Put canonical metric identifiers in `metrics`; readable
+`retrieval_query`. Every `required_concepts`, `required_predicates`, and
+`metric_dimensions` value must appear there as its exact literal phrase after
+whitespace normalization. Put canonical metric identifiers in `metrics`; readable
 metric aliases may appear in `retrieval_query` when the metric dictionary maps
 them to the same canonical identity.
 
@@ -203,6 +269,35 @@ Example metric clause:
 }
 ```
 
+Example dimensioned metric clause:
+
+```json
+{
+  "clause_id": "home_accessories_sales",
+  "retrieval_query": "Home and Accessories net sales",
+  "required": true,
+  "tickers": ["AAPL"],
+  "directness": "direct_required",
+  "object_types": ["MetricObservation"],
+  "metrics": ["revenue"],
+  "metric_dimensions": ["Home and Accessories"],
+  "metric_scope": "dimensioned"
+}
+```
+
+The following is invalid because the dimension is absent from
+`retrieval_query`; the runtime returns a `missing_literal_term` violation
+rather than silently adding it:
+
+```json
+{
+  "retrieval_query": "net sales by product category",
+  "metrics": ["revenue"],
+  "metric_dimensions": ["Home and Accessories"],
+  "metric_scope": "dimensioned"
+}
+```
+
 ## Metric and period semantics
 
 `absolute_change` and `growth_rate` require `calculation_window` on every
@@ -248,13 +343,17 @@ clause_coverage
 
 evidence_units
   Deduplicated facts and metrics with clause support and traceable source IDs.
+  Their operational identity is (ticker, object_id); a shared canonical ID may
+  have a distinct occurrence in more than one company.
 
 computed_values / calculation_coverage
   Deterministic values plus covered/partial/missing calculation support for
   each requested metric axis.
 
 missing_parts / recommended_actions
-  Precise gaps and bounded next actions tied to a clause, ticker, or object.
+  Precise gaps and bounded next actions tied to a clause and occurrence. When
+  an action supplies tool, ticker, and object_id, preserve all three fields in
+  the follow-up invocation; clause_id is explanatory context.
 
 continuation
   Whether bounded evidence was omitted and why.

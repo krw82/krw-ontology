@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>KRW Ontology — Codex Plugin Market Entry Research</title>
+    <style>
+      :root { color-scheme: light; --ink:#10233b; --muted:#557089; --line:#d9e4ee; --panel:#f7fbff; --blue:#0b6ef3; --amber:#9a6700; --red:#b42318; --green:#067647; }
+      * { box-sizing: border-box; }
+      body { margin:0; background:#f3f7fb; color:var(--ink); font:16px/1.65 ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+      main { max-width:900px; margin:32px auto 64px; padding:0 24px; }
+      article { background:#fff; border:1px solid var(--line); border-radius:18px; padding:40px; box-shadow:0 10px 40px rgba(15,40,70,.06); }
+      h1 { margin:0 0 8px; font-size:clamp(28px,5vw,42px); line-height:1.16; letter-spacing:-.035em; }
+      h2 { margin:44px 0 12px; font-size:23px; letter-spacing:-.02em; }
+      h3 { margin:28px 0 8px; font-size:18px; }
+      p, li { max-width:76ch; }
+      .meta { color:var(--muted); margin:0; }
+      .callout { margin:24px 0; padding:20px 22px; background:#eaf4ff; border:1px solid #bddcff; border-radius:12px; }
+      .callout strong { display:block; margin-bottom:6px; }
+      .score { display:grid; grid-template-columns:repeat(3,1fr); gap:12px; margin:18px 0; }
+      .score div { padding:15px; border:1px solid var(--line); border-radius:12px; background:var(--panel); }
+      .score b { display:block; color:var(--blue); font-size:23px; }
+      table { width:100%; border-collapse:collapse; margin:16px 0; font-size:14px; }
+      th, td { padding:11px 12px; vertical-align:top; text-align:left; border:1px solid var(--line); }
+      th { background:#eef5fb; }
+      .good { color:var(--green); font-weight:700; }
+      .risk { color:var(--red); font-weight:700; }
+      .warning { color:var(--amber); font-weight:700; }
+      .example { padding:16px 18px; margin:12px 0; border:1px solid var(--line); border-radius:12px; background:#fff; }
+      .example p { margin:4px 0 0; color:#405a72; }
+      a { color:#075fc6; }
+      code { background:#eef3f7; padding:2px 5px; border-radius:4px; }
+      .footnote { color:var(--muted); font-size:13px; }
+      @media (max-width:650px) { article { padding:24px 18px; } .score { grid-template-columns:1fr; } table { font-size:13px; } }
+    </style>
+  </head>
+  <body>
+    <main>
+      <article>
+        <h1>KRW Ontology의 Codex 공개 배포 가능성</h1>
+        <p class="meta">시장 진입 리서치 · 2026-07-14 · 대상: Codex/ChatGPT Plugin Directory</p>
+
+        <section class="callout">
+          <strong>결론: 공개 배포를 추천한다. 단, 지금 바로 ‘범용 주식 MCP’로 내는 것은 추천하지 않는다.</strong>
+          이 프로젝트의 강점은 SEC 데이터를 가져오는 것 자체가 아니라, 공시 근거를 제한된 흐름으로 수집하고 한국어 투자 판단으로 바꾸는 품질 레이어다. 먼저 소수 베타 사용자에게 이 차이를 증명한 뒤, 호스팅된 MCP와 공개용 패키징을 갖춰 공개 디렉터리에 내는 순서가 가장 설득력 있다.
+        </section>
+
+        <section>
+          <h2>Executive read</h2>
+          <p>현재 코드베이스에는 11개의 KRW Ontology 워크플로와 별도의 6개 Guru Advisor 워크플로가 있으며, 최근 10-Q를 현재 동인으로 우선하고, 공시 근거·계산·추론을 구분하도록 설계되어 있다. 이는 일반적인 “조회형” MCP보다 분명히 높은 제품적 잠재력이다.</p>
+          <p>하지만 공개 설치 관점에서는 <span class="risk">준비가 덜 됐다</span>. 두 플러그인 모두 로컬 절대 경로, 로컬 데이터 릴리스, <code>file://</code> 홈페이지/저장소 링크, <code>UNLICENSED</code>, 공개용 아이콘·스크린샷·지원·개인정보처리방침·이용약관 부재를 보인다. 따라서 지금 상태는 개인/팀용 로컬 배포에는 적합하지만, 외부 사용자가 설치해 즉시 가치를 얻는 공개 플러그인에는 적합하지 않다.</p>
+          <div class="score">
+            <div><b>7/10</b>제품 차별성<br /><span class="footnote">공시 근거 기반의 판단 흐름</span></div>
+            <div><b>3/10</b>공개 설치성<br /><span class="footnote">로컬 의존성·공개 메타데이터 공백</span></div>
+            <div><b>4/10</b>메시지 명확성<br /><span class="footnote">KRW 이름과 실제 SEC 중심 범위의 혼선</span></div>
+          </div>
+          <p class="footnote">점수는 공개 저장소·공식 문서·현재 워크스페이스를 기준으로 한 제품 판단이며, 시장 규모 예측은 아니다.</p>
+        </section>
+
+        <section>
+          <h2>무엇과 경쟁하는가</h2>
+          <p>데이터 접근 계층은 이미 붐빈다. SEC 공시 접근 MCP, 실시간 시장 데이터 MCP, 그리고 한국 DART/거래소 데이터 MCP가 설치 가능한 형태로 제공되고 있다. 따라서 “10-K를 읽는다”, “주가를 보여 준다”, “MCP다”만으로는 이기기 어렵다.</p>
+          <div class="example">
+            <strong>SEC EDGAR MCP <span class="footnote">[Web]</span></strong>
+            <p>공시·재무제표·내부자거래 접근, Docker/PyPI 설치, HTTP 전송, 평가 스위트와 문서까지 제공한다. 데이터 접근·설치 편의·신뢰 신호가 기준선이다.</p>
+          </div>
+          <div class="example">
+            <strong>Octagon Skills <span class="footnote">[Web]</span></strong>
+            <p>재무제표, 실적 콜, SEC 분석을 세분화한 대규모 스킬 모음이다. 워크플로 개수 경쟁으로 가면 후발주자가 불리하다는 신호다.</p>
+          </div>
+          <div class="example">
+            <strong>Korea Stock MCP / DART 생태계 <span class="footnote">[Web]</span></strong>
+            <p>DART·KRX 공식 API 기반의 공시, 재무, 시세 접근을 이미 제공한다. 만약 KRW Ontology를 ‘한국 주식 플러그인’으로 내세우려면 실제 DART/한국 기업 커버리지 또는 더 강한 분석 결과가 필요하다.</p>
+          </div>
+          <p><strong>기회:</strong> “근거를 정확히 인용하고, 최신 분기 변화와 장기 기준선을 구분하며, 한국어로 판단이 바뀌는 조건까지 제시한다”는 경험이다. 이 포지션은 단순 데이터 API와 달리 사용자가 반복적으로 돌아올 이유가 된다.</p>
+        </section>
+
+        <section>
+          <h2>추천 포지셔닝</h2>
+          <p><strong>권장 첫 제품:</strong> <em>“Korean Filing Analyst — 미국 상장기업의 10-K/10-Q를 근거로, 지금 중요한 변화와 판단 변경 조건을 한국어로 설명하는 Codex 리서치 도구.”</em></p>
+          <p>현재 코드와 가장 잘 맞는 약속은 “한국 주식 전체 분석”이 아니라 <strong>SEC 공시 기반의 한국어 리서치</strong>다. 이름에 KRW를 유지한다면 부제에서 범위를 명확히 해야 한다. 그렇지 않으면 DART/한국 시세까지 포함한다고 기대한 사용자가 첫 사용에서 이탈할 수 있다.</p>
+          <table>
+            <thead><tr><th>하면 좋은 것</th><th>피해야 할 것</th></tr></thead>
+            <tbody>
+              <tr><td><span class="good">“공시 근거 → 해석 → 판단 변경 조건”</span>을 한 번에 제공</td><td><span class="risk">“AI가 종목을 추천합니다”</span> 같은 과도한 약속</td></tr>
+              <tr><td>최신 10-Q와 연간 기준선의 차이를 눈에 보이게 설명</td><td>도구 수·뉴스 수·차트 수를 핵심 가치로 내세우기</td></tr>
+              <tr><td>한국어 개인 투자자가 그대로 보낼 수 있는 3개의 starter prompt</td><td><code>$skill-name</code>을 알아야 하는 온보딩</td></tr>
+              <tr><td>Guru Advisor는 “Investor Lenses”라는 선택 기능으로 분리</td><td>실제 투자 대가와의 제휴·승인을 연상시키는 공개 마케팅</td></tr>
+            </tbody>
+          </table>
+        </section>
+
+        <section>
+          <h2>출시 순서</h2>
+          <h3>1. 먼저 비공개 베타: 5–10명의 실제 사용자</h3>
+          <p>repo marketplace 또는 workspace 공유로 설치시키고, 아래 세 가지 질문이 “웹 검색보다 더 낫다”는 반응을 얻는지 본다. 이 단계에서 유료화는 필요 없다.</p>
+          <ol>
+            <li>“AAPL의 최근 분기에서 투자 판단을 바꿀 만한 변화는 무엇인가?”</li>
+            <li>“AMZN의 AWS와 리테일은 각각 무엇이 좋아지고 나빠졌는가?”</li>
+            <li>“NVDA의 가정이 틀렸음을 보여 줄 공시 신호는 무엇인가?”</li>
+          </ol>
+          <h3>2. 공개 가능한 런타임으로 전환</h3>
+          <p>현재의 <code>/Users/...</code> 경로와 개인 데이터 릴리스는 제거하고, 공개 HTTPS MCP endpoint 또는 사용자가 설치 가능한 패키지로 바꾼다. 설치 후 외부 사용자가 별도 파일을 갖고 있지 않아도 샘플 티커를 연구할 수 있어야 한다. 인증이 필요하다면 명확한 최초 연결 흐름과 데모 계정을 준비한다.</p>
+          <h3>3. 공개 제출</h3>
+          <p>공식 절차상 skills-only, MCP, app+skills 모두 제출할 수 있다. 이 제품은 <strong>호스팅된 read-only MCP + 간결한 스킬</strong> 조합이 가장 좋다. 전자는 검증 가능한 데이터를, 후자는 일관된 분석을 담당한다.</p>
+          <h3>4. 공개 후 증거를 쌓기</h3>
+          <p>최소 50문항의 고정 평가셋을 만들어 일반 웹 리서치/기본 SEC MCP와 비교한다. 정확한 인용, 최신 공시 우선 여부, 추론의 경계, 한국어 이해도, 응답 시간만 측정해도 제품의 신뢰도가 눈에 보인다.</p>
+        </section>
+
+        <section>
+          <h2>공개 배포 전 반드시 메울 항목</h2>
+          <table>
+            <thead><tr><th>우선순위</th><th>현재 신호</th><th>출시 전 조치</th></tr></thead>
+            <tbody>
+              <tr><td>매우 높음</td><td>플러그인 MCP 설정이 개인 경로와 로컬 데이터 릴리스를 가리킴</td><td>공개 endpoint 또는 설치 가능한 패키지·데이터 부트스트랩으로 교체</td></tr>
+              <tr><td>매우 높음</td><td><code>homepage</code>/<code>repository</code>가 <code>file://</code>, license가 <code>UNLICENSED</code></td><td>공개 사이트, 지원 연락처, 공개 라이선스/상용 약관을 정하고 실제 URL 연결</td></tr>
+              <tr><td>높음</td><td>브랜드 자산·소개 화면·개인정보처리방침·이용약관이 없음</td><td>목록용 로고, 1–2개 실제 결과 스크린샷, 개인정보·약관·지원 URL 준비</td></tr>
+              <tr><td>높음</td><td>KRW라는 이름과 SEC/AAPL 중심 예시의 범위가 다르게 읽힘</td><td>미국 SEC 분석용인지 한국 DART/주식용인지 하나를 첫 약속으로 고정</td></tr>
+              <tr><td>중간</td><td>플러그인 계약 테스트는 통과했지만 외부 사용자 가치 평가는 아직 보이지 않음</td><td>5개의 positive·3개의 negative 제출 테스트와 별도 품질 benchmark 추가</td></tr>
+            </tbody>
+          </table>
+        </section>
+
+        <section>
+          <h2>출시용 starter prompt 초안</h2>
+          <ol>
+            <li>“AAPL의 최근 공시 기준으로 지금 투자자가 가장 봐야 할 매출·마진 변화와 리스크를 한국어로 정리해줘.”</li>
+            <li>“AMZN의 AWS와 리테일을 나누어, 다음 분기에 내 판단을 바꿀 공시 신호를 알려줘.”</li>
+            <li>“NVDA의 투자 가정이 깨질 수 있는 조건을 최신 10-Q와 연간 기준선에 근거해 설명해줘.”</li>
+          </ol>
+          <p>좋은 starter prompt는 제품의 결과물을 미리 약속한다. “도구를 사용해”나 내부 스킬 이름이 아니라, 사용자가 얻고 싶은 결론을 써야 한다.</p>
+        </section>
+
+        <section>
+          <h2>Sources</h2>
+          <ul>
+            <li><a href="https://learn.chatgpt.com/docs/build-plugins.md">OpenAI — Build plugins</a>: marketplace, manifest, local/workspace distribution.</li>
+            <li><a href="https://learn.chatgpt.com/docs/submit-plugins.md">OpenAI — Submit plugins</a>: public submission, identity, tests, public publishing flow.</li>
+            <li><a href="https://github.com/stefanoamorelli/sec-edgar-mcp">SEC EDGAR MCP</a>: packaging, installation, documentation, evaluation reference.</li>
+            <li><a href="https://github.com/OctagonAI/skills">Octagon Skills</a>: broad financial and SEC workflow competition.</li>
+            <li><a href="https://github.com/jjlabsio/korea-stock-mcp">Korea Stock MCP</a>: DART/KRX Korean-market data competitor.</li>
+            <li><a href="https://github.com/eddmpython/dartlab">dartlab</a>: Korean DART + SEC structured data competitor.</li>
+          </ul>
+          <p class="footnote">Lazyweb screenshot database was not available in this session. The in-app browser connection also could not be initialized, so this report intentionally uses source-grounded text examples rather than mismatched or fabricated visual references.</p>
+        </section>
+      </article>
+    </main>
+  </body>
+</html>

@@ -451,10 +451,13 @@ Explicit comparison only when ResearchState lacks a required aligned comparison
 or the user asks for a comparison table.
 
 krw_ontology_trace
-Evidence lineage for one selected object. Use only when a strong claim needs verification.
+Evidence lineage for one selected `(ticker, object_id)` occurrence. Use only
+when a strong claim needs verification.
 
 krw_ontology_chain
-Business/semantic/temporal mechanism around one selected object. Use only when the causal path matters.
+Business/semantic/temporal mechanism around one selected `(ticker, object_id)`
+occurrence. Use only when the causal path matters, and inspect
+`response_budget` before treating returned paths as complete.
 
 krw_ontology_retrieve
 Rare bounded evidence expansion for a specific gap. It is not a substitute for
@@ -472,6 +475,12 @@ Debug, audit, or coverage only. Not for normal investor answers.
 
 For tickerless post-news discovery, use `universe="covered"`; for explicit
 companies, use `tickers`. Never combine both.
+
+Let `query_context` use the global index to choose candidates and company
+shards. Do not manually repeat the same event plan per keyword or company.
+When `recommended_actions` supplies `tool`, `ticker`, and `object_id`, forward
+that occurrence identity unchanged. Never guess a ticker for an ambiguous
+shared object ID.
 
 Do not impose fixed top-5, limit-3, one-follow-up, or hard tool-call caps.
 Choose adaptive `limit_results` and `limit_tickers` large enough for the

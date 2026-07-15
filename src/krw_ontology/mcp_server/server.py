@@ -12,7 +12,7 @@ from contextlib import closing
 from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version as package_version
 from pathlib import Path
-from typing import Any, Callable, TypeVar
+from typing import Any, Callable, Mapping, TypeVar
 
 from mcp.server.fastmcp import FastMCP
 from mcp.types import CallToolResult, TextContent, ToolAnnotations
@@ -45,8 +45,9 @@ from krw_ontology.mcp_server.tools import (
 )
 from krw_ontology.mcp_server.contracts import (
     MCP_CONTRACT_VERSION,
-    ResearchState,
+    QueryContextInputCorrection,
     SearchPlan,
+    validate_query_context_search_plan,
 )
 from krw_ontology.mcp_server.runtime import configured_mcp_root, prepare_mcp_runtime
 from krw_ontology.release import (
@@ -197,15 +198,23 @@ def _release_payload(
     configured_env = _configured_env_name()
     current_symlink = _current_symlink_metadata(supplied_root_path, root_path)
     resolved_global_spine_path = _health_global_spine_path(root_path, release_manifest)
-    index_outputs = release_manifest.get("indexes") if isinstance(release_manifest.get("indexes"), dict) else {}
+    index_outputs = (
+        release_manifest.get("indexes") if isinstance(release_manifest.get("indexes"), dict) else {}
+    )
     global_spine_output = (
-        index_outputs.get("global_spine") if isinstance(index_outputs.get("global_spine"), dict) else {}
+        index_outputs.get("global_spine")
+        if isinstance(index_outputs.get("global_spine"), dict)
+        else {}
     )
     global_spine_counts = (
-        global_spine_output.get("counts") if isinstance(global_spine_output.get("counts"), dict) else {}
+        global_spine_output.get("counts")
+        if isinstance(global_spine_output.get("counts"), dict)
+        else {}
     )
     company_shards_output = (
-        index_outputs.get("company_shards") if isinstance(index_outputs.get("company_shards"), dict) else {}
+        index_outputs.get("company_shards")
+        if isinstance(index_outputs.get("company_shards"), dict)
+        else {}
     )
     document_count = _manifest_non_negative_int(global_spine_counts.get("global_document_catalog"))
     object_count = _manifest_non_negative_int(
@@ -213,7 +222,16 @@ def _release_payload(
         if release_manifest.get("global_object_count") is not None
         else global_spine_counts.get("global_object_locator")
     )
-    global_topic_spine_count = _manifest_non_negative_int(global_spine_counts.get("global_topic_spine"))
+    object_occurrence_count = _manifest_non_negative_int(
+        global_spine_counts.get("global_object_replica")
+    )
+    edge_count = _manifest_non_negative_int(global_spine_counts.get("global_edge_spine"))
+    edge_occurrence_count = _manifest_non_negative_int(
+        global_spine_counts.get("global_edge_replica")
+    )
+    global_topic_spine_count = _manifest_non_negative_int(
+        global_spine_counts.get("global_topic_spine")
+    )
     company_shard_count = _manifest_non_negative_int(company_shards_output.get("count"))
     startup_verification = verify_release_startup_v3(
         supplied_root_path,
@@ -254,19 +272,26 @@ def _release_payload(
         "chart_series_present": bool(startup_verification.get("chart_series_present")),
         "chart_series_verification_ok": chart_series_verification_ok,
         "company_shards_present": bool(company_shards_output.get("required")),
-        "global_topic_spine_present": global_topic_spine_count is not None and global_topic_spine_count > 0,
+        "global_topic_spine_present": global_topic_spine_count is not None
+        and global_topic_spine_count > 0,
         "global_topic_spine_count": global_topic_spine_count,
-        "company_shards_dir": release_manifest.get("company_shards_dir") or company_shards_output.get("dir"),
+        "company_shards_dir": release_manifest.get("company_shards_dir")
+        or company_shards_output.get("dir"),
         "company_shard_count": company_shard_count,
         "documents": document_count,
         "objects": object_count,
+        "object_occurrences": object_occurrence_count,
+        "edges": edge_count,
+        "edge_occurrences": edge_occurrence_count,
         "sqlite_checked": False,
         "tools": fingerprints["tool_names"],
         **fingerprints,
     }
     if include_runtime_cache:
         cache_status = mcp_runtime_cache_status()
-        store_status = cache_status.get("store") if isinstance(cache_status.get("store"), dict) else {}
+        store_status = (
+            cache_status.get("store") if isinstance(cache_status.get("store"), dict) else {}
+        )
         payload["cache"] = cache_status
         payload["mcp_store_hot_swap"] = {
             "mode": store_status.get("mode"),
@@ -355,7 +380,11 @@ def _runtime_fingerprints(manifest_path: Path | None) -> dict[str, Any]:
         )
     for field, env_name in _EXPECTED_FINGERPRINT_ENVS.items():
         expected = os.environ.get(env_name)
-        if expected is not None and expected.strip() and str(payload.get(field) or "") != expected.strip():
+        if (
+            expected is not None
+            and expected.strip()
+            and str(payload.get(field) or "") != expected.strip()
+        ):
             mismatches.append(
                 {
                     "field": field,
@@ -421,11 +450,20 @@ def _source_build_sha256() -> str:
         and "__pycache__" not in path.parts
         and path.suffix in {".json", ".py", ".yaml", ".yml"}
     )
+    plugin_dir = repository_root / "plugins" / "krw-ontology"
+    files.extend(
+        path
+        for path in plugin_dir.rglob("*")
+        if path.is_file()
+        and "__pycache__" not in path.parts
+        and path.suffix in {".json", ".md", ".yaml", ".yml"}
+    )
     for relative_path in (
         "pyproject.toml",
         "uv.lock",
         "plugins/krw-ontology/.mcp.json",
-        "plugins/krw-ontology/plugin.json",
+        "plugins/krw-ontology/.claude-plugin/plugin.json",
+        "plugins/krw-ontology/.codex-plugin/plugin.json",
         "Dockerfile",
         "docker-compose.yml",
     ):
@@ -518,7 +556,7 @@ def _configured_env_name() -> str | None:
 
 
 def _health_global_spine_path(root_path: Path, release_manifest: dict[str, Any]) -> Path:
-    raw_path = (((release_manifest.get("indexes") or {}).get("global_spine") or {}).get("path"))
+    raw_path = ((release_manifest.get("indexes") or {}).get("global_spine") or {}).get("path")
     if isinstance(raw_path, str) and raw_path:
         candidate = Path(raw_path).expanduser()
         return candidate.resolve() if candidate.is_absolute() else (root_path / candidate).resolve()
@@ -528,7 +566,9 @@ def _health_global_spine_path(root_path: Path, release_manifest: dict[str, Any])
 def _current_symlink_metadata(supplied_root_path: Path, root_path: Path) -> dict[str, Any]:
     supplied_absolute = supplied_root_path.expanduser().absolute()
     root_is_current_symlink = supplied_absolute.name == "current" and supplied_absolute.is_symlink()
-    current_path = supplied_absolute if supplied_absolute.name == "current" else root_path.parent / "current"
+    current_path = (
+        supplied_absolute if supplied_absolute.name == "current" else root_path.parent / "current"
+    )
     current_target = os.readlink(current_path) if current_path.is_symlink() else None
     return {
         "current_symlink": current_path.is_symlink(),
@@ -673,6 +713,13 @@ def diagnostics_payload(
             payload["objects"] = conn.execute(
                 "SELECT COUNT(*) FROM global_object_locator"
             ).fetchone()[0]
+            payload["object_occurrences"] = conn.execute(
+                "SELECT COUNT(*) FROM global_object_replica"
+            ).fetchone()[0]
+            payload["edges"] = conn.execute("SELECT COUNT(*) FROM global_edge_spine").fetchone()[0]
+            payload["edge_occurrences"] = conn.execute(
+                "SELECT COUNT(*) FROM global_edge_replica"
+            ).fetchone()[0]
     except sqlite3.Error as exc:
         payload["error"] = f"sqlite_error: {exc}"
         payload["sqlite_checked"] = True
@@ -706,10 +753,7 @@ def _render_prometheus_metrics(
 def _prometheus_labels(labels: dict[str, Any]) -> str:
     if not labels:
         return ""
-    parts = [
-        f'{key}="{_prometheus_escape(str(value))}"'
-        for key, value in sorted(labels.items())
-    ]
+    parts = [f'{key}="{_prometheus_escape(str(value))}"' for key, value in sorted(labels.items())]
     return "{" + ",".join(parts) + "}"
 
 
@@ -742,7 +786,9 @@ async def krw_ontology_health(_request: Request) -> JSONResponse:
 async def krw_ontology_metrics(_request: Request) -> PlainTextResponse:
     """Prometheus-style metrics endpoint for release and hot-swap monitoring."""
     payload, status_code = metrics_payload()
-    return PlainTextResponse(payload, status_code=status_code, media_type="text/plain; version=0.0.4")
+    return PlainTextResponse(
+        payload, status_code=status_code, media_type="text/plain; version=0.0.4"
+    )
 
 
 @mcp.custom_route("/diagnostics", methods=["GET"], include_in_schema=False)
@@ -789,7 +835,11 @@ async def krw_ontology_index_context(
     response_format: ResponseFormat = ResponseFormat.JSON,
 ) -> str:
     """Return index schema, capabilities, coverage, and answerability policy."""
-    lane = _LANE_DIAGNOSTIC if allow_expensive or include_counts or include_quality_summary else _LANE_FAST
+    lane = (
+        _LANE_DIAGNOSTIC
+        if allow_expensive or include_counts or include_quality_summary
+        else _LANE_FAST
+    )
     return await _run_tool_in_lane(
         lane,
         index_context_tool,
@@ -833,26 +883,49 @@ async def krw_ontology_company_context(
     annotations=READ_ONLY,
 )
 async def krw_ontology_query_context(
-    search_plan: SearchPlan,
-) -> ResearchState:
+    search_plan: SearchPlan | Mapping[str, Any],
+) -> CallToolResult:
     """Execute one explicit agent search plan and return compact ResearchState v2.
 
     The search plan is mandatory. The server never infers or replaces its intent,
     clauses, ticker scope, document filters, or period filters from keywords.
-    Invalid plans fail input validation with an actionable `invalid_plan` error.
+    Invalid plans return one English structured correction result containing
+    every deterministic violation MCP can identify to the active agent run.
+    The server does not rewrite the plan or start another run.
     """
-    lane = _LANE_FAST if bool(search_plan.tickers) else _LANE_BROAD
+    validated_plan = validate_query_context_search_plan(search_plan)
+    if isinstance(validated_plan, QueryContextInputCorrection):
+        return _query_context_input_correction_result(validated_plan)
+
+    lane = _LANE_FAST if bool(validated_plan.tickers) else _LANE_BROAD
     state = await _run_tool_in_lane(
         lane,
         query_context_tool,
-        search_plan=search_plan,
+        search_plan=validated_plan,
     )
     compact_json = state.model_dump_json()
-    # Returning CallToolResult bypasses FastMCP's indented compatibility
-    # serializer while retaining the declared ResearchState output schema.
-    return CallToolResult(  # type: ignore[return-value]
+    # Returning CallToolResult preserves compact JSON and lets semantic input
+    # corrections use the same MCP result channel without output revalidation.
+    return CallToolResult(
         content=[TextContent(type="text", text=compact_json)],
         structuredContent=state.model_dump(mode="json", by_alias=True),
+    )
+
+
+def _query_context_input_correction_result(
+    correction: QueryContextInputCorrection,
+) -> CallToolResult:
+    """Return an actionable MCP tool error without a runner-side retry path."""
+    payload = correction.model_dump(mode="json", exclude_none=True)
+    return CallToolResult(
+        content=[
+            TextContent(
+                type="text",
+                text=json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+            )
+        ],
+        structuredContent=payload,
+        isError=True,
     )
 
 
@@ -981,13 +1054,15 @@ async def krw_ontology_retrieve(
 )
 async def krw_ontology_trace(
     object_id: str,
+    ticker: str | None = None,
     response_format: ResponseFormat = ResponseFormat.JSON,
 ) -> str:
-    """Trace an object id to its source document, supporting quotes, spans, and quality."""
+    """Trace an object occurrence to its source document, quotes, spans, and quality."""
     return await _run_tool_in_lane(
         _LANE_FAST,
         trace_tool,
         object_id=object_id,
+        ticker=ticker,
         response_format=response_format,
     )
 
@@ -1000,6 +1075,7 @@ async def krw_ontology_trace(
 async def krw_ontology_verify_evidence(
     ticker: str,
     questions: list[dict[str, Any]],
+    brief_hash: str | None = None,
     response_format: ResponseFormat = ResponseFormat.JSON,
 ) -> str:
     """Verify exact object ids and return a bounded, hash-stable company evidence pack."""
@@ -1008,6 +1084,7 @@ async def krw_ontology_verify_evidence(
         verify_evidence_tool,
         ticker=ticker,
         questions=questions,
+        brief_hash=brief_hash,
         response_format=response_format,
     )
 
@@ -1019,16 +1096,18 @@ async def krw_ontology_verify_evidence(
 )
 async def krw_ontology_chain(
     object_id: str,
+    ticker: str | None = None,
     max_depth: int = 2,
     direction: str = "both",
     include_quote_text: bool = False,
     response_format: ResponseFormat = ResponseFormat.JSON,
 ) -> str:
-    """Return evidence, semantic-neighbor, and temporal-context chains around an object."""
+    """Return evidence, semantic-neighbor, and temporal chains around an object occurrence."""
     return await _run_tool_in_lane(
         _LANE_FAST,
         chain_tool,
         object_id=object_id,
+        ticker=ticker,
         max_depth=max_depth,
         direction=direction,
         include_quote_text=include_quote_text,

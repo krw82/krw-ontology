@@ -200,7 +200,9 @@ def guru_run(
 @guru_app.command("run-worker", hidden=True)
 def guru_run_worker(
     root: Path | None = typer.Option(None, "--root", help="Mutable guru workspace root."),
-    running_root: Path | None = typer.Option(None, "--running-root", help="Mutable workspace root."),
+    running_root: Path | None = typer.Option(
+        None, "--running-root", help="Mutable workspace root."
+    ),
     authors: str | None = typer.Option(None, "--authors", help="Comma-separated author keys."),
     limit_per_author: int | None = typer.Option(None, "--limit-per-author", min=1),
     force: bool = typer.Option(False, "--force"),
@@ -300,13 +302,17 @@ def guru_start(
     if dry_run:
         typer.echo("dry_run: true")
     else:
-        typer.echo(f"next: krw-ontology guru fetch --root {root_path} --running-root {running_path}")
+        typer.echo(
+            f"next: krw-ontology guru fetch --root {root_path} --running-root {running_path}"
+        )
 
 
 @guru_app.command("plan")
 def guru_plan(
     root: Path | None = typer.Option(None, "--root", help="Mutable guru workspace root."),
-    running_root: Path | None = typer.Option(None, "--running-root", help="Mutable workspace root."),
+    running_root: Path | None = typer.Option(
+        None, "--running-root", help="Mutable workspace root."
+    ),
     authors: str | None = typer.Option(None, "--authors", help="Comma-separated author keys."),
 ) -> None:
     """Print the planned guru ontology DAG without writing files."""
@@ -316,13 +322,17 @@ def guru_plan(
         parse_author_keys(authors),
         running_root=guru_running_root(running_root),
     )
-    typer.echo(json.dumps(plan.model_dump(mode="json"), ensure_ascii=False, indent=2, sort_keys=True))
+    typer.echo(
+        json.dumps(plan.model_dump(mode="json"), ensure_ascii=False, indent=2, sort_keys=True)
+    )
 
 
 @guru_app.command("verify")
 def guru_verify(
     root: Path | None = typer.Option(None, "--root", help="Mutable guru workspace root."),
-    running_root: Path | None = typer.Option(None, "--running-root", help="Mutable workspace root."),
+    running_root: Path | None = typer.Option(
+        None, "--running-root", help="Mutable workspace root."
+    ),
 ) -> None:
     """Verify planned guru ontology artifacts."""
     root_path = _mutable_guru_root(root)
@@ -338,7 +348,9 @@ def guru_verify(
 @guru_app.command("status")
 def guru_status(
     root: Path | None = typer.Option(None, "--root", help="Long-lived guru release root."),
-    running_root: Path | None = typer.Option(None, "--running-root", help="Mutable workspace root."),
+    running_root: Path | None = typer.Option(
+        None, "--running-root", help="Mutable workspace root."
+    ),
 ) -> None:
     """Show whether a guru planning workspace exists."""
     status_root = _mutable_guru_root(root) if root is None else guru_root(root)
@@ -444,7 +456,9 @@ def guru_promote(
 
 @guru_app.command("rollback")
 def guru_rollback(
-    release_id: str = typer.Option(..., "--release-id", help="Existing release id to point current at."),
+    release_id: str = typer.Option(
+        ..., "--release-id", help="Existing release id to point current at."
+    ),
     env: str | None = typer.Option(
         None,
         "--env",
@@ -583,8 +597,7 @@ def guru_select_lenses(
     bridge = payload["company_bridge"]
     if bridge.get("filing_evidence_requirements"):
         typer.echo(
-            "filing_evidence_requirements: "
-            + ", ".join(bridge["filing_evidence_requirements"])
+            "filing_evidence_requirements: " + ", ".join(bridge["filing_evidence_requirements"])
         )
 
 
@@ -736,7 +749,9 @@ def guru_company_pack(
 @guru_app.command("fetch")
 def guru_fetch(
     root: Path | None = typer.Option(None, "--root", help="Mutable guru workspace root."),
-    running_root: Path | None = typer.Option(None, "--running-root", help="Mutable workspace root."),
+    running_root: Path | None = typer.Option(
+        None, "--running-root", help="Mutable workspace root."
+    ),
     limit_per_author: int | None = typer.Option(
         None,
         "--limit-per-author",
@@ -773,7 +788,9 @@ def guru_fetch(
 @guru_app.command("parse")
 def guru_parse(
     root: Path | None = typer.Option(None, "--root", help="Mutable guru workspace root."),
-    running_root: Path | None = typer.Option(None, "--running-root", help="Mutable workspace root."),
+    running_root: Path | None = typer.Option(
+        None, "--running-root", help="Mutable workspace root."
+    ),
     source_ids: str | None = typer.Option(
         None,
         "--source-ids",
@@ -812,7 +829,9 @@ def guru_parse(
 @guru_app.command("extract")
 def guru_extract(
     root: Path | None = typer.Option(None, "--root", help="Mutable guru workspace root."),
-    running_root: Path | None = typer.Option(None, "--running-root", help="Mutable workspace root."),
+    running_root: Path | None = typer.Option(
+        None, "--running-root", help="Mutable workspace root."
+    ),
     execute_agent_sdk: bool = typer.Option(
         False,
         "--execute-agent-sdk",
@@ -851,13 +870,17 @@ def guru_extract(
     typer.echo(f"agent_sdk_called: {str(manifest.agent_sdk_called).lower()}")
     typer.echo(f"concurrency: {manifest.concurrency}")
     typer.echo(f"batches: {len(manifest.batches)}")
-    typer.echo(f"extraction_manifest: {guru_running_root(running_root) / 'generated' / 'extraction_manifest.json'}")
+    typer.echo(
+        f"extraction_manifest: {guru_running_root(running_root) / 'generated' / 'extraction_manifest.json'}"
+    )
 
 
 @guru_app.command("curate")
 def guru_curate(
     root: Path | None = typer.Option(None, "--root", help="Long-lived guru release root."),
-    running_root: Path | None = typer.Option(None, "--running-root", help="Mutable workspace root."),
+    running_root: Path | None = typer.Option(
+        None, "--running-root", help="Mutable workspace root."
+    ),
     candidates_path: Path | None = typer.Option(
         None,
         "--candidates-path",
@@ -912,6 +935,21 @@ def guru_eval_quality(
         min=1,
         help="Optional cap for eval cases.",
     ),
+    budget_path: Path | None = typer.Option(
+        None,
+        "--budget-path",
+        help="Optional quality/latency budget JSON. Failed checks exit with status 2.",
+    ),
+    baseline_path: Path | None = typer.Option(
+        None,
+        "--baseline-path",
+        help="Previously accepted Guru quality report for regression comparison.",
+    ),
+    accept_baseline_path: Path | None = typer.Option(
+        None,
+        "--accept-baseline-path",
+        help="Explicitly save this passing run as the accepted baseline.",
+    ),
     json_output: bool = typer.Option(False, "--json", help="Print machine-readable JSON."),
 ) -> None:
     """Evaluate guru ResearchPack retrieval quality against a gold question set."""
@@ -920,17 +958,22 @@ def guru_eval_quality(
         eval_path=eval_path,
         output_path=output_path,
         limit=limit,
+        budget_path=budget_path,
+        baseline_path=baseline_path,
+        accept_baseline_path=accept_baseline_path,
     )
     if json_output:
         typer.echo(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
-        return
-    typer.echo("Guru quality eval complete")
-    typer.echo(f"cases: {report['cases']}")
-    typer.echo(f"passed: {report['passed']}")
-    typer.echo(f"failed: {report['failed']}")
-    typer.echo(f"mean_score: {report['mean_score']}")
-    typer.echo(f"quality_grade: {report['quality_grade']}")
-    typer.echo(f"report: {report['output_path']}")
+    else:
+        typer.echo("Guru quality eval complete")
+        typer.echo(f"cases: {report['cases']}")
+        typer.echo(f"passed: {report['passed']}")
+        typer.echo(f"failed: {report['failed']}")
+        typer.echo(f"mean_score: {report['mean_score']}")
+        typer.echo(f"quality_grade: {report['quality_grade']}")
+        typer.echo(f"report: {report['output_path']}")
+    if budget_path is not None and not bool(report.get("gate", {}).get("passed")):
+        raise typer.Exit(code=2)
 
 
 @guru_app.command("eval-answer")
@@ -1037,7 +1080,9 @@ def guru_eval_answer_batch(
 @guru_app.command("statu", hidden=True)
 def guru_statu_alias(
     root: Path | None = typer.Option(None, "--root", help="Long-lived guru data root."),
-    running_root: Path | None = typer.Option(None, "--running-root", help="Mutable workspace root."),
+    running_root: Path | None = typer.Option(
+        None, "--running-root", help="Mutable workspace root."
+    ),
 ) -> None:
     """Hidden compatibility alias for a common status typo."""
     guru_status(root=root, running_root=running_root)

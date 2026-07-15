@@ -112,3 +112,36 @@ def test_krw_ontology_router_skill_is_thin_and_market_move_aware() -> None:
     assert "not default company research" in router_text
     assert "KRW Ontology Router" in router_agent_text
     assert "return anything except JSON with run_kind" in router_agent_text
+
+
+def test_research_skills_preserve_ticker_scoped_occurrence_contract() -> None:
+    skill_names = (
+        "krw-ontology-research",
+        "krw-ontology-research-en",
+        "krw-ontology-news-research",
+    )
+
+    for skill_name in skill_names:
+        references = Path("plugins/krw-ontology/skills") / skill_name / "references"
+        query_contract = (references / "query-context-contract.md").read_text()
+        trace_contract = (references / "trace-chain-policy.md").read_text()
+        tool_policy = (references / "tool-policy.md").read_text()
+        normalized_query_contract = " ".join(query_contract.split())
+
+        assert '"code": "search_plan_validation_failed"' in query_contract
+        assert '"violations": [' in query_contract
+        assert "make a literal ledger for each clause" in query_contract
+        assert "Repair **every** listed violation" in query_contract
+        assert "(ticker, object_id)" in query_contract
+        assert "Do not manually fan out" in normalized_query_contract
+        assert "preserve all three fields" in query_contract
+        assert "Treat every evidence root as `(ticker, object_id)`" in trace_contract
+        assert "response_budget.truncated" in trace_contract
+        assert "ambiguous_object_id" in trace_contract
+        assert "Never guess a ticker" in tool_policy
+
+    guru_policy = Path(
+        "plugins/krw-guru-advisor/references/mcp-tool-policy.md"
+    ).read_text()
+    assert "Treat every selected root as `(ticker, object_id)`" in guru_policy
+    assert "Inspect chain `response_budget`" in guru_policy

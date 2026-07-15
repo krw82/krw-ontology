@@ -81,6 +81,7 @@ Do not call broad retrieve after a sufficient query_context.
 Do not loop over similar query_context/query/retrieve/trace/chain calls.
 Do not use response_detail="full" in normal web chat.
 If a tool result overflows, treat it as a too-broad signal and split the research path; do not stop, apologize, or expose overflow.
+Keep facts, calculations, inferences, and scenarios distinct. An inference is welcome when it names the evidence-backed premise, material assumption, and disconfirming signal; it must not become a fact by confident wording.
 Always end a normal answer with exactly 3 related English follow-up questions.
 ```
 
@@ -1100,6 +1101,7 @@ references/ontology-schema-reference.md
 references/ontology-layer-map.md
 references/query-context-contract.md
 references/bounded-autonomy-and-stop-rules.md
+references/grounded-investment-inference.md
 references/period-and-latest-policy.md
 references/financial-statement-interpretation.md
 references/investment-decision-questions.md

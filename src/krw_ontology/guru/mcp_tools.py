@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from collections import Counter
 from enum import Enum
+from functools import lru_cache
 import hashlib
 import json
 import os
 import re
+import sqlite3
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -15,6 +17,7 @@ from krw_ontology.guru.company_bridge import (
     build_guru_company_evidence_review,
     build_guru_company_research_pack,
     company_filing_brief_from_guru_lens,
+    validate_guru_agent_evidence_analysis,
 )
 from krw_ontology.guru.company_context import (
     coerce_company_context,
@@ -30,10 +33,15 @@ from krw_ontology.guru.context_taxonomy import (
     sector_context_tags,
 )
 from krw_ontology.guru.index import (
+    guru_ranking_text,
     guru_index_status,
+    load_guru_index_objects_by_id,
+    load_guru_index_relationships_by_id,
     load_guru_index_bundle,
+    scan_guru_index_compact_rows,
 )
 from krw_ontology.guru.models import (
+    GURU_RESEARCH_PACK_FORMAT,
     GuruAnswerability,
     GuruResearchIntent,
     GuruResearchPack,
@@ -63,6 +71,7 @@ OBJECT_FAMILY_BY_FILE = {
     "data_needs": "data_need",
     "corpus_metadata": "corpus_metadata",
 }
+FAMILY_BY_OBJECT_FAMILY = {value: key for key, value in OBJECT_FAMILY_BY_FILE.items()}
 AUTHOR_DISPLAY_NAMES = {
     "buffett": "Warren Buffett",
     "marks": "Howard Marks",
@@ -75,7 +84,84 @@ DEFAULT_GURU_SEARCH_FAMILIES = (
     "consultation_objects",
     "data_needs",
 )
+GURU_FTS_SHADOW_MIN = 64
+GURU_FTS_SHADOW_MAX = 512
+GURU_FTS_SHADOW_MULTIPLIER = 16
+DATA_NEED_THEME_PENALTY_CAP = 6
+UNSPECIFIED_GENERAL_DOMAIN_PENALTY_CAP = 4
 _WORD_RE = re.compile(r"[0-9A-Za-z가-힣_]+")
+_KOREAN_TOKEN_RE = re.compile(r"^[가-힣]+$")
+_LOW_INFORMATION_QUERY_TOKENS = {
+    "것",
+    "거",
+    "관점",
+    "관점에서",
+    "그",
+    "때",
+    "뭐",
+    "무엇",
+    "부분",
+    "수",
+    "어떤",
+    "어느",
+    "어떻게",
+    "왜",
+    "없이",
+    "있다",
+    "있어",
+    "있을",
+    "회사명",
+}
+_KOREAN_PARTICLE_SUFFIXES = (
+    "에게서",
+    "으로부터",
+    "에서부터",
+    "이라면",
+    "라면",
+    "으로",
+    "에서",
+    "에게",
+    "부터",
+    "까지",
+    "처럼",
+    "보다",
+    "하고",
+    "이나",
+    "나마",
+    "든지",
+    "라도",
+    "이며",
+    "로",
+    "을",
+    "를",
+    "이",
+    "가",
+    "은",
+    "는",
+    "의",
+    "에",
+    "와",
+    "과",
+    "도",
+    "만",
+)
+_KOREAN_PREDICATE_SUFFIXES = (
+    "하다면",
+    "하면서",
+    "하는데",
+    "했는데",
+    "한데",
+    "해서",
+    "하며",
+    "하면",
+    "하게",
+    "하고",
+    "하는",
+    "했다",
+    "하다",
+    "한",
+    "해",
+)
 NON_TICKER_ACRONYMS = {
     "ARR",
     "CAC",
@@ -321,7 +407,24 @@ def guru_search_tool(
 ) -> str:
     """Search reviewed guru lens and consultation objects."""
     root_path = _resolve_root(root)
-    bundle = _load_reviewed_bundle(root_path, author_keys=author_keys)
+    page_limit = _limit(limit, maximum=50)
+    page_offset = max(0, offset)
+    required_candidates = page_offset + page_limit
+    family_limits = {
+        family: _fts_shadow_limit(min(required_candidates, page_limit))
+        for family in DEFAULT_GURU_SEARCH_FAMILIES
+    }
+    bundle = _load_reviewed_bundle(
+        root_path,
+        author_keys=author_keys,
+        query=query,
+        family_limits=family_limits,
+        object_types=object_types,
+        intent_family=_clean_optional(intent_family),
+        decision_stage=_clean_optional(decision_stage),
+        requires_company_data=requires_company_data,
+        projection_profile="search",
+    )
     rows = _filter_rows(
         _iter_searchable_rows(bundle, DEFAULT_GURU_SEARCH_FAMILIES),
         author_keys=author_keys,
@@ -331,9 +434,7 @@ def guru_search_tool(
         requires_company_data=requires_company_data,
     )
     scored = [
-        (score, row)
-        for row in rows
-        if (score := _score_row(query, row)) > 0 or not query.strip()
+        (score, row) for row in rows if (score := _score_row(query, row)) > 0 or not query.strip()
     ]
     scored.sort(
         key=lambda item: (
@@ -343,7 +444,17 @@ def guru_search_tool(
         )
     )
     total = len(scored)
-    page = scored[max(0, offset) : max(0, offset) + _limit(limit, maximum=50)]
+    page = scored[page_offset : page_offset + page_limit]
+    _hydrate_candidate_payloads(
+        root_path,
+        bundle,
+        [row for _score, row in page],
+    )
+    _hydrate_candidate_relationships(
+        root_path,
+        bundle,
+        [row for _score, row in page],
+    )
     result_rows = [
         _compact_result(
             row,
@@ -359,9 +470,9 @@ def guru_search_tool(
         "runtime": _bundle_runtime(bundle),
         "total": total,
         "count": len(result_rows),
-        "offset": max(0, offset),
-        "limit": _limit(limit, maximum=50),
-        "has_more": total > max(0, offset) + len(result_rows),
+        "offset": page_offset,
+        "limit": page_limit,
+        "has_more": total > page_offset + len(result_rows),
         "filters": {
             "author_keys": _clean_list(author_keys),
             "object_types": _clean_list(object_types),
@@ -425,6 +536,9 @@ def guru_company_brief_tool(
     company_name: str | None = None,
     company_context: dict[str, Any] | None = None,
     company_context_json: Any = None,
+    guru_query_context: dict[str, Any] | None = None,
+    guru_query_context_json: Any = None,
+    investigation_questions: Sequence[Mapping[str, Any]] | None = None,
     intent_family: str | None = None,
     limit_lens: int = 4,
     limit_consultation: int = 3,
@@ -432,20 +546,33 @@ def guru_company_brief_tool(
     response_format: GuruResponseFormat = GuruResponseFormat.JSON,
 ) -> str:
     """Build a company filing brief from selected guru ontology lenses."""
-    query_payload = json.loads(
-        guru_query_context_tool(
-            question=question,
-            root=root,
+    raw_query_context = (
+        guru_query_context
+        if guru_query_context is not None
+        else guru_query_context_json
+    )
+    query_payload = (
+        _validated_supplied_guru_query_context(
+            _json_arg(raw_query_context, field_name="guru_query_context"),
             author_keys=author_keys,
             ticker=ticker,
-            company_context_json=(
-                company_context if company_context is not None else company_context_json
-            ),
-            intent_family=intent_family,
-            limit_lens=limit_lens,
-            limit_consultation=limit_consultation,
-            limit_data_needs=limit_data_needs,
-            response_format=GuruResponseFormat.JSON,
+        )
+        if raw_query_context is not None
+        else json.loads(
+            guru_query_context_tool(
+                question=question,
+                root=root,
+                author_keys=author_keys,
+                ticker=ticker,
+                company_context_json=(
+                    company_context if company_context is not None else company_context_json
+                ),
+                intent_family=intent_family,
+                limit_lens=limit_lens,
+                limit_consultation=limit_consultation,
+                limit_data_needs=limit_data_needs,
+                response_format=GuruResponseFormat.JSON,
+            )
         )
     )
     brief = company_filing_brief_from_guru_lens(
@@ -458,6 +585,7 @@ def guru_company_brief_tool(
         ),
         author_key=(author_keys[0] if author_keys else None),
         question=question,
+        investigation_questions=investigation_questions,
     )
     brief_payload = brief.model_dump(mode="json", exclude_none=True)
     payload = {
@@ -468,6 +596,11 @@ def guru_company_brief_tool(
         "selected_author_keys": query_payload.get("selected_author_keys"),
         "requires_company_evidence": brief.requires_company_evidence,
         "company_filing_brief": brief_payload,
+        "investigation_brief": (
+            brief.investigation_brief.model_dump(mode="json", exclude_none=True)
+            if brief.investigation_brief is not None
+            else None
+        ),
         "next_step": _company_brief_next_step(brief_payload),
         "do_not_call": [
             "Do not call broad guru search after this brief unless query_context returned ontology_gap.",
@@ -477,6 +610,57 @@ def guru_company_brief_tool(
     if response_format == GuruResponseFormat.MARKDOWN:
         return _company_brief_markdown(payload)
     return _json(payload)
+
+
+def _validated_supplied_guru_query_context(
+    payload: Mapping[str, Any],
+    *,
+    author_keys: Sequence[str] | None,
+    ticker: str | None,
+) -> dict[str, Any]:
+    """Accept the runner-bound research result that selected the draft rules.
+
+    Re-querying here can produce a different ranked set of lens IDs between the
+    main Guru's draft and the server's sealing check.  The feature-enabled path
+    therefore binds sealing to the original query-context response (or its
+    immutable research-pack projection).
+    """
+    supplied = dict(payload)
+    research_pack = supplied.get("research_pack")
+    context = supplied
+    if not isinstance(research_pack, Mapping) and supplied.get("format") == GURU_RESEARCH_PACK_FORMAT:
+        research_pack = supplied
+        context = {"research_pack": supplied}
+    if not isinstance(research_pack, Mapping):
+        raise ValueError(
+            "guru_query_context must be the exact krw_guru_query_context result "
+            "containing research_pack"
+        )
+    if research_pack.get("format") != GURU_RESEARCH_PACK_FORMAT:
+        raise ValueError("guru_query_context has an invalid Guru ResearchPack format")
+    pack_meta = research_pack.get("pack_meta")
+    if not isinstance(pack_meta, Mapping):
+        raise ValueError("guru_query_context research_pack is missing pack_meta")
+    pack_authors = _clean_list(pack_meta.get("guru_keys"))
+    requested_authors = _clean_list(author_keys)
+    if requested_authors and pack_authors != requested_authors:
+        raise ValueError(
+            "guru_query_context selected authors do not match author_keys for company brief"
+        )
+    requested_ticker = _clean_optional(ticker)
+    pack_intent = research_pack.get("intent")
+    pack_ticker = (
+        _clean_optional(pack_intent.get("ticker"))
+        if isinstance(pack_intent, Mapping)
+        else None
+    )
+    if requested_ticker and pack_ticker and requested_ticker.upper() != pack_ticker.upper():
+        raise ValueError(
+            "guru_query_context ticker does not match the requested company brief ticker"
+        )
+    if not isinstance(research_pack.get("selected_lenses"), Sequence):
+        raise ValueError("guru_query_context research_pack is missing selected_lenses")
+    return context
 
 
 def guru_company_pack_tool(
@@ -548,25 +732,70 @@ def guru_review_company_evidence_tool(
     company_name: str | None = None,
     company_payload: dict[str, Any] | None = None,
     company_payload_json: Any = None,
+    company_research_context: dict[str, Any] | None = None,
+    company_research_context_json: Any = None,
+    investigation_brief: dict[str, Any] | None = None,
+    investigation_brief_json: Any = None,
+    agent_analysis: dict[str, Any] | None = None,
+    agent_analysis_json: Any = None,
     company_context: dict[str, Any] | None = None,
     company_context_json: Any = None,
     intent_family: str | None = None,
     response_format: GuruResponseFormat = GuruResponseFormat.JSON,
 ) -> str:
-    """Review company evidence through selected guru lenses for final prose."""
-    query_payload = json.loads(
-        guru_query_context_tool(
-            question=question,
-            root=root,
-            author_keys=author_keys,
-            ticker=ticker,
-            company_context_json=(
-                company_context if company_context is not None else company_context_json
-            ),
-            intent_family=intent_family,
-            response_format=GuruResponseFormat.JSON,
-        )
+    """Validate Guru analysis or run the legacy evidence-review path."""
+    raw_investigation_brief = (
+        investigation_brief
+        if investigation_brief is not None
+        else investigation_brief_json
     )
+    raw_agent_analysis = (
+        agent_analysis if agent_analysis is not None else agent_analysis_json
+    )
+    investigation_brief_data = (
+        _json_arg(raw_investigation_brief, field_name="investigation_brief")
+        if raw_investigation_brief is not None
+        else None
+    )
+    agent_analysis_data = (
+        _json_arg(raw_agent_analysis, field_name="agent_analysis")
+        if raw_agent_analysis is not None
+        else None
+    )
+    if investigation_brief_data is not None or agent_analysis_data is not None:
+        if investigation_brief_data is None or agent_analysis_data is None:
+            raise ValueError(
+                "investigation_brief and agent_analysis must be supplied together"
+            )
+        research_context_data = _json_arg(
+            company_research_context
+            if company_research_context is not None
+            else company_research_context_json,
+            field_name="company_research_context",
+        )
+        if not research_context_data:
+            raise ValueError(
+                "company_research_context must be the runtime-built "
+                "krw-guru-company-research-context/v1 payload"
+            )
+        validated = validate_guru_agent_evidence_analysis(
+            investigation_brief=investigation_brief_data,
+            company_research_context=research_context_data,
+            agent_analysis=agent_analysis_data,
+        )
+        payload = {
+            "validated_evidence_analysis": validated.model_dump(
+                mode="json", exclude_none=True
+            ),
+            "usage": {
+                "purpose": "validate_main_guru_analysis_only",
+                "final_answer": "The main Guru writes the final consultation from its validated analysis.",
+            },
+        }
+        if response_format == GuruResponseFormat.MARKDOWN:
+            return _json(payload)
+        return _json(payload)
+
     company_payload_data = _json_arg(
         company_payload if company_payload is not None else company_payload_json,
         field_name="company_payload",
@@ -581,6 +810,19 @@ def guru_review_company_evidence_tool(
     payload_ticker = str(company_payload_data.get("ticker") or "").strip().upper()
     if normalized_ticker and payload_ticker != normalized_ticker:
         raise ValueError("company_payload ticker does not match the requested ticker")
+    query_payload = json.loads(
+        guru_query_context_tool(
+            question=question,
+            root=root,
+            author_keys=author_keys,
+            ticker=ticker,
+            company_context_json=(
+                company_context if company_context is not None else company_context_json
+            ),
+            intent_family=intent_family,
+            response_format=GuruResponseFormat.JSON,
+        )
+    )
     review = build_guru_company_evidence_review(
         query_payload,
         company_evidence_payload=company_payload_data,
@@ -629,8 +871,20 @@ def guru_context_tool(
     selected_authors = requested_authors or _infer_author_keys(question)
     if not selected_authors:
         selected_authors = _default_authors_for_question(question)
-    bundle = _load_reviewed_bundle(root_path, author_keys=selected_authors)
     inferred_intent = _clean_optional(intent_family) or _infer_intent_family(question)
+    lens_limit = _limit(limit_lens, maximum=20)
+    consultation_limit = _limit(limit_consultation, maximum=20)
+    data_need_limit = _limit(limit_data_needs, maximum=30)
+    bundle = _load_reviewed_bundle(
+        root_path,
+        author_keys=selected_authors,
+        query=question,
+        family_limits={
+            "guru_objects": _fts_shadow_limit(lens_limit),
+            "consultation_objects": _fts_shadow_limit(consultation_limit),
+            "data_needs": _fts_shadow_limit(data_need_limit),
+        },
+    )
 
     lens_rows = _rank_and_take(
         query=question,
@@ -639,9 +893,9 @@ def guru_context_tool(
             author_keys=selected_authors,
             intent_family=inferred_intent,
         ),
-        limit=_limit(limit_lens, maximum=20),
+        limit=lens_limit,
     )
-    if len(lens_rows) < _limit(limit_lens, maximum=20):
+    if len(lens_rows) < lens_limit:
         extra_lens = _rank_and_take(
             query=question,
             rows=[
@@ -649,7 +903,7 @@ def guru_context_tool(
                 for row in _filter_rows(bundle["guru_objects"], author_keys=selected_authors)
                 if row not in lens_rows
             ],
-            limit=_limit(limit_lens, maximum=20) - len(lens_rows),
+            limit=lens_limit - len(lens_rows),
         )
         lens_rows.extend(extra_lens)
 
@@ -660,13 +914,13 @@ def guru_context_tool(
             author_keys=selected_authors,
             intent_family=inferred_intent,
         ),
-        limit=_limit(limit_consultation, maximum=20),
+        limit=consultation_limit,
     )
     if not consultation_rows:
         consultation_rows = _rank_and_take(
             query=question,
             rows=_filter_rows(bundle["consultation_objects"], author_keys=selected_authors),
-            limit=_limit(limit_consultation, maximum=20),
+            limit=consultation_limit,
         )
 
     unresolved_asset_wrapper = _question_has_unresolved_asset_wrapper_ambiguity(question, ticker)
@@ -687,7 +941,7 @@ def guru_context_tool(
     data_needs = _rank_and_take(
         query=question,
         rows=_filter_rows(bundle["data_needs"], author_keys=selected_authors),
-        limit=_limit(limit_data_needs, maximum=30),
+        limit=data_need_limit,
     )
     if needs_company_data:
         company_data_needs = [
@@ -696,17 +950,21 @@ def guru_context_tool(
             if row.get("requires_company_data") or row.get("company_data_hooks")
         ]
         other_data_needs = [row for row in data_needs if row not in company_data_needs]
-        data_needs = (company_data_needs + other_data_needs)[: _limit(limit_data_needs, maximum=30)]
+        data_needs = (company_data_needs + other_data_needs)[:data_need_limit]
 
+    selected_rows = [*lens_rows, *consultation_rows, *data_needs]
+    _hydrate_candidate_payloads(root_path, bundle, selected_rows)
+    _hydrate_candidate_relationships(root_path, bundle, selected_rows)
     context_quality = _context_quality(
         question=question,
-        selected_rows=[*lens_rows, *consultation_rows, *data_needs],
+        selected_rows=selected_rows,
     )
     payload = {
         "context_pack_version": "krw-guru-context/v2",
         "question": question,
         "ticker": _clean_optional(ticker),
         "root": str(root_path),
+        "runtime": _bundle_runtime(bundle),
         "selected_author_keys": selected_authors,
         "selected_authors": [
             {"author_key": key, "display_name": AUTHOR_DISPLAY_NAMES.get(key, key)}
@@ -819,9 +1077,12 @@ def guru_evidence_tool(
 ) -> str:
     """Return one reviewed guru object with relationships and source support metadata."""
     root_path = _resolve_root(root)
-    bundle = _load_reviewed_bundle(
+    bundle = _load_point_reviewed_bundle(
         root_path,
-        author_keys=_author_keys_from_reviewed_id(reviewed_id),
+        reviewed_id=reviewed_id,
+        include_related=include_related,
+        include_neighbor_relationships=False,
+        related_limit=None,
     )
     object_row = bundle["objects_by_id"].get(reviewed_id)
     if object_row is None:
@@ -869,7 +1130,9 @@ def guru_evidence_tool(
         "rights_policy": {
             "default": "official_link_only_no_fulltext",
             "private_excerpt_included": include_private_excerpt,
-            "max_excerpt_words": max(1, min(max_excerpt_words, 25)) if include_private_excerpt else 0,
+            "max_excerpt_words": max(1, min(max_excerpt_words, 25))
+            if include_private_excerpt
+            else 0,
         },
     }
     if response_format == GuruResponseFormat.MARKDOWN:
@@ -909,9 +1172,12 @@ def guru_chain_tool(
 ) -> str:
     """Return bounded ontology neighbors around one selected guru object."""
     root_path = _resolve_root(root)
-    bundle = _load_reviewed_bundle(
+    bundle = _load_point_reviewed_bundle(
         root_path,
-        author_keys=_author_keys_from_reviewed_id(reviewed_id),
+        reviewed_id=reviewed_id,
+        include_related=True,
+        include_neighbor_relationships=True,
+        related_limit=_limit(max_neighbors, maximum=20),
     )
     object_row = bundle["objects_by_id"].get(reviewed_id)
     if object_row is None:
@@ -995,8 +1261,14 @@ def guru_data_needs_tool(
     """Return guru-derived data needs for bridging a consultation to filing research."""
     root_path = _resolve_root(root)
     selected_authors = _clean_list(author_keys) or _infer_author_keys(question)
-    bundle = _load_reviewed_bundle(root_path, author_keys=selected_authors or None)
     inferred_intent = _clean_optional(intent_family) or _infer_intent_family(question)
+    result_limit = _limit(limit, maximum=30)
+    bundle = _load_reviewed_bundle(
+        root_path,
+        author_keys=selected_authors or None,
+        query=question,
+        family_limits={"data_needs": _fts_shadow_limit(result_limit)},
+    )
     rows = _filter_rows(
         bundle["data_needs"],
         author_keys=selected_authors or None,
@@ -1004,16 +1276,21 @@ def guru_data_needs_tool(
     )
     if not rows:
         rows = _filter_rows(bundle["data_needs"], author_keys=selected_authors or None)
-    ranked = _rank_and_take(query=question, rows=rows, limit=_limit(limit, maximum=30))
+    ranked = _rank_and_take(query=question, rows=rows, limit=result_limit)
+    _hydrate_candidate_payloads(root_path, bundle, ranked)
+    _hydrate_candidate_relationships(root_path, bundle, ranked)
     payload = {
         "question": question,
         "root": str(root_path),
+        "runtime": _bundle_runtime(bundle),
         "selected_author_keys": selected_authors,
         "intent_family": inferred_intent,
         "requires_company_evidence": _question_mentions_company_need(question),
         "count": len(ranked),
         "data_needs": [
-            _compact_result(row, score=_score_row(question, row), relationships=bundle["relationships_by_id"])
+            _compact_result(
+                row, score=_score_row(question, row), relationships=bundle["relationships_by_id"]
+            )
             for row in ranked
         ],
         "filing_research_bridge": _filing_bridge_payload(
@@ -1085,7 +1362,6 @@ def _build_guru_research_context(
 ) -> dict[str, Any]:
     root_path = _resolve_root(root)
     selected_authors = _selected_author_keys(question, author_keys)
-    bundle = _load_reviewed_bundle(root_path, author_keys=selected_authors)
     inferred_intent = _clean_optional(intent_family) or _infer_intent_family(question)
     company_context_model = coerce_company_context(
         company_context or None,
@@ -1097,6 +1373,16 @@ def _build_guru_research_context(
     consultation_limit = _limit(limit_consultation, maximum=8)
     data_need_limit = _limit(limit_data_needs, maximum=12)
     scoring_query = _scoring_query(question, ticker, company_context_model)
+    bundle = _load_reviewed_bundle(
+        root_path,
+        author_keys=selected_authors,
+        query=scoring_query,
+        family_limits={
+            "guru_objects": _fts_shadow_limit(lens_limit),
+            "consultation_objects": _fts_shadow_limit(consultation_limit),
+            "data_needs": _fts_shadow_limit(data_need_limit),
+        },
+    )
 
     lens_rows = _rank_context_rows(
         query=scoring_query,
@@ -1114,7 +1400,6 @@ def _build_guru_research_context(
         row_family="consultation_object",
         limit=consultation_limit,
     )
-
     unresolved_asset_wrapper = _question_has_unresolved_asset_wrapper_ambiguity(question, ticker)
     explicit_no_company = (
         _question_denies_company_subject(question) or _question_is_generic_lens_framework(question)
@@ -1143,6 +1428,8 @@ def _build_guru_research_context(
         data_needs = _prioritize_company_data_needs(data_needs, data_need_limit)
 
     selected_rows = [*lens_rows, *consultation_rows, *data_needs]
+    _hydrate_candidate_payloads(root_path, bundle, selected_rows)
+    _hydrate_candidate_relationships(root_path, bundle, selected_rows)
     context_quality = _context_quality(
         question=question,
         selected_rows=selected_rows,
@@ -1242,6 +1529,11 @@ def _build_guru_research_context(
             ticker=_clean_optional(ticker),
         ),
         persona_profile=_persona_profile_from_rows(selected_authors, selected_rows),
+        philosophy_context=_philosophy_context_from_lenses(
+            selected_authors=selected_authors,
+            lens_rows=lens_rows,
+            compact_lenses=selected_lenses,
+        ),
         selected_lenses=selected_lenses,
         consultation_moves=consultation_moves,
         data_needs=compact_data_needs,
@@ -1537,13 +1829,11 @@ def _clarifying_questions_for_question(
     questions: list[str] = []
     if _question_has_unresolved_asset_wrapper_ambiguity(question, ticker):
         questions.append("원자재 자체, ETF/선물, 생산 기업, 로열티/인프라 중 무엇에 투자한 건가요?")
-    if (
-        needs_company_data
-        and not _clean_optional(ticker)
-        and not _has_ticker_like_token(question)
-    ):
+    if needs_company_data and not _clean_optional(ticker) and not _has_ticker_like_token(question):
         if _question_has_named_company_phrase(question):
-            questions.append("공시 조회를 위해 정확한 티커와 거래소, 보통주/우선주 구분을 확인해 주세요.")
+            questions.append(
+                "공시 조회를 위해 정확한 티커와 거래소, 보통주/우선주 구분을 확인해 주세요."
+            )
         else:
             questions.append("판단할 회사명이나 티커가 있나요?")
     if any(token in normalized for token in ("비중", "몰려", "포트폴리오", "평균단가", "손실")):
@@ -1617,6 +1907,68 @@ def _persona_profile_from_rows(
         "policy": (
             "Persona is derived from selected ontology objects. Skills must not add hard-coded "
             "guru principles outside this pack."
+        ),
+    }
+
+
+def _philosophy_context_from_lenses(
+    *,
+    selected_authors: Sequence[str],
+    lens_rows: Sequence[Mapping[str, Any]],
+    compact_lenses: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Expose source-grounded decision rules for a distinct virtual advisor.
+
+    The main Guru agent consumes this compact context to formulate its own
+    company-specific questions.  Every principle remains traceable to a
+    selected reviewed object. It may shape a selected-author-inspired virtual
+    advisor's reasoning and prose, but this function does not synthesize a
+    personality, a conclusion, or an ungrounded causal claim.
+    """
+    compact_by_id = {
+        str(item.get("reviewed_id")): item
+        for item in compact_lenses
+        if str(item.get("reviewed_id") or "").strip()
+    }
+    principles: list[dict[str, Any]] = []
+    for row in lens_rows:
+        reviewed_id = str(row.get("reviewed_id") or "").strip()
+        compact = compact_by_id.get(reviewed_id)
+        if not reviewed_id or compact is None:
+            continue
+        applicability = _public_soft_metadata(row.get("applicability"))
+        source_anchors = _list_value(row.get("supporting_span_ids"))
+        principle = {
+            "principle_id": reviewed_id,
+            "author_key": row.get("author_key"),
+            "label": row.get("label_ko") or row.get("label_en"),
+            "statement": row.get("summary_ko") or row.get("label_ko") or row.get("label_en"),
+            "decision_role": _resolved_answer_role(row).get("default"),
+            "evidence_to_seek": _list_value(compact.get("company_data_hooks")),
+            "applies_when": _list_value(applicability.get("strong_for")),
+            "weakened_when": _list_value(applicability.get("weak_for")),
+            "rejection_conditions": _list_value(applicability.get("anti_triggers")),
+            "clarify_when": _list_value(
+                applicability.get("requires_clarification_when")
+            ),
+            "source_anchor_ids": [str(item) for item in source_anchors],
+        }
+        principles.append(
+            {
+                key: value
+                for key, value in principle.items()
+                if value not in (None, [], "")
+            }
+        )
+    return {
+        "format": "krw-guru-philosophy-context/v1",
+        "selected_author_keys": list(selected_authors),
+        "principles": principles,
+        "boundary": (
+            "Use only these source-grounded decision rules to select questions and "
+            "shape a distinct selected-author-inspired virtual advisor. Do not claim "
+            "to be or speak as the real person, invent a rule, or infer a company "
+            "conclusion before verified filing evidence is returned."
         ),
     }
 
@@ -1776,18 +2128,153 @@ def _resolve_root(root: str | Path | None) -> Path:
     return guru_root(None)
 
 
+def _load_point_reviewed_bundle(
+    root_path: Path,
+    *,
+    reviewed_id: str,
+    include_related: bool,
+    include_neighbor_relationships: bool,
+    related_limit: int | None,
+) -> dict[str, Any]:
+    """Point-load one object and its bounded adjacency from an admitted shard index."""
+    author_keys = _author_keys_from_reviewed_id(reviewed_id)
+    objects = load_guru_index_objects_by_id(
+        root_path,
+        reviewed_ids=[reviewed_id],
+        author_keys=author_keys,
+    )
+    if objects is None:
+        return _load_reviewed_bundle(root_path, author_keys=author_keys)
+
+    relationships_by_id: dict[str, list[dict[str, Any]]] = {reviewed_id: []}
+    related_ids: list[str] = []
+    if include_related and reviewed_id in objects:
+        selected_relationships = load_guru_index_relationships_by_id(
+            root_path,
+            reviewed_ids=[reviewed_id],
+            author_keys=author_keys,
+        )
+        if selected_relationships is None:
+            return _load_reviewed_bundle(root_path, author_keys=author_keys)
+        relationships_by_id.update(selected_relationships)
+        for relationship in selected_relationships.get(reviewed_id, []):
+            other_id = (
+                relationship.get("to_id")
+                if relationship.get("from_id") == reviewed_id
+                else relationship.get("from_id")
+            )
+            if other_id:
+                related_ids.append(str(other_id))
+
+    related_ids = _clean_list(related_ids)
+    if related_limit is not None:
+        related_ids = related_ids[: max(0, int(related_limit))]
+    if related_ids:
+        related_objects = load_guru_index_objects_by_id(
+            root_path,
+            reviewed_ids=related_ids,
+            author_keys=author_keys,
+        )
+        if related_objects is None:
+            return _load_reviewed_bundle(root_path, author_keys=author_keys)
+        objects.update(related_objects)
+        if include_neighbor_relationships:
+            neighbor_relationships = load_guru_index_relationships_by_id(
+                root_path,
+                reviewed_ids=related_ids,
+                author_keys=author_keys,
+            )
+            if neighbor_relationships is None:
+                return _load_reviewed_bundle(root_path, author_keys=author_keys)
+            relationships_by_id.update(neighbor_relationships)
+
+    searchable: list[dict[str, Any]] = []
+    files: dict[str, list[dict[str, Any]]] = {family: [] for family in REVIEWED_FILES}
+    objects_by_id: dict[str, dict[str, Any]] = {}
+    for object_id, source_row in objects.items():
+        row = dict(source_row)
+        object_family = _row_family(row)
+        indexed_row = dict(row)
+        if object_family:
+            indexed_row["object_family"] = object_family
+            family = FAMILY_BY_OBJECT_FAMILY.get(object_family)
+            if family:
+                files[family].append(row)
+        searchable.append(indexed_row)
+        objects_by_id[object_id] = indexed_row
+
+    return {
+        **files,
+        "objects_by_id": objects_by_id,
+        "relationships_by_id": relationships_by_id,
+        "_index": {
+            "enabled": True,
+            "runtime_mode": "author_shard_point_lookup",
+            "author_keys": author_keys or [],
+            "payload_scope": "selected_and_neighbor_payloads",
+            "payload_object_count": len(searchable),
+            "relationships_scope": "selected_and_neighbor_relationships",
+            "relationship_object_count": len(relationships_by_id),
+        },
+    }
+
+
 def _load_reviewed_bundle(
     root_path: Path,
     *,
     author_keys: Sequence[str] | None = None,
+    query: str | None = None,
+    family_limits: Mapping[str, int] | None = None,
+    object_types: Sequence[str] | None = None,
+    intent_family: str | None = None,
+    decision_stage: str | None = None,
+    requires_company_data: bool | None = None,
+    projection_profile: str = "context",
 ) -> dict[str, Any]:
-    indexed = load_guru_index_bundle(root_path, author_keys=author_keys)
+    if family_limits is not None:
+        candidate_bundle = _load_index_candidate_bundle(
+            root_path,
+            query=str(query or ""),
+            author_keys=author_keys,
+            family_limits=family_limits,
+            object_types=object_types,
+            intent_family=intent_family,
+            decision_stage=decision_stage,
+            requires_company_data=requires_company_data,
+            projection_profile=projection_profile,
+        )
+        if candidate_bundle is not None:
+            return candidate_bundle
+        fallback_bundle = _load_reviewed_jsonl_bundle(root_path, author_keys=author_keys)
+        fallback_bundle["_index"].update(
+            {
+                "candidate_generation": {
+                    "mode": "reviewed_jsonl_fallback",
+                    "candidate_exhaustive": True,
+                    "fallback_reasons": ["candidate_index_unavailable"],
+                },
+                "payload_scope": "full_reviewed_jsonl_fallback",
+                "relationships_scope": "full_reviewed_jsonl_fallback",
+            }
+        )
+        return fallback_bundle
+    try:
+        indexed = load_guru_index_bundle(root_path, author_keys=author_keys)
+    except (json.JSONDecodeError, OSError, sqlite3.DatabaseError, TypeError, ValueError):
+        indexed = None
     if indexed is not None:
         return indexed
+    return _load_reviewed_jsonl_bundle(root_path, author_keys=author_keys)
+
+
+def _load_reviewed_jsonl_bundle(
+    root_path: Path,
+    *,
+    author_keys: Sequence[str] | None,
+) -> dict[str, Any]:
     reviewed_dir = root_path / "reviewed"
     files = {
-        family: _read_jsonl(reviewed_dir / filename)
-        for family, filename in REVIEWED_FILES.items()
+        family: _read_jsonl(reviewed_dir / filename) for family, filename in REVIEWED_FILES.items()
     }
     searchable: list[dict[str, Any]] = []
     for family in ("guru_objects", "consultation_objects", "data_needs", "corpus_metadata"):
@@ -1795,11 +2282,7 @@ def _load_reviewed_bundle(
             row = dict(row)
             row["object_family"] = OBJECT_FAMILY_BY_FILE[family]
             searchable.append(row)
-    objects_by_id = {
-        str(row["reviewed_id"]): row
-        for row in searchable
-        if row.get("reviewed_id")
-    }
+    objects_by_id = {str(row["reviewed_id"]): row for row in searchable if row.get("reviewed_id")}
     relationships_by_id: dict[str, list[dict[str, Any]]] = {}
     for relationship in files["relationships"]:
         if not isinstance(relationship, dict):
@@ -1820,16 +2303,329 @@ def _load_reviewed_bundle(
     }
 
 
+def _load_index_candidate_bundle(
+    root_path: Path,
+    *,
+    query: str,
+    author_keys: Sequence[str] | None,
+    family_limits: Mapping[str, int],
+    object_types: Sequence[str] | None,
+    intent_family: str | None,
+    decision_stage: str | None,
+    requires_company_data: bool | None,
+    projection_profile: str,
+) -> dict[str, Any] | None:
+    files: dict[str, list[dict[str, Any]]] = {family: [] for family in REVIEWED_FILES}
+    objects_by_id: dict[str, dict[str, Any]] = {}
+    family_diagnostics: dict[str, Any] = {}
+    index_payload: Mapping[str, Any] | None = None
+    for family in sorted(family_limits):
+        object_family = OBJECT_FAMILY_BY_FILE.get(family)
+        if not object_family:
+            continue
+        candidate_result = scan_guru_index_compact_rows(
+            root_path,
+            query=query,
+            author_keys=author_keys,
+            object_families=[object_family],
+            object_types=object_types,
+            intent_family=intent_family,
+            decision_stage=decision_stage,
+            requires_company_data=requires_company_data,
+            fts_shadow_limit=max(1, int(family_limits[family])),
+            projection_profile=projection_profile,
+        )
+        if candidate_result is None:
+            return None
+        rows = [dict(row) for row in candidate_result.get("rows") or [] if isinstance(row, Mapping)]
+        files[family].extend(rows)
+        for row in rows:
+            reviewed_id = str(row.get("reviewed_id") or "")
+            if reviewed_id:
+                indexed_row = dict(row)
+                indexed_row["object_family"] = object_family
+                objects_by_id[reviewed_id] = indexed_row
+        current_index = candidate_result.get("_index")
+        if isinstance(current_index, Mapping):
+            index_payload = current_index
+            family_diagnostics[family] = dict(current_index.get("candidate_generation") or {})
+    if index_payload is None:
+        return None
+    combined_diagnostics = _combined_candidate_diagnostics(family_diagnostics)
+    return {
+        **files,
+        "objects_by_id": objects_by_id,
+        "relationships_by_id": {},
+        "_index": {
+            **dict(index_payload),
+            "candidate_generation": combined_diagnostics,
+            "payload_scope": "exact_compact_projection",
+            "relationships_scope": "not_loaded",
+        },
+    }
+
+
+def _fts_shadow_limit(result_limit: int) -> int:
+    return min(
+        max(
+            max(1, int(result_limit)) * GURU_FTS_SHADOW_MULTIPLIER,
+            GURU_FTS_SHADOW_MIN,
+        ),
+        GURU_FTS_SHADOW_MAX,
+    )
+
+
+def _combined_candidate_diagnostics(
+    family_diagnostics: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    diagnostics = list(family_diagnostics.values())
+    return {
+        "mode": "exact_compact_scan",
+        "candidate_count": sum(int(item.get("candidate_count") or 0) for item in diagnostics),
+        "structural_total": sum(int(item.get("structural_total") or 0) for item in diagnostics),
+        "candidate_exhaustive": all(bool(item.get("candidate_exhaustive")) for item in diagnostics),
+        "exact_compact_row_count": sum(
+            int(item.get("exact_compact_row_count") or 0) for item in diagnostics
+        ),
+        "payload_json_row_count": sum(
+            int(item.get("payload_json_row_count") or 0) for item in diagnostics
+        ),
+        "compact_cache_hit_shards": sum(
+            int(item.get("compact_cache_hit_shards") or 0) for item in diagnostics
+        ),
+        "compact_cache_all_hit": bool(diagnostics)
+        and all(bool(item.get("compact_cache_all_hit")) for item in diagnostics),
+        "fts_shadow_count": sum(int(item.get("fts_shadow_count") or 0) for item in diagnostics),
+        "fallback_reasons": sorted(
+            {
+                str(reason)
+                for item in diagnostics
+                for reason in item.get("fallback_reasons") or []
+                if reason
+            }
+        ),
+        "families": {key: dict(value) for key, value in sorted(family_diagnostics.items())},
+    }
+
+
+def _is_candidate_bundle(bundle: Mapping[str, Any]) -> bool:
+    index_payload = bundle.get("_index")
+    return bool(
+        isinstance(index_payload, Mapping)
+        and index_payload.get("enabled")
+        and isinstance(index_payload.get("candidate_generation"), Mapping)
+    )
+
+
+def _hydrate_candidate_payloads(
+    root_path: Path,
+    bundle: dict[str, Any],
+    rows: Sequence[Mapping[str, Any]],
+) -> None:
+    """Replace selected compact projections with canonical full payloads in place."""
+    if not _is_candidate_bundle(bundle):
+        return
+    mutable_rows = [row for row in rows if isinstance(row, dict)]
+    reviewed_ids = _clean_list(row.get("reviewed_id") for row in mutable_rows)
+    if not reviewed_ids:
+        return
+    index_payload = bundle.get("_index")
+    author_keys = (
+        list(index_payload.get("author_keys") or []) if isinstance(index_payload, Mapping) else None
+    )
+    payloads = load_guru_index_objects_by_id(
+        root_path,
+        reviewed_ids=reviewed_ids,
+        author_keys=author_keys,
+    )
+    if payloads is None:
+        payloads = _reviewed_objects_by_id(root_path, reviewed_ids)
+        _append_candidate_fallback_reason(bundle, "payload_index_fallback_to_reviewed_jsonl")
+
+    objects_by_id = bundle.setdefault("objects_by_id", {})
+    hydrated = 0
+    for row in mutable_rows:
+        reviewed_id = str(row.get("reviewed_id") or "")
+        payload = payloads.get(reviewed_id)
+        if payload is None:
+            continue
+        exposed_object_family = row.get("object_family")
+        object_family = str(row.get("_index_object_family") or _row_family(row) or "")
+        row.clear()
+        row.update(payload)
+        if exposed_object_family:
+            row["object_family"] = exposed_object_family
+        indexed_payload = dict(payload)
+        if object_family:
+            indexed_payload["object_family"] = object_family
+        objects_by_id[reviewed_id] = indexed_payload
+        hydrated += 1
+    if isinstance(index_payload, dict):
+        hydrated_ids = index_payload.setdefault("_hydrated_payload_ids", set())
+        if isinstance(hydrated_ids, set):
+            hydrated_ids.update(reviewed_id for reviewed_id in payloads if reviewed_id)
+        index_payload["payload_scope"] = "selected_payloads"
+        index_payload["payload_object_count"] = (
+            len(hydrated_ids) if isinstance(hydrated_ids, set) else hydrated
+        )
+
+
+def _hydrate_candidate_relationships(
+    root_path: Path,
+    bundle: dict[str, Any],
+    rows: Sequence[Mapping[str, Any]],
+) -> None:
+    if not _is_candidate_bundle(bundle):
+        return
+    reviewed_ids = _clean_list(row.get("reviewed_id") for row in rows)
+    if not reviewed_ids:
+        return
+    index_payload = bundle.get("_index")
+    author_keys = (
+        list(index_payload.get("author_keys") or []) if isinstance(index_payload, Mapping) else None
+    )
+    relationships = load_guru_index_relationships_by_id(
+        root_path,
+        reviewed_ids=reviewed_ids,
+        author_keys=author_keys,
+    )
+    if relationships is None:
+        relationships = _reviewed_relationships_by_id(root_path, reviewed_ids)
+        _append_candidate_fallback_reason(bundle, "relationship_index_fallback_to_reviewed_jsonl")
+    current = bundle.setdefault("relationships_by_id", {})
+    for reviewed_id, items in relationships.items():
+        current[reviewed_id] = list(items)
+    if isinstance(index_payload, dict):
+        hydrated_relationship_ids = index_payload.setdefault("_hydrated_relationship_ids", set())
+        if isinstance(hydrated_relationship_ids, set):
+            hydrated_relationship_ids.update(reviewed_ids)
+        index_payload["relationships_scope"] = "selected_results"
+        index_payload["relationship_object_count"] = (
+            len(hydrated_relationship_ids)
+            if isinstance(hydrated_relationship_ids, set)
+            else len(reviewed_ids)
+        )
+
+
+def _hydrate_candidate_related_objects(
+    root_path: Path,
+    bundle: dict[str, Any],
+    rows: Sequence[Mapping[str, Any]],
+) -> None:
+    if not _is_candidate_bundle(bundle):
+        return
+    _hydrate_candidate_relationships(root_path, bundle, rows)
+    related_ids: list[str] = []
+    for row in rows:
+        related_ids.extend(_clean_list(row.get("related_reviewed_ids")))
+        reviewed_id = str(row.get("reviewed_id") or "")
+        for relationship in bundle.get("relationships_by_id", {}).get(reviewed_id, []):
+            other_id = (
+                relationship.get("to_id")
+                if relationship.get("from_id") == reviewed_id
+                else relationship.get("from_id")
+            )
+            if other_id:
+                related_ids.append(str(other_id))
+    missing_ids = [
+        reviewed_id
+        for reviewed_id in _clean_list(related_ids)
+        if reviewed_id not in bundle.get("objects_by_id", {})
+    ]
+    if not missing_ids:
+        return
+    index_payload = bundle.get("_index")
+    author_keys = (
+        list(index_payload.get("author_keys") or []) if isinstance(index_payload, Mapping) else None
+    )
+    related_objects = load_guru_index_objects_by_id(
+        root_path,
+        reviewed_ids=missing_ids,
+        author_keys=author_keys,
+    )
+    if related_objects is None:
+        related_objects = _reviewed_objects_by_id(root_path, missing_ids)
+        _append_candidate_fallback_reason(bundle, "object_index_fallback_to_reviewed_jsonl")
+    objects_by_id = bundle.setdefault("objects_by_id", {})
+    for reviewed_id, row in related_objects.items():
+        object_family = _row_family(row)
+        indexed_row = dict(row)
+        if object_family:
+            indexed_row["object_family"] = object_family
+        objects_by_id[reviewed_id] = indexed_row
+        family = FAMILY_BY_OBJECT_FAMILY.get(object_family)
+        if family is not None and all(
+            existing.get("reviewed_id") != reviewed_id for existing in bundle.setdefault(family, [])
+        ):
+            bundle[family].append(row)
+    if isinstance(index_payload, dict):
+        index_payload["related_payload_count"] = len(related_objects)
+
+
+def _reviewed_relationships_by_id(
+    root_path: Path,
+    reviewed_ids: Sequence[str],
+) -> dict[str, list[dict[str, Any]]]:
+    requested = set(reviewed_ids)
+    relationships_by_id = {reviewed_id: [] for reviewed_id in reviewed_ids}
+    for relationship in _read_jsonl(root_path / "reviewed" / REVIEWED_FILES["relationships"]):
+        for endpoint_key in ("from_id", "to_id"):
+            endpoint = str(relationship.get(endpoint_key) or "")
+            if endpoint in requested:
+                relationships_by_id[endpoint].append(relationship)
+    return relationships_by_id
+
+
+def _reviewed_objects_by_id(
+    root_path: Path,
+    reviewed_ids: Sequence[str],
+) -> dict[str, dict[str, Any]]:
+    requested = set(reviewed_ids)
+    objects_by_id: dict[str, dict[str, Any]] = {}
+    for family, object_family in OBJECT_FAMILY_BY_FILE.items():
+        for source_row in _read_jsonl(root_path / "reviewed" / REVIEWED_FILES[family]):
+            reviewed_id = str(source_row.get("reviewed_id") or "")
+            if reviewed_id not in requested:
+                continue
+            row = dict(source_row)
+            row["object_family"] = object_family
+            objects_by_id[reviewed_id] = row
+    return objects_by_id
+
+
+def _append_candidate_fallback_reason(bundle: dict[str, Any], reason: str) -> None:
+    index_payload = bundle.get("_index")
+    if not isinstance(index_payload, dict):
+        return
+    diagnostics = index_payload.get("candidate_generation")
+    if not isinstance(diagnostics, dict):
+        return
+    reasons = list(diagnostics.get("fallback_reasons") or [])
+    if reason not in reasons:
+        reasons.append(reason)
+    diagnostics["fallback_reasons"] = sorted(reasons)
+
+
 def _bundle_runtime(bundle: Mapping[str, Any]) -> dict[str, Any]:
     index_payload = bundle.get("_index")
     if not isinstance(index_payload, Mapping):
         return {"mode": "reviewed_jsonl", "index_enabled": False}
-    return {
+    runtime = {
         "mode": index_payload.get("runtime_mode", "reviewed_jsonl"),
         "index_enabled": bool(index_payload.get("enabled")),
         "index_manifest_path": index_payload.get("manifest_path"),
         "author_keys": list(index_payload.get("author_keys") or []),
     }
+    candidate_generation = index_payload.get("candidate_generation")
+    if isinstance(candidate_generation, Mapping):
+        runtime["candidate_generation"] = dict(candidate_generation)
+        runtime["payload_scope"] = index_payload.get("payload_scope")
+        runtime["relationships_scope"] = index_payload.get("relationships_scope")
+        runtime["payload_object_count"] = int(index_payload.get("payload_object_count") or 0)
+        runtime["relationship_object_count"] = int(
+            index_payload.get("relationship_object_count") or 0
+        )
+    return runtime
 
 
 def _author_keys_from_reviewed_id(reviewed_id: str) -> list[str] | None:
@@ -1871,7 +2667,10 @@ def _filter_rows(
             continue
         if stage and row.get("decision_stage") != stage:
             continue
-        if requires_company_data is not None and bool(row.get("requires_company_data")) != requires_company_data:
+        if (
+            requires_company_data is not None
+            and bool(row.get("requires_company_data")) != requires_company_data
+        ):
             continue
         filtered.append(row)
     return filtered
@@ -1884,12 +2683,18 @@ def _rank_and_take(
     limit: int,
 ) -> list[dict[str, Any]]:
     scored = [(max(_score_row(query, row), 0), row) for row in rows]
-    scored.sort(key=lambda item: (-item[0], item[1].get("author_key") or "", item[1].get("reviewed_id") or ""))
+    scored.sort(
+        key=lambda item: (
+            -item[0],
+            item[1].get("author_key") or "",
+            item[1].get("reviewed_id") or "",
+        )
+    )
     return [row for _score, row in scored[:limit]]
 
 
 def _score_row(query: str, row: Mapping[str, Any]) -> int:
-    query_tokens = _tokens(query)
+    query_tokens = _meaningful_query_tokens(query)
     if not query_tokens:
         return 1
     haystack = _row_text(row)
@@ -1898,7 +2703,9 @@ def _score_row(query: str, row: Mapping[str, Any]) -> int:
     for token in query_tokens:
         if token in haystack_tokens:
             score += 6
-        elif len(token) >= 3 and token in haystack:
+        elif (
+            len(token) >= 3 or (_KOREAN_TOKEN_RE.fullmatch(token) is not None and len(token) >= 2)
+        ) and token in haystack:
             score += 2
     author = str(row.get("author_key") or "")
     if author and author in _infer_author_keys(query):
@@ -1930,8 +2737,10 @@ def _context_score(
     score += _soft_metadata_score(query, row, intent_family=intent_family, row_family=row_family)
     score += _data_need_intent_bonus(query, row, intent_family=intent_family, row_family=row_family)
     score += _semantic_relevance_bonus(query, row)
-    score += _context_domain_adjustment(query, row, intent_family=intent_family, row_family=row_family)
-    score -= _theme_overfit_penalty(query, row)
+    score += _context_domain_adjustment(
+        query, row, intent_family=intent_family, row_family=row_family
+    )
+    score -= _effective_theme_overfit_penalty(query, row, row_family=row_family)
     if intent_family and row.get("intent_family") == intent_family:
         score += 7
     if row_family == "guru_object":
@@ -1963,7 +2772,9 @@ def _context_domain_adjustment(
         elif row_tags & sector_context_tags():
             score -= 10
 
-    company_context = bool(query_tags) or _has_ticker_like_token(query) or _question_mentions_company_need(query)
+    company_context = (
+        bool(query_tags) or _has_ticker_like_token(query) or _question_mentions_company_need(query)
+    )
     if company_context and row_family == "guru_object":
         if specificity_level == "general_principle":
             score += 4
@@ -1973,7 +2784,11 @@ def _context_domain_adjustment(
     if _question_is_generic_lens_framework(query):
         if specificity_level == "general_principle":
             score += 4
-        elif specificity_level in {"sector_specific", "asset_class_specific", "company_case_specific"}:
+        elif specificity_level in {
+            "sector_specific",
+            "asset_class_specific",
+            "company_case_specific",
+        }:
             score -= 8
 
     for tag in row_tags:
@@ -1984,6 +2799,28 @@ def _context_domain_adjustment(
         )
     for tag in query_tags & row_tags:
         score += context_match_bonus(tag)
+    return _cap_unspecified_general_domain_penalty(
+        score,
+        row,
+        row_family=row_family,
+        specificity=specificity,
+    )
+
+
+def _cap_unspecified_general_domain_penalty(
+    score: int,
+    row: Mapping[str, Any],
+    *,
+    row_family: str,
+    specificity: Mapping[str, Any],
+) -> int:
+    if (
+        score < 0
+        and row_family == "guru_object"
+        and not specificity
+        and str(row.get("object_type") or "") in {"principle", "decision_criterion"}
+    ):
+        return max(score, -UNSPECIFIED_GENERAL_DOMAIN_PENALTY_CAP)
     return score
 
 
@@ -2126,7 +2963,7 @@ def _metadata_values_match(
     values: Any,
 ) -> bool:
     normalized_query = query.lower()
-    query_tokens = {token for token in _tokens(query) if len(token) >= 2}
+    query_tokens = {token for token in _meaningful_query_tokens(query) if len(token) >= 2}
     for raw_value in _list_value(values):
         value = str(raw_value).strip().lower()
         if not value:
@@ -2164,7 +3001,9 @@ def _semantic_relevance_bonus(query: str, row: Mapping[str, Any]) -> int:
     haystack = _row_text(row)
     bonus = 0
     if _contains_any(normalized_query, ("훌륭한 사업", "좋은 사업", "좋은 회사", "사업 품질")):
-        if _contains_any(haystack, ("경제성", "경쟁력", "좋은 기업", "좋은 사업", "quality", "현금 창출")):
+        if _contains_any(
+            haystack, ("경제성", "경쟁력", "좋은 기업", "좋은 사업", "quality", "현금 창출")
+        ):
             bonus += 8
     if _contains_any(normalized_query, ("좋은 주식", "주식을 고르는", "고르는 체크리스트")):
         if _contains_any(
@@ -2198,7 +3037,11 @@ def _semantic_relevance_bonus(query: str, row: Mapping[str, Any]) -> int:
             ("포트폴리오", "비중", "집중", "분산", "리스크", "손실", "방어", "position"),
         ):
             bonus += 18
-        if str(row.get("object_type") or "") in {"risk_frame", "behavioral_warning", "anti_pattern"}:
+        if str(row.get("object_type") or "") in {
+            "risk_frame",
+            "behavioral_warning",
+            "anti_pattern",
+        }:
             bonus += 6
     if _contains_any(normalized_query, ("팔", "매도", "줄여", "축소", "trim", "sell")):
         if _contains_any(
@@ -2206,11 +3049,17 @@ def _semantic_relevance_bonus(query: str, row: Mapping[str, Any]) -> int:
             ("매도", "줄이", "축소", "thesis", "훼손", "리스크", "손실", "비중", "valuation"),
         ):
             bonus += 14
-    if _contains_any(normalized_query, ("현금 비중", "현금 보유", "cash allocation", "cash position")):
-        if _contains_any(haystack, ("현금", "cash", "인내", "기회비용", "대기", "방어", "position")):
+    if _contains_any(
+        normalized_query, ("현금 비중", "현금 보유", "cash allocation", "cash position")
+    ):
+        if _contains_any(
+            haystack, ("현금", "cash", "인내", "기회비용", "대기", "방어", "position")
+        ):
             bonus += 10
     if _contains_any(normalized_query, ("가격 인상", "비용 구조", "자본배분", "activist", "개선")):
-        if _contains_any(haystack, ("가격 인상", "비용", "마진", "자본배분", "개선", "촉매", "운영")):
+        if _contains_any(
+            haystack, ("가격 인상", "비용", "마진", "자본배분", "개선", "촉매", "운영")
+        ):
             bonus += 10
     if _contains_any(normalized_query, ("체크리스트", "질문 목록", "어떤 질문", "뭘 확인")):
         if str(row.get("object_type") or "") in {"question_template", "answer_playbook"}:
@@ -2239,6 +3088,18 @@ def _theme_overfit_penalty(query: str, row: Mapping[str, Any]) -> int:
     return penalty
 
 
+def _effective_theme_overfit_penalty(
+    query: str,
+    row: Mapping[str, Any],
+    *,
+    row_family: str,
+) -> int:
+    penalty = _theme_overfit_penalty(query, row)
+    if row_family == "data_need":
+        return min(penalty, DATA_NEED_THEME_PENALTY_CAP)
+    return penalty
+
+
 def _scoring_query(
     question: str,
     ticker: str | None,
@@ -2254,14 +3115,20 @@ def _scoring_query(
     return " ".join(parts)
 
 
+@lru_cache(maxsize=4096)
 def _query_domain_tags(query: str) -> set[str]:
     return context_tags_for_text(query)
 
 
 def _row_domain_tags(row: Mapping[str, Any]) -> set[str]:
+    materialized = row.get("_ranking_domain_tags")
+    if isinstance(materialized, list):
+        return {str(value) for value in materialized}
     text = _row_text(row)
     specificity = _mapping_value(row.get("specificity"))
-    source_tags = " ".join(str(value).lower() for value in _list_value(specificity.get("source_case_tags")))
+    source_tags = " ".join(
+        str(value).lower() for value in _list_value(specificity.get("source_case_tags"))
+    )
     haystack = f"{text} {source_tags}"
     return context_tags_for_text(haystack)
 
@@ -2271,7 +3138,7 @@ def _contains_any(value: str, terms: Sequence[str]) -> bool:
 
 
 def _row_family(row: Mapping[str, Any]) -> str:
-    family = row.get("object_family")
+    family = row.get("object_family") or row.get("_index_object_family")
     if family:
         return str(family)
     if row.get("data_need_key") or row.get("data_need_family"):
@@ -2284,47 +3151,45 @@ def _row_family(row: Mapping[str, Any]) -> str:
 
 
 def _row_text(row: Mapping[str, Any]) -> str:
-    parts: list[str] = []
-    for key in (
-        "author_key",
-        "object_type",
-        "label_ko",
-        "label_en",
-        "summary_ko",
-        "body_ko",
-        "question_pattern_ko",
-        "intent_family",
-        "decision_stage",
-        "answer_section_type",
-        "data_need_family",
-        "data_need_key",
-    ):
-        value = row.get(key)
-        if isinstance(value, str):
-            parts.append(value)
-    for key in (
-        "example_questions_ko",
-        "intent_tags",
-        "answer_sections",
-        "required_context",
-        "company_data_hooks",
-    ):
-        value = row.get(key)
-        if isinstance(value, list):
-            parts.extend(str(item) for item in value)
-    for key in ("applicability", "specificity", "answer_role"):
-        value = row.get(key)
-        if isinstance(value, Mapping):
-            for nested in value.values():
-                if isinstance(nested, str):
-                    parts.append(nested)
-                elif isinstance(nested, list):
-                    parts.extend(str(item) for item in nested)
-    return " ".join(parts).lower()
+    materialized = row.get("_ranking_text")
+    if isinstance(materialized, str):
+        return materialized
+    return guru_ranking_text(row)
 
 
+@lru_cache(maxsize=32768)
 def _tokens(value: str) -> list[str]:
     return [token.lower() for token in _WORD_RE.findall(value)]
+
+
+@lru_cache(maxsize=8192)
+def _meaningful_query_tokens(value: str) -> tuple[str, ...]:
+    meaningful: list[str] = []
+    for raw_token in _tokens(value):
+        if raw_token in _LOW_INFORMATION_QUERY_TOKENS:
+            continue
+        token = _normalize_query_token(raw_token)
+        if token in _LOW_INFORMATION_QUERY_TOKENS:
+            continue
+        if _KOREAN_TOKEN_RE.fullmatch(token) and len(token) < 2:
+            continue
+        if token and token not in meaningful:
+            meaningful.append(token)
+    return tuple(meaningful)
+
+
+def _normalize_query_token(token: str) -> str:
+    normalized = token.lower().strip()
+    if _KOREAN_TOKEN_RE.fullmatch(normalized):
+        for suffix in _KOREAN_PREDICATE_SUFFIXES:
+            if normalized.endswith(suffix) and len(normalized) - len(suffix) >= 2:
+                normalized = normalized[: -len(suffix)]
+                break
+    for suffix in _KOREAN_PARTICLE_SUFFIXES:
+        if normalized.endswith(suffix) and len(normalized) - len(suffix) >= 2:
+            normalized = normalized[: -len(suffix)]
+            break
+    return normalized
 
 
 def _compact_result(
@@ -2357,7 +3222,7 @@ def _compact_result(
         "supporting_span_ids": row.get("supporting_span_ids") or [],
         "applicability": _public_soft_metadata(row.get("applicability")),
         "specificity": _public_soft_metadata(row.get("specificity")),
-        "answer_role": _public_soft_metadata(row.get("answer_role")),
+        "answer_role": _resolved_answer_role(row),
         "confidence": row.get("confidence"),
         "score": score,
     }
@@ -2428,11 +3293,40 @@ def _public_object(row: Mapping[str, Any]) -> dict[str, Any]:
 def _public_soft_metadata(value: Any) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         return {}
-    return {
-        str(key): nested
-        for key, nested in value.items()
-        if nested not in (None, [], "")
-    }
+    return {str(key): nested for key, nested in value.items() if nested not in (None, [], "")}
+
+
+def _resolved_answer_role(row: Mapping[str, Any]) -> dict[str, Any]:
+    source_role = _public_soft_metadata(row.get("answer_role"))
+    source_default = source_role.get("default")
+    has_source_default = source_default is not None and (
+        not isinstance(source_default, str) or bool(source_default.strip())
+    )
+    if has_source_default:
+        return source_role
+
+    row_family = _row_family(row)
+    object_type = str(row.get("object_type") or "")
+    if row_family == "data_need":
+        default = "data_need"
+    elif object_type in {"risk_frame", "behavioral_warning"}:
+        default = "caution"
+    elif object_type == "anti_pattern":
+        default = "contrast"
+    elif object_type in {"question_template", "answer_playbook", "question_route"}:
+        default = "checklist"
+    elif object_type in {"principle", "decision_criterion"}:
+        default = "core_lens"
+    else:
+        default = "supporting_lens"
+    resolved = dict(source_role)
+    resolved["default"] = default
+    resolved.setdefault("derived", True)
+    resolved.setdefault(
+        "provenance",
+        "derived_from_object_family_and_object_type",
+    )
+    return resolved
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -2516,7 +3410,9 @@ def _eval_questions_path() -> Path:
     if raw_path:
         return Path(raw_path).expanduser()
     repo_root = Path(__file__).resolve().parents[3]
-    plugin_level_path = repo_root / "plugins" / "krw-guru-advisor" / "references" / "eval-questions.jsonl"
+    plugin_level_path = (
+        repo_root / "plugins" / "krw-guru-advisor" / "references" / "eval-questions.jsonl"
+    )
     if plugin_level_path.is_file():
         return plugin_level_path
     return (
@@ -2550,6 +3446,7 @@ def _eval_coverage(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     }
 
 
+@lru_cache(maxsize=4096)
 def _infer_author_keys(question: str) -> list[str]:
     normalized = question.lower()
     if any(token in normalized for token in ("구루들", "여러 구루", "멀티 구루", "multi-guru")):
@@ -2582,11 +3479,13 @@ def _default_authors_for_question(question: str) -> list[str]:
     return ["buffett", "marks"]
 
 
+@lru_cache(maxsize=4096)
 def _infer_intent_family(question: str) -> str | None:
     families = _infer_intent_families(question)
     return families[0] if families else None
 
 
+@lru_cache(maxsize=4096)
 def _infer_intent_families(question: str) -> list[str]:
     normalized = question.lower()
     if (
@@ -2606,7 +3505,9 @@ def _infer_intent_families(question: str) -> list[str]:
             return ["position_sizing"]
         if _contains_any(normalized, ("리스크", "위험", "손실", "하락", "불편", "downside")):
             return ["risk_check"]
-        if _contains_any(normalized, ("activist", "개선", "턴어라운드", "turnaround", "비용 구조", "가격 인상")):
+        if _contains_any(
+            normalized, ("activist", "개선", "턴어라운드", "turnaround", "비용 구조", "가격 인상")
+        ):
             return ["thesis_review"]
         if _contains_any(normalized, ("비싸", "밸류", "valuation", "per", "가격", "안전마진")):
             return ["valuation_check"]
@@ -2617,7 +3518,10 @@ def _infer_intent_families(question: str) -> list[str]:
         ("position_sizing", ("비중", "몰려", "집중", "포트폴리오", "position", "sizing")),
         ("holding_review", ("샀", "보유", "들고", "투자했", "holding", "장기 보유")),
         ("risk_check", ("리스크", "위험", "손실", "하락", "불편", "downside")),
-        ("thesis_review", ("activist", "개선", "턴어라운드", "turnaround", "비용 구조", "가격 인상")),
+        (
+            "thesis_review",
+            ("activist", "개선", "턴어라운드", "turnaround", "비용 구조", "가격 인상"),
+        ),
         ("capital_allocation_check", ("자본배분", "자사주", "배당", "capital allocation")),
         (
             "valuation_check",
@@ -2647,7 +3551,10 @@ def _infer_intent_families(question: str) -> list[str]:
         ),
         ("contrarian_check", ("좋은 뉴스", "과열", "컨센서스", "반대로")),
         ("sell_or_trim", ("팔", "매도", "trim", "sell")),
-        ("learn_guru_view", ("원칙", "철학", "설명", "배우", "체크리스트", "질문부터", "질문 목록")),
+        (
+            "learn_guru_view",
+            ("원칙", "철학", "설명", "배우", "체크리스트", "질문부터", "질문 목록"),
+        ),
     )
     matched: list[str] = []
     for intent, tokens in patterns:
@@ -2732,6 +3639,7 @@ def _question_denies_company_subject(question: str) -> bool:
     return any(pattern in normalized for pattern in negative_patterns)
 
 
+@lru_cache(maxsize=4096)
 def _question_is_generic_lens_framework(question: str) -> bool:
     """Return true for no-company guru framework questions.
 
@@ -3048,8 +3956,12 @@ def _search_markdown(payload: Mapping[str, Any]) -> str:
 
 
 def _query_context_markdown(payload: Mapping[str, Any]) -> str:
-    answerability = payload.get("answerability") if isinstance(payload.get("answerability"), Mapping) else {}
-    research_pack = payload.get("research_pack") if isinstance(payload.get("research_pack"), Mapping) else {}
+    answerability = (
+        payload.get("answerability") if isinstance(payload.get("answerability"), Mapping) else {}
+    )
+    research_pack = (
+        payload.get("research_pack") if isinstance(payload.get("research_pack"), Mapping) else {}
+    )
     lines = [
         "# KRW Guru Query Context",
         "",
@@ -3072,7 +3984,11 @@ def _query_context_markdown(payload: Mapping[str, Any]) -> str:
 
 
 def _company_brief_markdown(payload: Mapping[str, Any]) -> str:
-    brief = payload.get("company_filing_brief") if isinstance(payload.get("company_filing_brief"), Mapping) else {}
+    brief = (
+        payload.get("company_filing_brief")
+        if isinstance(payload.get("company_filing_brief"), Mapping)
+        else {}
+    )
     lines = [
         "# Guru Company Filing Brief",
         "",
@@ -3093,8 +4009,12 @@ def _company_brief_markdown(payload: Mapping[str, Any]) -> str:
 
 
 def _company_pack_markdown(payload: Mapping[str, Any]) -> str:
-    company_pack = payload.get("company_pack") if isinstance(payload.get("company_pack"), Mapping) else {}
-    render_plan = payload.get("render_plan") if isinstance(payload.get("render_plan"), Mapping) else {}
+    company_pack = (
+        payload.get("company_pack") if isinstance(payload.get("company_pack"), Mapping) else {}
+    )
+    render_plan = (
+        payload.get("render_plan") if isinstance(payload.get("render_plan"), Mapping) else {}
+    )
     identity = (
         company_pack.get("company_identity")
         if isinstance(company_pack.get("company_identity"), Mapping)
@@ -3175,7 +4095,9 @@ def _evidence_markdown(payload: Mapping[str, Any]) -> str:
     if spans:
         lines.extend(["", "## Supporting Spans"])
         for span in spans:
-            lines.append(f"- {span.get('title') or span.get('span_id')} ({span.get('official_url')})")
+            lines.append(
+                f"- {span.get('title') or span.get('span_id')} ({span.get('official_url')})"
+            )
     return "\n".join(lines)
 
 

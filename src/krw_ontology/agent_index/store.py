@@ -193,13 +193,17 @@ _DOCUMENT_TYPE_RECENCY_PRIORITY = {
 _FILING_ROLE_DOCUMENT_TYPES = {"10-Q", "10-K"}
 
 _COMPARE_TICKER_CACHE_MAX = 256
-_COMPARE_TICKER_CACHE: OrderedDict[tuple[Any, ...], tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any]]] = OrderedDict()
+_COMPARE_TICKER_CACHE: OrderedDict[
+    tuple[Any, ...], tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any]]
+] = OrderedDict()
 _COMPARE_TICKER_CACHE_LOCK = Lock()
 _DISCOVERY_CACHE_MAX = 128
 _DISCOVERY_CACHE: OrderedDict[tuple[Any, ...], dict[str, Any]] = OrderedDict()
 _DISCOVERY_CACHE_LOCK = Lock()
 _QUERY_COMPACT_CACHE_MAX = 512
-_QUERY_COMPACT_CACHE: OrderedDict[tuple[Any, ...], tuple[list[dict[str, Any]], dict[str, Any]]] = OrderedDict()
+_QUERY_COMPACT_CACHE: OrderedDict[tuple[Any, ...], tuple[list[dict[str, Any]], dict[str, Any]]] = (
+    OrderedDict()
+)
 _QUERY_COMPACT_CACHE_LOCK = Lock()
 _QUERY_CONTEXT_CACHE_MAX = 512
 _QUERY_CONTEXT_CACHE: OrderedDict[tuple[Any, ...], dict[str, Any]] = OrderedDict()
@@ -302,7 +306,14 @@ _TYPED_PROJECTION_SPECS: dict[str, dict[str, Any]] = {
             "currency",
             "scenario",
         },
-        "text_columns": ("factor", "benchmark", "impact_channel", "mechanism", "scenario_terms", "lookup_text"),
+        "text_columns": (
+            "factor",
+            "benchmark",
+            "impact_channel",
+            "mechanism",
+            "scenario_terms",
+            "lookup_text",
+        ),
     },
     "agreement_lookup": {
         "object_types": {"AgreementTerm"},
@@ -399,7 +410,9 @@ _TYPED_PROJECTION_SPECS: dict[str, dict[str, Any]] = {
 }
 
 
-def _metric_lookup_selected_types(object_types: Iterable[str], *, include_xbrl: bool = False) -> list[str]:
+def _metric_lookup_selected_types(
+    object_types: Iterable[str], *, include_xbrl: bool = False
+) -> list[str]:
     requested = list(object_types)
     selected = [object_type for object_type in requested if object_type in _METRIC_FAST_PATH_TYPES]
     if include_xbrl and "MetricObservation" in set(requested) and "XBRLFact" not in selected:
@@ -478,9 +491,7 @@ class OntologyStore:
         self.close()
 
     def list_companies(self) -> list[str]:
-        rows = self.conn.execute(
-            "SELECT DISTINCT ticker FROM documents ORDER BY ticker"
-        ).fetchall()
+        rows = self.conn.execute("SELECT DISTINCT ticker FROM documents ORDER BY ticker").fetchall()
         return [row["ticker"] for row in rows]
 
     def _available_tickers(self, tickers: Sequence[str]) -> set[str]:
@@ -502,9 +513,14 @@ class OntologyStore:
         self,
         *,
         ticker: str | None = None,
+        tickers: Iterable[str] | None = None,
         document_types: Iterable[str] | None = None,
     ) -> list[dict[str, Any]]:
-        where, params = _scope_where(ticker=ticker, document_types=document_types)
+        where, params = _scope_where(
+            ticker=ticker,
+            tickers=tickers,
+            document_types=document_types,
+        )
         rows = self.conn.execute(
             f"""
             SELECT ticker, document_type, doc_type_key, period, artifact_index_path,
@@ -552,7 +568,9 @@ class OntologyStore:
             "company_topic_profile_mode": build_metadata.get("company_topic_profile_mode"),
             "available_tickers": self.list_companies(),
             "available_document_types": sorted(document_types),
-            "available_periods_by_ticker": {ticker: sorted(periods) for ticker, periods in periods_by_ticker.items()},
+            "available_periods_by_ticker": {
+                ticker: sorted(periods) for ticker, periods in periods_by_ticker.items()
+            },
             "ticker_coverage": _ticker_coverage(self.conn),
             "answer_candidate_object_types": list(DEFAULT_QUERY_TYPES),
             "trace_only_object_types": [
@@ -591,7 +609,9 @@ class OntologyStore:
                 "object_traceability": _table_count(self.conn, "object_traceability"),
                 "company_topic_index": _table_count(self.conn, "company_topic_index"),
                 "company_topic_fts": _table_count(self.conn, "company_topic_fts"),
-                "company_topic_source_objects": _table_count(self.conn, "company_topic_source_objects"),
+                "company_topic_source_objects": _table_count(
+                    self.conn, "company_topic_source_objects"
+                ),
             }
         if include_capabilities:
             payload["capabilities"] = {
@@ -611,8 +631,7 @@ class OntologyStore:
                 "event_lookup": _table_exists(self.conn, "event_lookup"),
                 "factor_lookup": _table_exists(self.conn, "factor_lookup"),
                 "typed_projection_lookup": all(
-                    _table_exists(self.conn, table_name)
-                    for table_name in _TYPED_PROJECTION_SPECS
+                    _table_exists(self.conn, table_name) for table_name in _TYPED_PROJECTION_SPECS
                 ),
                 "company_context": _table_exists(self.conn, "company_topic_index"),
                 "query_context": _table_exists(self.conn, "company_topic_index"),
@@ -624,7 +643,9 @@ class OntologyStore:
             severity_counts = _count_by(self.conn, "quality_events", "severity")
             payload["quality_summary"] = {
                 "severity_counts": severity_counts,
-                "critical_errors": int(severity_counts.get("critical") or severity_counts.get("error") or 0),
+                "critical_errors": int(
+                    severity_counts.get("critical") or severity_counts.get("error") or 0
+                ),
                 "batch_failures": self.conn.execute(
                     "SELECT COUNT(*) FROM quality_events WHERE category = 'batch_failure'"
                 ).fetchone()[0],
@@ -677,13 +698,23 @@ class OntologyStore:
             """,
             [*params, max(1, min(int(limit_topics), 50))],
         ).fetchall()
-        topics = [_company_topic_payload(topic_from_row(dict(row)), include_internal_ids=include_internal_ids) for row in rows]
+        topics = [
+            _company_topic_payload(
+                topic_from_row(dict(row)), include_internal_ids=include_internal_ids
+            )
+            for row in rows
+        ]
         payload = {
             "ticker": ticker,
             "document_types": list(document_types or []),
             "periods": list(periods or []),
             "company_topics": topics,
-            "internal_only_fields": ["topic_id", "source_object_ids", "top_traceable_object_ids", "untraced_object_ids"],
+            "internal_only_fields": [
+                "topic_id",
+                "source_object_ids",
+                "top_traceable_object_ids",
+                "untraced_object_ids",
+            ],
         }
         if not topics:
             payload["warnings"] = ["no_company_topics_found"]
@@ -763,7 +794,9 @@ class OntologyStore:
                 "search_diagnostics": {
                     "mode": "research_context_stop_guard",
                     "timing_ms": {
-                        "query_context_total": int((time.perf_counter() - query_context_started_at) * 1000),
+                        "query_context_total": int(
+                            (time.perf_counter() - query_context_started_at) * 1000
+                        ),
                     },
                 },
                 "final_answer_guidance": {
@@ -782,7 +815,10 @@ class OntologyStore:
                         "out_of_scope": True,
                         "reason": valuation_guard["cannot_answer_reason"],
                         "allowed_answer": valuation_guard["allowed_answer"],
-                        "allowed_filing_support": valuation_guard.get("allowed_filing_based_support") or [],
+                        "allowed_filing_support": valuation_guard.get(
+                            "allowed_filing_based_support"
+                        )
+                        or [],
                     },
                     "metric_series_pack": None,
                     "projection_pack": None,
@@ -854,7 +890,9 @@ class OntologyStore:
                 research_pack=early_research_pack,
             )
             early_missing_parts = _research_missing_parts(early_research_pack)
-            if _research_pack_can_skip_discovery(early_research_status, early_research_pack, question=question):
+            if _research_pack_can_skip_discovery(
+                early_research_status, early_research_pack, question=question
+            ):
                 payload = {
                     "question": question,
                     "query_frame": early_query_frame,
@@ -879,7 +917,13 @@ class OntologyStore:
                         missing_parts=early_missing_parts,
                     ),
                     "do_not_call": _research_do_not_call(early_research_status),
-                    "internal_only_fields": ["topic_id", "primary_object_id", "source_object_ids", "top_traceable_object_ids", "recommended_tools.object_id"],
+                    "internal_only_fields": [
+                        "topic_id",
+                        "primary_object_id",
+                        "source_object_ids",
+                        "top_traceable_object_ids",
+                        "recommended_tools.object_id",
+                    ],
                 }
                 if include_internal_ids:
                     payload["results_by_ticker"] = {}
@@ -921,7 +965,9 @@ class OntologyStore:
         if _question_requires_direct_match(question):
             query_frame["question_requires_direct_match"] = True
         answerability = _answerability_from_candidates(query_frame, selected_candidates)
-        recommended_tools = _recommended_trace_tools(selected_candidates, limit=max(1, min(int(limit_results), 10)))
+        recommended_tools = _recommended_trace_tools(
+            selected_candidates, limit=max(1, min(int(limit_results), 10))
+        )
         research_pack = self._research_context_pack(
             question=question,
             search_topic=(discovery.get("search_diagnostics") or {}).get("search_topic"),
@@ -941,7 +987,9 @@ class OntologyStore:
             research_pack=research_pack,
         )
         missing_parts = _research_missing_parts(research_pack)
-        needs_trace = research_status == "sufficient_but_trace_recommended" or bool(recommended_tools)
+        needs_trace = research_status == "sufficient_but_trace_recommended" or bool(
+            recommended_tools
+        )
         payload = {
             "question": question,
             "query_frame": query_frame,
@@ -960,7 +1008,13 @@ class OntologyStore:
                 missing_parts=missing_parts,
             ),
             "do_not_call": _research_do_not_call(research_status),
-            "internal_only_fields": ["topic_id", "primary_object_id", "source_object_ids", "top_traceable_object_ids", "recommended_tools.object_id"],
+            "internal_only_fields": [
+                "topic_id",
+                "primary_object_id",
+                "source_object_ids",
+                "top_traceable_object_ids",
+                "recommended_tools.object_id",
+            ],
         }
         if include_internal_ids:
             payload["results_by_ticker"] = discovery.get("results_by_ticker") or {}
@@ -968,8 +1022,12 @@ class OntologyStore:
         if isinstance(search_diagnostics, dict):
             timing = dict(search_diagnostics.get("timing_ms") or {})
             timing["query_context_discovery"] = discovery_elapsed_ms
-            timing["query_context_planning"] = int((time.perf_counter() - planning_started_at) * 1000)
-            timing["query_context_total"] = int((time.perf_counter() - query_context_started_at) * 1000)
+            timing["query_context_planning"] = int(
+                (time.perf_counter() - planning_started_at) * 1000
+            )
+            timing["query_context_total"] = int(
+                (time.perf_counter() - query_context_started_at) * 1000
+            )
             search_diagnostics["timing_ms"] = timing
             pack_diagnostics = _research_pack_search_diagnostics(
                 research_pack,
@@ -979,7 +1037,9 @@ class OntologyStore:
                 planning_started_at=planning_started_at,
             )
             if pack_diagnostics.get("typed_projection"):
-                search_diagnostics.setdefault("typed_projection", pack_diagnostics["typed_projection"])
+                search_diagnostics.setdefault(
+                    "typed_projection", pack_diagnostics["typed_projection"]
+                )
             if pack_diagnostics.get("metric_series"):
                 search_diagnostics.setdefault("metric_series", pack_diagnostics["metric_series"])
         payload["kernel"] = kernel.build_envelope(
@@ -1177,10 +1237,18 @@ class OntologyStore:
                 "root_label": root.get("label") or root.get("name") or root.get("id"),
                 "root_type": root.get("type"),
                 "chain_depth": (chain.get("chain") or {}).get("max_depth"),
-                "semantic_neighbor_count": len((chain.get("chain") or {}).get("semantic_neighbors") or []),
-                "temporal_context_count": len((chain.get("chain") or {}).get("temporal_context") or []),
-                "evidence_claim_count": len(((chain.get("chain") or {}).get("evidence_chain") or {}).get("claims") or []),
-                "evidence_quote_count": len(((chain.get("chain") or {}).get("evidence_chain") or {}).get("quotes") or []),
+                "semantic_neighbor_count": len(
+                    (chain.get("chain") or {}).get("semantic_neighbors") or []
+                ),
+                "temporal_context_count": len(
+                    (chain.get("chain") or {}).get("temporal_context") or []
+                ),
+                "evidence_claim_count": len(
+                    ((chain.get("chain") or {}).get("evidence_chain") or {}).get("claims") or []
+                ),
+                "evidence_quote_count": len(
+                    ((chain.get("chain") or {}).get("evidence_chain") or {}).get("quotes") or []
+                ),
                 "quality_warnings": (chain.get("quality") or {}).get("warnings") or [],
             }
             if include_internal_ids:
@@ -1416,13 +1484,18 @@ class OntologyStore:
             and set(selected_types).intersection(_METRIC_FAST_PATH_TYPES)
         ):
             scope_guard_types = tuple(dict.fromkeys([*selected_types, "XBRLFact"]))
-        if tickers and periods and not self._has_query_scope_objects(
-            tickers=tickers,
-            document_types=document_types,
-            periods=periods,
-            object_types=scope_guard_types,
-            include_rejected=include_rejected,
-        ) and not metric_profile["enabled"]:
+        if (
+            tickers
+            and periods
+            and not self._has_query_scope_objects(
+                tickers=tickers,
+                document_types=document_types,
+                periods=periods,
+                object_types=scope_guard_types,
+                include_rejected=include_rejected,
+            )
+            and not metric_profile["enabled"]
+        ):
             diagnostics = _search_diagnostics(topic, result_count=0)
             diagnostics["compact_fast_path"] = True
             diagnostics["scope_guard"] = "no_objects_for_ticker_period_scope"
@@ -1575,9 +1648,7 @@ class OntologyStore:
         started_at = time.perf_counter()
         result_limit = max(1, int(limit))
         original_tickers = list(tickers) if tickers is not None else None
-        available_tickers, unavailable_tickers = self._query_available_tickers(
-            original_tickers
-        )
+        available_tickers, unavailable_tickers = self._query_available_tickers(original_tickers)
         if original_tickers is not None and not available_tickers:
             diagnostics = _ticker_guard_query_diagnostics(
                 retrieval_query,
@@ -1589,9 +1660,7 @@ class OntologyStore:
                     "execution_mode": "planned_fts",
                     "strict_result_count": 0,
                     "relaxed_result_count": 0,
-                    "timing_ms": {
-                        "total": int((time.perf_counter() - started_at) * 1000)
-                    },
+                    "timing_ms": {"total": int((time.perf_counter() - started_at) * 1000)},
                 }
             )
             return [], diagnostics
@@ -1601,9 +1670,7 @@ class OntologyStore:
             str(metric).strip() for metric in metrics or [] if str(metric).strip()
         )
         requested_comparison_axes = _unique(
-            str(axis).strip().casefold()
-            for axis in comparison_axes or []
-            if str(axis).strip()
+            str(axis).strip().casefold() for axis in comparison_axes or [] if str(axis).strip()
         )
         lexical_terms = _planned_retrieval_terms(
             retrieval_query,
@@ -1614,9 +1681,7 @@ class OntologyStore:
             retrieval_terms=retrieval_terms,
         )
         predicate_lexical_terms = _unique(
-            term
-            for value in predicate_terms or []
-            for term in _planned_query_terms(str(value))
+            term for value in predicate_terms or [] for term in _planned_query_terms(str(value))
         )[:32]
         metric_started_at = time.perf_counter()
         queried_metric_rows = self._query_metrics(
@@ -1727,9 +1792,7 @@ class OntologyStore:
             for row in [*metric_rows, *fts_predicate_rows, *fts_strict_rows]
             if row["id"]
         }
-        predicate_ids = {
-            str(row["id"]) for row in fts_predicate_rows if row["id"]
-        }
+        predicate_ids = {str(row["id"]) for row in fts_predicate_rows if row["id"]}
         relaxed_ids: set[str] = set()
         relaxed_elapsed_ms = 0
         if allow_relaxed and lexical_terms and len(ordered_rows) < result_limit:
@@ -1752,9 +1815,7 @@ class OntologyStore:
                 ordered_rows.append(row)
                 if len(ordered_rows) >= result_limit:
                     break
-            relaxed_elapsed_ms = int(
-                (time.perf_counter() - relaxed_started_at) * 1000
-            )
+            relaxed_elapsed_ms = int((time.perf_counter() - relaxed_started_at) * 1000)
 
         bundles = self._compact_bundles_from_rows(ordered_rows[:result_limit])
         metric_metadata_by_id = {
@@ -1768,61 +1829,41 @@ class OntologyStore:
             metadata = metric_metadata_by_id.get(row_id)
             if metadata is not None:
                 obj = dict(bundle.get("object") or {})
-                obj["is_company_total"] = bool(
-                    metadata["planned_metric_is_company_total"]
-                )
+                obj["is_company_total"] = bool(metadata["planned_metric_is_company_total"])
                 try:
-                    dimensions = json.loads(
-                        str(metadata["planned_metric_dimensions_json"] or "{}")
-                    )
+                    dimensions = json.loads(str(metadata["planned_metric_dimensions_json"] or "{}"))
                 except (TypeError, ValueError):
                     dimensions = {}
                 if isinstance(dimensions, Mapping):
                     obj["dimensions"] = dict(dimensions)
                 if metadata["planned_metric_canonical_metric"]:
-                    obj["canonical_metric"] = metadata[
-                        "planned_metric_canonical_metric"
-                    ]
+                    obj["canonical_metric"] = metadata["planned_metric_canonical_metric"]
                 if metadata["planned_metric_unit"] and not obj.get("unit"):
                     obj["unit"] = metadata["planned_metric_unit"]
                 observation_period = str(
                     metadata["planned_metric_observation_period"] or ""
                 ).strip()
-                filing_period = str(
-                    metadata["planned_metric_filing_period"] or ""
-                ).strip()
+                filing_period = str(metadata["planned_metric_filing_period"] or "").strip()
                 if observation_period:
                     bundle["period"] = observation_period
                     obj["observation_period"] = observation_period
                 if filing_period:
                     bundle["filing_period"] = filing_period
                     obj["filing_period"] = filing_period
-                period_type = str(
-                    metadata["planned_metric_observation_period_type"] or ""
-                ).strip()
+                period_type = str(metadata["planned_metric_observation_period_type"] or "").strip()
                 if period_type:
                     obj["period_type"] = period_type
                 if metadata["planned_metric_observation_start_date"]:
-                    obj["period_start"] = metadata[
-                        "planned_metric_observation_start_date"
-                    ]
+                    obj["period_start"] = metadata["planned_metric_observation_start_date"]
                 if metadata["planned_metric_observation_end_date"]:
-                    obj["period_end"] = metadata[
-                        "planned_metric_observation_end_date"
-                    ]
-                obj["observation_context_key"] = metadata[
-                    "planned_metric_observation_context_key"
-                ]
-                conflict_count = int(
-                    metadata["planned_metric_conflict_value_count"] or 0
-                )
+                    obj["period_end"] = metadata["planned_metric_observation_end_date"]
+                obj["observation_context_key"] = metadata["planned_metric_observation_context_key"]
+                conflict_count = int(metadata["planned_metric_conflict_value_count"] or 0)
                 if conflict_count > 1:
                     obj["metric_conflict"] = True
                     obj["metric_conflict_value_count"] = conflict_count
                 bundle["object"] = obj
-            bundle["planned_match_mode"] = (
-                "strict" if row_id in strict_ids else "relaxed"
-            )
+            bundle["planned_match_mode"] = "strict" if row_id in strict_ids else "relaxed"
             bundle["planned_lexical_terms"] = lexical_terms
             bundle["planned_evidence_terms"] = evidence_terms
 
@@ -1843,9 +1884,7 @@ class OntologyStore:
             "comparison_axes": sorted(requested_comparison_axes),
             "metric_observation_period_v2": bool(requested_metrics),
             "metric_conflict_result_count": sum(
-                1
-                for bundle in bundles
-                if bool((bundle.get("object") or {}).get("metric_conflict"))
+                1 for bundle in bundles if bool((bundle.get("object") or {}).get("metric_conflict"))
             ),
             "relaxed_enabled": bool(allow_relaxed),
             "relaxed_result_count": len(relaxed_ids),
@@ -1905,7 +1944,9 @@ class OntologyStore:
         document_types: Iterable[str] | None,
     ) -> dict[str, dict[str, Any]]:
         documents: list[dict[str, Any]] = []
-        ticker_values = [str(ticker).upper() for ticker in tickers or [] if str(ticker or "").strip()]
+        ticker_values = [
+            str(ticker).upper() for ticker in tickers or [] if str(ticker or "").strip()
+        ]
         if ticker_values:
             for ticker in ticker_values:
                 documents.extend(self.list_documents(ticker=ticker, document_types=document_types))
@@ -1928,7 +1969,9 @@ class OntologyStore:
         if not isinstance(anchors, Mapping) or not anchors:
             return list(rows)[: max(1, int(limit))]
 
-        def row_key(index_and_row: tuple[int, sqlite3.Row]) -> tuple[int, tuple[int, int], int, int]:
+        def row_key(
+            index_and_row: tuple[int, sqlite3.Row],
+        ) -> tuple[int, tuple[int, int], int, int]:
             index, row = index_and_row
             ticker = str(row["ticker"] or "").upper()
             period = str(row["period"] or "")
@@ -2037,13 +2080,21 @@ class OntologyStore:
                 )
                 return attempt_rows
 
-            if fts_query and len(ticker_scope) == 1 and len(_query_terms(expanded_search_topic)) >= 4:
+            if (
+                fts_query
+                and len(ticker_scope) == 1
+                and len(_query_terms(expanded_search_topic)) >= 4
+            ):
                 and_fts_query = _fts_query(expanded_search_topic, operator="AND")
-                and_rows = query_company_topics_attempt(
-                    "ticker_full_and",
-                    and_fts_query,
-                    attempt_limit=limit,
-                ) if and_fts_query else []
+                and_rows = (
+                    query_company_topics_attempt(
+                        "ticker_full_and",
+                        and_fts_query,
+                        attempt_limit=limit,
+                    )
+                    if and_fts_query
+                    else []
+                )
                 if len(and_rows) >= max(1, int(limit_per_group)):
                     rows = and_rows
                     fts_query = and_fts_query
@@ -2088,14 +2139,21 @@ class OntologyStore:
                         fts_strategy = "and_fallback_or"
             elif fts_query and not ticker_scope and len(_query_terms(expanded_search_topic)) >= 4:
                 and_fts_query = _fts_query(expanded_search_topic, operator="AND")
-                and_rows = query_company_topics_attempt(
-                    "global_full_and",
-                    and_fts_query,
-                    attempt_limit=limit,
-                ) if and_fts_query else []
+                and_rows = (
+                    query_company_topics_attempt(
+                        "global_full_and",
+                        and_fts_query,
+                        attempt_limit=limit,
+                    )
+                    if and_fts_query
+                    else []
+                )
                 and_ticker_count = len({row["ticker"] for row in and_rows if row["ticker"]})
                 required_tickers = min(max(2, int(limit_groups) // 2), 5)
-                if len(and_rows) >= max(1, int(limit_per_group)) and and_ticker_count >= required_tickers:
+                if (
+                    len(and_rows) >= max(1, int(limit_per_group))
+                    and and_ticker_count >= required_tickers
+                ):
                     rows = and_rows
                     fts_query = and_fts_query
                     fts_strategy = "global_and_first"
@@ -2108,7 +2166,9 @@ class OntologyStore:
                         if len(_query_terms(chunk)) >= 2
                     ]
                     pair_limit = max(1, min(max(int(limit_per_group) * 2, 6), int(limit)))
-                    pair_stop = max(1, min(max(int(limit_groups) * int(limit_per_group), 16), int(limit)))
+                    pair_stop = max(
+                        1, min(max(int(limit_groups) * int(limit_per_group), 16), int(limit))
+                    )
                     for pair_query in pair_queries:
                         if not pair_query:
                             continue
@@ -2124,16 +2184,33 @@ class OntologyStore:
                             pair_rows.append(row)
                             if (
                                 len(pair_rows) >= pair_stop
-                                and len({candidate["ticker"] for candidate in pair_rows if candidate["ticker"]}) >= required_tickers
+                                and len(
+                                    {
+                                        candidate["ticker"]
+                                        for candidate in pair_rows
+                                        if candidate["ticker"]
+                                    }
+                                )
+                                >= required_tickers
                             ):
                                 break
                         if (
                             len(pair_rows) >= pair_stop
-                            and len({candidate["ticker"] for candidate in pair_rows if candidate["ticker"]}) >= required_tickers
+                            and len(
+                                {
+                                    candidate["ticker"]
+                                    for candidate in pair_rows
+                                    if candidate["ticker"]
+                                }
+                            )
+                            >= required_tickers
                         ):
                             break
                     pair_ticker_count = len({row["ticker"] for row in pair_rows if row["ticker"]})
-                    if len(pair_rows) >= max(1, int(limit_per_group)) and pair_ticker_count >= required_tickers:
+                    if (
+                        len(pair_rows) >= max(1, int(limit_per_group))
+                        and pair_ticker_count >= required_tickers
+                    ):
                         rows = pair_rows[:limit]
                         fts_query = " OR ".join(pair_queries[:4])
                         fts_strategy = "global_and_pair_fallback"
@@ -2250,7 +2327,9 @@ class OntologyStore:
                 )
                 if topic_payload is None:
                     continue
-                grouped.setdefault(str(topic_payload.get("ticker") or "UNKNOWN"), []).append(topic_payload)
+                grouped.setdefault(str(topic_payload.get("ticker") or "UNKNOWN"), []).append(
+                    topic_payload
+                )
             projection_elapsed_ms = int((time.perf_counter() - projection_started_at) * 1000)
             projection_diagnostics = projection_strategy
         classify_elapsed_ms = int((time.perf_counter() - classify_started_at) * 1000)
@@ -2266,7 +2345,8 @@ class OntologyStore:
                     float(item.get("specificity_score") or 0.0),
                     -float(item.get("generic_score") or 0.0),
                     -float(item.get("boilerplate_score") or 0.0),
-                    int(item.get("support_quote_count") or 0) + int(item.get("support_claim_count") or 0),
+                    int(item.get("support_quote_count") or 0)
+                    + int(item.get("support_claim_count") or 0),
                 ),
                 reverse=True,
             )
@@ -2283,7 +2363,13 @@ class OntologyStore:
             candidates.append(
                 {
                     "ticker": ticker,
-                    "score": round(sum(float((topic.get("match") or {}).get("score") or 0.0) for topic in selected), 4),
+                    "score": round(
+                        sum(
+                            float((topic.get("match") or {}).get("score") or 0.0)
+                            for topic in selected
+                        ),
+                        4,
+                    ),
                     "tier": best_tier,
                     "matched_topic_count": len(topics),
                     "matched_object_counts": _topic_object_counts(topics),
@@ -2425,8 +2511,12 @@ class OntologyStore:
                 "entity_terms": [],
                 "mechanism_terms": [],
                 "scenario_terms": [],
-                "top_traceable_object_ids": [bundle.get("id")] if traceable and bundle.get("id") else [],
-                "untraced_object_ids": [] if traceable or not bundle.get("id") else [bundle.get("id")],
+                "top_traceable_object_ids": [bundle.get("id")]
+                if traceable and bundle.get("id")
+                else [],
+                "untraced_object_ids": []
+                if traceable or not bundle.get("id")
+                else [bundle.get("id")],
                 "match": {
                     "tier": "traceable_related" if traceable else "untraced_related",
                     "semantic_relevance": "object_fallback",
@@ -2445,7 +2535,13 @@ class OntologyStore:
             candidates.append(
                 {
                     "ticker": ticker,
-                    "score": round(sum(float((topic.get("match") or {}).get("score") or 0.0) for topic in selected), 4),
+                    "score": round(
+                        sum(
+                            float((topic.get("match") or {}).get("score") or 0.0)
+                            for topic in selected
+                        ),
+                        4,
+                    ),
                     "tier": str((selected[0].get("match") or {}).get("tier") or "untraced_related"),
                     "matched_topic_count": len(topics),
                     "matched_object_counts": _topic_object_counts(topics),
@@ -2737,7 +2833,9 @@ class OntologyStore:
         kernel = ResearchKernel(self)
         return kernel.build_envelope(
             request,
-            research_status="sufficient_for_default_answer" if has_results else "needs_targeted_followup",
+            research_status="sufficient_for_default_answer"
+            if has_results
+            else "needs_targeted_followup",
             answer_mode="comparison_research_state",
             research_pack={"comparison_contexts": comparison_contexts},
             answerability={
@@ -2754,7 +2852,9 @@ class OntologyStore:
             missing_parts=[] if has_results else ["comparison_candidates_not_found"],
             recommended_tools=[],
             agent_autonomy={
-                "allowed_next_tools": ["krw_ontology_trace", "krw_ontology_chain"] if has_results else ["krw_ontology_query"],
+                "allowed_next_tools": ["krw_ontology_trace", "krw_ontology_chain"]
+                if has_results
+                else ["krw_ontology_query"],
                 "max_additional_tool_calls": 2 if has_results else 1,
             },
             do_not_call=["raw_fts_winner_by_hit_count", "broad_retrieve"],
@@ -2878,7 +2978,9 @@ class OntologyStore:
             document_type_key = tuple(document_types or ())
             period_key = tuple(periods or ())
 
-            def compare_one(ticker: str) -> tuple[str, list[dict[str, Any]], dict[str, Any], dict[str, Any]]:
+            def compare_one(
+                ticker: str,
+            ) -> tuple[str, list[dict[str, Any]], dict[str, Any], dict[str, Any]]:
                 cache_key = (
                     *index_signature,
                     ticker,
@@ -2925,14 +3027,18 @@ class OntologyStore:
                         query_bundles = []
                     else:
                         query_compact_started_at = time.perf_counter()
-                        query_bundles, query_compact_diagnostics = store.query_compact_with_diagnostics(
-                            topic=topic,
-                            tickers=[ticker],
-                            document_types=document_types,
-                            periods=periods,
-                            limit=limit_per_ticker,
+                        query_bundles, query_compact_diagnostics = (
+                            store.query_compact_with_diagnostics(
+                                topic=topic,
+                                tickers=[ticker],
+                                document_types=document_types,
+                                periods=periods,
+                                limit=limit_per_ticker,
+                            )
                         )
-                        query_compact_elapsed_ms = int((time.perf_counter() - query_compact_started_at) * 1000)
+                        query_compact_elapsed_ms = int(
+                            (time.perf_counter() - query_compact_started_at) * 1000
+                        )
                     ticker_results = _merge_bundle_lists(
                         context_bundles,
                         query_bundles,
@@ -2957,11 +3063,12 @@ class OntologyStore:
                         else None
                     )
                     if isinstance(context.get("search_diagnostics"), Mapping):
-                        timing_payload["query_context_fts_strategy"] = (context.get("search_diagnostics") or {}).get("fts_strategy")
+                        timing_payload["query_context_fts_strategy"] = (
+                            context.get("search_diagnostics") or {}
+                        ).get("fts_strategy")
                         timing_payload["query_context_company_topic_attempts"] = (
-                            (context.get("search_diagnostics") or {}).get("company_topic_attempts")
-                            or []
-                        )
+                            context.get("search_diagnostics") or {}
+                        ).get("company_topic_attempts") or []
                     if isinstance(context_stage_timing, Mapping):
                         timing_payload["query_context_stages"] = dict(context_stage_timing)
                     evaluation["timing_ms"] = timing_payload
@@ -2970,14 +3077,15 @@ class OntologyStore:
                     if skipped_query_compact:
                         context_payload["query_compact_skipped"] = True
                         context_payload["query_compact_skip_reason"] = skip_reason
-                    _compare_ticker_cache_set(cache_key, (ticker_results, evaluation, context_payload))
+                    _compare_ticker_cache_set(
+                        cache_key, (ticker_results, evaluation, context_payload)
+                    )
                     return ticker, ticker_results, evaluation, context_payload
 
             max_workers = min(len(ticker_list), 4)
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 future_by_ticker = {
-                    executor.submit(compare_one, ticker): ticker
-                    for ticker in searchable_tickers
+                    executor.submit(compare_one, ticker): ticker for ticker in searchable_tickers
                 }
                 for future in as_completed(future_by_ticker):
                     ticker, ticker_results, evaluation, context = future.result()
@@ -2986,12 +3094,10 @@ class OntologyStore:
                     comparison_contexts[ticker] = context
             results = {ticker: results.get(ticker, []) for ticker in ticker_list}
             comparison_evaluations = {
-                ticker: comparison_evaluations.get(ticker, {})
-                for ticker in ticker_list
+                ticker: comparison_evaluations.get(ticker, {}) for ticker in ticker_list
             }
             comparison_contexts = {
-                ticker: comparison_contexts.get(ticker, {})
-                for ticker in ticker_list
+                ticker: comparison_contexts.get(ticker, {}) for ticker in ticker_list
             }
             payload = {
                 "mode": "topic",
@@ -3126,9 +3232,15 @@ class OntologyStore:
             "summary": {
                 "documents": len(documents),
                 "events": len(events),
-                "rejected_objects": sum(1 for event in events if event["category"] == "rejected_object"),
-                "batch_failures": sum(1 for event in events if event["category"] == "batch_failure"),
-                "section_warnings": sum(1 for event in events if event["category"] == "section_quality"),
+                "rejected_objects": sum(
+                    1 for event in events if event["category"] == "rejected_object"
+                ),
+                "batch_failures": sum(
+                    1 for event in events if event["category"] == "batch_failure"
+                ),
+                "section_warnings": sum(
+                    1 for event in events if event["category"] == "section_quality"
+                ),
             },
         }
 
@@ -3232,10 +3344,7 @@ class OntologyStore:
             if tickers and len(tickers) == 1 and not periods and limit <= 2:
                 split_limit = 5
             split_topics = _split_topic_queries(expanded_topic, limit=split_limit)
-            should_prescan_split_terms = bool(
-                tickers
-                and periods
-            )
+            should_prescan_split_terms = bool(tickers and periods)
             if should_prescan_split_terms:
                 present_terms = self._scoped_present_terms(
                     tickers=tickers,
@@ -3379,7 +3488,9 @@ class OntologyStore:
                 return rows
         return run(fts_query)
 
-    def _bundles_from_object_ids(self, object_ids: Iterable[str], *, limit: int) -> list[dict[str, Any]]:
+    def _bundles_from_object_ids(
+        self, object_ids: Iterable[str], *, limit: int
+    ) -> list[dict[str, Any]]:
         bundles: list[dict[str, Any]] = []
         seen: set[str] = set()
         for object_id in object_ids:
@@ -3394,7 +3505,9 @@ class OntologyStore:
                 break
         return bundles
 
-    def _compact_bundles_from_object_ids(self, object_ids: Iterable[str], *, limit: int) -> list[dict[str, Any]]:
+    def _compact_bundles_from_object_ids(
+        self, object_ids: Iterable[str], *, limit: int
+    ) -> list[dict[str, Any]]:
         ids: list[str] = []
         seen: set[str] = set()
         for object_id in object_ids:
@@ -3470,9 +3583,7 @@ class OntologyStore:
         terms: Sequence[str],
     ) -> set[str]:
         candidate_terms = _unique(
-            term
-            for term in terms
-            if term not in _SPLIT_TOPIC_STOP_TERMS and len(term) > 2
+            term for term in terms if term not in _SPLIT_TOPIC_STOP_TERMS and len(term) > 2
         )
         if not candidate_terms:
             return set()
@@ -3593,7 +3704,11 @@ class OntologyStore:
         if not set(object_types).intersection(_METRIC_FAST_PATH_TYPES):
             return {"enabled": False, "topic": topic, "normalization": {}}
         if not _table_exists(self.conn, "metric_lookup"):
-            return {"enabled": False, "topic": topic, "normalization": {"warning": "metric_lookup_unavailable"}}
+            return {
+                "enabled": False,
+                "topic": topic,
+                "normalization": {"warning": "metric_lookup_unavailable"},
+            }
         normalized_topic, normalization = _normalize_metric_lookup_topic(topic, metric_periods)
         if not periods and metric_periods:
             normalization["inferred_period_filters"] = list(metric_periods)
@@ -3619,20 +3734,25 @@ class OntologyStore:
         terms = _metric_lookup_search_terms(topic)
         ticker_terms = {str(ticker).lower() for ticker in tickers or []}
         dimension_anchors = [
-            term for term in _metric_lookup_dimension_anchors(topic)
-            if term not in ticker_terms
+            term for term in _metric_lookup_dimension_anchors(topic) if term not in ticker_terms
         ]
         metric_terms = [term for term in terms if term not in set(dimension_anchors)] or terms
         metric_terms = _metric_lookup_base_metric_terms(metric_terms)
         period_values = _metric_lookup_period_values(periods)
         years = _metric_lookup_years(periods)
-        selected_types = _metric_lookup_selected_types(object_types, include_xbrl=bool(dimension_anchors))
+        selected_types = _metric_lookup_selected_types(
+            object_types, include_xbrl=bool(dimension_anchors)
+        )
         dimension_matches = self._resolve_metric_dimension_anchors(
             topic=topic,
             tickers=tickers,
             dimension_anchors=dimension_anchors,
         )
-        if dimension_anchors and dimension_matches and _table_exists(self.conn, "metric_dimension_lookup"):
+        if (
+            dimension_anchors
+            and dimension_matches
+            and _table_exists(self.conn, "metric_dimension_lookup")
+        ):
             return self._query_metric_dimension_lookup_with_strategy(
                 topic,
                 tickers=tickers,
@@ -3648,8 +3768,15 @@ class OntologyStore:
             )
         where_parts = ["1 = 1"]
         where_params: list[Any] = []
-        _add_in_filter(where_parts, where_params, "metric_lookup.ticker", [ticker.upper() for ticker in tickers or []])
-        _add_in_filter(where_parts, where_params, "metric_lookup.document_type", list(document_types or []))
+        _add_in_filter(
+            where_parts,
+            where_params,
+            "metric_lookup.ticker",
+            [ticker.upper() for ticker in tickers or []],
+        )
+        _add_in_filter(
+            where_parts, where_params, "metric_lookup.document_type", list(document_types or [])
+        )
         _add_in_filter(where_parts, where_params, "metric_lookup.object_type", selected_types)
         period_clause_parts: list[str] = []
         period_params: list[Any] = []
@@ -3671,7 +3798,9 @@ class OntologyStore:
             where_parts.append("(" + " OR ".join(period_clause_parts) + ")")
             where_params.extend(period_params)
         if not include_rejected:
-            where_parts.append("(objects.review_status IS NULL OR objects.review_status != 'rejected')")
+            where_parts.append(
+                "(objects.review_status IS NULL OR objects.review_status != 'rejected')"
+            )
         score_parts: list[str] = []
         score_params: list[Any] = []
         wants_total = _metric_lookup_wants_total(topic)
@@ -3697,7 +3826,9 @@ class OntologyStore:
                 "CASE WHEN lower(COALESCE(metric_lookup.metric_alias_text, '')) LIKE ? THEN 8 ELSE 0 END"
             )
             score_params.append(like)
-        canonical_candidates = _unique(_canonical_metric_name(term) for term in metric_terms if term)
+        canonical_candidates = _unique(
+            _canonical_metric_name(term) for term in metric_terms if term
+        )
         if "sales" in metric_terms or "revenue" in metric_terms:
             canonical_candidates = _unique([*canonical_candidates, "revenue", "net_sales"])
         if canonical_candidates:
@@ -3765,7 +3896,11 @@ class OntologyStore:
         ).fetchall()
         dimension_metric_not_found = False
         if dimension_anchors:
-            dimension_rows = [row for row in rows if row["dimension_match_score"] and row["dimension_match_score"] > 0]
+            dimension_rows = [
+                row
+                for row in rows
+                if row["dimension_match_score"] and row["dimension_match_score"] > 0
+            ]
             dimension_metric_not_found = not dimension_rows
             rows = dimension_rows
         rows = _dedupe_metric_lookup_rows(rows, limit=limit)
@@ -3776,7 +3911,9 @@ class OntologyStore:
             "dimension_anchors": dimension_anchors,
             "dimension_anchor_filter": bool(dimension_anchors),
             "dimension_metric_not_found": dimension_metric_not_found,
-            "company_total_role": "denominator_or_support" if dimension_anchors else ("primary" if wants_total else None),
+            "company_total_role": "denominator_or_support"
+            if dimension_anchors
+            else ("primary" if wants_total else None),
             "period_values": period_values,
             "period_years": years,
             "object_types": selected_types,
@@ -3792,7 +3929,12 @@ class OntologyStore:
         tickers: Sequence[str] | None,
         dimension_anchors: Sequence[str],
     ) -> list[dict[str, Any]]:
-        if not topic or not tickers or not dimension_anchors or not _table_exists(self.conn, "company_dimension_catalog"):
+        if (
+            not topic
+            or not tickers
+            or not dimension_anchors
+            or not _table_exists(self.conn, "company_dimension_catalog")
+        ):
             return []
         ticker_values = [ticker.upper() for ticker in tickers if ticker]
         if not ticker_values:
@@ -3815,7 +3957,8 @@ class OntologyStore:
             dimension_key = str(row["dimension_key"] or "")
             label = str(row["dimension_label"] or dimension_key)
             aliases = " ".join(
-                part for part in (
+                part
+                for part in (
                     dimension_key.replace("_", " "),
                     label.lower(),
                     str(row["aliases_text"] or "").lower(),
@@ -3834,7 +3977,9 @@ class OntologyStore:
                 matched = True
             if not matched:
                 for anchor_key in anchor_keys:
-                    if anchor_key and re.search(rf"\b{re.escape(anchor_key.replace('_', ' '))}\b", aliases):
+                    if anchor_key and re.search(
+                        rf"\b{re.escape(anchor_key.replace('_', ' '))}\b", aliases
+                    ):
                         matched = True
                         break
             dedupe_key = (str(row["ticker"]), dimension_key)
@@ -3868,10 +4013,14 @@ class OntologyStore:
         period_values = _metric_lookup_period_values(periods)
         years = _metric_lookup_years(periods)
         selected_types = _metric_lookup_selected_types(object_types, include_xbrl=True)
-        canonical_candidates = _unique(_canonical_metric_name(term) for term in metric_terms if term)
+        canonical_candidates = _unique(
+            _canonical_metric_name(term) for term in metric_terms if term
+        )
         if "sales" in metric_terms or "revenue" in metric_terms:
             canonical_candidates = _unique([*canonical_candidates, "revenue", "net_sales"])
-        dimension_keys = _unique(str(match["dimension_key"]) for match in dimension_matches if match.get("dimension_key"))
+        dimension_keys = _unique(
+            str(match["dimension_key"]) for match in dimension_matches if match.get("dimension_key")
+        )
 
         def add_period_filters(parts: list[str], params: list[Any], prefix: str) -> None:
             period_clause_parts: list[str] = []
@@ -3882,7 +4031,9 @@ class OntologyStore:
                 period_params.extend(years)
                 if period_values:
                     placeholders = ",".join("?" for _ in period_values)
-                    period_clause_parts.append(f"({prefix}.fiscal_year IS NULL AND {prefix}.observation_period IN ({placeholders}))")
+                    period_clause_parts.append(
+                        f"({prefix}.fiscal_year IS NULL AND {prefix}.observation_period IN ({placeholders}))"
+                    )
                     period_params.extend(period_values)
             elif period_values:
                 placeholders = ",".join("?" for _ in period_values)
@@ -3903,34 +4054,58 @@ class OntologyStore:
                     (f"{prefix}.text", 45),
                     (f"{prefix}.metric_name", 30),
                 ):
-                    score_parts.append(f"CASE WHEN lower(COALESCE({column}, '')) LIKE ? THEN {weight} ELSE 0 END")
+                    score_parts.append(
+                        f"CASE WHEN lower(COALESCE({column}, '')) LIKE ? THEN {weight} ELSE 0 END"
+                    )
                     score_params.append("%net sales%")
             for term in metric_terms[:8]:
                 like = f"%{term}%"
-                score_parts.append(f"CASE WHEN lower(COALESCE({prefix}.metric_name, '')) LIKE ? THEN 18 ELSE 0 END")
+                score_parts.append(
+                    f"CASE WHEN lower(COALESCE({prefix}.metric_name, '')) LIKE ? THEN 18 ELSE 0 END"
+                )
                 score_params.append(like)
-                score_parts.append(f"CASE WHEN lower(COALESCE({prefix}.metric_alias_text, '')) LIKE ? THEN 8 ELSE 0 END")
+                score_parts.append(
+                    f"CASE WHEN lower(COALESCE({prefix}.metric_alias_text, '')) LIKE ? THEN 8 ELSE 0 END"
+                )
                 score_params.append(like)
             if canonical_candidates:
                 placeholders = ",".join("?" for _ in canonical_candidates)
-                score_parts.append(f"CASE WHEN {prefix}.canonical_metric IN ({placeholders}) THEN 40 ELSE 0 END")
+                score_parts.append(
+                    f"CASE WHEN {prefix}.canonical_metric IN ({placeholders}) THEN 40 ELSE 0 END"
+                )
                 score_params.extend(canonical_candidates)
                 lookup_clauses.append(f"{prefix}.canonical_metric IN ({placeholders})")
                 lookup_params.extend(canonical_candidates)
             for term in metric_terms[:8]:
                 lookup_clauses.append(f"lower(COALESCE({prefix}.metric_alias_text, '')) LIKE ?")
                 lookup_params.append(f"%{term}%")
-            return " + ".join(score_parts) if score_parts else "0", score_params, lookup_clauses, lookup_params
+            return (
+                " + ".join(score_parts) if score_parts else "0",
+                score_params,
+                lookup_clauses,
+                lookup_params,
+            )
 
         target_where = ["1 = 1"]
         target_params: list[Any] = []
-        _add_in_filter(target_where, target_params, "metric_dimension_lookup.ticker", [ticker.upper() for ticker in tickers or []])
-        _add_in_filter(target_where, target_params, "metric_lookup.document_type", list(document_types or []))
+        _add_in_filter(
+            target_where,
+            target_params,
+            "metric_dimension_lookup.ticker",
+            [ticker.upper() for ticker in tickers or []],
+        )
+        _add_in_filter(
+            target_where, target_params, "metric_lookup.document_type", list(document_types or [])
+        )
         _add_in_filter(target_where, target_params, "metric_lookup.object_type", selected_types)
-        _add_in_filter(target_where, target_params, "metric_dimension_lookup.dimension_key", dimension_keys)
+        _add_in_filter(
+            target_where, target_params, "metric_dimension_lookup.dimension_key", dimension_keys
+        )
         add_period_filters(target_where, target_params, "metric_dimension_lookup")
         if not include_rejected:
-            target_where.append("(objects.review_status IS NULL OR objects.review_status != 'rejected')")
+            target_where.append(
+                "(objects.review_status IS NULL OR objects.review_status != 'rejected')"
+            )
         score_expr, score_params, lookup_clauses, lookup_params = metric_score("metric_lookup")
         if lookup_clauses:
             target_where.append("(" + " OR ".join(lookup_clauses) + ")")
@@ -3967,20 +4142,33 @@ class OntologyStore:
             [*score_params, *target_params, max(1, min(limit * 8, 240))],
         ).fetchall()
 
-        found_keys = {str(row["metric_dimension_key"]) for row in rows if row["metric_dimension_key"]}
+        found_keys = {
+            str(row["metric_dimension_key"]) for row in rows if row["metric_dimension_key"]
+        }
         missing_dimension_keys = [key for key in dimension_keys if key not in found_keys]
         denominator_rows: list[sqlite3.Row] = []
         denominator_needed = _metric_lookup_needs_denominator(topic)
         if denominator_needed and rows:
             total_where = ["metric_lookup.is_company_total = 1"]
             total_params: list[Any] = []
-            _add_in_filter(total_where, total_params, "metric_lookup.ticker", [ticker.upper() for ticker in tickers or []])
-            _add_in_filter(total_where, total_params, "metric_lookup.document_type", list(document_types or []))
+            _add_in_filter(
+                total_where,
+                total_params,
+                "metric_lookup.ticker",
+                [ticker.upper() for ticker in tickers or []],
+            )
+            _add_in_filter(
+                total_where, total_params, "metric_lookup.document_type", list(document_types or [])
+            )
             _add_in_filter(total_where, total_params, "metric_lookup.object_type", selected_types)
             add_period_filters(total_where, total_params, "metric_lookup")
             if not include_rejected:
-                total_where.append("(objects.review_status IS NULL OR objects.review_status != 'rejected')")
-            total_score_expr, total_score_params, total_lookup_clauses, total_lookup_params = metric_score("metric_lookup")
+                total_where.append(
+                    "(objects.review_status IS NULL OR objects.review_status != 'rejected')"
+                )
+            total_score_expr, total_score_params, total_lookup_clauses, total_lookup_params = (
+                metric_score("metric_lookup")
+            )
             if total_lookup_clauses:
                 total_where.append("(" + " OR ".join(total_lookup_clauses) + ")")
                 total_params.extend(total_lookup_params)
@@ -4114,7 +4302,9 @@ class OntologyStore:
     ) -> tuple[list[sqlite3.Row], dict[str, Any]]:
         table_name = str(profile["table"])
         spec = _TYPED_PROJECTION_SPECS[table_name]
-        selected_types = [object_type for object_type in object_types if object_type in set(spec["object_types"])]
+        selected_types = [
+            object_type for object_type in object_types if object_type in set(spec["object_types"])
+        ]
         terms = [
             term
             for term in _query_terms(str(profile.get("topic") or ""))
@@ -4122,12 +4312,21 @@ class OntologyStore:
         ][:10]
         where_parts = ["1 = 1"]
         where_params: list[Any] = []
-        _add_in_filter(where_parts, where_params, f"{table_name}.ticker", [ticker.upper() for ticker in tickers or []])
-        _add_in_filter(where_parts, where_params, f"{table_name}.document_type", list(document_types or []))
+        _add_in_filter(
+            where_parts,
+            where_params,
+            f"{table_name}.ticker",
+            [ticker.upper() for ticker in tickers or []],
+        )
+        _add_in_filter(
+            where_parts, where_params, f"{table_name}.document_type", list(document_types or [])
+        )
         _add_in_filter(where_parts, where_params, f"{table_name}.period", list(periods or []))
         _add_in_filter(where_parts, where_params, f"{table_name}.object_type", selected_types)
         if not include_rejected:
-            where_parts.append("(objects.review_status IS NULL OR objects.review_status != 'rejected')")
+            where_parts.append(
+                "(objects.review_status IS NULL OR objects.review_status != 'rejected')"
+            )
 
         text_columns = tuple(spec["text_columns"])
         term_clauses: list[str] = []
@@ -4140,7 +4339,9 @@ class OntologyStore:
             for column in text_columns:
                 per_term.append(f"lower(COALESCE({table_name}.{column}, '')) LIKE ?")
                 term_params.append(like)
-                score_parts.append(f"CASE WHEN lower(COALESCE({table_name}.{column}, '')) LIKE ? THEN 1 ELSE 0 END")
+                score_parts.append(
+                    f"CASE WHEN lower(COALESCE({table_name}.{column}, '')) LIKE ? THEN 1 ELSE 0 END"
+                )
                 score_params.append(like)
             if per_term:
                 term_clauses.append("(" + " OR ".join(per_term) + ")")
@@ -4221,9 +4422,7 @@ class OntologyStore:
         calculation_window: str | None = None,
         comparison_axes: Iterable[str] | None = None,
     ) -> list[sqlite3.Row]:
-        requested = _unique(
-            str(metric).strip() for metric in metrics if str(metric).strip()
-        )
+        requested = _unique(str(metric).strip() for metric in metrics if str(metric).strip())
         if not requested:
             return []
         normalized_scope = str(metric_scope or "company_total").strip().lower()
@@ -4248,15 +4447,11 @@ class OntologyStore:
         )
         if normalized_tickers:
             clauses.append(
-                "metric_lookup.ticker IN ("
-                + ",".join("?" for _ in normalized_tickers)
-                + ")"
+                "metric_lookup.ticker IN (" + ",".join("?" for _ in normalized_tickers) + ")"
             )
             params.extend(normalized_tickers)
         normalized_document_types = _unique(
-            str(value).strip().upper()
-            for value in document_types or []
-            if str(value).strip()
+            str(value).strip().upper() for value in document_types or [] if str(value).strip()
         )
         if normalized_document_types:
             clauses.append(
@@ -4275,19 +4470,15 @@ class OntologyStore:
                 + ")"
             ]
             params.extend(normalized_periods)
-            for year, quarter in _planned_metric_period_coordinates(
-                normalized_periods
-            ):
+            for year, quarter in _planned_metric_period_coordinates(normalized_periods):
                 if quarter is None:
                     period_clauses.append(
-                        "(metric_lookup.fiscal_year = ? "
-                        "AND metric_lookup.fiscal_quarter IS NULL)"
+                        "(metric_lookup.fiscal_year = ? AND metric_lookup.fiscal_quarter IS NULL)"
                     )
                     params.append(year)
                 else:
                     period_clauses.append(
-                        "(metric_lookup.fiscal_year = ? "
-                        "AND metric_lookup.fiscal_quarter = ?)"
+                        "(metric_lookup.fiscal_year = ? AND metric_lookup.fiscal_quarter = ?)"
                     )
                     params.extend([year, quarter])
             clauses.append("(" + " OR ".join(period_clauses) + ")")
@@ -4296,9 +4487,7 @@ class OntologyStore:
         elif normalized_scope == "dimensioned":
             clauses.append("metric_lookup.is_company_total = 0")
         dimension_keys = _unique(
-            key
-            for value in metric_dimensions or []
-            if (key := _metric_dimension_key(value))
+            key for value in metric_dimensions or [] if (key := _metric_dimension_key(value))
         )
         for dimension_key in dimension_keys:
             # Dimension identity is exact.  Substring matching here can turn
@@ -4317,15 +4506,12 @@ class OntologyStore:
         metric_placeholders = ",".join("?" for _ in metric_candidates)
         clauses[0] = clauses[0].format(metrics=metric_placeholders)
         normalized_axes = {
-            str(axis).strip().casefold()
-            for axis in comparison_axes or []
-            if str(axis).strip()
+            str(axis).strip().casefold() for axis in comparison_axes or [] if str(axis).strip()
         }
-        temporal = (
-            str(calculation_window or "").strip()
-            in {"period_over_period", "year_over_year"}
-            and bool(normalized_axes.intersection({"absolute_change", "growth_rate"}))
-        )
+        temporal = str(calculation_window or "").strip() in {
+            "period_over_period",
+            "year_over_year",
+        } and bool(normalized_axes.intersection({"absolute_change", "growth_rate"}))
         observation_depth = max(
             4 if temporal else 2,
             len(normalized_periods),
@@ -4603,8 +4789,12 @@ class OntologyStore:
         include_quote_text: bool,
     ) -> list[dict[str, Any]]:
         object_ids = {obj.get("id")}
-        object_ids.update(claim.get("id") for claim in evidence.get("claims", []) if claim.get("id"))
-        object_ids.update(quote.get("id") for quote in evidence.get("quotes", []) if quote.get("id"))
+        object_ids.update(
+            claim.get("id") for claim in evidence.get("claims", []) if claim.get("id")
+        )
+        object_ids.update(
+            quote.get("id") for quote in evidence.get("quotes", []) if quote.get("id")
+        )
         for path in graph_paths:
             for step in path.get("steps", []):
                 step_object = step.get("object") or {}
@@ -4626,7 +4816,9 @@ class OntologyStore:
         temporal: list[dict[str, Any]] = []
         for row in rows:
             candidate = _object_from_row(row)
-            if candidate.get("id") == obj.get("id") or _temporal_references_object(candidate, object_ids):
+            if candidate.get("id") == obj.get("id") or _temporal_references_object(
+                candidate, object_ids
+            ):
                 temporal.append(_chain_node(candidate, include_quote_text=include_quote_text))
             if len(temporal) >= _CHAIN_MAX_TEMPORAL_CONTEXT:
                 break
@@ -4640,46 +4832,64 @@ class OntologyStore:
         obj_type = obj.get("type")
         if obj_type == "ResearchClaim":
             claims = [obj]
-            quotes = _dedupe_objects([
-                *self._objects_by_ids(obj.get("supported_by_quotes") or []),
-                *self._support_objects_for(obj["id"], support_types={"EvidenceQuote"}),
-            ])
+            quotes = _dedupe_objects(
+                [
+                    *self._objects_by_ids(obj.get("supported_by_quotes") or []),
+                    *self._support_objects_for(obj["id"], support_types={"EvidenceQuote"}),
+                ]
+            )
         elif obj_type == "EvidenceQuote":
             quotes = [obj]
             claims = self._claims_supported_by_quote(obj["id"])
-        elif obj_type in {"BusinessFactor", "AgreementTerm", "BusinessEvent", "BusinessActivity", "ExternalFactorExposure"}:
-            claims = _dedupe_objects([
-                *self._objects_by_ids(obj.get("supported_by_claims") or []),
-                *self._support_objects_for(obj["id"], support_types={"ResearchClaim"}),
-            ])
+        elif obj_type in {
+            "BusinessFactor",
+            "AgreementTerm",
+            "BusinessEvent",
+            "BusinessActivity",
+            "ExternalFactorExposure",
+        }:
+            claims = _dedupe_objects(
+                [
+                    *self._objects_by_ids(obj.get("supported_by_claims") or []),
+                    *self._support_objects_for(obj["id"], support_types={"ResearchClaim"}),
+                ]
+            )
             quote_ids = _unique(
-                quote_id
-                for claim in claims
-                for quote_id in claim.get("supported_by_quotes") or []
+                quote_id for claim in claims for quote_id in claim.get("supported_by_quotes") or []
             )
             quote_ids = _unique([*quote_ids, *(obj.get("supported_by_quotes") or [])])
-            quotes = _dedupe_objects([
-                *self._objects_by_ids(quote_ids),
-                *self._support_objects_for(obj["id"], support_types={"EvidenceQuote"}),
-            ])
+            quotes = _dedupe_objects(
+                [
+                    *self._objects_by_ids(quote_ids),
+                    *self._support_objects_for(obj["id"], support_types={"EvidenceQuote"}),
+                ]
+            )
         elif obj_type == "AssumptionCandidate":
-            quotes = _dedupe_objects([
-                *self._objects_by_ids(obj.get("supported_by_quotes") or []),
-                *self._support_objects_for(obj["id"], support_types={"EvidenceQuote"}),
-            ])
-            claims = _dedupe_objects([
-                *self._objects_by_ids(obj.get("supported_by_claims") or []),
-                *self._support_objects_for(obj["id"], support_types={"ResearchClaim"}),
-            ])
+            quotes = _dedupe_objects(
+                [
+                    *self._objects_by_ids(obj.get("supported_by_quotes") or []),
+                    *self._support_objects_for(obj["id"], support_types={"EvidenceQuote"}),
+                ]
+            )
+            claims = _dedupe_objects(
+                [
+                    *self._objects_by_ids(obj.get("supported_by_claims") or []),
+                    *self._support_objects_for(obj["id"], support_types={"ResearchClaim"}),
+                ]
+            )
         elif obj_type == "ChangeEvent":
-            quotes = _dedupe_objects([
-                *self._objects_by_ids(obj.get("supported_by_quotes") or []),
-                *self._support_objects_for(obj["id"], support_types={"EvidenceQuote"}),
-            ])
-            claims = _dedupe_objects([
-                *self._objects_by_ids(obj.get("supported_by_claims") or []),
-                *self._support_objects_for(obj["id"], support_types={"ResearchClaim"}),
-            ])
+            quotes = _dedupe_objects(
+                [
+                    *self._objects_by_ids(obj.get("supported_by_quotes") or []),
+                    *self._support_objects_for(obj["id"], support_types={"EvidenceQuote"}),
+                ]
+            )
+            claims = _dedupe_objects(
+                [
+                    *self._objects_by_ids(obj.get("supported_by_claims") or []),
+                    *self._support_objects_for(obj["id"], support_types={"ResearchClaim"}),
+                ]
+            )
         elif obj_type == "CompanyBusinessProfile":
             source_objects = self._objects_by_ids(obj.get("source_object_ids") or [])
             claims = self._claims_from_source_objects(source_objects)
@@ -4702,13 +4912,13 @@ class OntologyStore:
             source_objects = self._objects_by_ids(obj.get("supported_by_objects") or [])
             claims = self._claims_from_source_objects(source_objects)
             quote_ids = _unique(
-                quote_id
-                for claim in claims
-                for quote_id in claim.get("supported_by_quotes") or []
+                quote_id for claim in claims for quote_id in claim.get("supported_by_quotes") or []
             )
             quotes = self._objects_by_ids(quote_ids)
 
-        span_ids = _unique(quote.get("source_span_id") for quote in quotes if quote.get("source_span_id"))
+        span_ids = _unique(
+            quote.get("source_span_id") for quote in quotes if quote.get("source_span_id")
+        )
         spans = self._objects_by_ids(span_ids)
         related_objects = self._objects_sharing_claims(obj, claims)
         evidence: dict[str, Any] = {
@@ -4741,9 +4951,7 @@ class OntologyStore:
             fact_ids.extend(input_metric.get("source_fact_ids") or [])
         xbrl_facts = self._objects_by_ids(_unique(fact_ids))
         source_document_ids = _unique(
-            fact.get("source_document_id")
-            for fact in xbrl_facts
-            if fact.get("source_document_id")
+            fact.get("source_document_id") for fact in xbrl_facts if fact.get("source_document_id")
         )
         return {
             "trace_type": "metric_lineage",
@@ -4797,10 +5005,12 @@ class OntologyStore:
             """,
             (quote_id,),
         ).fetchall()
-        return _dedupe_objects([
-            *[_object_from_row(row) for row in rows],
-            *self._support_targets_for(quote_id, target_types={"ResearchClaim"}),
-        ])
+        return _dedupe_objects(
+            [
+                *[_object_from_row(row) for row in rows],
+                *self._support_targets_for(quote_id, target_types={"ResearchClaim"}),
+            ]
+        )
 
     def _support_objects_for(
         self,
@@ -4864,7 +5074,9 @@ class OntologyStore:
             if obj.get("type") in target_types
         ]
 
-    def _claims_from_source_objects(self, source_objects: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _claims_from_source_objects(
+        self, source_objects: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
         claim_ids = _unique(
             [
                 *[
@@ -5003,7 +5215,9 @@ def _count_by(conn: sqlite3.Connection, table_name: str, column_name: str) -> di
     return {str(row["key"] or "unknown"): int(row["value"] or 0) for row in rows}
 
 
-def _company_topic_payload(topic: Mapping[str, Any], *, include_internal_ids: bool) -> dict[str, Any]:
+def _company_topic_payload(
+    topic: Mapping[str, Any], *, include_internal_ids: bool
+) -> dict[str, Any]:
     payload = {
         "ticker": topic.get("ticker"),
         "period": topic.get("period"),
@@ -5051,9 +5265,13 @@ def _company_topic_payload(topic: Mapping[str, Any], *, include_internal_ids: bo
     return payload
 
 
-def _answerability_from_candidates(query_frame: Mapping[str, Any], candidates: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+def _answerability_from_candidates(
+    query_frame: Mapping[str, Any], candidates: Sequence[Mapping[str, Any]]
+) -> dict[str, Any]:
     tiers = _collect_values(candidates, "tier")
-    has_direct = any(str(tier) in {"traceable_direct", "traceable_metric_lineage"} for tier in tiers)
+    has_direct = any(
+        str(tier) in {"traceable_direct", "traceable_metric_lineage"} for tier in tiers
+    )
     has_related = any(
         str(tier)
         in {
@@ -5065,7 +5283,10 @@ def _answerability_from_candidates(query_frame: Mapping[str, Any], candidates: S
         }
         for tier in tiers
     )
-    requires_direct = bool(query_frame.get("question_requires_direct_match") or query_frame.get("requires_direct_match"))
+    requires_direct = bool(
+        query_frame.get("question_requires_direct_match")
+        or query_frame.get("requires_direct_match")
+    )
     needs_clarification = not candidates
     return {
         "direct_answerable": has_direct,
@@ -5087,11 +5308,19 @@ def _answerability_from_candidates(query_frame: Mapping[str, Any], candidates: S
 def _compact_comparison_context(context: Mapping[str, Any]) -> dict[str, Any]:
     candidates = list(context.get("ticker_candidates") or [])
     research_pack = context.get("research_pack") or {}
-    metric_pack = research_pack.get("metric_series_pack") if isinstance(research_pack, Mapping) else None
-    projection_pack = research_pack.get("projection_pack") if isinstance(research_pack, Mapping) else None
+    metric_pack = (
+        research_pack.get("metric_series_pack") if isinstance(research_pack, Mapping) else None
+    )
+    projection_pack = (
+        research_pack.get("projection_pack") if isinstance(research_pack, Mapping) else None
+    )
     chain_pack = research_pack.get("chain_pack") if isinstance(research_pack, Mapping) else None
-    directness_guard = research_pack.get("directness_guard") if isinstance(research_pack, Mapping) else None
-    metric_calculations = metric_pack.get("calculations") if isinstance(metric_pack, Mapping) else {}
+    directness_guard = (
+        research_pack.get("directness_guard") if isinstance(research_pack, Mapping) else None
+    )
+    metric_calculations = (
+        metric_pack.get("calculations") if isinstance(metric_pack, Mapping) else {}
+    )
     metric_quality = metric_pack.get("quality") if isinstance(metric_pack, Mapping) else {}
     return {
         "answerability": context.get("answerability") or {},
@@ -5105,17 +5334,39 @@ def _compact_comparison_context(context: Mapping[str, Any]) -> dict[str, Any]:
         "directness_guard": directness_guard or {},
         "research_pack_summary": {
             "metric_mode": metric_pack.get("mode") if isinstance(metric_pack, Mapping) else None,
-            "metric_result_count": metric_pack.get("result_count") if isinstance(metric_pack, Mapping) else 0,
+            "metric_result_count": metric_pack.get("result_count")
+            if isinstance(metric_pack, Mapping)
+            else 0,
             "metric_roles": metric_pack.get("roles") if isinstance(metric_pack, Mapping) else [],
-            "metric_series_count": len(metric_pack.get("series") or []) if isinstance(metric_pack, Mapping) else 0,
-            "metric_share_of_total_count": len(metric_calculations.get("share_of_total") or []) if isinstance(metric_calculations, Mapping) else 0,
-            "metric_growth_rate_count": len(metric_calculations.get("growth_rate") or []) if isinstance(metric_calculations, Mapping) else 0,
-            "metric_growth_difference_count": len(metric_calculations.get("growth_difference") or []) if isinstance(metric_calculations, Mapping) else 0,
-            "metric_period_alignment": metric_quality.get("period_alignment") if isinstance(metric_quality, Mapping) else None,
-            "metric_unit_consistency": metric_quality.get("unit_consistency") if isinstance(metric_quality, Mapping) else None,
-            "projection_mode": projection_pack.get("mode") if isinstance(projection_pack, Mapping) else None,
-            "projection_result_count": projection_pack.get("result_count") if isinstance(projection_pack, Mapping) else 0,
-            "chain_preview_count": len(chain_pack.get("primary_chains") or []) if isinstance(chain_pack, Mapping) else 0,
+            "metric_series_count": len(metric_pack.get("series") or [])
+            if isinstance(metric_pack, Mapping)
+            else 0,
+            "metric_share_of_total_count": len(metric_calculations.get("share_of_total") or [])
+            if isinstance(metric_calculations, Mapping)
+            else 0,
+            "metric_growth_rate_count": len(metric_calculations.get("growth_rate") or [])
+            if isinstance(metric_calculations, Mapping)
+            else 0,
+            "metric_growth_difference_count": len(
+                metric_calculations.get("growth_difference") or []
+            )
+            if isinstance(metric_calculations, Mapping)
+            else 0,
+            "metric_period_alignment": metric_quality.get("period_alignment")
+            if isinstance(metric_quality, Mapping)
+            else None,
+            "metric_unit_consistency": metric_quality.get("unit_consistency")
+            if isinstance(metric_quality, Mapping)
+            else None,
+            "projection_mode": projection_pack.get("mode")
+            if isinstance(projection_pack, Mapping)
+            else None,
+            "projection_result_count": projection_pack.get("result_count")
+            if isinstance(projection_pack, Mapping)
+            else 0,
+            "chain_preview_count": len(chain_pack.get("primary_chains") or [])
+            if isinstance(chain_pack, Mapping)
+            else 0,
         },
     }
 
@@ -5129,10 +5380,15 @@ def _comparison_candidate_summary(candidate: Mapping[str, Any]) -> dict[str, Any
         "primary_object_id": candidate.get("primary_object_id"),
         "primary_object_type": candidate.get("primary_object_type"),
         "tier": candidate.get("tier") or match.get("tier"),
-        "semantic_relevance": candidate.get("semantic_relevance") or match.get("semantic_relevance"),
+        "semantic_relevance": candidate.get("semantic_relevance")
+        or match.get("semantic_relevance"),
         "trace_status": candidate.get("trace_status") or match.get("trace_status"),
-        "matched_required_facets": candidate.get("matched_required_facets") or match.get("matched_required_facets") or [],
-        "missing_required_facets": candidate.get("missing_required_facets") or match.get("missing_required_facets") or [],
+        "matched_required_facets": candidate.get("matched_required_facets")
+        or match.get("matched_required_facets")
+        or [],
+        "missing_required_facets": candidate.get("missing_required_facets")
+        or match.get("missing_required_facets")
+        or [],
         "why_tier": candidate.get("why_tier") or match.get("why_tier"),
     }
 
@@ -5147,8 +5403,12 @@ def _comparison_evaluation_from_query_context(context: Mapping[str, Any]) -> dic
     tier = top.get("tier") or match.get("tier")
     semantic_relevance = top.get("semantic_relevance") or match.get("semantic_relevance")
     trace_status = top.get("trace_status") or match.get("trace_status")
-    matched_required = top.get("matched_required_facets") or match.get("matched_required_facets") or []
-    missing_required = top.get("missing_required_facets") or match.get("missing_required_facets") or []
+    matched_required = (
+        top.get("matched_required_facets") or match.get("matched_required_facets") or []
+    )
+    missing_required = (
+        top.get("missing_required_facets") or match.get("missing_required_facets") or []
+    )
     why_tier = top.get("why_tier") or match.get("why_tier")
     return {
         "direct_answerable": bool(answerability.get("direct_answerable")),
@@ -5174,7 +5434,12 @@ def _object_ids_from_query_context(context: Mapping[str, Any]) -> list[str]:
     candidates = list(context.get("ticker_candidates") or [])
     ids: list[str] = []
     for candidate in candidates:
-        for key in ("top_traceable_object_ids", "top_object_ids", "source_object_ids", "primary_object_id"):
+        for key in (
+            "top_traceable_object_ids",
+            "top_object_ids",
+            "source_object_ids",
+            "primary_object_id",
+        ):
             value = candidate.get(key)
             if isinstance(value, list):
                 ids.extend(str(item) for item in value if item)
@@ -5275,13 +5540,19 @@ def _research_metric_topic(question: str, search_topic: str | None) -> str | Non
     elif any(term in raw_lower for term in ("매출", "수익", "revenue", "sales")):
         metric_terms.extend(seed_terms)
         metric_terms.append("revenue net sales")
-    elif any(term in raw_lower for term in ("마진", "margin", "영업이익률", "gross margin", "operating margin")):
+    elif any(
+        term in raw_lower
+        for term in ("마진", "margin", "영업이익률", "gross margin", "operating margin")
+    ):
         metric_terms.extend(seed_terms)
         metric_terms.append("margin gross margin operating margin")
     elif any(term in raw_lower for term in ("비용", "원가", "cost", "expense", "영업비용")):
         metric_terms.extend(seed_terms)
         metric_terms.append("cost expense operating expense")
-    elif any(term in raw_lower for term in ("대손", "신용", "credit", "charge-off", "provision", "allowance")):
+    elif any(
+        term in raw_lower
+        for term in ("대손", "신용", "credit", "charge-off", "provision", "allowance")
+    ):
         metric_terms.extend(seed_terms)
         metric_terms.append("credit loss provision allowance charge off")
     elif any(term in raw_lower for term in ("nii", "net interest", "순이자")):
@@ -5295,7 +5566,9 @@ def _research_metric_topic(question: str, search_topic: str | None) -> str | Non
     return topic or None
 
 
-def _metric_series_research_pack(results: Sequence[Mapping[str, Any]], diagnostics: Mapping[str, Any]) -> dict[str, Any]:
+def _metric_series_research_pack(
+    results: Sequence[Mapping[str, Any]], diagnostics: Mapping[str, Any]
+) -> dict[str, Any]:
     strategy = diagnostics.get("search_strategy") or diagnostics.get("projection") or {}
     role_by_id = strategy.get("metric_roles_by_object_id") or {}
     dimension_by_id = strategy.get("metric_dimensions_by_object_id") or {}
@@ -5306,7 +5579,9 @@ def _metric_series_research_pack(results: Sequence[Mapping[str, Any]], diagnosti
         role = role_by_id.get(object_id)
         if not role:
             role = "denominator_metric" if obj.get("is_company_total") else "metric"
-        dimension_info = dimension_by_id.get(object_id) if isinstance(dimension_by_id, Mapping) else None
+        dimension_info = (
+            dimension_by_id.get(object_id) if isinstance(dimension_by_id, Mapping) else None
+        )
         dimensions = obj.get("dimensions") or obj.get("dimension") or {}
         if dimension_info and role == "target_dimension_metric" and not dimensions:
             dimension_key = str(dimension_info.get("dimension_key") or "")
@@ -5323,14 +5598,24 @@ def _metric_series_research_pack(results: Sequence[Mapping[str, Any]], diagnosti
             "period": item.get("period") or obj.get("period"),
             "document_type": item.get("document_type") or obj.get("document_type"),
             "metric_name": obj.get("metric_name") or obj.get("metric_term_id") or obj.get("name"),
-            "canonical_metric": obj.get("canonical_metric") or obj.get("metric_term_id") or obj.get("metric_name"),
+            "canonical_metric": obj.get("canonical_metric")
+            or obj.get("metric_term_id")
+            or obj.get("metric_name"),
             "value": obj.get("value"),
             "unit": obj.get("unit"),
             "dimensions": dimensions,
-            "dimension_key": dimension_info.get("dimension_key") if isinstance(dimension_info, Mapping) else None,
-            "dimension_label": dimension_info.get("dimension_label") if isinstance(dimension_info, Mapping) else None,
-            "dimension_display_label": dimension_info.get("dimension_display_label") if isinstance(dimension_info, Mapping) else None,
-            "dimension_kind": dimension_info.get("dimension_kind") if isinstance(dimension_info, Mapping) else None,
+            "dimension_key": dimension_info.get("dimension_key")
+            if isinstance(dimension_info, Mapping)
+            else None,
+            "dimension_label": dimension_info.get("dimension_label")
+            if isinstance(dimension_info, Mapping)
+            else None,
+            "dimension_display_label": dimension_info.get("dimension_display_label")
+            if isinstance(dimension_info, Mapping)
+            else None,
+            "dimension_kind": dimension_info.get("dimension_kind")
+            if isinstance(dimension_info, Mapping)
+            else None,
             "metric_role": role,
             "trace_status": item.get("trace_status"),
             "metric_lineage_status": item.get("metric_lineage_status"),
@@ -5351,12 +5636,15 @@ def _metric_series_research_pack(results: Sequence[Mapping[str, Any]], diagnosti
     if not observations and diagnostics.get("metric_fast_path"):
         missing_parts.append("metric_series_not_found")
     return {
-        "mode": strategy.get("mode") or ("metric_lookup" if diagnostics.get("metric_fast_path") else None),
+        "mode": strategy.get("mode")
+        or ("metric_lookup" if diagnostics.get("metric_fast_path") else None),
         "result_count": len(observations),
         "observations": observations,
         "series": series,
         "calculations": calculations,
-        "roles": sorted({str(obs.get("metric_role")) for obs in observations if obs.get("metric_role")}),
+        "roles": sorted(
+            {str(obs.get("metric_role")) for obs in observations if obs.get("metric_role")}
+        ),
         "dimension_anchors": strategy.get("dimension_anchors") or [],
         "resolved_dimensions": strategy.get("resolved_dimensions") or [],
         "denominator_needed": bool(strategy.get("denominator_needed")),
@@ -5386,7 +5674,9 @@ def _metric_series_research_pack(results: Sequence[Mapping[str, Any]], diagnosti
     }
 
 
-def _metric_series_from_observations(observations: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+def _metric_series_from_observations(
+    observations: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
     grouped: dict[str, dict[str, Any]] = {}
     for observation in observations:
         value = _metric_observation_number(observation.get("value"))
@@ -5434,20 +5724,30 @@ def _metric_series_from_observations(observations: Sequence[Mapping[str, Any]]) 
 def _metric_observation_series_key(observation: Mapping[str, Any]) -> tuple[str, str]:
     role = str(observation.get("metric_role") or "metric")
     metric = str(observation.get("canonical_metric") or observation.get("metric_name") or "metric")
-    dimensions = observation.get("dimensions") if isinstance(observation.get("dimensions"), Mapping) else {}
+    dimensions = (
+        observation.get("dimensions") if isinstance(observation.get("dimensions"), Mapping) else {}
+    )
     dimension_bits = [f"{key}:{value}" for key, value in sorted(dimensions.items()) if value]
     if dimension_bits:
-        dimension_label = " / ".join(str(value) for _key, value in sorted(dimensions.items()) if value)
+        dimension_label = " / ".join(
+            str(value) for _key, value in sorted(dimensions.items()) if value
+        )
     elif role == "denominator_metric":
         dimension_label = "Company total"
     else:
         object_id = str(observation.get("id") or "")
         dimension_label = object_id.rsplit(":", 1)[-1] if object_id else role
-    key = "|".join([role, metric, *dimension_bits]) if dimension_bits else "|".join([role, metric, dimension_label])
+    key = (
+        "|".join([role, metric, *dimension_bits])
+        if dimension_bits
+        else "|".join([role, metric, dimension_label])
+    )
     return key, dimension_label
 
 
-def _metric_dimension_display_label(label: Any, dimension_key: Any, dimension_anchors: Sequence[Any] | None = None) -> str:
+def _metric_dimension_display_label(
+    label: Any, dimension_key: Any, dimension_anchors: Sequence[Any] | None = None
+) -> str:
     text = str(label or "").strip() or str(dimension_key or "").replace("_", " ").strip()
     if not text:
         return ""
@@ -5505,8 +5805,12 @@ def _metric_series_calculations(
 ) -> dict[str, Any]:
     units = {str(item.get("unit") or "").lower() for item in series if item.get("unit")}
     unit_consistency = len(units) <= 1
-    denominator_series = [item for item in series if item.get("metric_role") == "denominator_metric"]
-    target_series = [item for item in series if item.get("metric_role") == "target_dimension_metric"]
+    denominator_series = [
+        item for item in series if item.get("metric_role") == "denominator_metric"
+    ]
+    target_series = [
+        item for item in series if item.get("metric_role") == "target_dimension_metric"
+    ]
     denominator_by_period: dict[str, float] = {}
     if denominator_series:
         for point in denominator_series[0].get("points") or []:
@@ -5567,7 +5871,9 @@ def _metric_series_calculations(
             if not right_key:
                 continue
             common_periods = sorted(
-                set(growth_by_series.get(left_key, {})).intersection(growth_by_series.get(right_key, {})),
+                set(growth_by_series.get(left_key, {})).intersection(
+                    growth_by_series.get(right_key, {})
+                ),
                 key=_period_sort_key,
             )
             for period in common_periods:
@@ -5583,12 +5889,15 @@ def _metric_series_calculations(
                         "to_period": period,
                         "left_growth": left_growth.get("growth"),
                         "right_growth": right_growth.get("growth"),
-                        "difference": float(left_growth.get("growth")) - float(right_growth.get("growth")),
+                        "difference": float(left_growth.get("growth"))
+                        - float(right_growth.get("growth")),
                     }
                 )
 
     period_sets = [set(item.get("periods") or []) for item in series if item.get("periods")]
-    period_alignment = len({tuple(sorted(periods)) for periods in period_sets}) <= 1 if period_sets else None
+    period_alignment = (
+        len({tuple(sorted(periods)) for periods in period_sets}) <= 1 if period_sets else None
+    )
     return {
         "share_of_total": share_of_total,
         "growth_rate": growth_rate,
@@ -5626,7 +5935,10 @@ def _projection_research_pack(
         "matched_terms": strategy.get("matched_terms") or [],
         "result_count": len(candidates),
         "candidates": candidates,
-        "directness": {**directness_guard, "projection_candidates_are_search_candidates_only": True},
+        "directness": {
+            **directness_guard,
+            "projection_candidates_are_search_candidates_only": True,
+        },
         "quality": {
             "fallback_used": bool(strategy.get("fallback_used")),
             "missing_parts": [] if candidates else ["projection_candidates_not_found"],
@@ -5647,7 +5959,9 @@ def _company_topic_research_pack(candidates: Sequence[Mapping[str, Any]]) -> dic
                         "ticker": topic.get("ticker") or candidate.get("ticker"),
                         "period": topic.get("period"),
                         "document_type": topic.get("document_type"),
-                        "tier": topic.get("tier") or candidate.get("tier") or (topic.get("match") or {}).get("tier"),
+                        "tier": topic.get("tier")
+                        or candidate.get("tier")
+                        or (topic.get("match") or {}).get("tier"),
                         "trace_status": topic.get("trace_status") or candidate.get("trace_status"),
                         "topic_label": _public_topic_label(topic.get("topic_label")),
                         "topic_summary": topic.get("topic_summary"),
@@ -5687,7 +6001,13 @@ def _public_topic_label(value: Any) -> str | None:
     label = str(value or "").strip()
     if not label:
         return None
-    if label in {"EvidenceQuote", "ResearchClaim", "MetricObservation", "BusinessActivity", "BusinessFactor"}:
+    if label in {
+        "EvidenceQuote",
+        "ResearchClaim",
+        "MetricObservation",
+        "BusinessActivity",
+        "BusinessFactor",
+    }:
         return None
     return label
 
@@ -5702,7 +6022,10 @@ def _business_profile_research_pack(
     preferred_answer_order: Mapping[str, Any],
     period_display_policy: Mapping[str, Any],
 ) -> dict[str, Any] | None:
-    if str(getattr(route.intent, "value", route.intent)) not in {"company_overview", "general_research"}:
+    if str(getattr(route.intent, "value", route.intent)) not in {
+        "company_overview",
+        "general_research",
+    }:
         return None
     topics = list(company_topic_pack.get("top_candidates") or [])
     business_segments: list[dict[str, Any]] = []
@@ -5778,9 +6101,15 @@ def _risk_mechanism_research_pack(
         return None
     source_candidates: list[Mapping[str, Any]] = []
     if isinstance(projection_pack, Mapping):
-        source_candidates.extend(candidate for candidate in projection_pack.get("candidates") or [] if isinstance(candidate, Mapping))
+        source_candidates.extend(
+            candidate
+            for candidate in projection_pack.get("candidates") or []
+            if isinstance(candidate, Mapping)
+        )
     source_candidates.extend(
-        candidate for candidate in company_topic_pack.get("top_candidates") or [] if isinstance(candidate, Mapping)
+        candidate
+        for candidate in company_topic_pack.get("top_candidates") or []
+        if isinstance(candidate, Mapping)
     )
     risk_channels: list[dict[str, Any]] = []
     for candidate in source_candidates[:6]:
@@ -5878,7 +6207,11 @@ def _direct_exposure_research_pack(
     related_candidates: list[dict[str, Any]] = []
     if isinstance(projection_pack, Mapping):
         for candidate in projection_pack.get("candidates") or []:
-            target = direct_candidates if directness_guard.get("direct_answerable") else related_candidates
+            target = (
+                direct_candidates
+                if directness_guard.get("direct_answerable")
+                else related_candidates
+            )
             target.append(dict(candidate))
     for candidate in company_topic_pack.get("top_candidates") or []:
         related_candidates.append(dict(candidate))
@@ -5892,7 +6225,9 @@ def _direct_exposure_research_pack(
             "Use direct exposure wording only when strong_claim_allowed is true; otherwise answer as no direct evidence with related context."
         ),
         "quality": {
-            "missing_parts": [] if direct_candidates or related_candidates else ["direct_exposure_candidates_not_found"],
+            "missing_parts": []
+            if direct_candidates or related_candidates
+            else ["direct_exposure_candidates_not_found"],
         },
     }
 
@@ -5908,10 +6243,17 @@ def _cross_company_signal_research_pack(
     recommended_tools: Sequence[Mapping[str, Any]],
     period_display_policy: Mapping[str, Any],
 ) -> dict[str, Any] | None:
-    topic_rows = [row for row in company_topic_pack.get("top_candidates") or [] if isinstance(row, Mapping)]
+    topic_rows = [
+        row for row in company_topic_pack.get("top_candidates") or [] if isinstance(row, Mapping)
+    ]
     projection_rows = [
         row
-        for row in ((projection_pack or {}).get("candidates") if isinstance(projection_pack, Mapping) else []) or []
+        for row in (
+            (projection_pack or {}).get("candidates")
+            if isinstance(projection_pack, Mapping)
+            else []
+        )
+        or []
         if isinstance(row, Mapping)
     ]
     ticker_basket = _cross_company_ticker_basket(requested_tickers, topic_rows, projection_rows)
@@ -5942,9 +6284,7 @@ def _cross_company_signal_research_pack(
 
     signals = _cross_company_signal_rows(deduped_rows)
     trace_roots = [
-        str(tool.get("object_id"))
-        for tool in recommended_tools[:3]
-        if tool.get("object_id")
+        str(tool.get("object_id")) for tool in recommended_tools[:3] if tool.get("object_id")
     ]
     chain_roots = [
         str(root.get("root_object_id"))
@@ -5975,10 +6315,18 @@ def _cross_company_signal_research_pack(
     }
 
 
-def _is_cross_company_signal_question(question: str, *, route: Any, ticker_basket: Sequence[str]) -> bool:
+def _is_cross_company_signal_question(
+    question: str, *, route: Any, ticker_basket: Sequence[str]
+) -> bool:
     text = str(question or "").lower()
     intent = str(getattr(getattr(route, "intent", None), "value", getattr(route, "intent", "")))
-    if len(set(ticker_basket)) >= 2 and intent in {"comparison", "risk_thesis", "discovery", "general_research", "company_overview"}:
+    if len(set(ticker_basket)) >= 2 and intent in {
+        "comparison",
+        "risk_thesis",
+        "discovery",
+        "general_research",
+        "company_overview",
+    }:
         return True
     return any(
         term in text
@@ -6023,7 +6371,9 @@ def _cross_company_ticker_basket(
 
 
 def _cross_company_evidence_row(row: Mapping[str, Any], *, source: str) -> dict[str, Any]:
-    summary = str(row.get("summary") or row.get("topic_summary") or row.get("topic_label") or "").strip()
+    summary = str(
+        row.get("summary") or row.get("topic_summary") or row.get("topic_label") or ""
+    ).strip()
     object_type = row.get("type") or row.get("primary_object_type") or row.get("topic_type")
     signal = _cross_company_signal_name(summary, object_type=object_type)
     evidence_strength = _cross_company_evidence_strength(row, summary=summary)
@@ -6047,7 +6397,9 @@ def _cross_company_evidence_row(row: Mapping[str, Any], *, source: str) -> dict[
 
 
 def _cross_company_evidence_type(row: Mapping[str, Any], *, source: str) -> str:
-    object_type = str(row.get("type") or row.get("primary_object_type") or row.get("topic_type") or "")
+    object_type = str(
+        row.get("type") or row.get("primary_object_type") or row.get("topic_type") or ""
+    )
     if object_type in {"MetricObservation", "Calculation", "XBRLFact"}:
         return "numeric_metric"
     if object_type in {"ResearchClaim", "EvidenceQuote"}:
@@ -6065,13 +6417,26 @@ def _cross_company_evidence_strength(row: Mapping[str, Any], *, summary: str) ->
     evidence_grade = str(row.get("evidence_grade") or row.get("evidence_strength") or "").lower()
     specificity = _metric_observation_number(row.get("specificity_score"))
     boilerplate = _metric_observation_number(row.get("boilerplate_score"))
-    if tier in {"traceable_direct", "traceable_metric_lineage"} or evidence_grade == "direct" or trace_status == "traceable":
+    if (
+        tier in {"traceable_direct", "traceable_metric_lineage"}
+        or evidence_grade == "direct"
+        or trace_status == "traceable"
+    ):
         return "strong"
-    if specificity is not None and specificity >= 0.65 and (boilerplate is None or boilerplate <= 0.45):
+    if (
+        specificity is not None
+        and specificity >= 0.65
+        and (boilerplate is None or boilerplate <= 0.45)
+    ):
         return "strong"
-    if _looks_like_generic_boilerplate(summary) or (boilerplate is not None and boilerplate >= 0.65):
+    if _looks_like_generic_boilerplate(summary) or (
+        boilerplate is not None and boilerplate >= 0.65
+    ):
         return "weak"
-    if tier in {"traceable_related", "untraced_direct_candidate"} or evidence_grade in {"indirect", "derived"}:
+    if tier in {"traceable_related", "untraced_direct_candidate"} or evidence_grade in {
+        "indirect",
+        "derived",
+    }:
         return "medium"
     return "medium"
 
@@ -6095,15 +6460,32 @@ def _cross_company_signal_name(summary: str, *, object_type: Any) -> str:
     text = summary.lower()
     if any(term in text for term in ("price", "pricing", "pass through", "가격", "전가")):
         return "pricing_power"
-    if any(term in text for term in ("volume", "traffic", "comparable sales", "unit", "demand", "수요", "판매량", "트래픽")):
+    if any(
+        term in text
+        for term in (
+            "volume",
+            "traffic",
+            "comparable sales",
+            "unit",
+            "demand",
+            "수요",
+            "판매량",
+            "트래픽",
+        )
+    ):
         return "demand_or_volume"
-    if any(term in text for term in ("cost", "input", "commodity", "freight", "cogs", "원가", "비용", "운임")):
+    if any(
+        term in text
+        for term in ("cost", "input", "commodity", "freight", "cogs", "원가", "비용", "운임")
+    ):
         return "input_cost_pressure"
     if any(term in text for term in ("margin", "gross", "operating income", "마진", "이익률")):
         return "margin_pressure"
     if any(term in text for term in ("rate", "credit", "interest", "funding", "금리", "신용")):
         return "rates_or_credit"
-    if any(term in text for term in ("regulation", "tariff", "geopolitical", "관세", "규제", "지정학")):
+    if any(
+        term in text for term in ("regulation", "tariff", "geopolitical", "관세", "규제", "지정학")
+    ):
         return "policy_or_geopolitical"
     if str(object_type or "") in {"MetricObservation", "Calculation", "XBRLFact"}:
         return "numeric_operating_signal"
@@ -6113,9 +6495,14 @@ def _cross_company_signal_name(summary: str, *, object_type: Any) -> str:
 def _cross_company_financial_channels(summary: str) -> list[str]:
     text = summary.lower()
     channels: list[str] = []
-    if any(term in text for term in ("revenue", "sales", "demand", "volume", "traffic", "매출", "수요", "판매량")):
+    if any(
+        term in text
+        for term in ("revenue", "sales", "demand", "volume", "traffic", "매출", "수요", "판매량")
+    ):
         channels.append("revenue_or_volume")
-    if any(term in text for term in ("gross margin", "margin", "operating income", "마진", "영업이익")):
+    if any(
+        term in text for term in ("gross margin", "margin", "operating income", "마진", "영업이익")
+    ):
         channels.append("margin")
     if any(term in text for term in ("cost", "expense", "cogs", "input", "원가", "비용")):
         channels.append("cost")
@@ -6131,7 +6518,10 @@ def _cross_company_signal_rows(evidence_rows: Sequence[Mapping[str, Any]]) -> li
     signal_rows: list[dict[str, Any]] = []
     for signal, rows in grouped.items():
         strengths = [str(row.get("evidence_strength") or "medium") for row in rows]
-        companies = [str(value) for value in _unique(str(row.get("ticker")) for row in rows if row.get("ticker"))]
+        companies = [
+            str(value)
+            for value in _unique(str(row.get("ticker")) for row in rows if row.get("ticker"))
+        ]
         channels: list[str] = []
         for row in rows:
             channels.extend(str(channel) for channel in row.get("financial_channel") or [])
@@ -6145,7 +6535,9 @@ def _cross_company_signal_rows(evidence_rows: Sequence[Mapping[str, Any]]) -> li
                 "interpretation_hint": _cross_company_interpretation_hint(signal),
             }
         )
-    signal_rows.sort(key=lambda row: (-int(row.get("evidence_count") or 0), str(row.get("signal") or "")))
+    signal_rows.sort(
+        key=lambda row: (-int(row.get("evidence_count") or 0), str(row.get("signal") or ""))
+    )
     return signal_rows[:8]
 
 
@@ -6167,7 +6559,10 @@ def _cross_company_interpretation_hint(signal: str) -> str:
         "policy_or_geopolitical": "Use as a risk channel unless latest commentary or numbers show current impact.",
         "numeric_operating_signal": "Use same-period, same-unit numeric comparisons before drawing cross-company conclusions.",
     }
-    return hints.get(signal, "Use multiple company signals and current filing commentary before making a broad conclusion.")
+    return hints.get(
+        signal,
+        "Use multiple company signals and current filing commentary before making a broad conclusion.",
+    )
 
 
 def _cross_company_signal_quality(evidence_rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
@@ -6177,10 +6572,16 @@ def _cross_company_signal_quality(evidence_rows: Sequence[Mapping[str, Any]]) ->
         "medium_evidence_count": sum(1 for strength in strengths if strength == "medium"),
         "weak_evidence_count": sum(1 for strength in strengths if strength == "weak"),
         "generic_boilerplate_count": sum(
-            1 for row in evidence_rows if _looks_like_generic_boilerplate(str(row.get("commentary_summary") or ""))
+            1
+            for row in evidence_rows
+            if _looks_like_generic_boilerplate(str(row.get("commentary_summary") or ""))
         ),
-        "latest_evidence_count": sum(1 for row in evidence_rows if _is_latestish_period(row.get("period"))),
-        "numeric_support_count": sum(1 for row in evidence_rows if row.get("evidence_type") == "numeric_metric"),
+        "latest_evidence_count": sum(
+            1 for row in evidence_rows if _is_latestish_period(row.get("period"))
+        ),
+        "numeric_support_count": sum(
+            1 for row in evidence_rows if row.get("evidence_type") == "numeric_metric"
+        ),
     }
 
 
@@ -6236,6 +6637,7 @@ def _research_evidence_index(
                 "role": "trace_candidate",
                 "rank": index,
                 "object_id": tool.get("object_id"),
+                "ticker": tool.get("ticker"),
                 "tool": tool.get("tool") or "krw_ontology_trace",
                 "purpose": tool.get("purpose"),
             }
@@ -6249,7 +6651,10 @@ def _research_evidence_index(
                     "chain_depth": chain_pack.get("allowed_additional_chain_depth"),
                 }
             )
-    for pack_name, pack in (("metric_series_pack", metric_series_pack), ("projection_pack", projection_pack)):
+    for pack_name, pack in (
+        ("metric_series_pack", metric_series_pack),
+        ("projection_pack", projection_pack),
+    ):
         if not isinstance(pack, Mapping):
             continue
         for item in pack.get("observations") or pack.get("candidates") or []:
@@ -6275,14 +6680,40 @@ def _research_evidence_index(
 
 def _risk_financial_path(summary: str) -> list[str]:
     text = summary.lower()
-    if any(term in text for term in ("cost", "expense", "wage", "labor", "input", "freight", "비용", "인건비")):
-        return ["cost pressure", "operating expense increase", "operating margin pressure", "weaker earnings conversion"]
+    if any(
+        term in text
+        for term in ("cost", "expense", "wage", "labor", "input", "freight", "비용", "인건비")
+    ):
+        return [
+            "cost pressure",
+            "operating expense increase",
+            "operating margin pressure",
+            "weaker earnings conversion",
+        ]
     if any(term in text for term in ("rate", "deposit", "interest", "funding", "금리", "예금")):
-        return ["rate sensitivity", "funding or yield pressure", "net interest income impact", "earnings volatility"]
+        return [
+            "rate sensitivity",
+            "funding or yield pressure",
+            "net interest income impact",
+            "earnings volatility",
+        ]
     if any(term in text for term in ("demand", "volume", "sales", "revenue", "수요", "매출")):
-        return ["demand change", "revenue growth impact", "operating leverage change", "margin implication"]
-    if any(term in text for term in ("regulation", "regulatory", "approval", "litigation", "규제", "소송")):
-        return ["regulatory or legal constraint", "timing/cost uncertainty", "revenue or margin impact", "valuation assumption risk"]
+        return [
+            "demand change",
+            "revenue growth impact",
+            "operating leverage change",
+            "margin implication",
+        ]
+    if any(
+        term in text
+        for term in ("regulation", "regulatory", "approval", "litigation", "규제", "소송")
+    ):
+        return [
+            "regulatory or legal constraint",
+            "timing/cost uncertainty",
+            "revenue or margin impact",
+            "valuation assumption risk",
+        ]
     return ["business risk", "revenue/cost channel", "margin or cash-flow implication"]
 
 
@@ -6305,10 +6736,15 @@ def _risk_implication(summary: str) -> str:
     return f"Mechanism to evaluate: {' -> '.join(path)}."
 
 
-def _research_directness_guard(query_frame: Mapping[str, Any], answerability: Mapping[str, Any]) -> dict[str, Any]:
+def _research_directness_guard(
+    query_frame: Mapping[str, Any], answerability: Mapping[str, Any]
+) -> dict[str, Any]:
     direct_answerable = bool(answerability.get("direct_answerable"))
     return {
-        "requires_direct_match": bool(query_frame.get("question_requires_direct_match") or query_frame.get("requires_direct_match")),
+        "requires_direct_match": bool(
+            query_frame.get("question_requires_direct_match")
+            or query_frame.get("requires_direct_match")
+        ),
         "direct_answerable": direct_answerable,
         "related_context_available": bool(answerability.get("related_context_available")),
         "negative_answer_supported": bool(answerability.get("negative_answer_supported")),
@@ -6353,7 +6789,9 @@ def _research_missing_parts(research_pack: Mapping[str, Any]) -> list[str]:
     metric_pack = research_pack.get("metric_series_pack") or {}
     projection_pack = research_pack.get("projection_pack") or {}
     metric_quality = metric_pack.get("quality") if isinstance(metric_pack, Mapping) else {}
-    projection_quality = projection_pack.get("quality") if isinstance(projection_pack, Mapping) else {}
+    projection_quality = (
+        projection_pack.get("quality") if isinstance(projection_pack, Mapping) else {}
+    )
     for part in (metric_quality or {}).get("missing_parts") or []:
         missing.append(str(part))
     for part in (projection_quality or {}).get("missing_parts") or []:
@@ -6376,7 +6814,10 @@ def _research_status_from_pack(
             return "sufficient_for_default_answer"
         return "partial_answer_possible"
     business_profile_pack = research_pack.get("business_profile_pack")
-    if isinstance(business_profile_pack, Mapping) and (business_profile_pack.get("business_segments") or business_profile_pack.get("current_drivers")):
+    if isinstance(business_profile_pack, Mapping) and (
+        business_profile_pack.get("business_segments")
+        or business_profile_pack.get("current_drivers")
+    ):
         return "sufficient_but_trace_recommended"
     risk_mechanism_pack = research_pack.get("risk_mechanism_pack")
     if isinstance(risk_mechanism_pack, Mapping) and risk_mechanism_pack.get("risk_channels"):
@@ -6401,7 +6842,11 @@ def _research_status_from_pack(
     if answerability.get("recommended_answer_mode") == "no_direct_evidence_with_related_context":
         return "sufficient_but_trace_recommended"
     if candidates:
-        return "partial_answer_possible" if not answerability.get("related_context_available") else "sufficient_but_trace_recommended"
+        return (
+            "partial_answer_possible"
+            if not answerability.get("related_context_available")
+            else "sufficient_but_trace_recommended"
+        )
     return "needs_targeted_followup"
 
 
@@ -6418,7 +6863,11 @@ def _research_pack_can_skip_discovery(
     projection_pack = research_pack.get("projection_pack")
     if not isinstance(projection_pack, Mapping) or not projection_pack.get("result_count"):
         return False
-    directness = projection_pack.get("directness") if isinstance(projection_pack.get("directness"), Mapping) else {}
+    directness = (
+        projection_pack.get("directness")
+        if isinstance(projection_pack.get("directness"), Mapping)
+        else {}
+    )
     if directness.get("requires_direct_match"):
         return False
     return research_status == "sufficient_but_trace_recommended"
@@ -6531,7 +6980,11 @@ def _research_agent_autonomy(
         return {
             "mode": "bounded",
             "may_continue_research": True,
-            "allowed_next_tools": ["krw_ontology_query", "krw_ontology_trace", "krw_ontology_chain"],
+            "allowed_next_tools": [
+                "krw_ontology_query",
+                "krw_ontology_trace",
+                "krw_ontology_chain",
+            ],
             "disallowed_next_tools": ["krw_ontology_retrieve", "unscoped_krw_ontology_query"],
             "max_additional_tool_calls": 3,
             "purpose": "Verify selected roots and use bounded chain expansion. Use one targeted query only when the selected roots miss the requested latest period or a listed missing part.",
@@ -6567,7 +7020,9 @@ def _research_do_not_call(research_status: str) -> list[str]:
     return ["broad_unscoped_retrieve"]
 
 
-def _merge_bundle_lists(*bundle_lists: Sequence[Mapping[str, Any]], limit: int) -> list[dict[str, Any]]:
+def _merge_bundle_lists(
+    *bundle_lists: Sequence[Mapping[str, Any]], limit: int
+) -> list[dict[str, Any]]:
     merged: list[dict[str, Any]] = []
     seen: set[str] = set()
     for bundles in bundle_lists:
@@ -6582,7 +7037,9 @@ def _merge_bundle_lists(*bundle_lists: Sequence[Mapping[str, Any]], limit: int) 
     return merged
 
 
-def _comparison_evaluation_from_items(items: Sequence[Mapping[str, Any]], *, metric: str | None) -> dict[str, Any]:
+def _comparison_evaluation_from_items(
+    items: Sequence[Mapping[str, Any]], *, metric: str | None
+) -> dict[str, Any]:
     if not items:
         return {
             "direct_answerable": False,
@@ -6605,25 +7062,37 @@ def _comparison_evaluation_from_items(items: Sequence[Mapping[str, Any]], *, met
             tier = "traceable_related"
         else:
             tier = "untraced_direct_candidate"
-    trace_status = "traceable" if tier in {"traceable_direct", "traceable_metric_lineage", "traceable_related"} else "untraced"
+    trace_status = (
+        "traceable"
+        if tier in {"traceable_direct", "traceable_metric_lineage", "traceable_related"}
+        else "untraced"
+    )
     return {
         "direct_answerable": tier in {"traceable_direct", "traceable_metric_lineage"},
         "related_context_available": tier == "traceable_related",
         "negative_answer_supported": False,
-        "recommended_answer_mode": "direct_answer" if tier in {"traceable_direct", "traceable_metric_lineage"} else "related_context_only",
-        "semantic_relevance": "direct" if tier in {"traceable_direct", "traceable_metric_lineage"} else "related",
+        "recommended_answer_mode": "direct_answer"
+        if tier in {"traceable_direct", "traceable_metric_lineage"}
+        else "related_context_only",
+        "semantic_relevance": "direct"
+        if tier in {"traceable_direct", "traceable_metric_lineage"}
+        else "related",
         "trace_status": trace_status,
         "tier": tier,
         "matched_required_facets": [],
         "missing_required_facets": [],
-        "why_tier": "Metric comparison uses traceable metric lineage." if tier == "traceable_metric_lineage" else "Comparison candidate inferred from returned evidence support.",
+        "why_tier": "Metric comparison uses traceable metric lineage."
+        if tier == "traceable_metric_lineage"
+        else "Comparison candidate inferred from returned evidence support.",
         "evidence_chain_count": 1 if trace_status == "traceable" else 0,
         "support_quote_count": len(evidence.get("quotes") or []),
         "support_claim_count": len(evidence.get("claims") or []),
     }
 
 
-def _apply_comparison_evaluation(items: Sequence[dict[str, Any]], evaluation: Mapping[str, Any]) -> None:
+def _apply_comparison_evaluation(
+    items: Sequence[dict[str, Any]], evaluation: Mapping[str, Any]
+) -> None:
     for item in items:
         for key in (
             "semantic_relevance",
@@ -6657,27 +7126,33 @@ def _question_requires_direct_match(question: str) -> bool:
     )
 
 
-def _recommended_trace_tools(candidates: Sequence[Mapping[str, Any]], *, limit: int) -> list[dict[str, Any]]:
-    object_ids: list[str] = []
-    for key in ("top_traceable_object_ids", "source_object_ids", "primary_object_id"):
-        for value in _collect_values(candidates, key):
-            if isinstance(value, list):
-                object_ids.extend(str(item) for item in value if item)
-            elif value:
-                object_ids.append(str(value))
-    selected: list[str] = []
-    for object_id in object_ids:
-        if object_id not in selected:
-            selected.append(object_id)
-    selected = sorted(selected, key=_object_id_recency_key, reverse=True)[:limit]
+def _recommended_trace_tools(
+    candidates: Sequence[Mapping[str, Any]], *, limit: int
+) -> list[dict[str, Any]]:
+    occurrences: list[tuple[str, str | None]] = []
+    for candidate in candidates:
+        ticker = str(candidate.get("ticker") or "").strip().upper() or None
+        for key in ("top_traceable_object_ids", "source_object_ids", "primary_object_id"):
+            for value in _collect_values([candidate], key):
+                if isinstance(value, list):
+                    occurrences.extend((str(item), ticker) for item in value if item)
+                elif value:
+                    occurrences.append((str(value), ticker))
+    selected = list(dict.fromkeys(occurrences))
+    selected = sorted(
+        selected,
+        key=lambda occurrence: (_object_id_recency_key(occurrence[0]), occurrence[1] or ""),
+        reverse=True,
+    )[:limit]
     return [
         {
             "tool": "krw_ontology_trace",
             "object_id": object_id,
+            **({"ticker": ticker} if ticker else {}),
             "purpose": "verify_final_or_related_context",
             "internal_only": True,
         }
-        for object_id in selected
+        for object_id, ticker in selected
     ]
 
 
@@ -6686,11 +7161,15 @@ def _object_id_recency_key(object_id: str) -> tuple[int, int, int]:
     match = re.search(r"(?:CY|FY)?(20\d{2}|19\d{2})(?:Q([1-4]))?", text)
     year = int(match.group(1)) if match else 0
     quarter = int(match.group(2) or 0) if match else 0
-    doc_score = 2 if "10-Q" in text or "10Q" in text else 1 if "10-K" in text or "10K" in text else 0
+    doc_score = (
+        2 if "10-Q" in text or "10Q" in text else 1 if "10-K" in text or "10K" in text else 0
+    )
     return (year, quarter, doc_score)
 
 
-def _final_answer_guidance(answerability: Mapping[str, Any], candidates: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+def _final_answer_guidance(
+    answerability: Mapping[str, Any], candidates: Sequence[Mapping[str, Any]]
+) -> dict[str, Any]:
     missing: list[str] = []
     for value in _collect_values(candidates, "missing_required_facets"):
         if isinstance(value, list):
@@ -6708,9 +7187,13 @@ def _final_answer_guidance(answerability: Mapping[str, Any], candidates: Sequenc
         )
         guidance["missing_required_facets"] = sorted(set(missing))
     elif answerability.get("direct_answerable"):
-        guidance["safe_answer_pattern"] = "공시자료에서 직접 확인되는 내용과 영향을 받는 사업/재무 채널을 함께 설명합니다."
+        guidance["safe_answer_pattern"] = (
+            "공시자료에서 직접 확인되는 내용과 영향을 받는 사업/재무 채널을 함께 설명합니다."
+        )
     else:
-        guidance["safe_answer_pattern"] = "현재 검색 맥락만으로는 단정하지 말고 확인되는 관련 맥락만 제한적으로 설명합니다."
+        guidance["safe_answer_pattern"] = (
+            "현재 검색 맥락만으로는 단정하지 말고 확인되는 관련 맥락만 제한적으로 설명합니다."
+        )
     return guidance
 
 
@@ -7001,6 +7484,7 @@ def _topic_payload_from_compact_bundle(
 def _scope_where(
     *,
     ticker: str | None,
+    tickers: Iterable[str] | None = None,
     document_types: Iterable[str] | None,
 ) -> tuple[str, list[Any]]:
     parts: list[str] = []
@@ -7008,11 +7492,16 @@ def _scope_where(
     if ticker:
         parts.append("ticker = ?")
         params.append(ticker.upper())
+    elif tickers:
+        ticker_values = list(
+            dict.fromkeys(
+                str(value).strip().upper() for value in tickers if str(value or "").strip()
+            )
+        )
+        _add_in_filter(parts, params, "ticker", ticker_values)
     if document_types:
-        values = list(document_types)
-        placeholders = ",".join("?" for _ in values)
-        parts.append(f"document_type IN ({placeholders})")
-        params.extend(values)
+        values = [str(value) for value in document_types if str(value or "").strip()]
+        _add_in_filter(parts, params, "document_type", values)
     return (f"WHERE {' AND '.join(parts)}" if parts else ""), params
 
 
@@ -7072,11 +7561,7 @@ def _scope_token(prefix: str, value: Any) -> str:
 
 
 def _discovery_search_topic(topic: str | None) -> str:
-    terms = [
-        term
-        for term in _query_terms(topic)
-        if term not in _SPLIT_TOPIC_STOP_TERMS
-    ]
+    terms = [term for term in _query_terms(topic) if term not in _SPLIT_TOPIC_STOP_TERMS]
     if len(terms) >= 2:
         return " ".join(terms)
     return " ".join(str(topic or "").split())
@@ -7093,9 +7578,7 @@ def _planned_retrieval_terms(
 ) -> list[str]:
     """Return bounded lexical tokens without domain-specific query expansion."""
     hint_terms = _unique(
-        term
-        for value in retrieval_terms or []
-        for term in _planned_query_terms(str(value))
+        term for value in retrieval_terms or [] for term in _planned_query_terms(str(value))
     )
     if hint_terms:
         return hint_terms[:64]
@@ -7108,18 +7591,14 @@ def _planned_evidence_terms(
     retrieval_terms: Iterable[str] | None,
 ) -> list[str]:
     hint_terms = _unique(
-        term
-        for value in retrieval_terms or []
-        for term in _planned_query_terms(str(value))
+        term for value in retrieval_terms or [] for term in _planned_query_terms(str(value))
     )
     return (hint_terms or _planned_query_terms(retrieval_query))[:64]
 
 
 def _planned_query_terms(value: str | None) -> list[str]:
     return _unique(
-        term.casefold()
-        for term in _PLANNED_TERM_RE.findall(value or "")
-        if len(term) > 1
+        term.casefold() for term in _PLANNED_TERM_RE.findall(value or "") if len(term) > 1
     )
 
 
@@ -7156,9 +7635,7 @@ def _select_planned_metric_rows(
     )
     grouped: dict[tuple[str, str], list[sqlite3.Row]] = {}
     for row in rows:
-        metric = str(
-            row["planned_metric_canonical_metric"] or row["metric_name"] or ""
-        ).casefold()
+        metric = str(row["planned_metric_canonical_metric"] or row["metric_name"] or "").casefold()
         ticker = str(row["ticker"] or "").upper()
         grouped.setdefault((ticker, metric), []).append(row)
 
@@ -7185,8 +7662,7 @@ def _select_planned_metric_rows(
                     [],
                 ).append(row)
             context_rows = [
-                sorted(values, key=lambda row: str(row["id"]))
-                for values in by_context.values()
+                sorted(values, key=lambda row: str(row["id"])) for values in by_context.values()
             ]
             context_rows.sort(
                 key=lambda values: _planned_metric_row_period_key(values[0]),
@@ -7257,7 +7733,13 @@ def _select_planned_metric_rows(
                     )
                 )
 
-        bundles.sort(key=lambda item: (not item[0], tuple(-value if isinstance(value, int) else value for value in item[1][:2]), item[2]))
+        bundles.sort(
+            key=lambda item: (
+                not item[0],
+                tuple(-value if isinstance(value, int) else value for value in item[1][:2]),
+                item[2],
+            )
+        )
         selected: list[sqlite3.Row] = []
         for _conflict, _period_key, _series_key, bundle in bundles:
             remaining = limit_per_group - len(selected)
@@ -7318,12 +7800,8 @@ def _planned_metric_rows_match_window(
     current_year, current_quarter, _ = _planned_metric_row_period_key(current)
     if not previous_year or not current_year:
         return False
-    period_type = str(
-        previous["planned_metric_observation_period_type"] or "unknown"
-    )
-    if period_type != str(
-        current["planned_metric_observation_period_type"] or "unknown"
-    ):
+    period_type = str(previous["planned_metric_observation_period_type"] or "unknown")
+    if period_type != str(current["planned_metric_observation_period_type"] or "unknown"):
         return False
     if period_type == "year_to_date" and calculation_window != "year_over_year":
         return False
@@ -7333,9 +7811,7 @@ def _planned_metric_rows_match_window(
         return False
     if calculation_window == "year_over_year":
         return current_year - previous_year == 1 and current_quarter == previous_quarter
-    return (current_year * 4 + current_quarter) - (
-        previous_year * 4 + previous_quarter
-    ) == 1
+    return (current_year * 4 + current_quarter) - (previous_year * 4 + previous_quarter) == 1
 
 
 def _query_wants_current_document_prior(topic: str | None) -> bool:
@@ -7383,7 +7859,9 @@ def _document_type_recency_priority(document_type: Any) -> int:
 def _document_recency_key(document: Mapping[str, Any]) -> tuple[tuple[int, int], int]:
     return (
         _period_recency_key(document.get("period")),
-        _document_type_recency_priority(document.get("document_type") or document.get("doc_type_key")),
+        _document_type_recency_priority(
+            document.get("document_type") or document.get("doc_type_key")
+        ),
     )
 
 
@@ -7416,7 +7894,9 @@ def filing_document_roles_from_documents(
     by_ticker: dict[str, list[Mapping[str, Any]]] = {}
     for document in documents:
         ticker = str(document.get("ticker") or "").upper()
-        document_type = str(document.get("document_type") or document.get("doc_type_key") or "").upper()
+        document_type = str(
+            document.get("document_type") or document.get("doc_type_key") or ""
+        ).upper()
         period = str(document.get("period") or "").strip()
         if not ticker or (requested and ticker not in requested):
             continue
@@ -7432,13 +7912,20 @@ def filing_document_roles_from_documents(
         annual_candidates = [
             document
             for document in ticker_documents
-            if str(document.get("document_type") or document.get("doc_type_key") or "").upper() == "10-K"
+            if str(document.get("document_type") or document.get("doc_type_key") or "").upper()
+            == "10-K"
         ]
-        annual_baseline = max(annual_candidates, key=_document_recency_key) if annual_candidates else None
+        annual_baseline = (
+            max(annual_candidates, key=_document_recency_key) if annual_candidates else None
+        )
         role_payload: dict[str, Any] = {
             "ticker": ticker,
-            "current_driver": _document_anchor(latest_available, ticker=ticker, role="current_driver"),
-            "latest_available": _document_anchor(latest_available, ticker=ticker, role="latest_available"),
+            "current_driver": _document_anchor(
+                latest_available, ticker=ticker, role="current_driver"
+            ),
+            "latest_available": _document_anchor(
+                latest_available, ticker=ticker, role="latest_available"
+            ),
             "available_document_types": sorted(
                 {
                     str(document.get("document_type") or document.get("doc_type_key") or "").upper()
@@ -7498,7 +7985,12 @@ def _normalize_metric_lookup_topic(
         removed_tokens.append(token)
         return " "
 
-    normalized = re.sub(r"\b(?:CY|FY)?(?:19|20)\d{2}(?:Q[1-4])?\b", replace_period_token, original, flags=re.IGNORECASE)
+    normalized = re.sub(
+        r"\b(?:CY|FY)?(?:19|20)\d{2}(?:Q[1-4])?\b",
+        replace_period_token,
+        original,
+        flags=re.IGNORECASE,
+    )
     topic_years = sorted({int(year) for year in re.findall(r"\b((?:19|20)\d{2})\b", original)})
     normalized = " ".join(normalized.split())
     diagnostics: dict[str, Any] = {
@@ -7524,7 +8016,9 @@ def _metric_lookup_period_filters(topic: str | None, periods: Iterable[str] | No
     return [str(year) for year in years]
 
 
-def _metric_lookup_research_period_filters(topic: str | None, periods: Iterable[str] | None) -> list[str]:
+def _metric_lookup_research_period_filters(
+    topic: str | None, periods: Iterable[str] | None
+) -> list[str]:
     explicit_periods = _metric_lookup_period_filters(None, periods)
     topic_periods = _metric_lookup_period_filters(topic, None)
     if topic_periods and len(topic_periods) > len(explicit_periods):
@@ -7621,7 +8115,9 @@ def _metric_lookup_fallback_object_types(
 ) -> tuple[str, ...]:
     if not search_strategy or not search_strategy.get("dimension_metric_not_found"):
         return tuple(object_types)
-    return tuple(object_type for object_type in object_types if object_type not in _METRIC_FAST_PATH_TYPES)
+    return tuple(
+        object_type for object_type in object_types if object_type not in _METRIC_FAST_PATH_TYPES
+    )
 
 
 def _metric_lookup_wants_total(topic: str | None) -> bool:
@@ -7709,9 +8205,7 @@ def _expanded_topic(topic: str) -> str:
         return ""
     topic_lower = topic.lower()
     expansions = [
-        expansion
-        for needle, expansion in _QUERY_EXPANSION_RULES
-        if needle in topic_lower
+        expansion for needle, expansion in _QUERY_EXPANSION_RULES if needle in topic_lower
     ]
     if not expansions:
         return topic
@@ -7726,11 +8220,7 @@ def _split_topic_queries(topic: str, *, limit: int = 12) -> list[str]:
     ]
     chunks: list[str] = []
     chunks.extend(term for term in terms if "_" in term)
-    chunks.extend(
-        f"{left} {right}"
-        for left, right in zip(terms, terms[1:])
-        if left != right
-    )
+    chunks.extend(f"{left} {right}" for left, right in zip(terms, terms[1:]) if left != right)
     chunks.extend(terms)
     return _unique(chunks)[:limit]
 
@@ -7893,7 +8383,10 @@ def _temporal_references_object(candidate: dict[str, Any], object_ids: set[str |
         return False
     candidate_type = candidate.get("type")
     if candidate_type == "TemporalLink":
-        return candidate.get("from_object_id") in object_ids or candidate.get("to_object_id") in object_ids
+        return (
+            candidate.get("from_object_id") in object_ids
+            or candidate.get("to_object_id") in object_ids
+        )
     if candidate_type == "TrendObservation":
         return bool(set(candidate.get("supported_by_objects") or []).intersection(object_ids))
     if candidate_type == "ChangeEvent":
@@ -7914,14 +8407,19 @@ def _chain_warnings(
     warnings: list[str] = []
     if obj.get("review_status") == "rejected":
         warnings.append("object_is_rejected")
-    if not evidence.get("claims") and not evidence.get("quotes") and obj.get("type") not in {
-        "EvidenceQuote",
-        "ResearchClaim",
-        "SourceSpan",
-        "MetricObservation",
-        "Calculation",
-        "XBRLFact",
-    }:
+    if (
+        not evidence.get("claims")
+        and not evidence.get("quotes")
+        and obj.get("type")
+        not in {
+            "EvidenceQuote",
+            "ResearchClaim",
+            "SourceSpan",
+            "MetricObservation",
+            "Calculation",
+            "XBRLFact",
+        }
+    ):
         warnings.append("no_supporting_evidence_found")
     evidence_grade = obj.get("evidence_grade")
     if evidence_grade in {"derived", "unsupported"}:

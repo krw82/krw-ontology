@@ -9,7 +9,7 @@ import re
 from pathlib import Path
 
 from krw_ontology.config.constants import normalize_doc_type
-from krw_ontology.errors import PipelineStageError, RateLimitError
+from krw_ontology.errors import PipelineStageError, ProviderOverloadError, RateLimitError
 from krw_ontology.extraction.prompts.quote_extraction import (
     QUOTE_EXTRACTION_PROMPT,
     QUOTE_TYPES,
@@ -582,6 +582,7 @@ async def extract_evidence_quotes(
         concurrency=concurrency,
         run_one=run_batch,
         on_complete=log_complete,
+        stage_name=stage_name,
     )
 
     for _batch_idx, (batch_quotes, failed_spans) in sorted(results, key=lambda row: row[0]):
@@ -708,6 +709,8 @@ async def _extract_batch_with_split_retry(
             candidate_count=len(candidates),
             split_depth=split_depth,
         ), 0
+    except ProviderOverloadError:
+        raise
     except RateLimitError as e:
         batch_span_ids = [s["id"] for s in batch]
         logger.warning(

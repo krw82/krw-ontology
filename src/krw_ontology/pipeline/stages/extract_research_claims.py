@@ -8,7 +8,7 @@ import hashlib
 from pathlib import Path
 
 from krw_ontology.config.constants import normalize_doc_type
-from krw_ontology.errors import PipelineStageError, RateLimitError
+from krw_ontology.errors import PipelineStageError, ProviderOverloadError, RateLimitError
 from krw_ontology.extraction.prompts.claim_extraction import (
     CLAIM_EXTRACTION_PROMPT,
     CLAIM_TYPES,
@@ -215,6 +215,7 @@ async def extract_research_claims(
         concurrency=concurrency,
         run_one=run_batch,
         on_complete=log_complete,
+        stage_name=stage_name,
     )
 
     seen_claim_ids: set[str] = set()
@@ -317,6 +318,8 @@ async def _extract_batch_with_split_retry(
             source_span_count=len(_quote_source_span_ids(batch_quotes)),
             split_depth=split_depth,
         ), 0
+    except ProviderOverloadError:
+        raise
     except RateLimitError as e:
         span_ids = _quote_source_span_ids(batch_quotes)
         logger.warning(

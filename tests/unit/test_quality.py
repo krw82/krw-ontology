@@ -20,8 +20,15 @@ from krw_ontology.agent_index.source_artifact_sqlite import (
     SOURCE_ARTIFACT_SQLITE_SCHEMA_VERSION,
 )
 from krw_ontology.agent_index.router_sidecar import build_router_sidecar
+from krw_ontology.agent_index.router_coherence import build_router_coherence
 from krw_ontology.agent_index.metric_dictionary import metric_dictionary_binding
-from krw_ontology.agent_index.spine_schema import create_global_spine_schema, write_global_spine_metadata
+from krw_ontology.agent_index.spine_schema import (
+    GLOBAL_SPINE_TABLES,
+    create_global_spine_schema,
+    verify_global_spine_schema,
+    write_global_spine_metadata,
+    write_spine_verification_seal,
+)
 from krw_ontology.quality.models import (
     BATCH_FAILURE,
     DOCS_MISSING,
@@ -95,7 +102,9 @@ def test_quality_scanner_summarizes_problem_tickers(tmp_path: Path):
     assert explanation["documents"][0]["section_quality"]["missing_core_sections"] == ["item7"]
 
 
-def test_quality_scanner_builds_repair_plan_jobs(tmp_path: Path):
+def test_quality_scanner_builds_repair_plan_jobs_without_disabled_section_repairs(
+    tmp_path: Path,
+):
     index_path = _write_quality_index(tmp_path)
 
     jobs = QualityShardScanner(index_path).build_repair_jobs(plan_id="qr_test", min_docs=5)
@@ -104,19 +113,24 @@ def test_quality_scanner_builds_repair_plan_jobs(tmp_path: Path):
         by_kind[job.kind] = by_kind.get(job.kind, 0) + 1
 
     assert by_kind[DOCS_MISSING] == 1
-    assert by_kind[SECTION_FAIL] == 1
+    assert SECTION_FAIL not in by_kind
     assert by_kind[BATCH_FAILURE] == 1
     assert by_kind[NORMALIZE_NUMERIC] == 1
     assert by_kind[REPAIR_REFERENCE] == 1
     assert all(job.plan_id == "qr_test" for job in jobs)
 
 
-def test_quality_cli_check_tickers_explain_and_events_use_v3_release_root(tmp_path: Path, monkeypatch):
+def test_quality_cli_check_tickers_explain_and_events_use_v3_release_root(
+    tmp_path: Path, monkeypatch
+):
     release_root = _write_v3_quality_release(tmp_path)
 
     check = runner.invoke(app, ["quality", "check", "--release-root", str(release_root)])
     assert check.exit_code == 0
-    assert "Scan: mode=full-release-diagnostic rollup=shard_scan opened_shards=2 full_consistency=True" in check.output
+    assert (
+        "Scan: mode=full-release-diagnostic rollup=shard_scan opened_shards=2 full_consistency=True"
+        in check.output
+    )
     assert "Problem tickers: 1" in check.output
     assert "section_fail=1" in check.output
 
@@ -130,7 +144,9 @@ def test_quality_cli_check_tickers_explain_and_events_use_v3_release_root(tmp_pa
     assert "Scan: mode=bounded" in tickers.output
     assert "FCX" in tickers.output
     assert "OK" not in tickers.output
-    full_tickers = runner.invoke(app, ["quality", "tickers", "--release-root", str(release_root), "--full"])
+    full_tickers = runner.invoke(
+        app, ["quality", "tickers", "--release-root", str(release_root), "--full"]
+    )
     assert full_tickers.exit_code == 0
     assert "Scan: mode=full" in full_tickers.output
 
@@ -141,7 +157,16 @@ def test_quality_cli_check_tickers_explain_and_events_use_v3_release_root(tmp_pa
 
     events = runner.invoke(
         app,
-        ["quality", "events", "--ticker", "FCX", "--category", "batch_failure", "--release-root", str(release_root)],
+        [
+            "quality",
+            "events",
+            "--ticker",
+            "FCX",
+            "--category",
+            "batch_failure",
+            "--release-root",
+            str(release_root),
+        ],
     )
     assert events.exit_code == 0
     assert "extract_assumption_candidates" in events.output
@@ -205,7 +230,10 @@ def test_quality_release_scanner_reports_declared_missing_company_shards(tmp_pat
     assert report["consistency"]["declared_shards"] == 2
     assert report["consistency"]["available_shards"] == 1
     assert report["consistency"]["missing_shards"] == report["shards"]["missing"]
-    assert any(error.startswith(f"shard_missing:OK:{missing_shard}") for error in report["consistency"]["errors"])
+    assert any(
+        error.startswith(f"shard_missing:OK:{missing_shard}")
+        for error in report["consistency"]["errors"]
+    )
     assert report["kind_counts"]["release_consistency"] >= 1
 
     result = runner.invoke(app, ["quality", "check", "--release-root", str(release_root)])
@@ -246,7 +274,9 @@ def test_quality_cli_check_defaults_to_configured_v3_current(tmp_path: Path, mon
     assert "Consistency: pass" in result.output
 
 
-def test_quality_repair_plan_records_v3_fingerprint_and_refuses_stale_run(tmp_path: Path, monkeypatch):
+def test_quality_repair_plan_records_v3_fingerprint_and_refuses_stale_run(
+    tmp_path: Path, monkeypatch
+):
     _patch_expected_filing_discovery(monkeypatch)
     release_root = _write_v3_quality_release(tmp_path)
     root = tmp_path / "running"
@@ -281,7 +311,9 @@ def test_quality_repair_plan_records_v3_fingerprint_and_refuses_stale_run(tmp_pa
     manifest["release_id"] = "v3-quality-mutated"
     manifest_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
 
-    stale = runner.invoke(app, ["quality", "repair", "run", "--root", str(root), "--plan", "qr_v3", "--preview"])
+    stale = runner.invoke(
+        app, ["quality", "repair", "run", "--root", str(root), "--plan", "qr_v3", "--preview"]
+    )
     assert stale.exit_code == 1
     assert "quality repair plan is stale" in stale.output
 
@@ -379,25 +411,41 @@ def test_quality_cli_repair_plan_show_status_list_clear(tmp_path: Path, monkeypa
 
     store = QualityRepairStore(root)
     assert store.load_plan("qr_test").plan_id == "qr_test"
-    assert store.status_counts(plan_id="qr_test")["pending"] == 4
+    assert store.status_counts(plan_id="qr_test")["pending"] == 3
 
-    show = runner.invoke(app, ["quality", "repair", "show", "--root", str(root), "--plan", "qr_test"])
+    show = runner.invoke(
+        app, ["quality", "repair", "show", "--root", str(root), "--plan", "qr_test"]
+    )
     assert show.exit_code == 0
     assert "Repair plan: qr_test" in show.output
     assert "normalize_numeric" not in show.output
 
-    status = runner.invoke(app, ["quality", "repair", "status", "--root", str(root), "--plan", "qr_test"])
+    status = runner.invoke(
+        app, ["quality", "repair", "status", "--root", str(root), "--plan", "qr_test"]
+    )
     assert status.exit_code == 0
-    assert "pending=4" in status.output
+    assert "pending=3" in status.output
 
     listed = runner.invoke(
         app,
-        ["quality", "repair", "list", "--root", str(root), "--plan", "qr_test", "--kind", BATCH_FAILURE],
+        [
+            "quality",
+            "repair",
+            "list",
+            "--root",
+            str(root),
+            "--plan",
+            "qr_test",
+            "--kind",
+            BATCH_FAILURE,
+        ],
     )
     assert listed.exit_code == 0
     assert "extract_assumption_candidates" in listed.output
 
-    clear = runner.invoke(app, ["quality", "repair", "clear", "--root", str(root), "--plan", "qr_test", "--yes"])
+    clear = runner.invoke(
+        app, ["quality", "repair", "clear", "--root", str(root), "--plan", "qr_test", "--yes"]
+    )
     assert clear.exit_code == 0
     assert "removed=" in clear.output
 
@@ -424,18 +472,31 @@ def test_quality_repair_run_preview_defaults_to_executable_jobs(tmp_path: Path, 
     )
     assert plan.exit_code == 0
 
-    preview = runner.invoke(app, ["quality", "repair", "run", "--root", str(root), "--plan", "qr_test", "--preview"])
+    preview = runner.invoke(
+        app, ["quality", "repair", "run", "--root", str(root), "--plan", "qr_test", "--preview"]
+    )
 
     assert preview.exit_code == 1
     assert "Skipped" not in preview.output
-    assert "would run section_fail" in preview.output
+    assert "would run section_fail" not in preview.output
     assert "would run batch_failure" in preview.output
     assert "would run docs_missing" in preview.output
     assert "would run repair_reference" in preview.output
 
     numeric_preview = runner.invoke(
         app,
-        ["quality", "repair", "run", "--root", str(root), "--plan", "qr_test", "--kind", NORMALIZE_NUMERIC, "--preview"],
+        [
+            "quality",
+            "repair",
+            "run",
+            "--root",
+            str(root),
+            "--plan",
+            "qr_test",
+            "--kind",
+            NORMALIZE_NUMERIC,
+            "--preview",
+        ],
     )
 
     assert numeric_preview.exit_code == 0
@@ -467,12 +528,22 @@ def test_quality_repair_run_all_and_watch_once(tmp_path: Path, monkeypatch):
 
     preview = runner.invoke(
         app,
-        ["quality", "repair", "run", "--root", str(root), "--plan", "qr_test", "--all", "--preview"],
+        [
+            "quality",
+            "repair",
+            "run",
+            "--root",
+            str(root),
+            "--plan",
+            "qr_test",
+            "--all",
+            "--preview",
+        ],
     )
 
     assert preview.exit_code == 1
     assert "Selection: all executable pending jobs" in preview.output
-    assert preview.output.count("would run") == 4
+    assert preview.output.count("would run") == 3
     assert "would run docs_missing" in preview.output
 
     watch = runner.invoke(
@@ -482,7 +553,7 @@ def test_quality_repair_run_all_and_watch_once(tmp_path: Path, monkeypatch):
 
     assert watch.exit_code == 0
     assert "QUALITY_QUEUE=" in watch.output
-    assert "pending=4" in watch.output
+    assert "pending=3" in watch.output
 
 
 def test_quality_repair_run_defaults_to_latest_all_background(tmp_path: Path, monkeypatch):
@@ -531,14 +602,18 @@ def test_quality_repair_run_defaults_to_latest_all_background(tmp_path: Path, mo
     assert calls[0][1] is cli_main.subprocess.DEVNULL
     assert calls[0][2] is cli_main.subprocess.STDOUT
     assert calls[0][3] is True
-    assert "Started quality repair worker pid=12345" in result.output
-    assert "selected_jobs: 4" in result.output
+    assert "Started quality repair reference worker pid=12345" in result.output
+    assert "reference_jobs: 1" in result.output
     assert (root / ".krw_pipeline" / "quality" / "logs" / "worker.log").exists()
 
 
-def test_docs_missing_repair_falls_back_to_full_refresh_when_missing_periods_are_ambiguous(tmp_path: Path):
+def test_docs_missing_repair_falls_back_to_full_refresh_when_missing_periods_are_ambiguous(
+    tmp_path: Path,
+):
     index_path = _write_quality_index(tmp_path)
-    jobs = QualityShardScanner(index_path).build_repair_jobs(plan_id="qr_test", min_docs=5, kinds=[DOCS_MISSING])
+    jobs = QualityShardScanner(index_path).build_repair_jobs(
+        plan_id="qr_test", min_docs=5, kinds=[DOCS_MISSING]
+    )
     root = tmp_path / "running"
     store = QualityRepairStore(root)
     plan = store.add_plan(
@@ -578,10 +653,30 @@ def test_docs_missing_repair_uses_expected_filing_diff_for_targeted_update(tmp_p
     def expected_provider(ticker: str):
         return (
             [
-                {"ticker": ticker, "document_type": "10-K", "doc_type_key": "10K", "period": "CY2023"},
-                {"ticker": ticker, "document_type": "10-K", "doc_type_key": "10K", "period": "CY2024"},
-                {"ticker": ticker, "document_type": "10-K", "doc_type_key": "10K", "period": "CY2025"},
-                {"ticker": ticker, "document_type": "10-Q", "doc_type_key": "10Q", "period": "CY2026Q1"},
+                {
+                    "ticker": ticker,
+                    "document_type": "10-K",
+                    "doc_type_key": "10K",
+                    "period": "CY2023",
+                },
+                {
+                    "ticker": ticker,
+                    "document_type": "10-K",
+                    "doc_type_key": "10K",
+                    "period": "CY2024",
+                },
+                {
+                    "ticker": ticker,
+                    "document_type": "10-K",
+                    "doc_type_key": "10K",
+                    "period": "CY2025",
+                },
+                {
+                    "ticker": ticker,
+                    "document_type": "10-Q",
+                    "doc_type_key": "10Q",
+                    "period": "CY2026Q1",
+                },
             ],
             None,
         )
@@ -664,7 +759,10 @@ def test_docs_missing_repair_falls_back_when_expected_filing_discovery_fails(tmp
     assert len(jobs) == 1
     assert jobs[0].payload["action"] == "full_refresh_fallback"
     assert jobs[0].payload["expected_discovery_error"] == "resolve_ticker failed"
-    assert jobs[0].payload["fallback_reason"] == "expected filing discovery failed: resolve_ticker failed"
+    assert (
+        jobs[0].payload["fallback_reason"]
+        == "expected filing discovery failed: resolve_ticker failed"
+    )
 
 
 def test_docs_missing_repair_skips_when_expected_filing_coverage_is_complete(tmp_path: Path):
@@ -673,7 +771,12 @@ def test_docs_missing_repair_skips_when_expected_filing_coverage_is_complete(tmp
     def expected_provider(ticker: str):
         return (
             [
-                {"ticker": ticker, "document_type": "10-K", "doc_type_key": "10K", "period": "CY2025"},
+                {
+                    "ticker": ticker,
+                    "document_type": "10-K",
+                    "doc_type_key": "10K",
+                    "period": "CY2025",
+                },
             ],
             None,
         )
@@ -703,7 +806,9 @@ def test_docs_missing_repair_enqueues_targeted_filing_update_for_inferred_gap(tm
             )
         conn.commit()
 
-    jobs = QualityShardScanner(index_path).build_repair_jobs(plan_id="qr_test", min_docs=5, kinds=[DOCS_MISSING])
+    jobs = QualityShardScanner(index_path).build_repair_jobs(
+        plan_id="qr_test", min_docs=5, kinds=[DOCS_MISSING]
+    )
     assert len(jobs) == 1
     assert jobs[0].payload["action"] == "targeted_filing_update"
     assert jobs[0].payload["missing_documents"] == [
@@ -759,7 +864,9 @@ def test_docs_missing_repair_skips_existing_targeted_update(tmp_path: Path):
             )
         conn.commit()
 
-    jobs = QualityShardScanner(index_path).build_repair_jobs(plan_id="qr_test", min_docs=5, kinds=[DOCS_MISSING])
+    jobs = QualityShardScanner(index_path).build_repair_jobs(
+        plan_id="qr_test", min_docs=5, kinds=[DOCS_MISSING]
+    )
     root = tmp_path / "running"
     pipeline_queue = PipelineQueue(root)
     active = pipeline_queue.add_update_job(
@@ -797,7 +904,9 @@ def test_docs_missing_repair_skips_existing_targeted_update(tmp_path: Path):
 
 def test_docs_missing_repair_skips_existing_active_pipeline_job(tmp_path: Path):
     index_path = _write_quality_index(tmp_path)
-    jobs = QualityShardScanner(index_path).build_repair_jobs(plan_id="qr_test", min_docs=5, kinds=[DOCS_MISSING])
+    jobs = QualityShardScanner(index_path).build_repair_jobs(
+        plan_id="qr_test", min_docs=5, kinds=[DOCS_MISSING]
+    )
     root = tmp_path / "running"
     pipeline_queue = PipelineQueue(root)
     active = pipeline_queue.add_job(
@@ -872,12 +981,8 @@ def _write_v3_quality_release(tmp_path: Path) -> Path:
                 "release_id": "v3-quality",
                 "source_manifest_hash": "test-source",
                 "spine_projection_version": SPINE_PROJECTION_VERSION,
-                "source_artifact_sqlite_schema_version": (
-                    SOURCE_ARTIFACT_SQLITE_SCHEMA_VERSION
-                ),
-                "source_artifact_sqlite_builder_version": (
-                    SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION
-                ),
+                "source_artifact_sqlite_schema_version": (SOURCE_ARTIFACT_SQLITE_SCHEMA_VERSION),
+                "source_artifact_sqlite_builder_version": (SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION),
                 "company_shard_schema_version": COMPANY_SHARD_SCHEMA_VERSION,
             },
         )
@@ -905,6 +1010,16 @@ def _write_v3_quality_release(tmp_path: Path) -> Path:
                         "fail" if ticker == "FCX" else "pass",
                     ),
                 )
+        write_global_spine_metadata(
+            conn,
+            {
+                "counts": {
+                    table: int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+                    for table in GLOBAL_SPINE_TABLES
+                    if table != "metadata"
+                }
+            },
+        )
         conn.commit()
 
     source_manifest_path = release_root / "source_manifest.json"
@@ -928,12 +1043,8 @@ def _write_v3_quality_release(tmp_path: Path) -> Path:
                 "index_layout": "global-spine-and-company-shards",
                 "release_id": "v3-quality",
                 "company_shard_schema_version": COMPANY_SHARD_SCHEMA_VERSION,
-                "source_artifact_sqlite_schema_version": (
-                    SOURCE_ARTIFACT_SQLITE_SCHEMA_VERSION
-                ),
-                "source_artifact_sqlite_builder_version": (
-                    SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION
-                ),
+                "source_artifact_sqlite_schema_version": (SOURCE_ARTIFACT_SQLITE_SCHEMA_VERSION),
+                "source_artifact_sqlite_builder_version": (SOURCE_ARTIFACT_SQLITE_BUILDER_VERSION),
                 "metric_dictionary": metric_dictionary_binding(),
                 "shards": {
                     "FCX": {
@@ -978,8 +1089,17 @@ def _write_v3_quality_release(tmp_path: Path) -> Path:
         ),
         encoding="utf-8",
     )
+    global_verification = verify_global_spine_schema(
+        global_spine_path,
+        deep=True,
+        trust_seal=False,
+    )
+    write_spine_verification_seal(global_spine_path, global_verification)
     build_router_sidecar(global_spine_path, release_id="v3-quality")
-    write_release_manifest_v3(release_root, release_id="v3-quality", env="dev", source_root=release_root)
+    build_router_coherence(global_spine_path, release_id="v3-quality")
+    write_release_manifest_v3(
+        release_root, release_id="v3-quality", env="dev", source_root=release_root
+    )
     return release_root
 
 
@@ -1015,8 +1135,22 @@ def _write_quality_shard(
         )
         """
     )
-    conn.execute("CREATE TABLE objects(id TEXT, ticker TEXT)")
-    conn.execute("CREATE TABLE edges(id TEXT)")
+    conn.execute(
+        """
+        CREATE TABLE objects(
+            id TEXT, ticker TEXT, document_type TEXT, doc_type_key TEXT,
+            period TEXT, source_document_id TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE edges(
+            id TEXT, ticker TEXT, document_type TEXT, doc_type_key TEXT,
+            period TEXT, source_document_id TEXT
+        )
+        """
+    )
     conn.execute(
         """
         CREATE TABLE quality_events(
@@ -1039,7 +1173,9 @@ def _write_quality_shard(
         (json.dumps({"root": str(release_root), "ticker": ticker}),),
     )
     for period in periods:
-        _insert_doc(conn, ticker=ticker, period=period, status=status, quality=quality, root=release_root)
+        _insert_doc(
+            conn, ticker=ticker, period=period, status=status, quality=quality, root=release_root
+        )
     if include_problem_events:
         _insert_event(
             conn,
@@ -1469,49 +1605,57 @@ def _write_safe_repair_ontology(root: Path) -> Path:
     }
     write_jsonl(
         ontology_dir / "source_documents.jsonl",
-        [{
-            "id": source_document_id,
-            "type": "SourceDocument",
-            "ticker": "FCX",
-            "document_type": "10-K",
-            "period": "CY2025",
-            "schema_version": "test",
-        }],
+        [
+            {
+                "id": source_document_id,
+                "type": "SourceDocument",
+                "ticker": "FCX",
+                "document_type": "10-K",
+                "period": "CY2025",
+                "schema_version": "test",
+            }
+        ],
     )
     write_jsonl(
         ontology_dir / "spans.jsonl",
-        [{
-            "id": "span:FCX:CY2025:10K:item7",
-            "type": "SourceSpan",
-            **common,
-            "section_name": "item7",
-            "text": "Revenue increased 12% year over year.",
-        }],
+        [
+            {
+                "id": "span:FCX:CY2025:10K:item7",
+                "type": "SourceSpan",
+                **common,
+                "section_name": "item7",
+                "text": "Revenue increased 12% year over year.",
+            }
+        ],
     )
     write_jsonl(
         ontology_dir / "evidence_quotes.jsonl",
-        [{
-            "id": "quote:FCX:CY2025:10K:revenue",
-            "type": "EvidenceQuote",
-            **common,
-            "source_span_id": "span:FCX:CY2025:10K:item7",
-            "section_name": "item7",
-            "quote_text": "Revenue increased 12% year over year.",
-            "quote_type": "metric",
-        }],
+        [
+            {
+                "id": "quote:FCX:CY2025:10K:revenue",
+                "type": "EvidenceQuote",
+                **common,
+                "source_span_id": "span:FCX:CY2025:10K:item7",
+                "section_name": "item7",
+                "quote_text": "Revenue increased 12% year over year.",
+                "quote_type": "metric",
+            }
+        ],
     )
     write_jsonl(
         ontology_dir / "claims.jsonl",
-        [{
-            "id": "claim:FCX:CY2025:10K:revenue",
-            "type": "ResearchClaim",
-            **common,
-            "claim_text": "Revenue increased 12% year over year.",
-            "claim_type": "financial_performance",
-            "supported_by_quotes": ["quote:FCX:CY2025:10K:revenue"],
-            "confidence": "high",
-            "review_status": "accepted",
-        }],
+        [
+            {
+                "id": "claim:FCX:CY2025:10K:revenue",
+                "type": "ResearchClaim",
+                **common,
+                "claim_text": "Revenue increased 12% year over year.",
+                "claim_type": "financial_performance",
+                "supported_by_quotes": ["quote:FCX:CY2025:10K:revenue"],
+                "confidence": "high",
+                "review_status": "accepted",
+            }
+        ],
     )
     write_jsonl(
         ontology_dir / "rejected_objects.jsonl",
@@ -1539,8 +1683,7 @@ def _write_safe_repair_ontology(root: Path) -> Path:
                 "review_status": "accepted",
                 "rejection_stage": "reference_validation",
                 "rejection_reason": (
-                    "Dangling references: [('supported_by_quotes', "
-                    "'quote:FCX:CY2025:10K:missing')]"
+                    "Dangling references: [('supported_by_quotes', 'quote:FCX:CY2025:10K:missing')]"
                 ),
             },
         ],

@@ -17,6 +17,10 @@ class RateLimitError(ExtractionError):
     """AI provider rejected the request due to rate limiting or overload."""
 
 
+class ProviderOverloadError(RateLimitError):
+    """Provider reported temporary server overload; retry the same batch after cooldown."""
+
+
 class ValidationError(KrwOntologyError):
     """Validation found issues with extracted objects."""
 

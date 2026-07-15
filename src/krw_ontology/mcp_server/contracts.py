@@ -11,11 +11,19 @@ import hashlib
 import json
 import math
 import re
+import unicodedata
 from datetime import date
 from enum import Enum
 from typing import Annotated, Any, Literal, Mapping, Sequence
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from krw_ontology.agent_index.metric_dictionary import (
     canonical_metric_name,
@@ -31,6 +39,19 @@ RESEARCH_STATE_VERSION = "research-state/v2"
 MAX_RESEARCH_STATE_MODEL_BYTES = 80_000
 MAX_RESEARCH_STATE_WIRE_BYTES = 180_000
 _TOKEN_RE = re.compile(r"[0-9A-Za-z\u3131-\u318e\uac00-\ud7a3_]+")
+# Directness verification deliberately uses a much smaller equivalence policy
+# than retrieval.  These aliases only bridge notation or an unambiguous filing
+# synonym inside one already traceable atomic claim/quote.  They do not expand
+# queries, select companies, or make related multi-sentence context direct.
+_DIRECT_EVIDENCE_TOKEN_EQUIVALENTS = {
+    "debt": "debt",
+    "indebtedness": "debt",
+    "operating": "operations",
+    "operation": "operations",
+    "operations": "operations",
+    "percent": "percent",
+    "percentage": "percent",
+}
 EvidenceDirectness = Literal["direct", "metric_lineage", "related", "unverified"]
 EvidenceGrade = Literal["strong", "medium", "weak", "unverified"]
 ComparisonAxis = Literal[
@@ -54,6 +75,43 @@ class ContractModel(BaseModel):
         frozen=True,
         str_strip_whitespace=True,
         validate_default=True,
+    )
+
+
+InputCorrectionRule = Literal[
+    "missing_literal_term",
+    "mixed_metric_and_qualitative_clause",
+    "missing_calculation_window",
+    "invalid_search_plan",
+]
+
+
+class QueryContextInputViolation(ContractModel):
+    """One deterministic SearchPlan input problem that MCP can describe exactly."""
+
+    field: str = Field(min_length=1, max_length=512)
+    rule: InputCorrectionRule
+    message: str = Field(min_length=1, max_length=2_000)
+    required_change: str = Field(min_length=1, max_length=2_000)
+    required_literals: list[str] = Field(default_factory=list, max_length=32)
+
+
+class QueryContextInputCorrection(ContractModel):
+    """Machine-readable batch of SearchPlan corrections returned by query_context.
+
+    This is a tool result for the active SDK run, not a user-facing answer
+    annotation and not an instruction to restart research. The caller corrects
+    every listed violation, then controls the next tool call.
+    """
+
+    status: Literal["input_correction_required"] = "input_correction_required"
+    code: Literal["search_plan_validation_failed"] = "search_plan_validation_failed"
+    message: str = Field(min_length=1, max_length=2_000)
+    violations: list[QueryContextInputViolation] = Field(min_length=1, max_length=32)
+    allowed_next_tools: list[Literal["krw_ontology_query_context"]] = Field(
+        default_factory=lambda: ["krw_ontology_query_context"],
+        min_length=1,
+        max_length=1,
     )
 
 
@@ -592,6 +650,7 @@ class RecommendedAction(ContractModel):
     reason: str
     object_id: str | None = None
     clause_id: str | None = None
+    ticker: str | None = None
 
 
 class Continuation(ContractModel):
@@ -629,6 +688,345 @@ def validate_search_plan(value: SearchPlan | Mapping[str, Any]) -> SearchPlan:
         return SearchPlan.model_validate(value)
     except Exception as exc:
         raise ValueError(f"invalid_plan: {exc}") from exc
+
+
+def validate_query_context_search_plan(
+    value: SearchPlan | Mapping[str, Any],
+) -> SearchPlan | QueryContextInputCorrection:
+    """Validate one query-context input without raising an opaque MCP error.
+
+    FastMCP can only return a generic parameter-validation failure when the
+    public argument is typed strictly as ``SearchPlan``.  The query-context
+    boundary accepts a mapping as a fallback, performs the same canonical
+    SearchPlan validation here, and turns known, field-local mistakes into a
+    structured tool result the agent can act on within the same SDK run.
+    """
+    if isinstance(value, SearchPlan):
+        return value
+    if not isinstance(value, Mapping):
+        return _query_context_correction([
+            _query_context_violation(
+                field="search_plan",
+                rule="invalid_search_plan",
+                message="search_plan must be a JSON object that follows the SearchPlan v2 contract.",
+                required_change=(
+                    "Send one complete SearchPlan v2 object with question, intent, and clauses. "
+                    "Do not send a scalar, array, or legacy query payload."
+                ),
+            )
+        ])
+
+    raw_plan = dict(value)
+    violations = _inspect_query_context_plan(raw_plan)
+    try:
+        validated_plan = SearchPlan.model_validate(raw_plan)
+    except ValidationError as exc:
+        violations = _merge_query_context_violations(
+            violations,
+            _non_redundant_schema_violations(
+                semantic_violations=violations,
+                schema_violations=_invalid_search_plan_violations(exc),
+            ),
+        )
+    else:
+        if not violations:
+            return validated_plan
+
+    return _query_context_correction(violations)
+
+
+def _inspect_query_context_plan(
+    plan: Mapping[str, Any],
+) -> list[QueryContextInputViolation]:
+    """Surface deterministic repair instructions before broad schema errors.
+
+    The canonical Pydantic models remain the source of truth.  This narrow
+    pass only recognizes errors for which the server can identify an exact
+    field and an exact correction; it never edits, drops, or invents plan
+    content on the model's behalf.
+    """
+    violations: list[QueryContextInputViolation] = []
+    clauses = plan.get("clauses")
+    if not isinstance(clauses, list):
+        return violations
+
+    for index, clause in enumerate(clauses):
+        if not isinstance(clause, Mapping):
+            continue
+        path = f"clauses[{index}]"
+        metrics = _raw_string_list(clause.get("metrics"))
+        concepts = _raw_string_list(clause.get("required_concepts"))
+        predicates = _raw_string_list(clause.get("required_predicates"))
+        dimensions = _raw_string_list(clause.get("metric_dimensions"))
+        qualitative_concepts = _non_metric_required_concepts(
+            metrics=metrics,
+            dimensions=dimensions,
+            concepts=concepts,
+        )
+
+        if metrics and (predicates or qualitative_concepts):
+            conflicting_fields = [
+                field
+                for field, values in (
+                    (f"{path}.required_predicates", predicates),
+                    (f"{path}.required_concepts", qualitative_concepts),
+                )
+                if values
+            ]
+            conflicts = [*predicates, *qualitative_concepts]
+            violations.append(
+                _query_context_violation(
+                    field=path,
+                    rule="mixed_metric_and_qualitative_clause",
+                    message=(
+                        "A metric clause also contains qualitative requirements: "
+                        + ", ".join(repr(value) for value in conflicts)
+                        + ". Metric values and qualitative relationships must be independently "
+                        "verifiable."
+                    ),
+                    required_change=(
+                        "Split this into a metric clause and a separate qualitative clause. "
+                        "The metric clause must not contain required_predicates or non-metric "
+                        "required_concepts ("
+                        + ", ".join(conflicting_fields)
+                        + ")."
+                    ),
+                )
+            )
+
+        retrieval_query = clause.get("retrieval_query")
+        if not isinstance(retrieval_query, str):
+            continue
+        literal_fields = (
+            # A non-metric concept in a metric clause must be moved or removed,
+            # rather than first being copied into an already-invalid query.
+            ("required_concepts", [] if qualitative_concepts else concepts),
+            ("required_predicates", [] if metrics and predicates else predicates),
+            ("metric_dimensions", dimensions),
+        )
+        for field_name, values in literal_fields:
+            missing_literals = [
+                value for value in values if not _contains_literal_phrase(retrieval_query, value)
+            ]
+            if not missing_literals:
+                continue
+            quoted_literals = ", ".join(repr(value) for value in missing_literals)
+            violations.append(
+                _query_context_violation(
+                    field=f"{path}.retrieval_query",
+                    rule="missing_literal_term",
+                    message=(
+                        f"The {field_name} literal(s) {quoted_literals} are missing from "
+                        f"{path}.retrieval_query."
+                    ),
+                    required_change=(
+                        f"Include every exact phrase in required_literals in "
+                        f"{path}.retrieval_query, or remove those values from "
+                        f"{path}.{field_name}."
+                    ),
+                    required_literals=missing_literals,
+                )
+            )
+
+    comparison_axes = _raw_string_list(plan.get("comparison_axes"))
+    if {"absolute_change", "growth_rate"}.intersection(comparison_axes):
+        for index, clause in enumerate(clauses):
+            if not isinstance(clause, Mapping):
+                continue
+            is_required = clause.get("required") is not False
+            has_metrics = bool(_raw_string_list(clause.get("metrics")))
+            calculation_window = clause.get("calculation_window")
+            has_window = calculation_window in {"period_over_period", "year_over_year"}
+            if not (is_required and has_metrics and not has_window):
+                continue
+            path = f"clauses[{index}]"
+            violations.append(
+                _query_context_violation(
+                    field=f"{path}.calculation_window",
+                    rule="missing_calculation_window",
+                    message=(
+                        "A required metric clause needs calculation_window when comparison_axes "
+                        "requests absolute_change or growth_rate."
+                    ),
+                    required_change=(
+                        "Set calculation_window to period_over_period or year_over_year for "
+                        "this required metric clause, or remove the temporal comparison axis."
+                    ),
+                )
+            )
+
+    return _merge_query_context_violations([], violations)
+
+
+def _non_metric_required_concepts(
+    *,
+    metrics: Sequence[str],
+    dimensions: Sequence[str],
+    concepts: Sequence[str],
+) -> list[str]:
+    """Match QueryClause's metric/qualitative split before canonical validation.
+
+    Raw input can contain metric aliases, including an invalid alias. Unknown
+    aliases intentionally contribute no identity tokens here; canonical
+    validation later returns the precise schema error for that metric field.
+    """
+    if not metrics:
+        return []
+    catalog = metric_dictionary_catalog()
+    identity_tokens = {token for value in dimensions for token in _tokens(value)}
+    for metric in metrics:
+        canonical = catalog.canonicalize(metric)
+        if not canonical:
+            continue
+        for alias in catalog.aliases_for(canonical):
+            identity_tokens.update(_tokens(alias))
+    return [
+        concept
+        for concept in concepts
+        if (concept_tokens := set(_tokens(concept))) and not concept_tokens.issubset(identity_tokens)
+    ]
+
+
+def _invalid_search_plan_violations(exc: ValidationError) -> list[QueryContextInputViolation]:
+    violations: list[QueryContextInputViolation] = []
+    for error in exc.errors(include_url=False):
+        field = _validation_error_field(error) or "search_plan"
+        violations.append(
+            _query_context_violation(
+                field=field,
+                rule="invalid_search_plan",
+                message=(
+                    "The supplied SearchPlan v2 is invalid: "
+                    + str(error.get("msg") or "invalid SearchPlan v2 input")
+                ),
+                required_change=(
+                    f"Correct {field} so it satisfies the SearchPlan v2 contract, then submit "
+                    "one complete {search_plan} envelope. Do not switch to a legacy query shape."
+                ),
+            )
+        )
+    return violations
+
+
+def _validation_error_fields(errors: Sequence[Mapping[str, Any]]) -> list[str]:
+    return _dedupe_strings(
+        field
+        for error in errors
+        if (field := _validation_error_field(error))
+    )[:32]
+
+
+def _validation_error_field(error: Mapping[str, Any]) -> str:
+    location = error.get("loc")
+    if not isinstance(location, (list, tuple)):
+        return ""
+    path = ""
+    for value in location:
+        if isinstance(value, int):
+            path += f"[{value}]"
+        else:
+            token = str(value).strip()
+            if not token:
+                continue
+            path = f"{path}.{token}" if path else token
+    return path
+
+
+def _merge_query_context_violations(
+    current: Sequence[QueryContextInputViolation],
+    incoming: Sequence[QueryContextInputViolation],
+) -> list[QueryContextInputViolation]:
+    """Keep stable, non-duplicated corrections within the public result cap."""
+    merged: list[QueryContextInputViolation] = []
+    keys: set[tuple[str, str, tuple[str, ...]]] = set()
+    for violation in [*current, *incoming]:
+        key = (
+            violation.field,
+            violation.rule,
+            tuple(value.casefold() for value in violation.required_literals),
+        )
+        if key in keys:
+            continue
+        keys.add(key)
+        merged.append(violation)
+        if len(merged) == 32:
+            break
+    return merged
+
+
+def _non_redundant_schema_violations(
+    *,
+    semantic_violations: Sequence[QueryContextInputViolation],
+    schema_violations: Sequence[QueryContextInputViolation],
+) -> list[QueryContextInputViolation]:
+    """Suppress generic clause-model errors already explained by a precise rule.
+
+    Pydantic reports an after-model-validator failure at ``clauses[n]``. If
+    the narrow pass has already named the literal, metric/qualitative split, or
+    calculation-window field in that clause, emitting both only makes the
+    agent repair the same issue twice.
+    """
+    semantic_clause_paths = {
+        violation.field.split(".", 1)[0]
+        for violation in semantic_violations
+        if violation.field.startswith("clauses[")
+    }
+    return [
+        violation
+        for violation in schema_violations
+        if not (
+            violation.field in semantic_clause_paths
+            and violation.field.startswith("clauses[")
+        )
+    ]
+
+
+def _query_context_violation(
+    *,
+    field: str,
+    rule: InputCorrectionRule,
+    message: str,
+    required_change: str,
+    required_literals: Sequence[str] | None = None,
+) -> QueryContextInputViolation:
+    return QueryContextInputViolation(
+        field=field,
+        rule=rule,
+        message=message,
+        required_change=required_change,
+        required_literals=list(required_literals or []),
+    )
+
+
+def _query_context_correction(
+    violations: Sequence[QueryContextInputViolation],
+) -> QueryContextInputCorrection:
+    corrections = _merge_query_context_violations([], violations)
+    if not corrections:
+        raise ValueError("query_context correction requires at least one violation")
+    return QueryContextInputCorrection(
+        message=(
+            f"The SearchPlan has {len(corrections)} correctable input error(s). "
+            "Correct every listed violation before calling krw_ontology_query_context again."
+        ),
+        violations=corrections,
+    )
+
+
+def _raw_string_list(value: Any) -> list[str]:
+    if not isinstance(value, (list, tuple, set)):
+        return []
+    return [item.strip() for item in value if isinstance(item, str) and item.strip()]
+
+
+def _contains_literal_phrase(query: str, term: str) -> bool:
+    normalized_query = _normalize_literal_phrase(query)
+    normalized_term = _normalize_literal_phrase(term)
+    return bool(normalized_term and normalized_term in normalized_query)
+
+
+def _normalize_literal_phrase(value: str) -> str:
+    return " ".join(unicodedata.normalize("NFKC", value).casefold().split())
 
 
 def compile_research_state(
@@ -1031,8 +1429,9 @@ def _topic_evidence_candidate(row: Mapping[str, Any]) -> dict[str, Any] | None:
             )
         )
     source_label = _first_text(row, "source_label") or _source_label(ticker, period, document_type)
+    occurrence_key = _occurrence_identity(ticker, object_id)
     unit = EvidenceUnit(
-        evidence_id=_stable_id("ev", object_id),
+        evidence_id=_stable_id("ev", occurrence_key),
         object_id=object_id,
         object_type=object_type,
         ticker=ticker,
@@ -1061,7 +1460,7 @@ def _topic_evidence_candidate(row: Mapping[str, Any]) -> dict[str, Any] | None:
         ),
     )
     return {
-        "key": object_id,
+        "key": occurrence_key,
         "unit": unit,
         "search_text": _search_text(row, unit),
         "raw_clause_ids": _string_list(row.get("_plan_clause_ids")),
@@ -1100,6 +1499,7 @@ def _metric_evidence_candidate(series: Mapping[str, Any]) -> dict[str, Any] | No
         or f"{metric}:{_first_text(series, 'ticker')}:{','.join(p.period for p in points)}"
     )
     ticker = _first_text(series, "ticker")
+    occurrence_key = _occurrence_identity(ticker, f"metric:{key}")
     periods = [point.period for point in points]
     title = _first_text(series, "label") or metric or key
     summary_values = [point.formatted_value for point in points if point.formatted_value]
@@ -1109,7 +1509,7 @@ def _metric_evidence_candidate(series: Mapping[str, Any]) -> dict[str, Any] | No
     dimensions = _metric_dimensions(series.get("dimensions"))
     is_company_total = _truthy(series.get("is_company_total"))
     unit = EvidenceUnit(
-        evidence_id=_stable_id("ev", key),
+        evidence_id=_stable_id("ev", occurrence_key),
         object_id=object_ids[0] if len(object_ids) == 1 else None,
         object_type="MetricSeries",
         ticker=ticker,
@@ -1132,7 +1532,7 @@ def _metric_evidence_candidate(series: Mapping[str, Any]) -> dict[str, Any] | No
             source_label=_source_label(ticker, periods[-1] if periods else None, None),
         ),
     )
-    return {"key": f"metric:{key}", "unit": unit, "search_text": _search_text(series, unit)}
+    return {"key": occurrence_key, "unit": unit, "search_text": _search_text(series, unit)}
 
 
 def _projection_evidence_candidate(row: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -1143,8 +1543,9 @@ def _projection_evidence_candidate(row: Mapping[str, Any]) -> dict[str, Any] | N
     summary = _first_text(row, "summary", "label", "title") or object_id
     ticker = _first_text(row, "ticker") or _ticker_from_object_id(object_id)
     period = _first_text(row, "period")
+    occurrence_key = _occurrence_identity(ticker, object_id)
     unit = EvidenceUnit(
-        evidence_id=_stable_id("ev", object_id),
+        evidence_id=_stable_id("ev", occurrence_key),
         object_id=object_id,
         object_type=_first_text(row, "type", "object_type") or "ProjectionCandidate",
         ticker=ticker,
@@ -1159,7 +1560,7 @@ def _projection_evidence_candidate(row: Mapping[str, Any]) -> dict[str, Any] | N
             source_label=_source_label(ticker, period, _first_text(row, "document_type")),
         ),
     )
-    return {"key": object_id, "unit": unit, "search_text": _search_text(row, unit)}
+    return {"key": occurrence_key, "unit": unit, "search_text": _search_text(row, unit)}
 
 
 def _cross_company_evidence_candidate(row: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -1859,6 +2260,7 @@ def _build_recommended_actions(
                 tool=tool,
                 object_id=object_id,
                 clause_id=_first_text(item, "clause_id") or None,
+                ticker=_first_text(item, "ticker") or None,
                 reason=_first_text(item, "purpose", "reason") or "verify selected evidence lineage",
             )
         )
@@ -1885,13 +2287,17 @@ def _build_recommended_actions(
                     tool="krw_ontology_trace",
                     clause_id=row.clause_id,
                     object_id=object_id,
+                    ticker=candidate_unit.ticker if candidate_unit is not None else None,
                     reason="verify a direct filing lineage before making a strong claim",
                 )
             )
     deduped: list[RecommendedAction] = []
     seen: set[tuple[str, str | None, str | None]] = set()
     for action in actions:
-        key = (action.tool, action.object_id, action.clause_id)
+        # Deduplicate the actual tool invocation. ``clause_id`` is explanatory
+        # context, while ticker is part of the occurrence identity and must
+        # never be collapsed for shared semantic object ids.
+        key = (action.tool, action.object_id, action.ticker)
         if key not in seen:
             seen.add(key)
             deduped.append(action)
@@ -2757,6 +3163,11 @@ def _stable_id(prefix: str, value: str) -> str:
     return f"{prefix}:{hashlib.sha256(value.encode('utf-8')).hexdigest()[:12]}"
 
 
+def _occurrence_identity(ticker: str | None, object_id: str) -> str:
+    """Return the canonical agent identity for one ticker-scoped occurrence."""
+    return f"{str(ticker or '').strip().upper()}\x1f{object_id}"
+
+
 def _bounded_text(value: str, limit: int) -> str:
     normalized = " ".join(str(value or "").split())
     if len(normalized) <= limit:
@@ -2821,17 +3232,8 @@ def _planned_terms_visible_in_evidence(
         )
         if value
     )
-    visible_tokens = {
-        token.casefold()
-        for token in _TOKEN_RE.findall(visible_text)
-        if len(token) >= 2 or token.isdigit()
-    }
-    required_tokens = {
-        token.casefold()
-        for term in terms
-        for token in _TOKEN_RE.findall(term)
-        if len(token) >= 2 or token.isdigit()
-    }
+    visible_tokens = _direct_evidence_tokens(visible_text)
+    required_tokens = set().union(*(_direct_evidence_tokens(term) for term in terms))
     return bool(required_tokens) and required_tokens.issubset(visible_tokens)
 
 
@@ -2844,12 +3246,7 @@ def _planned_terms_visible_in_atomic_evidence(
     ticker = _first_text(row, "ticker")
     if ticker:
         terms = [term for term in terms if term.casefold() != ticker.casefold()]
-    required_tokens = {
-        token.casefold()
-        for term in terms
-        for token in _TOKEN_RE.findall(term)
-        if len(token) >= 2 or token.isdigit()
-    }
+    required_tokens = set().union(*(_direct_evidence_tokens(term) for term in terms))
     if not required_tokens:
         return False
     object_payload = _mapping(row.get("object"))
@@ -2870,14 +3267,22 @@ def _planned_terms_visible_in_atomic_evidence(
     )
     for text in texts:
         for span in re.split(r"(?:[.!?。！？]+|\n+)", text):
-            visible_tokens = {
-                token.casefold()
-                for token in _TOKEN_RE.findall(span)
-                if len(token) >= 2 or token.isdigit()
-            }
+            visible_tokens = _direct_evidence_tokens(span)
             if required_tokens.issubset(visible_tokens):
                 return True
     return False
+
+
+def _direct_evidence_tokens(value: str) -> set[str]:
+    """Return conservative token identities for one atomic evidence span."""
+    tokens = {
+        _DIRECT_EVIDENCE_TOKEN_EQUIVALENTS.get(token.casefold(), token.casefold())
+        for token in _TOKEN_RE.findall(value)
+        if len(token) >= 2 or token.isdigit()
+    }
+    if "%" in value:
+        tokens.add("percent")
+    return tokens
 
 
 def _conservative_directness(

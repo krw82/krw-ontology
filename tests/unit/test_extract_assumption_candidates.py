@@ -67,7 +67,7 @@ def test_extract_assumption_candidates_batches_and_merges(tmp_path: Path):
         def __init__(self):
             self.calls = []
 
-        async def extract(self, prompt_template, input_data, output_schema, stage_name):
+        async def extract(self, prompt_template, input_data, output_schema, stage_name, **_kwargs):
             batch_claims = json.loads(input_data["claims_json"])
             batch_quotes = json.loads(input_data["quotes_json"])
             assert batch_claims[0]["id"].startswith("c")
@@ -127,7 +127,7 @@ def test_extract_assumption_candidates_records_only_failed_batches(tmp_path: Pat
     write_jsonl(tmp_path / "evidence_quotes.jsonl", [])
 
     class FakeWorker:
-        async def extract(self, prompt_template, input_data, output_schema, stage_name):
+        async def extract(self, prompt_template, input_data, output_schema, stage_name, **_kwargs):
             batch_claims = json.loads(input_data["claims_json"])
             if len(batch_claims) == 8:
                 raise TimeoutError("batch too large")
@@ -163,7 +163,7 @@ def test_extract_assumption_candidates_marks_provider_transient_failure(tmp_path
     write_jsonl(tmp_path / "evidence_quotes.jsonl", [])
 
     class FakeWorker:
-        async def extract(self, prompt_template, input_data, output_schema, stage_name):
+        async def extract(self, prompt_template, input_data, output_schema, stage_name, **_kwargs):
             raise RuntimeError("API Error: 529 [The service may be temporarily overloaded]")
 
     result = asyncio.run(
@@ -204,7 +204,7 @@ def test_extract_assumption_candidates_rejects_unknown_aliases(tmp_path: Path):
     }])
 
     class FakeWorker:
-        async def extract(self, prompt_template, input_data, output_schema, stage_name):
+        async def extract(self, prompt_template, input_data, output_schema, stage_name, **_kwargs):
             return [
                 {
                     "id": "ignored",

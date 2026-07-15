@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import shutil
 import sqlite3
 from copy import deepcopy
 from pathlib import Path
 
 import pytest
 
+import krw_ontology.agent_index.router_sidecar as router_sidecar_module
 from krw_ontology.agent_index.router_sidecar import (
     ROUTER_SIDECAR_SCHEMA_VERSION,
     RouterSidecar,
@@ -14,10 +16,14 @@ from krw_ontology.agent_index.router_sidecar import (
     build_router_sidecar,
     load_router_ranking_profile,
     rebind_router_sidecar_release,
+    rebind_router_sidecar_source,
     verify_router_sidecar,
 )
 from krw_ontology.agent_index.spine_schema import (
     create_global_spine_schema,
+    read_spine_verification_sha256,
+    verify_global_spine_schema,
+    write_spine_verification_seal,
     write_global_spine_metadata,
 )
 
@@ -71,6 +77,22 @@ def _write_global_spine(path: Path) -> Path:
                           'FY2025', ?, 'AAPL', 'indexes/companies/AAPL.sqlite', ?)
                 """,
                 (object_id, object_type, label),
+            )
+            conn.execute(
+                """
+                INSERT INTO global_object_replica(
+                    object_id, ticker, document_id, document_type, period,
+                    shard_id, shard_path, object_type, local_object_key,
+                    object_hash, semantic_hash, quality_status
+                )
+                SELECT object_id, ticker, COALESCE(document_id, ''),
+                       COALESCE(document_type, ''), COALESCE(period, ''),
+                       shard_id, shard_path, object_type, local_object_key,
+                       object_hash, semantic_hash, quality_status
+                FROM global_object_locator
+                WHERE object_id = ?
+                """,
+                (object_id,),
             )
         conn.execute(
             """
@@ -312,11 +334,18 @@ def test_build_router_sidecar_is_verified_and_bound_to_source(tmp_path: Path) ->
     assert verification["metadata"]["source_global_spine_sha256"]
     assert verification["metadata"]["content_sha256"]
     assert verification["metadata"]["build_fingerprint_sha256"]
+    build_settings = verification["metadata"]["build_settings"]
+    assert build_settings["temp_store"] == 1
+    assert build_settings["cache_size_kib"] == 524_288
+    assert 0 <= build_settings["sqlite_threads"] <= build_settings["requested_threads"]
+    assert build_settings["source_mmap_bytes"] >= 0
     assert verification["counts"]["ticker_profile"] == 1
     assert verification["counts"]["routing_unit"] == 2
     assert verification["counts"]["routing_fts"] == 2
     assert verification["counts"]["micro_routing_unit"] == 0
     assert verification["counts"]["micro_routing_fts"] == 0
+    assert verification["counts"]["term_stats"] > 0
+    assert verification["counts"]["routing_term_posting"] > 0
     assert verification["counts"]["facet_posting"] >= 5
     assert verification["counts"]["short_token_posting"] > 0
     assert verification["counts"]["graph_prior"] == 1
@@ -324,12 +353,106 @@ def test_build_router_sidecar_is_verified_and_bound_to_source(tmp_path: Path) ->
         micro_fts_sql = conn.execute(
             "SELECT sql FROM sqlite_master WHERE name = 'micro_routing_fts'"
         ).fetchone()[0]
+        revenue_stats = conn.execute(
+            """
+            SELECT fts_unit_df, fts_ticker_df, alias_unit_df, alias_ticker_df
+            FROM term_stats
+            WHERE term_norm = 'revenue'
+            """
+        ).fetchone()
+        table_names = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type IN ('table', 'view')"
+            )
+        }
         source_kinds = {
             row[0] for row in conn.execute("SELECT DISTINCT source_kind FROM micro_routing_unit")
         }
     assert "routing_unit_id UNINDEXED" not in micro_fts_sql
     assert "routing_unit_id" in micro_fts_sql
+    assert revenue_stats is not None
+    assert revenue_stats[0] >= revenue_stats[1] >= 1
+    assert revenue_stats[2] >= 1
+    assert revenue_stats[3] >= 1
+    assert "term_stats" in table_names
+    assert "routing_term_posting" in table_names
     assert source_kinds == set()
+
+
+def test_build_router_sidecar_preserves_existing_target_when_candidate_fails_verification(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spine_path = _write_global_spine(tmp_path / "indexes" / "global_spine.sqlite")
+    target_path = tmp_path / "indexes" / "router_sidecar.sqlite"
+    target_path.write_bytes(b"existing-valid-artifact")
+
+    monkeypatch.setattr(
+        router_sidecar_module,
+        "verify_router_sidecar",
+        lambda *_args, **_kwargs: {
+            "ok": False,
+            "errors": ["synthetic_candidate_failure"],
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="synthetic_candidate_failure"):
+        build_router_sidecar(spine_path, target_path)
+
+    assert target_path.read_bytes() == b"existing-valid-artifact"
+
+
+def test_immutable_file_hash_cache_is_reused_only_for_same_stat_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact = tmp_path / "immutable.sqlite"
+    artifact.write_bytes(b"first")
+    calls: list[Path] = []
+    original = router_sidecar_module._file_sha256
+
+    def counted(path: Path) -> str:
+        calls.append(path)
+        return original(path)
+
+    router_sidecar_module._immutable_file_sha256_for_stat.cache_clear()
+    monkeypatch.setattr(router_sidecar_module, "_file_sha256", counted)
+
+    first = router_sidecar_module.immutable_file_sha256(artifact)
+    assert router_sidecar_module.immutable_file_sha256(artifact) == first
+    assert len(calls) == 1
+
+    artifact.write_bytes(b"second-and-byte-distinct")
+    second = router_sidecar_module.immutable_file_sha256(artifact)
+    assert second != first
+    assert len(calls) == 2
+
+
+def test_immutable_global_spine_hash_persists_in_matching_deep_seal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spine_path = _write_global_spine(tmp_path / "indexes" / "global_spine.sqlite")
+    verification = verify_global_spine_schema(
+        spine_path,
+        deep=True,
+        trust_seal=False,
+    )
+    assert verification["ok"] is True, verification["errors"]
+    write_spine_verification_seal(spine_path, verification)
+
+    router_sidecar_module._immutable_file_sha256_for_stat.cache_clear()
+    first = router_sidecar_module.immutable_file_sha256(spine_path)
+    assert read_spine_verification_sha256(spine_path) == first
+
+    router_sidecar_module._immutable_file_sha256_for_stat.cache_clear()
+
+    def unexpected_hash(_path: Path) -> str:
+        raise AssertionError("matching deep seal should provide the persisted digest")
+
+    monkeypatch.setattr(router_sidecar_module, "_file_sha256", unexpected_hash)
+    assert router_sidecar_module.immutable_file_sha256(spine_path) == first
 
 
 def test_router_sidecar_exact_alias_fielded_search_facets_and_graph(tmp_path: Path) -> None:
@@ -405,6 +528,98 @@ def test_router_sidecar_coverage_first_ranking_and_safe_auxiliary_gates(
     assert coverage["graph_expansion_used"] is False
     assert nonselective_micro["micro_rerank"]["applied"] is False
     assert nonselective_micro["micro_rerank"]["reason"] == "insufficient_selective_anchor"
+
+
+def test_router_sidecar_uses_build_time_df_and_materialized_term_postings(
+    tmp_path: Path,
+) -> None:
+    spine_path = _write_ranking_safety_spine(tmp_path / "indexes" / "global_spine.sqlite")
+    result = build_router_sidecar(spine_path)
+
+    statements: list[str] = []
+    with RouterSidecar(result.path) as router:
+        router._conn.set_trace_callback(statements.append)
+        search = router.search("rare shared")
+
+    diagnostics = search["lexical_diagnostics"]
+    assert diagnostics["term_stats_source"] == "build_time_term_stats"
+    assert diagnostics["coverage_mode"] == "materialized_term_posting"
+    assert diagnostics["coverage_candidate_count"] > 0
+    assert diagnostics["coverage_query_count"] == 1
+    assert diagnostics["full_term_posting_materialized"] is True
+
+    normalized_sql = [" ".join(statement.lower().split()) for statement in statements]
+    assert any("from term_stats" in statement for statement in normalized_sql)
+    assert not any(
+        "count(*) as unit_count" in statement and "from routing_fts" in statement
+        for statement in normalized_sql
+    )
+    coverage_queries = [
+        statement for statement in normalized_sql if "from routing_term_posting" in statement
+    ]
+    assert len(coverage_queries) == 1
+    assert "where term_norm in (" in coverage_queries[0]
+    assert not any(
+        "select rowid as fts_rowid from routing_fts" in statement and "and rowid in (" in statement
+        for statement in normalized_sql
+    )
+
+    with sqlite3.connect(result.path) as conn:
+        stats = {
+            row[0]: tuple(row[1:])
+            for row in conn.execute(
+                """
+                SELECT term_norm, fts_unit_df, fts_ticker_df
+                FROM term_stats
+                WHERE term_norm IN ('common', 'shared', 'rare')
+                ORDER BY term_norm
+                """
+            )
+        }
+    assert stats["common"] == (100, 100)
+    assert stats["shared"] == (70, 70)
+    assert stats["rare"] == (1, 1)
+
+
+def test_router_sidecar_fusion_calibrates_primary_to_rrf_scale_deterministically(
+    tmp_path: Path,
+) -> None:
+    spine_path = _write_ranking_safety_spine(tmp_path / "indexes" / "global_spine.sqlite")
+    result = build_router_sidecar(spine_path)
+
+    with RouterSidecar(result.path) as router:
+        first = router.search(
+            "infrastructure rare shared",
+            explicit_entity_scope=True,
+        )
+        second = router.search(
+            "infrastructure rare shared",
+            explicit_entity_scope=True,
+        )
+
+    fusion = first["fusion_diagnostics"]
+    assert fusion["mode"] == "rrf_scale_calibrated_v1"
+    assert fusion["configured_primary_rrf_scale"] == 1.0
+    assert fusion["primary_contribution_scale"] == pytest.approx(1.0 / 61.0)
+    assert fusion["legacy_primary_contribution_scale"] == 1.0
+    assert fusion["raw_primary_score_retained"] is True
+    assert first["resolved_tickers"] == ["T069"]
+    assert first["ticker_candidates"][0]["ticker"] == "T069"
+    alias_unit = next(
+        row for row in first["routing_units"] if "exact_alias" in row["channel_scores"]
+    )
+    assert 0.0 < alias_unit["channel_scores"]["exact_alias"] <= 4.0 / 61.0
+    assert alias_unit["channel_scores"].get("fielded_fts", 0.0) <= 1.0 / 61.0
+    assert [row["ticker"] for row in first["ticker_candidates"]] == [
+        row["ticker"] for row in second["ticker_candidates"]
+    ]
+    assert [
+        (row["routing_unit_id"], row["score"], row["channel_scores"])
+        for row in first["routing_units"]
+    ] == [
+        (row["routing_unit_id"], row["score"], row["channel_scores"])
+        for row in second["routing_units"]
+    ]
 
 
 def test_micro_rerank_requires_query_terms_in_one_source_coherent_unit(
@@ -602,6 +817,45 @@ def test_rebind_router_sidecar_release_updates_only_release_fingerprint(
     )
 
 
+def test_rebind_router_sidecar_source_updates_only_immutable_binding(
+    tmp_path: Path,
+) -> None:
+    first_spine = _write_global_spine(tmp_path / "first" / "indexes" / "global_spine.sqlite")
+    built = build_router_sidecar(first_spine, release_id="candidate-old")
+    cached_copy = tmp_path / "cached-copy.sqlite"
+    shutil.copy2(built.path, cached_copy)
+    second_spine = _write_global_spine(tmp_path / "second" / "indexes" / "global_spine.sqlite")
+    with sqlite3.connect(second_spine) as conn:
+        write_global_spine_metadata(
+            conn,
+            {
+                "release_id": "candidate-new",
+                "source_manifest_hash": "source-hash",
+                "created_at": "2026-07-11T00:00:00+00:00",
+            },
+        )
+
+    rebound = rebind_router_sidecar_source(
+        cached_copy,
+        global_spine_path=second_spine,
+        release_id="candidate-new",
+        expected_previous_global_spine_sha256=built.metadata["source_global_spine_sha256"],
+        expected_previous_release_id="candidate-old",
+    )
+
+    assert rebound["ok"] is True, rebound["errors"]
+    assert rebound["metadata"]["release_id"] == "candidate-new"
+    assert rebound["metadata"]["content_sha256"] == built.metadata["content_sha256"]
+    assert (
+        rebound["metadata"]["source_global_spine_sha256"]
+        != built.metadata["source_global_spine_sha256"]
+    )
+    assert (
+        rebound["metadata"]["build_fingerprint_sha256"]
+        != built.metadata["build_fingerprint_sha256"]
+    )
+
+
 def test_router_sidecar_derives_company_alias_from_sec_registrant_heading(
     tmp_path: Path,
 ) -> None:
@@ -654,6 +908,7 @@ def test_router_sidecar_derives_company_alias_from_inline_xbrl_fact(
         (("rrf_k",), 0),
         (("candidate_limit",), -1),
         (("channel_weights", "facet"), float("nan")),
+        (("fusion", "primary_rrf_scale"), 0),
         (("fts_field_weights", "company_text"), -0.1),
         (("bigram", "field_weights", "topic_text"), float("inf")),
         (("micro_rerank", "micro_unit_candidate_limit"), 0),

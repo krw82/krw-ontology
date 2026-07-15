@@ -1,4 +1,4 @@
-"""Serving Index V4 router sidecar for immutable v3 ontology releases.
+"""Serving Index V5 router sidecar for immutable v3 ontology releases.
 
 The sidecar is a deterministic, derived search artifact.  It does not change
 the ontology schema or the company/global-spine databases that remain the
@@ -26,10 +26,30 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
-ROUTER_SIDECAR_SCHEMA_VERSION = "krw-ontology-router-sidecar/v4"
-ROUTER_SIDECAR_BUILDER_VERSION = "router-sidecar-builder/v4"
+from krw_ontology.agent_index.cache_seal import (
+    assert_trusted_immutable_copy,
+    immutable_sqlite_cache_seal_path,
+    read_immutable_sqlite_cache_seal,
+    read_immutable_sqlite_cache_sha256,
+    remove_immutable_sqlite_cache_seal,
+    write_immutable_sqlite_cache_seal,
+)
+from krw_ontology.agent_index.router_coherence import (
+    ROUTER_COHERENCE_RELATIVE_PATH,
+    RouterCoherence,
+)
+from krw_ontology.agent_index.spine_schema import (
+    read_spine_verification_sha256,
+    record_spine_verification_sha256,
+)
+
+ROUTER_SIDECAR_SCHEMA_VERSION = "krw-ontology-router-sidecar/v6"
+ROUTER_SIDECAR_BUILDER_VERSION = "router-sidecar-builder/v6"
 ROUTER_SIDECAR_RELATIVE_PATH = Path("indexes") / "router_sidecar.sqlite"
 ROUTER_RANKING_PROFILE_FILENAME = "router_ranking_v1.json"
+DEFAULT_ROUTER_SQLITE_THREADS = 8
+DEFAULT_ROUTER_SQLITE_CACHE_KIB = 524_288
+DEFAULT_ROUTER_SOURCE_MMAP_BYTES = 1_073_741_824
 
 ROUTER_SIDECAR_TABLES = (
     "metadata",
@@ -38,8 +58,10 @@ ROUTER_SIDECAR_TABLES = (
     "alias_lookup",
     "routing_unit",
     "routing_fts",
+    "routing_term_posting",
     "micro_routing_unit",
     "micro_routing_fts",
+    "term_stats",
     "facet_posting",
     "short_token_posting",
     "graph_prior",
@@ -56,6 +78,12 @@ ROUTER_SIDECAR_REQUIRED_METADATA_KEYS = (
     "build_fingerprint_sha256",
     "counts",
 )
+
+
+def _connect_immutable_readonly(path: Path) -> sqlite3.Connection:
+    uri = f"file:{quote(path.resolve().as_posix(), safe='/')}?mode=ro&immutable=1"
+    return sqlite3.connect(uri, uri=True)
+
 
 _WORD_RE = re.compile(r"[0-9A-Za-z]+|[가-힣]+")
 _HANGUL_RE = re.compile(r"^[가-힣]+$")
@@ -159,6 +187,20 @@ CREATE VIRTUAL TABLE IF NOT EXISTS routing_fts USING fts5(
     tokenize = 'unicode61 remove_diacritics 2'
 );
 
+CREATE TABLE IF NOT EXISTS routing_term_posting (
+    term_norm TEXT NOT NULL,
+    fts_rowid INTEGER NOT NULL,
+    PRIMARY KEY (term_norm, fts_rowid)
+) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS term_stats (
+    term_norm TEXT PRIMARY KEY,
+    fts_unit_df INTEGER NOT NULL CHECK(fts_unit_df >= 0),
+    fts_ticker_df INTEGER NOT NULL CHECK(fts_ticker_df >= 0),
+    alias_unit_df INTEGER NOT NULL CHECK(alias_unit_df >= 0),
+    alias_ticker_df INTEGER NOT NULL CHECK(alias_ticker_df >= 0)
+) WITHOUT ROWID;
+
 CREATE TABLE IF NOT EXISTS micro_routing_unit (
     micro_unit_id TEXT PRIMARY KEY,
     routing_unit_id TEXT NOT NULL REFERENCES routing_unit(routing_unit_id),
@@ -239,6 +281,8 @@ _CONTENT_HASH_TABLES = (
     "ticker_profile",
     "alias_lookup",
     "routing_unit",
+    "routing_term_posting",
+    "term_stats",
     "micro_routing_unit",
     "facet_posting",
     "short_token_posting",
@@ -250,6 +294,8 @@ _CONTENT_HASH_ORDER_BY = {
     "ticker_profile": "ticker",
     "alias_lookup": ("alias_norm, alias_kind, canonical_key, ticker, routing_unit_id, source_kind"),
     "routing_unit": "routing_unit_id",
+    "routing_term_posting": "term_norm, fts_rowid",
+    "term_stats": "term_norm",
     "micro_routing_unit": "micro_unit_id",
     "facet_posting": ("facet_kind, facet_key, ticker, routing_unit_id"),
     "short_token_posting": "term_norm, routing_unit_id, field_name",
@@ -264,6 +310,76 @@ class RouterSidecarBuildResult:
     metadata: Mapping[str, Any]
     verification: Mapping[str, Any]
     elapsed_ms: int
+
+
+def _configure_router_sidecar_build_connections(
+    source: sqlite3.Connection,
+    target: sqlite3.Connection,
+) -> dict[str, int | str]:
+    """Apply bounded bulk-build settings and report what SQLite accepted."""
+    source.execute("PRAGMA query_only=ON")
+    requested_mmap = _environment_integer(
+        "KRW_ROUTER_SOURCE_MMAP_BYTES",
+        DEFAULT_ROUTER_SOURCE_MMAP_BYTES,
+        minimum=0,
+    )
+    source.execute(f"PRAGMA mmap_size={requested_mmap}")
+
+    journal_mode = str(target.execute("PRAGMA journal_mode=OFF").fetchone()[0])
+    target.execute("PRAGMA synchronous=OFF")
+    # Multi-million-row FTS sorts must spill to disk instead of consuming an
+    # unbounded amount of resident memory.
+    target.execute("PRAGMA temp_store=FILE")
+    cache_kib = _environment_integer(
+        "KRW_ROUTER_SQLITE_CACHE_KIB",
+        DEFAULT_ROUTER_SQLITE_CACHE_KIB,
+        minimum=1,
+    )
+    target.execute(f"PRAGMA cache_size=-{cache_kib}")
+    compiled_threads = _sqlite_compile_max_worker_threads(target)
+    requested_threads = _environment_integer(
+        "KRW_ROUTER_SQLITE_THREADS",
+        DEFAULT_ROUTER_SQLITE_THREADS,
+        minimum=0,
+    )
+    thread_limit = min(
+        requested_threads,
+        compiled_threads,
+        max(0, int(os.cpu_count() or 1) - 1),
+    )
+    target.execute(f"PRAGMA threads={thread_limit}")
+    return {
+        "sqlite_version": sqlite3.sqlite_version,
+        "journal_mode": journal_mode,
+        "synchronous": int(target.execute("PRAGMA synchronous").fetchone()[0]),
+        "temp_store": int(target.execute("PRAGMA temp_store").fetchone()[0]),
+        "cache_size_kib": abs(int(target.execute("PRAGMA cache_size").fetchone()[0])),
+        "compiled_max_worker_threads": compiled_threads,
+        "requested_threads": requested_threads,
+        "sqlite_threads": int(target.execute("PRAGMA threads").fetchone()[0]),
+        "source_mmap_bytes": int(source.execute("PRAGMA mmap_size").fetchone()[0]),
+    }
+
+
+def _sqlite_compile_max_worker_threads(conn: sqlite3.Connection) -> int:
+    for row in conn.execute("PRAGMA compile_options"):
+        option = str(row[0] or "")
+        if option.startswith("MAX_WORKER_THREADS="):
+            try:
+                return max(0, int(option.split("=", 1)[1]))
+            except ValueError:
+                return 0
+    return 0
+
+
+def _environment_integer(name: str, default: int, *, minimum: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return max(minimum, int(default))
+    try:
+        return max(minimum, int(raw))
+    except ValueError:
+        return max(minimum, int(default))
 
 
 @dataclass
@@ -334,7 +450,7 @@ def build_router_sidecar(
     release_id: str | None = None,
     ranking_profile_path: Path | str | None = None,
 ) -> RouterSidecarBuildResult:
-    """Build the immutable Serving Index V4 sidecar from a v3 global spine."""
+    """Build the immutable Serving Index V5 sidecar from a v3 global spine."""
     started_at = time.perf_counter()
     source_path = Path(global_spine_path).expanduser().resolve()
     if not source_path.is_file():
@@ -359,15 +475,16 @@ def build_router_sidecar(
     tmp_path = target_path.parent / f".{target_path.name}.{os.getpid()}.{time.time_ns()}.tmp"
     _cleanup_sqlite_files(tmp_path)
     try:
-        with sqlite3.connect(source_path) as source, sqlite3.connect(tmp_path) as target:
+        with (
+            _connect_immutable_readonly(source_path) as source,
+            sqlite3.connect(tmp_path) as target,
+        ):
             source.row_factory = sqlite3.Row
             target.row_factory = sqlite3.Row
-            target.execute("PRAGMA journal_mode = OFF")
-            target.execute("PRAGMA synchronous = OFF")
-            # Large releases can require multi-million-row temporary sorts
-            # during FTS optimization and verification. Keep those bounded by
-            # disk instead of allowing transient multi-GB resident memory.
-            target.execute("PRAGMA temp_store = FILE")
+            build_settings = _configure_router_sidecar_build_connections(
+                source,
+                target,
+            )
             target.executescript(_SCHEMA_SQL)
 
             source_metadata = _read_metadata(source)
@@ -441,6 +558,7 @@ def build_router_sidecar(
                 "schema_sql_sha256": schema_sha256,
                 "content_sha256": content_sha256,
                 "build_fingerprint_sha256": build_fingerprint,
+                "build_settings": build_settings,
                 "counts": counts,
             }
             _write_metadata(target, metadata)
@@ -449,20 +567,36 @@ def build_router_sidecar(
             target.execute("INSERT INTO micro_routing_fts(micro_routing_fts) VALUES('optimize')")
             target.commit()
             target.execute("VACUUM")
+        verification = verify_router_sidecar(
+            tmp_path,
+            expected_global_spine_sha256=source_sha256,
+            expected_release_id=resolved_release_id,
+            deep=True,
+        )
+        if not verification["ok"]:
+            raise RuntimeError(
+                "router sidecar failed verification: " + ", ".join(verification["errors"])
+            )
+        remove_immutable_sqlite_cache_seal(target_path)
         os.replace(tmp_path, target_path)
+        write_immutable_sqlite_cache_seal(
+            target_path,
+            kind="router_sidecar",
+            cache_key=str(
+                (verification.get("metadata") or {}).get("build_fingerprint_sha256") or ""
+            ),
+            verification=verification,
+            metadata=verification.get("metadata") or {},
+            counts=verification.get("counts") or {},
+            source_path=source_path,
+        )
     finally:
         _cleanup_sqlite_files(tmp_path)
 
-    verification = verify_router_sidecar(
-        target_path,
-        expected_global_spine_sha256=source_sha256,
-        expected_release_id=resolved_release_id,
-        deep=True,
-    )
-    if not verification["ok"]:
-        raise RuntimeError(
-            "router sidecar failed verification: " + ", ".join(verification["errors"])
-        )
+    verification = {
+        **verification,
+        "path": str(target_path),
+    }
     return RouterSidecarBuildResult(
         path=target_path,
         counts=verification.get("counts") or {},
@@ -515,6 +649,7 @@ def build_router_micro_derivative(
             "ticker_profile",
             "routing_unit",
             "routing_fts",
+            "term_stats",
             "alias_lookup",
             "facet_posting",
             "short_token_posting",
@@ -562,7 +697,10 @@ def build_router_micro_derivative(
     _cleanup_sqlite_files(tmp_path)
     try:
         shutil.copyfile(base_path, tmp_path)
-        with sqlite3.connect(source_path) as source, sqlite3.connect(tmp_path) as target:
+        with (
+            _connect_immutable_readonly(source_path) as source,
+            sqlite3.connect(tmp_path) as target,
+        ):
             source.row_factory = sqlite3.Row
             target.row_factory = sqlite3.Row
             source.execute("PRAGMA query_only = ON")
@@ -614,6 +752,7 @@ def build_router_micro_derivative(
             target.execute("INSERT INTO micro_routing_fts(micro_routing_fts) VALUES('optimize')")
             target.commit()
             target.execute("VACUUM")
+        remove_immutable_sqlite_cache_seal(target_path)
         os.replace(tmp_path, target_path)
     finally:
         _cleanup_sqlite_files(tmp_path)
@@ -628,6 +767,14 @@ def build_router_micro_derivative(
         raise RuntimeError(
             "router micro derivative failed verification: " + ", ".join(verification["errors"])
         )
+    write_immutable_sqlite_cache_seal(
+        target_path,
+        kind="router_sidecar",
+        cache_key=str((verification.get("metadata") or {}).get("build_fingerprint_sha256") or ""),
+        verification=verification,
+        metadata=verification.get("metadata") or {},
+        counts=verification.get("counts") or {},
+    )
     return RouterSidecarBuildResult(
         path=target_path,
         counts=verification.get("counts") or {},
@@ -661,6 +808,7 @@ def load_router_ranking_profile(path: Path | str | None = None) -> dict[str, Any
         "default_limit",
         "max_query_terms",
         "channel_weights",
+        "fusion",
         "fts_field_weights",
         "bigram",
         "aggregation",
@@ -696,6 +844,8 @@ def _validate_router_ranking_profile(profile: Mapping[str, Any]) -> None:
         keys=("exact_alias", "facet", "fielded_fts", "short_token"),
         label="channel_weights",
     )
+    fusion = _require_mapping(profile, "fusion")
+    _require_positive_number(fusion, "primary_rrf_scale")
     fts_fields = (
         "company_text",
         "topic_text",
@@ -938,7 +1088,7 @@ def _require_weight_map(
 
 
 def create_router_sidecar_schema(conn: sqlite3.Connection) -> None:
-    """Create the Serving Index V4 schema in an open SQLite connection."""
+    """Create the Serving Index V5 schema in an open SQLite connection."""
     conn.executescript(_SCHEMA_SQL)
 
 
@@ -980,11 +1130,88 @@ def verify_router_sidecar(
             "tables": tables,
             "verification_mode": "router-sidecar-deep" if deep else "router-sidecar-light",
         }
+    seal, seal_status = read_immutable_sqlite_cache_seal(
+        resolved,
+        kind="router_sidecar",
+    )
+    if deep and seal_status == "valid":
+        raw_metadata = seal.get("metadata")
+        raw_counts = seal.get("counts")
+        metadata = dict(raw_metadata) if isinstance(raw_metadata, Mapping) else {}
+        counts = {
+            str(key): int(value)
+            for key, value in dict(raw_counts or {}).items()
+            if isinstance(value, int) and not isinstance(value, bool)
+        }
+        tables = list(ROUTER_SIDECAR_TABLES)
+        if metadata.get("schema_version") != ROUTER_SIDECAR_SCHEMA_VERSION:
+            errors.append("router_sidecar_schema_version_mismatch")
+        if metadata.get("builder_version") != ROUTER_SIDECAR_BUILDER_VERSION:
+            errors.append("router_sidecar_builder_version_mismatch")
+        if counts.get("routing_unit", 0) != counts.get("routing_fts", 0):
+            errors.append("router_sidecar_fts_unit_count_mismatch")
+        if counts.get("micro_routing_unit", 0) != counts.get("micro_routing_fts", 0):
+            errors.append("router_sidecar_micro_fts_unit_count_mismatch")
+        expected_fingerprint = _json_sha256(
+            {
+                "builder_version": metadata.get("builder_version"),
+                "content_sha256": metadata.get("content_sha256"),
+                "ranking_profile_sha256": metadata.get("ranking_profile_sha256"),
+                "release_id": metadata.get("release_id"),
+                "schema_sql_sha256": metadata.get("schema_sql_sha256"),
+                "schema_version": metadata.get("schema_version"),
+                "source_global_spine_sha256": metadata.get("source_global_spine_sha256"),
+            }
+        )
+        if metadata.get("build_fingerprint_sha256") != expected_fingerprint:
+            errors.append("router_sidecar_build_fingerprint_mismatch")
+        if (
+            expected_global_spine_sha256 is not None
+            and metadata.get("source_global_spine_sha256") != expected_global_spine_sha256
+        ):
+            errors.append("router_sidecar_source_global_spine_hash_mismatch")
+        elif global_spine_path is not None:
+            source = Path(global_spine_path).expanduser().resolve()
+            if not source.is_file():
+                errors.append("router_sidecar_source_global_spine_missing")
+            elif metadata.get("source_global_spine_sha256") != immutable_file_sha256(source):
+                errors.append("router_sidecar_source_global_spine_hash_mismatch")
+        if expected_release_id is not None and metadata.get("release_id") != expected_release_id:
+            errors.append("router_sidecar_release_id_mismatch")
+        if (
+            expected_ranking_profile_sha256 is not None
+            and metadata.get("ranking_profile_sha256") != expected_ranking_profile_sha256
+        ):
+            errors.append("router_sidecar_manifest_ranking_profile_hash_mismatch")
+        if (
+            expected_build_fingerprint_sha256 is not None
+            and metadata.get("build_fingerprint_sha256") != expected_build_fingerprint_sha256
+        ):
+            errors.append("router_sidecar_manifest_build_fingerprint_mismatch")
+        return {
+            "ok": not errors,
+            "errors": errors,
+            "warnings": warnings,
+            "path": str(resolved),
+            "metadata": metadata,
+            "counts": counts,
+            "tables": tables,
+            "verification_mode": "router-sidecar-deep-sealed",
+            "deep": True,
+            "integrity_check": "ok",
+            "integrity_source": "immutable_cache_seal",
+            "seal_status": seal_status,
+            "seal_trusted": True,
+        }
+    integrity_check: str | None = None
     try:
-        with sqlite3.connect(resolved) as conn:
+        with _connect_immutable_readonly(resolved) as conn:
             conn.row_factory = sqlite3.Row
             if deep:
                 integrity = conn.execute("PRAGMA integrity_check").fetchall()
+                integrity_check = (
+                    "ok" if [tuple(row) for row in integrity] == [("ok",)] else repr(integrity)
+                )
                 if [tuple(row) for row in integrity] != [("ok",)]:
                     errors.append(f"sqlite_integrity_check_failed:{integrity!r}")
             tables = sorted(
@@ -1027,6 +1254,100 @@ def verify_router_sidecar(
             if deep and counts.get("micro_routing_unit", 0) != counts.get("micro_routing_fts", 0):
                 errors.append("router_sidecar_micro_fts_unit_count_mismatch")
             if deep and not any("table_missing" in error for error in errors):
+                invalid_term_stats = int(
+                    conn.execute(
+                        """
+                        SELECT COUNT(*)
+                        FROM term_stats
+                        WHERE fts_unit_df < 0
+                           OR fts_ticker_df < 0
+                           OR fts_ticker_df > fts_unit_df
+                           OR alias_unit_df < 0
+                           OR alias_ticker_df < 0
+                        """
+                    ).fetchone()[0]
+                )
+                if invalid_term_stats:
+                    errors.append(f"router_sidecar_term_stats_invalid:{invalid_term_stats}")
+                conn.execute("DROP TABLE IF EXISTS temp.routing_fts_vocab_verify")
+                conn.execute(
+                    "CREATE VIRTUAL TABLE temp.routing_fts_vocab_verify "
+                    "USING fts5vocab(main, routing_fts, 'row')"
+                )
+                fts_df_mismatches = int(
+                    conn.execute(
+                        """
+                        SELECT COUNT(*)
+                        FROM temp.routing_fts_vocab_verify AS vocab
+                        LEFT JOIN term_stats AS stats
+                          ON stats.term_norm = vocab.term
+                        WHERE stats.term_norm IS NULL
+                           OR stats.fts_unit_df != vocab.doc
+                        """
+                    ).fetchone()[0]
+                )
+                conn.execute("DROP TABLE temp.routing_fts_vocab_verify")
+                if fts_df_mismatches:
+                    errors.append(f"router_sidecar_term_stats_fts_df_mismatch:{fts_df_mismatches}")
+                posting_df_mismatches = int(
+                    conn.execute(
+                        """
+                        WITH posting_df AS (
+                            SELECT term_norm, COUNT(*) AS unit_count
+                            FROM routing_term_posting
+                            GROUP BY term_norm
+                        )
+                        SELECT COUNT(*)
+                        FROM term_stats AS stats
+                        LEFT JOIN posting_df USING(term_norm)
+                        WHERE stats.fts_unit_df > 0
+                          AND COALESCE(posting_df.unit_count, 0) != stats.fts_unit_df
+                        """
+                    ).fetchone()[0]
+                )
+                if posting_df_mismatches:
+                    errors.append(
+                        f"router_sidecar_term_posting_df_mismatch:{posting_df_mismatches}"
+                    )
+                orphan_postings = int(
+                    conn.execute(
+                        """
+                        SELECT COUNT(*)
+                        FROM routing_term_posting AS posting
+                        LEFT JOIN routing_fts AS fts
+                          ON fts.rowid = posting.fts_rowid
+                        WHERE fts.rowid IS NULL
+                        """
+                    ).fetchone()[0]
+                )
+                if orphan_postings:
+                    errors.append(f"router_sidecar_term_posting_orphans:{orphan_postings}")
+                alias_df_mismatches = int(
+                    conn.execute(
+                        """
+                        WITH actual AS (
+                            SELECT alias_norm AS term_norm,
+                                   COUNT(DISTINCT CASE
+                                       WHEN routing_unit_id != '' THEN routing_unit_id
+                                       ELSE NULL
+                                   END) AS unit_count,
+                                   COUNT(DISTINCT ticker) AS ticker_count
+                            FROM alias_lookup
+                            GROUP BY alias_norm
+                        )
+                        SELECT COUNT(*)
+                        FROM actual
+                        LEFT JOIN term_stats AS stats USING(term_norm)
+                        WHERE stats.term_norm IS NULL
+                           OR stats.alias_unit_df != actual.unit_count
+                           OR stats.alias_ticker_df != actual.ticker_count
+                        """
+                    ).fetchone()[0]
+                )
+                if alias_df_mismatches:
+                    errors.append(
+                        f"router_sidecar_term_stats_alias_df_mismatch:{alias_df_mismatches}"
+                    )
                 if metadata.get("content_sha256") != _content_sha256(conn):
                     errors.append("router_sidecar_content_hash_mismatch")
                 fk_errors = conn.execute("PRAGMA foreign_key_check").fetchall()
@@ -1110,6 +1431,10 @@ def verify_router_sidecar(
         "tables": tables,
         "verification_mode": "router-sidecar-deep" if deep else "router-sidecar-light",
         "deep": deep,
+        "integrity_check": integrity_check,
+        "integrity_source": "sqlite_integrity_check" if deep else "none",
+        "seal_status": seal_status,
+        "seal_trusted": False,
     }
 
 
@@ -1119,6 +1444,7 @@ def rebind_router_sidecar_release(
     release_id: str,
     expected_global_spine_sha256: str | None = None,
     expected_previous_release_id: str | None = None,
+    trusted_source_path: Path | str | None = None,
 ) -> dict[str, Any]:
     """Rebind a copied candidate sidecar to a new immutable release ID.
 
@@ -1126,9 +1452,43 @@ def rebind_router_sidecar_release(
     it on a candidate copy, never an active release artifact.
     """
     resolved = Path(path).expanduser().resolve()
+    trusted_source = (
+        Path(trusted_source_path).expanduser().resolve()
+        if trusted_source_path is not None
+        else None
+    )
     normalized_release_id = str(release_id).strip()
     if not normalized_release_id:
         raise ValueError("router sidecar release_id is required")
+    inherited_source_verification: dict[str, Any] | None = None
+    if trusted_source is not None:
+        source_seal, source_seal_status = read_immutable_sqlite_cache_seal(
+            trusted_source,
+            kind="router_sidecar",
+        )
+        if source_seal_status != "valid":
+            raise ValueError(
+                "cannot inherit router sidecar verification from an untrusted source: "
+                f"{source_seal_status}"
+            )
+        inherited_source_verification = verify_router_sidecar(
+            trusted_source,
+            expected_global_spine_sha256=expected_global_spine_sha256,
+            expected_release_id=expected_previous_release_id,
+            deep=True,
+        )
+        if not inherited_source_verification.get("ok"):
+            raise ValueError(
+                "cannot inherit invalid router sidecar verification: "
+                + ", ".join(inherited_source_verification.get("errors") or [])
+            )
+        assert_trusted_immutable_copy(
+            trusted_source,
+            resolved,
+            cached_source_sha256=read_immutable_sqlite_cache_sha256(trusted_source),
+            role="router sidecar",
+        )
+
     verification = verify_router_sidecar(
         resolved,
         expected_global_spine_sha256=expected_global_spine_sha256,
@@ -1165,22 +1525,125 @@ def rebind_router_sidecar_release(
             },
         )
         conn.commit()
-    return verify_router_sidecar(
+    remove_immutable_sqlite_cache_seal(resolved)
+    rebound = verify_router_sidecar(
         resolved,
         expected_global_spine_sha256=expected_global_spine_sha256,
+        expected_release_id=normalized_release_id,
+        deep=False,
+    )
+    if inherited_source_verification is not None:
+        inherited = {
+            **rebound,
+            "integrity_check": "ok",
+            "integrity_source": "inherited_immutable_cache_seal",
+            "verification_mode": "router-sidecar-deep-sealed-inherited-rebind",
+        }
+        write_immutable_sqlite_cache_seal(
+            resolved,
+            kind="router_sidecar",
+            cache_key=str(metadata["build_fingerprint_sha256"]),
+            verification=inherited,
+            metadata=rebound.get("metadata") or {},
+            counts=rebound.get("counts") or {},
+            source_path=trusted_source,
+            details={"inheritance": "controlled-release-id-rebind"},
+        )
+        rebound = verify_router_sidecar(
+            resolved,
+            expected_global_spine_sha256=expected_global_spine_sha256,
+            expected_release_id=normalized_release_id,
+            deep=True,
+        )
+    return rebound
+
+
+def rebind_router_sidecar_source(
+    path: Path | str,
+    *,
+    global_spine_path: Path | str,
+    release_id: str,
+    expected_previous_global_spine_sha256: str | None = None,
+    expected_previous_release_id: str | None = None,
+) -> dict[str, Any]:
+    """Rebind a verified semantic-cache copy to a byte-distinct global spine.
+
+    The caller must independently prove semantic equivalence, normally with a
+    content-addressed cache key over all ordered spine fragments and builder
+    versions. This function only updates immutable source/release metadata on
+    the copied candidate and then verifies the new binding.
+    """
+    resolved = Path(path).expanduser().resolve()
+    source_path = Path(global_spine_path).expanduser().resolve()
+    normalized_release_id = str(release_id).strip()
+    if not normalized_release_id:
+        raise ValueError("router sidecar release_id is required")
+    if not source_path.is_file():
+        raise FileNotFoundError(f"Global spine not found: {source_path}")
+    verification = verify_router_sidecar(resolved, deep=False)
+    if not verification.get("ok"):
+        raise ValueError(
+            "cannot rebind invalid router sidecar: " + ", ".join(verification.get("errors") or [])
+        )
+    metadata = dict(verification.get("metadata") or {})
+    if (
+        expected_previous_global_spine_sha256 is not None
+        and metadata.get("source_global_spine_sha256") != expected_previous_global_spine_sha256
+    ):
+        raise ValueError("router sidecar previous global spine SHA-256 mismatch")
+    if (
+        expected_previous_release_id is not None
+        and metadata.get("release_id") != expected_previous_release_id
+    ):
+        raise ValueError("router sidecar previous release_id mismatch")
+
+    with _connect_immutable_readonly(source_path) as source:
+        source_metadata = _read_metadata(source)
+    source_sha256 = immutable_file_sha256(source_path)
+    rebound_metadata = {
+        "release_id": normalized_release_id,
+        "source_global_spine_sha256": source_sha256,
+        "source_global_spine_schema_version": source_metadata.get("schema_version"),
+        "source_manifest_hash": source_metadata.get("source_manifest_hash"),
+        "source_created_at": source_metadata.get("created_at"),
+    }
+    rebound_metadata["build_fingerprint_sha256"] = _json_sha256(
+        {
+            "builder_version": metadata.get("builder_version"),
+            "content_sha256": metadata.get("content_sha256"),
+            "ranking_profile_sha256": metadata.get("ranking_profile_sha256"),
+            "release_id": normalized_release_id,
+            "schema_sql_sha256": metadata.get("schema_sql_sha256"),
+            "schema_version": metadata.get("schema_version"),
+            "source_global_spine_sha256": source_sha256,
+        }
+    )
+    with sqlite3.connect(resolved) as conn:
+        _write_metadata(conn, rebound_metadata)
+        conn.commit()
+    remove_immutable_sqlite_cache_seal(resolved)
+    return verify_router_sidecar(
+        resolved,
+        expected_global_spine_sha256=source_sha256,
         expected_release_id=normalized_release_id,
         deep=False,
     )
 
 
 class RouterSidecar:
-    """One read-only connection to an immutable Serving Index V4 artifact.
+    """One read-only connection to an immutable Serving Index V5 artifact.
 
     Instances are intentionally not shared across threads.  A caller can keep
     one instance per store lease, matching the immutable release lifecycle.
     """
 
-    def __init__(self, path: Path | str):
+    def __init__(
+        self,
+        path: Path | str,
+        *,
+        coherence_path: Path | str | None = None,
+        require_coherence: bool = False,
+    ):
         self.path = Path(path).expanduser().resolve()
         if not self.path.is_file():
             raise FileNotFoundError(f"Router sidecar not found: {self.path}")
@@ -1192,8 +1655,30 @@ class RouterSidecar:
         self._conn.execute("PRAGMA query_only = ON")
         self._metadata = _read_metadata(self._conn)
         self._profile = self._load_active_profile()
+        resolved_coherence_path = (
+            Path(coherence_path).expanduser().resolve()
+            if coherence_path is not None
+            else self.path.parent / ROUTER_COHERENCE_RELATIVE_PATH.name
+        )
+        self._coherence: RouterCoherence | None = None
+        if resolved_coherence_path.is_file():
+            coherence = RouterCoherence(resolved_coherence_path)
+            coherence_metadata = coherence.metadata
+            if coherence_metadata.get("source_global_spine_sha256") != self._metadata.get(
+                "source_global_spine_sha256"
+            ):
+                coherence.close()
+                self._conn.close()
+                raise ValueError("Router coherence source-spine binding mismatch")
+            if coherence_metadata.get("release_id") != self._metadata.get("release_id"):
+                coherence.close()
+                self._conn.close()
+                raise ValueError("Router coherence release binding mismatch")
+            self._coherence = coherence
+        elif require_coherence:
+            self._conn.close()
+            raise FileNotFoundError(f"Router coherence index not found: {resolved_coherence_path}")
         self._term_stat_cache: dict[str, _QueryTermStat] = {}
-        self._alias_df_cache: dict[str, tuple[int, int]] = {}
         self._alias_rows_cache: OrderedDict[
             tuple[str, tuple[str, ...], int], tuple[dict[str, Any], ...]
         ] = OrderedDict()
@@ -1212,7 +1697,14 @@ class RouterSidecar:
     def ranking_profile(self) -> Mapping[str, Any]:
         return dict(self._profile)
 
+    @property
+    def coherence_available(self) -> bool:
+        return self._coherence is not None
+
     def close(self) -> None:
+        if self._coherence is not None:
+            self._coherence.close()
+            self._coherence = None
         self._conn.close()
 
     def lookup_alias(
@@ -1334,22 +1826,34 @@ class RouterSidecar:
             ]
         unit_headers = self._hydrate_unit_headers(ranked_units[:candidate_limit])
         micro_config = self._profile["micro_rerank"]
+        coherence_config = (
+            self._coherence.profile.get("query") if self._coherence is not None else {}
+        )
         coarse_pool_limit = min(
             candidate_limit,
             max(
                 resolved_limit,
                 resolved_limit * int(micro_config["candidate_ticker_multiplier"]),
+                resolved_limit * int(coherence_config.get("candidate_ticker_multiplier") or 1),
             ),
         )
         coarse_ticker_candidates = self._aggregate_tickers(
             unit_headers,
             limit=coarse_pool_limit,
         )
-        ticker_candidates, micro_diagnostics, micro_rows = self._micro_rerank_tickers(
+        micro_candidates, micro_diagnostics, micro_rows = self._micro_rerank_tickers(
             terms=terms,
             term_stats=lexical_term_stats,
             coarse_candidates=coarse_ticker_candidates,
             protected_tickers=resolved_tickers,
+            limit=(coarse_pool_limit if self._coherence is not None else resolved_limit),
+        )
+        ticker_candidates, coherence_diagnostics, coherence_rows = self._coherence_rerank_tickers(
+            terms=terms,
+            coarse_candidates=micro_candidates,
+            protected_tickers=resolved_tickers,
+            scoped_tickers=scoped_tickers,
+            candidate_generation_allowed=hard_facet_units is None,
             limit=resolved_limit,
         )
         unit_rows = self._hydrate_units(
@@ -1357,6 +1861,10 @@ class RouterSidecar:
             primary_diagnostics={str(row["routing_unit_id"]): row for row in fts_rows},
         )
         minimum_should_match = int(fts_rows[0]["minimum_should_match"]) if fts_rows else 0
+        coverage_candidate_count = int(fts_rows[0]["coverage_candidate_count"]) if fts_rows else 0
+        coverage_query_count = int(fts_rows[0]["coverage_query_count"]) if fts_rows else 0
+        rrf_k = float(self._profile["rrf_k"])
+        configured_primary_scale = float(self._profile["fusion"]["primary_rrf_scale"])
         return {
             "contract_version": "router-search/v3",
             "query": query,
@@ -1369,6 +1877,8 @@ class RouterSidecar:
             "routing_units": unit_rows,
             "micro_routing_units": micro_rows,
             "micro_rerank": micro_diagnostics,
+            "coherence_units": coherence_rows,
+            "coherence_rerank": coherence_diagnostics,
             "query_term_stats": [
                 term_stats[term].as_dict(
                     facet_eligible=self._facet_term_is_eligible(term_stats[term])
@@ -1376,6 +1886,21 @@ class RouterSidecar:
                 for term in alias_terms
                 if term in term_stats
             ],
+            "lexical_diagnostics": {
+                "term_stats_source": "build_time_term_stats",
+                "coverage_mode": "materialized_term_posting",
+                "coverage_candidate_count": coverage_candidate_count,
+                "coverage_query_count": coverage_query_count,
+                "full_term_posting_materialized": True,
+            },
+            "fusion_diagnostics": {
+                "mode": "rrf_scale_calibrated_v1",
+                "rrf_k": rrf_k,
+                "configured_primary_rrf_scale": configured_primary_scale,
+                "primary_contribution_scale": configured_primary_scale / (rrf_k + 1.0),
+                "legacy_primary_contribution_scale": 1.0,
+                "raw_primary_score_retained": True,
+            },
             "minimum_should_match": minimum_should_match,
             "graph_expansion_used": False,
             "graph_expansion_reason": "no_high_confidence_seed_expansion",
@@ -1448,6 +1973,22 @@ class RouterSidecar:
                 "fallback": "preserve_coarse_order",
             },
             "query_term_stats": [],
+            "lexical_diagnostics": {
+                "term_stats_source": "build_time_term_stats",
+                "coverage_mode": "materialized_term_posting",
+                "coverage_candidate_count": 0,
+                "coverage_query_count": 0,
+                "full_term_posting_materialized": True,
+            },
+            "fusion_diagnostics": {
+                "mode": "rrf_scale_calibrated_v1",
+                "rrf_k": float(self._profile["rrf_k"]),
+                "configured_primary_rrf_scale": float(self._profile["fusion"]["primary_rrf_scale"]),
+                "primary_contribution_scale": float(self._profile["fusion"]["primary_rrf_scale"])
+                / (float(self._profile["rrf_k"]) + 1.0),
+                "legacy_primary_contribution_scale": 1.0,
+                "raw_primary_score_retained": True,
+            },
             "minimum_should_match": 0,
             "graph_expansion_used": False,
             "graph_expansion_reason": "no_high_confidence_seed_expansion",
@@ -1475,60 +2016,55 @@ class RouterSidecar:
         lexical_term_set = {
             normalize_router_text(term) for term in lexical_terms if normalize_router_text(term)
         }
-        result: dict[str, _QueryTermStat] = {}
-        for raw_term in dict.fromkeys(terms):
-            term = normalize_router_text(raw_term)
-            if not term:
-                continue
-            cached_alias_df = self._alias_df_cache.get(term)
-            if cached_alias_df is None:
-                alias_row = self._conn.execute(
-                    """
-                    SELECT COUNT(DISTINCT NULLIF(routing_unit_id, '')) AS unit_count,
-                           COUNT(DISTINCT ticker) AS ticker_count
-                    FROM alias_lookup
-                    WHERE alias_norm = ?
+        normalized_terms = [
+            term for term in dict.fromkeys(normalize_router_text(value) for value in terms) if term
+        ]
+        missing_terms = [term for term in normalized_terms if term not in self._term_stat_cache]
+        rows_by_term: dict[str, sqlite3.Row] = {}
+        if missing_terms:
+            placeholders = ", ".join("?" for _ in missing_terms)
+            rows_by_term = {
+                str(row["term_norm"]): row
+                for row in self._conn.execute(
+                    f"""
+                    SELECT term_norm, fts_unit_df, fts_ticker_df,
+                           alias_unit_df, alias_ticker_df
+                    FROM term_stats
+                    WHERE term_norm IN ({placeholders})
                     """,
-                    (term,),
-                ).fetchone()
-                cached_alias_df = (int(alias_row[0] or 0), int(alias_row[1] or 0))
-                self._alias_df_cache[term] = cached_alias_df
-            alias_unit_df, alias_ticker_df = cached_alias_df
+                    missing_terms,
+                ).fetchall()
+            }
+        for term in missing_terms:
+            row = rows_by_term.get(term)
+            fts_unit_df = int(row["fts_unit_df"] or 0) if row is not None else 0
+            fts_ticker_df = int(row["fts_ticker_df"] or 0) if row is not None else 0
+            alias_unit_df = int(row["alias_unit_df"] or 0) if row is not None else 0
+            alias_ticker_df = int(row["alias_ticker_df"] or 0) if row is not None else 0
             if term not in lexical_term_set and alias_unit_df <= 0 and alias_ticker_df <= 0:
                 continue
-            cached_stat = self._term_stat_cache.get(term)
-            if cached_stat is not None:
-                result[term] = cached_stat
-                continue
-            fts_row = self._conn.execute(
-                """
-                SELECT COUNT(*) AS unit_count, COUNT(DISTINCT ticker) AS ticker_count
-                FROM routing_fts
-                WHERE routing_fts MATCH ?
-                """,
-                (_fts_quote(term),),
-            ).fetchone()
-            fts_unit_df = int(fts_row[0] or 0)
-            fts_ticker_df = int(fts_row[1] or 0)
             effective_unit_df = max(fts_unit_df, alias_unit_df)
             effective_ticker_df = max(fts_ticker_df, alias_ticker_df)
-            information = max(
-                0.0,
-                math.log((total_units + 1) / (effective_unit_df + 1))
-                + math.log((total_tickers + 1) / (effective_ticker_df + 1)),
-            )
-            stat = _QueryTermStat(
+            self._term_stat_cache[term] = _QueryTermStat(
                 term=term,
                 fts_unit_df=fts_unit_df,
                 fts_ticker_df=fts_ticker_df,
                 alias_unit_df=alias_unit_df,
                 alias_ticker_df=alias_ticker_df,
-                information=information,
+                information=max(
+                    0.0,
+                    math.log((total_units + 1) / (effective_unit_df + 1))
+                    + math.log((total_tickers + 1) / (effective_ticker_df + 1)),
+                ),
                 unit_df_ratio=effective_unit_df / max(1, total_units),
                 ticker_df_ratio=effective_ticker_df / max(1, total_tickers),
             )
-            self._term_stat_cache[term] = stat
-            result[term] = stat
+
+        result: dict[str, _QueryTermStat] = {}
+        for term in normalized_terms:
+            cached_stat = self._term_stat_cache.get(term)
+            if cached_stat is not None:
+                result[term] = cached_stat
         return result
 
     def _facet_term_is_eligible(self, stat: _QueryTermStat) -> bool:
@@ -1705,7 +2241,7 @@ class RouterSidecar:
         params.append(lexical_limit)
         rows = self._conn.execute(
             f"""
-            SELECT routing_unit_id, ticker,
+            SELECT rowid AS fts_rowid, routing_unit_id, ticker,
                    bm25(
                        routing_fts,
                        0.0, 0.0,
@@ -1727,22 +2263,28 @@ class RouterSidecar:
             return []
 
         matched_terms_by_unit: defaultdict[str, set[str]] = defaultdict(set)
-        for term in indexed_terms:
-            term_params: list[Any] = [_fts_quote(term)]
-            term_ticker_sql = ""
-            if tickers:
-                placeholders = ", ".join("?" for _ in tickers)
-                term_ticker_sql = f" AND ticker IN ({placeholders})"
-                term_params.extend(tickers)
-            for row in self._conn.execute(
-                f"""
-                SELECT routing_unit_id
-                FROM routing_fts
-                WHERE routing_fts MATCH ? {term_ticker_sql}
-                """,
-                term_params,
-            ):
-                matched_terms_by_unit[str(row["routing_unit_id"])].add(term)
+        candidate_rowids = [int(row["fts_rowid"]) for row in rows]
+        candidate_rowid_set = set(candidate_rowids)
+        candidate_units_by_rowid = {
+            int(row["fts_rowid"]): str(row["routing_unit_id"]) for row in rows
+        }
+        term_placeholders = ", ".join("?" for _ in indexed_terms)
+        coverage_query_count = 1
+        for matched in self._conn.execute(
+            f"""
+            SELECT term_norm, fts_rowid
+            FROM routing_term_posting
+            WHERE term_norm IN ({term_placeholders})
+            ORDER BY term_norm, fts_rowid
+            """,
+            indexed_terms,
+        ):
+            fts_rowid = int(matched["fts_rowid"])
+            if fts_rowid not in candidate_rowid_set:
+                continue
+            unit_id = candidate_units_by_rowid.get(fts_rowid)
+            if unit_id is not None:
+                matched_terms_by_unit[unit_id].add(str(matched["term_norm"]))
 
         min_should_match = min(
             len(indexed_terms),
@@ -1800,6 +2342,10 @@ class RouterSidecar:
                     "bm25_normalized": bm25_normalized,
                     "strict_match": strict_match,
                     "minimum_should_match": min_should_match,
+                    "term_stats_source": "build_time_term_stats",
+                    "coverage_mode": "materialized_term_posting",
+                    "coverage_candidate_count": len(candidate_rowids),
+                    "coverage_query_count": coverage_query_count,
                 }
             )
             ranked.append(payload)
@@ -1979,10 +2525,11 @@ class RouterSidecar:
         totals: defaultdict[str, float] = defaultdict(float)
         contributions: defaultdict[str, dict[str, float]] = defaultdict(dict)
         primary_weight = float(channel_weights["fielded_fts"])
+        primary_scale = float(self._profile["fusion"]["primary_rrf_scale"]) / (rrf_k + 1.0)
         for unit_id, score in primary_scores.items():
             if allowed_units is not None and unit_id not in allowed_units:
                 continue
-            contribution = primary_weight * max(0.0, float(score))
+            contribution = primary_weight * max(0.0, float(score)) * primary_scale
             totals[unit_id] += contribution
             contributions[unit_id]["fielded_fts"] = contribution
         for channel, unit_ids in sorted(channels.items()):
@@ -2081,6 +2628,144 @@ class RouterSidecar:
                 row["strict_match"] = bool(primary["strict_match"])
             hydrated.append(row)
         return hydrated
+
+    def _coherence_rerank_tickers(
+        self,
+        *,
+        terms: Sequence[str],
+        coarse_candidates: Sequence[Mapping[str, Any]],
+        protected_tickers: Sequence[str],
+        scoped_tickers: Sequence[str],
+        candidate_generation_allowed: bool,
+        limit: int,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any], list[dict[str, Any]]]:
+        """Fuse coarse rank with source-object term coherence."""
+        coarse = [dict(row) for row in coarse_candidates]
+
+        def fallback(
+            reason: str,
+        ) -> tuple[list[dict[str, Any]], dict[str, Any], list[dict[str, Any]]]:
+            return (
+                coarse[:limit],
+                {
+                    "available": self._coherence is not None,
+                    "applied": False,
+                    "reason": reason,
+                    "fallback": "preserve_coarse_order",
+                    "candidate_pool_size": len(coarse),
+                },
+                [],
+            )
+
+        if self._coherence is None:
+            return fallback("coherence_index_absent")
+        coherence_scope = tuple(scoped_tickers)
+        if not candidate_generation_allowed and not coherence_scope:
+            coherence_scope = tuple(
+                str(row.get("ticker") or "").strip().upper()
+                for row in coarse
+                if str(row.get("ticker") or "").strip()
+            )
+        result = self._coherence.search_terms(terms, tickers=coherence_scope)
+        if not result.get("applied"):
+            return fallback(str(result.get("reason") or "coherence_not_applied"))
+        coherence_rows = [
+            dict(row) for row in result.get("candidates") or [] if isinstance(row, Mapping)
+        ]
+        if not coherence_rows:
+            return fallback("coherence_candidates_empty")
+        config = self._coherence.profile["query"]
+        coherence_weight = float(config["coherence_weight"])
+        coarse_weight = float(config["coarse_weight"])
+        weight_total = coherence_weight + coarse_weight or 1.0
+        coherence_by_ticker = {str(row["ticker"]): row for row in coherence_rows}
+        coarse_by_ticker = {str(row["ticker"]): dict(row) for row in coarse}
+        missing_tickers = sorted(set(coherence_by_ticker) - set(coarse_by_ticker))
+        if not candidate_generation_allowed:
+            missing_tickers = []
+        if missing_tickers:
+            placeholders = ", ".join("?" for _ in missing_tickers)
+            profiles = {
+                str(row["ticker"]): dict(row)
+                for row in self._conn.execute(
+                    f"""
+                    SELECT ticker, company_name
+                    FROM ticker_profile
+                    WHERE ticker IN ({placeholders})
+                    """,
+                    missing_tickers,
+                ).fetchall()
+            }
+            for ticker in missing_tickers:
+                profile = profiles.get(ticker)
+                if profile is None:
+                    continue
+                coarse_by_ticker[ticker] = {
+                    "ticker": ticker,
+                    "company_name": str(profile.get("company_name") or ticker),
+                    "score": 0.0,
+                    "best_topic_family": "",
+                    "routing_unit_ids": [],
+                    "matched_unit_count": 0,
+                }
+
+        coarse_ranks = {str(row["ticker"]): rank for rank, row in enumerate(coarse, start=1)}
+        fused: list[dict[str, Any]] = []
+        for ticker, base in coarse_by_ticker.items():
+            coarse_rank = coarse_ranks.get(ticker)
+            coarse_rank_score = 1.0 / math.log2(coarse_rank + 1) if coarse_rank else 0.0
+            coherent = coherence_by_ticker.get(ticker)
+            coherence_score = float(coherent.get("coherence_score") or 0.0) if coherent else 0.0
+            final_score = (
+                coherence_weight * coherence_score + coarse_weight * coarse_rank_score
+            ) / weight_total
+            payload = dict(base)
+            payload.update(
+                {
+                    "coarse_rank": coarse_rank,
+                    "coarse_score": float(base.get("score") or 0.0),
+                    "coarse_rank_score": coarse_rank_score,
+                    "coherence_score": coherence_score,
+                    "source_coherent_match": coherent is not None,
+                    "coherence_source_locator_rowid": (
+                        int(coherent["source_locator_rowid"]) if coherent else None
+                    ),
+                    "coherence_matched_terms": (
+                        list(coherent.get("matched_terms") or []) if coherent else []
+                    ),
+                    "score": final_score,
+                }
+            )
+            fused.append(payload)
+        protected = set(protected_tickers)
+        fused.sort(
+            key=lambda row: (
+                str(row["ticker"]) not in protected,
+                -float(row["score"]),
+                int(row["coarse_rank"]) if row.get("coarse_rank") else len(coarse) + 1,
+                str(row["ticker"]),
+            )
+        )
+        return (
+            fused[:limit],
+            {
+                "available": True,
+                "applied": True,
+                "reason": str(result.get("reason") or "source_coherent_term_pairs"),
+                "fallback": "preserve_coarse_order",
+                "candidate_pool_size": len(fused),
+                "candidate_generation_allowed": candidate_generation_allowed,
+                "coherence_weight": coherence_weight,
+                "coarse_weight": coarse_weight,
+                "pair_query_count": int(result.get("pair_query_count") or 0),
+                "truncated_pair_count": int(result.get("truncated_pair_count") or 0),
+                "matched_document_count": int(result.get("matched_document_count") or 0),
+                "matched_ticker_count": int(result.get("matched_ticker_count") or 0),
+                "usable_terms": list(result.get("usable_terms") or []),
+                "protected_tickers": sorted(protected),
+            },
+            coherence_rows[: max(limit, 20)],
+        )
 
     def _micro_rerank_tickers(
         self,
@@ -3378,13 +4063,25 @@ def _write_short_token_postings(conn: sqlite3.Connection) -> None:
         f"""
         SELECT routing_unit_id, ticker, {", ".join(fields)}
         FROM routing_unit
-        ORDER BY routing_unit_id
+        ORDER BY ticker, routing_unit_id
         """
     )
+    fts_unit_df: Counter[str] = Counter()
+    fts_ticker_df: Counter[str] = Counter()
+    current_ticker: str | None = None
+    current_ticker_terms: set[str] = set()
     for row in rows:
+        ticker = str(row["ticker"])
+        if current_ticker is not None and ticker != current_ticker:
+            fts_ticker_df.update(current_ticker_terms)
+            current_ticker_terms.clear()
+        current_ticker = ticker
+        unit_terms: set[str] = set()
         for field_name in fields:
             counts: Counter[str] = Counter()
-            for token in _lexical_terms(str(row[field_name] or ""), limit=100_000):
+            field_terms = _lexical_terms(str(row[field_name] or ""), limit=100_000)
+            unit_terms.update(field_terms)
+            for token in field_terms:
                 counts.update(_rescue_terms(token))
             conn.executemany(
                 """
@@ -3403,6 +4100,113 @@ def _write_short_token_postings(conn: sqlite3.Connection) -> None:
                     for term, count in sorted(counts.items())
                 ),
             )
+        fts_unit_df.update(unit_terms)
+        current_ticker_terms.update(unit_terms)
+    if current_ticker is not None:
+        fts_ticker_df.update(current_ticker_terms)
+    _write_term_stats(
+        conn,
+        python_fts_unit_df=fts_unit_df,
+        python_fts_ticker_df=fts_ticker_df,
+    )
+
+
+def _write_term_stats(
+    conn: sqlite3.Connection,
+    *,
+    python_fts_unit_df: Mapping[str, int],
+    python_fts_ticker_df: Mapping[str, int],
+) -> None:
+    """Materialize exact term postings and cold-query document frequencies."""
+    alias_df = {
+        str(row["term_norm"]): (
+            int(row["unit_count"] or 0),
+            int(row["ticker_count"] or 0),
+        )
+        for row in conn.execute(
+            """
+            SELECT alias_norm AS term_norm,
+                   COUNT(DISTINCT CASE
+                       WHEN routing_unit_id != '' THEN routing_unit_id
+                       ELSE NULL
+                   END) AS unit_count,
+                   COUNT(DISTINCT ticker) AS ticker_count
+            FROM alias_lookup
+            GROUP BY alias_norm
+            ORDER BY alias_norm
+            """
+        )
+    }
+    conn.execute("DELETE FROM routing_term_posting")
+    conn.execute("DROP TABLE IF EXISTS temp.routing_fts_vocab_for_postings")
+    conn.execute(
+        "CREATE VIRTUAL TABLE temp.routing_fts_vocab_for_postings "
+        "USING fts5vocab(main, routing_fts, 'instance')"
+    )
+    conn.execute(
+        """
+        INSERT INTO routing_term_posting(term_norm, fts_rowid)
+        SELECT DISTINCT term, doc
+        FROM temp.routing_fts_vocab_for_postings
+        ORDER BY term, doc
+        """
+    )
+    conn.execute("DROP TABLE temp.routing_fts_vocab_for_postings")
+    fts_df = {
+        str(row["term_norm"]): int(row["unit_count"] or 0)
+        for row in conn.execute(
+            """
+            SELECT term_norm, COUNT(*) AS unit_count
+            FROM routing_term_posting
+            GROUP BY term_norm
+            ORDER BY term_norm
+            """
+        )
+    }
+    exact_ticker_df_cache: dict[str, int] = {}
+
+    def fts_ticker_df(term: str, unit_df: int) -> int:
+        python_unit_df = int(python_fts_unit_df.get(term, 0))
+        python_ticker_df = int(python_fts_ticker_df.get(term, 0))
+        if python_unit_df == unit_df and 0 < python_ticker_df <= unit_df:
+            return python_ticker_df
+        cached = exact_ticker_df_cache.get(term)
+        if cached is not None:
+            return cached
+        row = conn.execute(
+            """
+            SELECT COUNT(DISTINCT ticker)
+            FROM routing_fts
+            WHERE routing_fts MATCH ?
+            """,
+            (_fts_quote(term),),
+        ).fetchone()
+        exact = int(row[0] or 0)
+        exact_ticker_df_cache[term] = exact
+        return exact
+
+    payload: list[tuple[Any, ...]] = []
+    for term in sorted(set(fts_df) | set(alias_df)):
+        unit_df = int(fts_df.get(term, 0))
+        alias_unit_df, alias_ticker_df = alias_df.get(term, (0, 0))
+        payload.append(
+            (
+                term,
+                unit_df,
+                fts_ticker_df(term, unit_df) if unit_df else 0,
+                alias_unit_df,
+                alias_ticker_df,
+            )
+        )
+    conn.executemany(
+        """
+        INSERT INTO term_stats(
+            term_norm, fts_unit_df, fts_ticker_df,
+            alias_unit_df, alias_ticker_df
+        ) VALUES (?, ?, ?, ?, ?)
+        """,
+        payload,
+    )
 
 
 def _write_graph_priors(source: sqlite3.Connection, target: sqlite3.Connection) -> None:
@@ -3707,6 +4511,9 @@ def _file_sha256(path: Path) -> str:
 def immutable_file_sha256(path: Path | str) -> str:
     """Hash an immutable artifact once for each stable stat signature."""
     resolved = Path(path).expanduser().resolve()
+    sealed_digest = read_spine_verification_sha256(resolved)
+    if sealed_digest is not None:
+        return sealed_digest
     for _attempt in range(2):
         before = resolved.stat()
         stat_key = (
@@ -3714,7 +4521,6 @@ def immutable_file_sha256(path: Path | str) -> str:
             int(before.st_ino),
             int(before.st_size),
             int(before.st_mtime_ns),
-            int(before.st_ctime_ns),
         )
         digest = _immutable_file_sha256_for_stat(str(resolved), *stat_key)
         after = resolved.stat()
@@ -3723,26 +4529,37 @@ def immutable_file_sha256(path: Path | str) -> str:
             int(after.st_ino),
             int(after.st_size),
             int(after.st_mtime_ns),
-            int(after.st_ctime_ns),
         )
         if after_key == stat_key:
+            try:
+                record_spine_verification_sha256(resolved, digest)
+            except (OSError, RuntimeError, ValueError):
+                # Most immutable artifacts are not spine databases and do not
+                # carry a deep-verification seal. The stat-bound in-process
+                # cache remains the fallback for those files.
+                pass
             return digest
     raise RuntimeError(f"immutable artifact changed while hashing: {resolved}")
 
 
-@lru_cache(maxsize=64)
+@lru_cache(maxsize=4096)
 def _immutable_file_sha256_for_stat(
     path: str,
     device: int,
     inode: int,
     size: int,
     mtime_ns: int,
-    ctime_ns: int,
 ) -> str:
-    del device, inode, size, mtime_ns, ctime_ns
+    del device, inode, size, mtime_ns
     return _file_sha256(Path(path))
 
 
 def _cleanup_sqlite_files(path: Path) -> None:
-    for candidate in (path, Path(f"{path}-wal"), Path(f"{path}-shm"), Path(f"{path}-journal")):
+    for candidate in (
+        path,
+        Path(f"{path}-wal"),
+        Path(f"{path}-shm"),
+        Path(f"{path}-journal"),
+        immutable_sqlite_cache_seal_path(path),
+    ):
         candidate.unlink(missing_ok=True)

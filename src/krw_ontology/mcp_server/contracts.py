@@ -531,6 +531,20 @@ class VisualizationMetricPoint(ContractModel):
     object_id: str
 
 
+class VisualizationMetricScope(ContractModel):
+    """Stable semantic ownership for one renderer-neutral metric series.
+
+    The chart sidecar already indexes company totals, geographic segments,
+    products, and other dimensions separately.  Preserve that distinction in
+    the public MCP contract so presentation code can choose a total or a
+    breakdown without parsing a technical ``series_key``.
+    """
+
+    kind: str
+    key: str
+    label: str | None = None
+
+
 class VisualizationMetricSeries(ContractModel):
     """One bounded, renderer-neutral metric series from the verified sidecar."""
 
@@ -542,6 +556,7 @@ class VisualizationMetricSeries(ContractModel):
     unit: str | None = None
     period_type: str | None = None
     duration: str | None = None
+    scope: VisualizationMetricScope
     points: list[VisualizationMetricPoint] = Field(default_factory=list, max_length=12)
 
 
@@ -1211,6 +1226,12 @@ def _compact_visualization_metric_series_pack(
         series_key = _first_text(raw_series, "series_key")
         if not series_key:
             continue
+        raw_scope = _mapping(raw_series.get("scope"))
+        scope = VisualizationMetricScope(
+            kind=_first_text(raw_scope, "kind") or "unspecified",
+            key=_first_text(raw_scope, "key") or series_key,
+            label=_first_text(raw_scope, "label"),
+        )
         canonical_metric = _first_text(raw_series, "canonical_metric")
         label = _first_text(raw_series, "label") or canonical_metric or series_key
         points: list[VisualizationMetricPoint] = []
@@ -1246,6 +1267,7 @@ def _compact_visualization_metric_series_pack(
                 unit=_first_text(raw_series, "unit"),
                 period_type=_first_text(raw_series, "period_type"),
                 duration=_first_text(raw_series, "duration"),
+                scope=scope,
                 points=points,
             )
         )

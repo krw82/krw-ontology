@@ -79,6 +79,9 @@ def test_search_plan_exposes_verified_chart_series_when_enabled(
     assert pack.mode == "chart_series_sidecar"
     revenue = next(series for series in pack.series if series.canonical_metric == "revenue")
     assert revenue.ticker == "AAPL"
+    assert revenue.scope.kind == "company_total"
+    assert revenue.scope.key == "company_total"
+    assert revenue.scope.label == "Company total"
     assert [point.period for point in revenue.points] == ["CY2024", "CY2025"]
     assert [point.value for point in revenue.points] == [110.0, 130.0]
     assert all(point.object_id.startswith("metric_observation:") for point in revenue.points)

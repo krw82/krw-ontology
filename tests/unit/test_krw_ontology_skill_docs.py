@@ -96,6 +96,40 @@ def test_krw_ontology_market_move_skill_is_separate_from_news_research() -> None
     assert "app-normalized provider results" in discovery_text
 
 
+def test_source_filing_follow_up_skill_is_runtime_scoped() -> None:
+    skill_dir = Path("plugins/krw-ontology/skills/krw-ontology-filing-follow-up")
+
+    skill_text = (skill_dir / "SKILL.md").read_text()
+    agent_text = (skill_dir / "agents" / "openai.yaml").read_text()
+    scope_policy_text = (skill_dir / "references" / "source-filing-scope.md").read_text()
+    output_contract_text = (skill_dir / "references" / "output-contract.md").read_text()
+    normalized_skill_text = " ".join(skill_text.split())
+    normalized_output_contract_text = " ".join(output_contract_text.split())
+    normalized_scope_policy_text = " ".join(scope_policy_text.split())
+
+    assert "name: krw-ontology-filing-follow-up" in skill_text
+    assert "runtime-owned source filing context" in normalized_skill_text
+    assert "references/source-filing-scope.md" in skill_text
+    assert "references/output-contract.md" in skill_text
+    assert "Do not search for, substitute, or compare another filing" in normalized_skill_text
+    assert "For an 8-K or 6-K" in skill_text
+    assert "list this filing's" in skill_text
+    assert "EX-99.1" in skill_text
+    assert "For a Form 4" in skill_text
+    assert "For Form 4, do not infer an executive's intent" in normalized_skill_text
+    assert "Do not expose tool names, MCP names, runtime restrictions" in normalized_skill_text
+    assert "runtime, not the user or the model, owns the" in scope_policy_text
+    assert "Do not discover filings, search a filing catalog, compare filings" in scope_policy_text
+    assert "8-K, 8-K/A, 6-K, or 6-K/A" in scope_policy_text
+    assert "Form 4 or 4/A" in scope_policy_text
+    assert "verified documents and read only the returned text exhibit" in scope_policy_text
+    assert "never guess a filename, compose a SEC URL" in normalized_scope_policy_text
+    assert "Do not reveal tool names, MCP names, runtime restrictions" in output_contract_text
+    assert "Do not give personalized buy, sell, hold, position-size, or target-price advice" in normalized_output_contract_text
+    assert "KRW Ontology Filing Follow-up" in agent_text
+    assert "verified SEC filing card" in agent_text
+
+
 def test_krw_ontology_router_skill_is_thin_and_market_move_aware() -> None:
     router_dir = Path("plugins/krw-ontology/skills/krw-ontology-router")
 

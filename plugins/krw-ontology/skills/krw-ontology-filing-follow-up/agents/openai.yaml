@@ -1,0 +1,4 @@
+interface:
+  display_name: "KRW Ontology Filing Follow-up"
+  short_description: "선택한 SEC 공시 원문 한 건을 읽고 후속 질문에 답합니다"
+  default_prompt: "Use $krw-ontology-filing-follow-up to explain the verified SEC filing card that opened this chat."

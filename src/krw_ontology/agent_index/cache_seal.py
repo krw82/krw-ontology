@@ -14,7 +14,10 @@ from typing import Any
 
 IMMUTABLE_SQLITE_CACHE_SEAL_FORMAT = "krw-ontology-immutable-sqlite-cache-seal/v1"
 IMMUTABLE_SQLITE_CACHE_SEAL_SUFFIX = ".cache-seal.json"
-IMMUTABLE_FILE_IDENTITY_FIELDS = ("device", "inode", "size_bytes", "mtime_ns")
+# ``st_dev`` can change after an APFS volume remount or reboot without the
+# immutable file changing. Keep it in a seal for diagnostics, but do not make
+# a healthy cached verification fail solely because the mount identity moved.
+IMMUTABLE_FILE_IDENTITY_FIELDS = ("inode", "size_bytes", "mtime_ns")
 
 
 def immutable_sqlite_cache_seal_path(path: Path | str) -> Path:
@@ -196,7 +199,11 @@ def immutable_file_identity(path: Path | str) -> dict[str, int]:
 
 
 def immutable_file_identity_matches(sealed: Any, current: Mapping[str, int]) -> bool:
-    """Match both new identities and v1 seals that contain an extra ctime."""
+    """Match immutable files across remounts while rejecting byte-relevant drift.
+
+    Existing v1 seals may contain ``device`` and ``ctime``. Both are ignored:
+    device is mount-scoped and ctime changes for metadata-only operations.
+    """
     return bool(
         isinstance(sealed, Mapping)
         and all(sealed.get(field) == current.get(field) for field in IMMUTABLE_FILE_IDENTITY_FIELDS)

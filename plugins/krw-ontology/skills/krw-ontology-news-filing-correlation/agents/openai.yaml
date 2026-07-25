@@ -1,0 +1,4 @@
+interface:
+  display_name: "KRW Ontology News Filing Correlation"
+  short_description: "뉴스와 8-K·6-K를 대조해 주가 움직임을 해석합니다"
+  default_prompt: "Use $krw-ontology-news-filing-correlation to compare a recent stock move and news with related 8-K or 6-K filings."

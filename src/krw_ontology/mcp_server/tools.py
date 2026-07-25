@@ -19,9 +19,15 @@ from typing import Any, Mapping, Sequence
 
 from krw_ontology.agent_index import (
     AgentRetriever,
+    CHART_SERIES_RELATIVE_PATH,
     GLOBAL_SPINE_RELATIVE_PATH,
     QueryPlan,
     open_ontology_store,
+    query_chart_series_pack,
+)
+from krw_ontology.agent_index.spine_router import (
+    _chart_series_runtime_enabled,
+    _should_attach_chart_series,
 )
 from krw_ontology.agent_index.retrieval_text import format_metric_compact
 from krw_ontology.agent_index.research_kernel import ResearchKernel, request_from_query_context_args
@@ -1927,6 +1933,11 @@ def query_context_tool(
     retrieval_started_at = time.perf_counter()
     with _store(index) as store:
         raw_payload = _execute_search_plan(store=store, search_plan=plan)
+    _attach_chart_series_sidecar_to_search_plan_payload(
+        raw_payload=raw_payload,
+        question=plan.question,
+        requested_tickers=plan.tickers,
+    )
     retrieval_elapsed_ms = _elapsed_ms(retrieval_started_at)
     compile_started_at = time.perf_counter()
     state = compile_research_state(
@@ -1984,6 +1995,74 @@ def query_context_tool(
         execution=execution_telemetry,
     )
     return state
+
+
+def _attach_chart_series_sidecar_to_search_plan_payload(
+    *,
+    raw_payload: dict[str, Any],
+    question: str,
+    requested_tickers: Sequence[str],
+) -> None:
+    """Attach a bounded sidecar pack before compiling public ResearchState v2.
+
+    SearchPlan v2 deliberately executes directly against the shard store, rather
+    than through ``OntologySpineRouter.query_context``.  Keep its visualization
+    input on the same opt-in, verified sidecar path as the router without
+    exposing the raw filing payload to the model.
+    """
+    if not _chart_series_runtime_enabled() or not _should_attach_chart_series(question):
+        return
+
+    routing = _safe_payload_dict(raw_payload.get("routing"))
+    resolved_tickers = _dedupe_preserving_order(
+        [
+            *[str(ticker).strip().upper() for ticker in requested_tickers if str(ticker).strip()],
+            *[
+                str(ticker).strip().upper()
+                for ticker in routing.get("resolved_tickers") or []
+                if str(ticker).strip()
+            ],
+        ]
+    )
+    if not resolved_tickers:
+        return
+
+    chart_series_path = _runtime_root() / CHART_SERIES_RELATIVE_PATH
+    diagnostics = raw_payload.setdefault("search_diagnostics", {})
+    if not isinstance(diagnostics, dict):
+        diagnostics = {}
+        raw_payload["search_diagnostics"] = diagnostics
+    chart_diagnostics = {
+        "available": chart_series_path.is_file(),
+        "source": "chart_series_sidecar",
+    }
+    diagnostics["chart_series"] = chart_diagnostics
+    if not chart_diagnostics["available"]:
+        chart_diagnostics["disabled_reason"] = "missing"
+        return
+
+    pack = query_chart_series_pack(
+        chart_series_path,
+        question=question,
+        tickers=resolved_tickers,
+        limit_series=8,
+        limit_points=12,
+    )
+    if not pack:
+        chart_diagnostics["matched"] = False
+        return
+
+    chart_diagnostics["matched"] = True
+    chart_diagnostics["series_count"] = len(pack.get("series") or [])
+    research_pack = raw_payload.setdefault("research_pack", {})
+    if not isinstance(research_pack, dict):
+        research_pack = {}
+        raw_payload["research_pack"] = research_pack
+    existing = research_pack.get("metric_series_pack")
+    if isinstance(existing, Mapping) and existing.get("series"):
+        research_pack["dynamic_metric_series_pack"] = existing
+    research_pack["chart_series_pack"] = pack
+    research_pack["metric_series_pack"] = pack
 
 
 def _execute_search_plan(*, store: Any, search_plan: SearchPlan) -> dict[str, Any]:

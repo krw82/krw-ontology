@@ -19,7 +19,7 @@ from krw_ontology.validators.metric_validator import (
     validate_metric_fields,
     _load_metric_names,
 )
-from krw_ontology.validators.numeric_guard import validate_numeric
+from krw_ontology.validators.numeric_guard import numeric_support_objects, validate_numeric
 from krw_ontology.validators.relation_validator import (
     validate_edge,
     _load_relations,
@@ -44,6 +44,10 @@ _JSONL_FILES: dict[str, str] = {
     "EntityMention": "entity_mentions.jsonl",
     "ResearchClaim": "claims.jsonl",
     "MetricObservation": "metric_observations.jsonl",
+    "FinancialMetricValue": "financial_metric_values.jsonl",
+    "DerivedMetricValue": "derived_metric_values.jsonl",
+    "CalculatedNumericSupport": "calculated_numeric_support.jsonl",
+    "NumericEvidence": "numeric_evidence.jsonl",
     "Calculation": "calculations.jsonl",
     "BusinessFactor": "business_factors.jsonl",
     "AgreementTerm": "agreement_terms.jsonl",
@@ -77,6 +81,10 @@ _ACCEPTED_FILES: dict[str, str] = {
     "EntityMention": "entity_mentions.jsonl",
     "ResearchClaim": "claims.jsonl",
     "MetricObservation": "metric_observations.jsonl",
+    "FinancialMetricValue": "financial_metric_values.jsonl",
+    "DerivedMetricValue": "derived_metric_values.jsonl",
+    "CalculatedNumericSupport": "calculated_numeric_support.jsonl",
+    "NumericEvidence": "numeric_evidence.jsonl",
     "Calculation": "calculations.jsonl",
     "BusinessFactor": "business_factors.jsonl",
     "AgreementTerm": "agreement_terms.jsonl",
@@ -153,14 +161,7 @@ def _get_quotes(all_objects: dict[str, dict]) -> dict[str, dict]:
 
 
 def _get_xbrl_facts(all_objects: dict[str, dict]) -> dict[str, dict]:
-    return {
-        oid: obj
-        for oid, obj in all_objects.items()
-        if obj.get("type") in (
-            "XBRLFact",
-            "MetricObservation",
-        )
-    }
+    return numeric_support_objects(all_objects)
 
 
 def _prune_dangling_supports(accepted: dict[str, dict]) -> list[dict]:

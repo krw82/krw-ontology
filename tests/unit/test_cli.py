@@ -2691,6 +2691,40 @@ class TestReleaseCommand:
         assert os.readlink(releases_root / "dev" / "current") == target.name
         assert result["verify_report"] == str(target / "verify" / "release_verify.json")
 
+    def test_release_promote_lightweight_uses_lightweight_preverification(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+    ):
+        releases_root = tmp_path / "releases"
+        target = releases_root / "prod" / "new-release"
+        _write_minimal_v3_release(target, release_id=target.name, env="prod")
+        calls: list[bool] = []
+        original_verify = cli_main.verify_release_root
+
+        def observe_verify(*args, **kwargs):
+            calls.append(bool(kwargs.get("deep")))
+            return original_verify(*args, **kwargs)
+
+        monkeypatch.setattr(cli_main, "verify_release_root", observe_verify)
+        result = runner.invoke(
+            app,
+            [
+                "release",
+                "promote",
+                target.name,
+                "--releases-root",
+                str(releases_root),
+                "--env",
+                "prod",
+                "--lightweight",
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert calls == [False]
+        assert os.readlink(releases_root / "prod" / "current") == target.name
+
     def test_release_promote_rejects_preverification_for_another_release(
         self,
         tmp_path: Path,
@@ -3430,6 +3464,37 @@ class TestReleaseCommand:
         assert "Prod startup-check: ok" in result.output
         assert "startup_release_id: 20260528_080000" in result.output
         assert "krw-ontology release promote 20260528_080000" not in result.output
+
+    def test_release_materialize_prod_reuses_verified_candidate_for_promotion(
+        self, tmp_path: Path, monkeypatch
+    ):
+        releases_root = tmp_path / "releases"
+        source = releases_root / "dev" / "20260528_081000"
+        _write_minimal_v3_release(source, release_id=source.name, env="dev", ticker="VG")
+        original_promote = cli_main.promote_local_release
+
+        def observe_promote(*args, **kwargs):
+            verification = kwargs.get("preverified")
+            report = kwargs.get("preverified_report")
+            assert verification is not None and verification["ok"] is True
+            assert verification["deep"] is False
+            assert report is not None and report["ok"] is True
+            return original_promote(*args, **kwargs)
+
+        monkeypatch.setattr(cli_main, "promote_local_release", observe_promote)
+        result = runner.invoke(
+            app,
+            [
+                "release",
+                "materialize-prod",
+                source.name,
+                "--releases-root",
+                str(releases_root),
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert os.readlink(releases_root / "prod" / "current") == source.name
 
     def test_release_materialize_prod_no_promote_keeps_copy_only_behavior(self, tmp_path: Path):
         releases_root = tmp_path / "releases"

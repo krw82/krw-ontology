@@ -1,271 +1,132 @@
-# News Event Policy
+# Feed-First News Event Policy
 
 Use this reference only for `krw-ontology-news-research`.
 
-News research is market-narrative-led and ontology-augmented. The market narrative can come from stock-news discovery, a selected event card, or a user-provided URL.
+## 1. Event Selection
+
+Treat a selected KRW Feed issue as the user's chosen research starting point.
 
 ```text
-market narrative = current event, selected event, or user-provided URL context
-KRW ontology = company-specific baseline, financial channel, accounting context, risk channel, and investment meaning
-AI analyst = fused Korean investor interpretation
+selected issue -> read it first -> keep it as the analysis anchor
+no selected issue -> find a bounded ticker or company item in KRW Feed
+feed lacks a material detail -> use one Yahoo Finance item only as a supplement
 ```
 
-The final answer should not mechanically separate "news" and "filing" sections unless that is the clearest structure. Internally preserve source provenance, but write the user-facing answer as one coherent investment interpretation.
+Never replace the selected issue with a supplementary item. Do not construct a market event from model memory, generic web search, or a loosely related headline.
 
-## 1. When To Search News Events
+When several selected issues are present, preserve each issue and identify whether they describe one event, a sequence, or unrelated narratives before forming a conclusion.
 
-In news discovery mode, attempt stock-news event discovery before the final answer.
+If the selected issue is primarily an observed intraday or after-hours price move, route to `krw-ontology-market-move-research` instead of this skill.
 
-In news research mode, if the web app already provides `selected_news_event_context`, do not run broad new event discovery. Treat the selected context as the narrative to interpret against KRW ontology evidence.
+## 2. Event Interpretation Ledger
 
-If the selected context is primarily an observed stock move or `market-move-context/v1`, route to `krw-ontology-market-move-research` instead of this skill.
-
-Use it to find:
+Build this internal ledger before writing the SearchPlan:
 
 ```text
-latest news or reporting
-company announcement
-earnings-related update
-post-filing event
-M&A, partnership, litigation, regulation, product, guidance, or capital-allocation update
-management comment after the latest indexed filing
-market event that may change the filing baseline
-current market reaction to a known event
+reported event: what the feed item literally says
+original wording: the exact company, executive, or source wording when present
+company baseline: what the company has reported about the affected business condition
+financial channel: revenue, volume, pricing, margin, cost, cash flow, balance sheet, dilution, or capital allocation
+counterargument: the strongest fact that limits the event's significance
+observable condition: what later company commentary, earnings, or disclosure would confirm or weaken the interpretation
 ```
 
-Do not answer from memory if the news event layer can verify the current situation.
+Do not turn a title or summary into a company fact when the original wording does not support it. Do not require an official source before discussing a selected narrative; frame uncertain claims as scenarios and explain the company baseline that matters if they are directionally right.
 
-## 1.1 User-Provided URL Mode
+## 3. Event-To-Research Patterns
 
-When `selected_news_event_context.version = user-url-event/v1`, the user pasted a URL. Treat the extracted page text as a market hypothesis:
+### Company statement or official post
 
 ```text
-if this is directionally true, what changes for the company?
-what does the latest filing baseline say about that channel?
-what remains uncertain or needs follow-up?
+Question: "AMD and Meta say they are co-engineering AI infrastructure. What changes?"
+
+Plan:
+- retrieve the company wording about the collaboration
+- retrieve the affected product, demand, or infrastructure baseline
+- retrieve any direct financial channel or management commentary
+- state whether the connection is commercial, technical, or still unquantified
 ```
 
-Do not frame the answer as a hostile rebuttal. Avoid opening with phrases like:
+Do not infer revenue magnitude from a partnership announcement without a reported contract, demand, backlog, guidance, or management comment.
+
+### Earnings or operating update
 
 ```text
-신뢰할 수 없는 기사입니다
-공시로 확인되지 않습니다
-이 주장은 틀렸습니다
-공시 기준으로 점검한 결과입니다
+Question: "Microsoft reported cloud growth. Does this strengthen the AI thesis?"
+
+Plan:
+- retrieve the exact reported metric with its period and scope
+- retrieve explanatory management commentary
+- retrieve the cost, capex, margin, or cash-flow counterweight when material
+- separate reported performance from the forward thesis
 ```
 
-Those points may still matter, but they should appear naturally as limits or open questions after the investment implication is clear.
+Do not answer an Azure question with total Microsoft revenue unless the requested segment metric is genuinely unavailable and the answer says only what total-company evidence can support.
 
-Do not summarize the URL as an article replacement. Use it only to set the research angle.
-
-Even when the user asks for 점검/검증/fact-check, do not turn the output into an audit checklist. Avoid headings and labels like:
+### Partnership, contract, acquisition, or product event
 
 ```text
-공시 기준 확인 내용
-공시 확인됨
-공시에서 확인되지 않은 주장
-✅ 확인됨
-❌ 미확인
+Question: "Does this partnership change the investment case?"
+
+Plan:
+- identify the stated commitment, counterparty, and product scope
+- retrieve the company's existing customer, product, capacity, or capital-allocation baseline
+- test the first financial transmission channel
+- identify what later disclosure would make the event material
 ```
 
-Use softer investor language. Say what would matter if the narrative is true, what the filing baseline suggests, and what remains a question.
-
-Forward-looking claims, rumors, and possible future actions such as equity raises, debt issuance, M&A, product launches, guidance changes, legal outcomes, or organization changes should be treated as scenarios, not filing-presence checks. Do not make "not in filings" the main point. Use the filing baseline to discuss current cash generation, capex commitments, balance-sheet flexibility, dilution or leverage risk, margin sensitivity, and what would need to be watched if the scenario happens.
-
-## 2. Default Recency Window
-
-Default current-news window:
+### Rumor, future plan, or market narrative
 
 ```text
-today
-yesterday
-within 72 hours
-last 3 US trading sessions fallback
+Question: "A report says the company may raise capital. What does that mean?"
+
+Plan:
+- treat the report as a scenario, not a filing-presence test
+- retrieve cash generation, liquidity, debt, capex, buyback, or dilution baseline
+- explain the financial consequence if the scenario occurs
+- name the confirmation condition
 ```
 
-Extend to 7 calendar days only when the default window lacks useful high-quality evidence. Use older sources only as background or to confirm the original event date.
-
-If the user names a specific period, respect it.
-
-## 3. Source Roles
-
-Separate discovery from verification.
-
-Discovery role:
+### Multi-company or sector event
 
 ```text
-major financial news
-market-reaction reporting
-high-quality financial portals with clear original reporting
+Question: "How do recent AI updates differ across NVDA, AMD, and MSFT?"
+
+Plan:
+- select only the relevant feed items for each company
+- give every company the same comparison axis
+- retrieve company baseline evidence for each axis
+- compare business channel and evidence strength, not headline volume
 ```
 
-Verification role:
+## 4. Quality Gates
+
+Before making a material conclusion, check:
 
 ```text
-SEC filings
-company IR
-earnings releases
-shareholder letters
-official blogs or press releases
-regulatory or exchange sources
+event identity is clear
+event date and company reporting period are not conflated
+named company and ticker match the evidence
+each exact metric has scope, dimension, unit, and period support
+each management-comment claim has direct company wording or direct explanatory support
+each causal claim names the first affected financial variable
+each comparison uses the same period and axis
+each scenario has both a confirming and a weakening condition when evidence permits
 ```
 
-Commentary role:
+If a gate fails, narrow the conclusion. Do not use generic risk language as filler and do not manufacture a numeric estimate, management quote, or buy/sell conclusion.
+
+## 5. Final Answer Behavior
+
+Lead with the investment interpretation, then make the evidence and mechanism clear in natural Korean.
+
+Useful phrasing:
 
 ```text
-Trefis
-TIKR
-Seeking Alpha
-newsletters
-blogs
-YouTube
-Reddit
-forums
-social platforms
+이 뉴스가 의미 있으려면 실제로 확인돼야 할 것은 ...입니다.
+회사가 직접 언급한 부분은 ...이고, 아직 숫자로 연결되지 않은 부분은 ...입니다.
+투자적으로는 매출 자체보다 ... 경로를 먼저 보는 편이 맞습니다.
+이 해석은 다음 실적 발표에서 ...이 확인되면 강해지고, ...이면 약해집니다.
 ```
 
-Commentary can help identify what the market is talking about, but it is not final-answer evidence unless the user explicitly asks about sentiment, social reaction, or online discussion.
-
-## 4. Source Quality
-
-Use the MCP source classifications internally:
-
-```text
-tier_1_official
-tier_2_major_news
-tier_3_financial_portal
-tier_4_commentary
-tier_5_social
-unknown
-```
-
-Do not expose these labels to the user.
-
-Practical source priority:
-
-```text
-official/company/SEC source for exact facts and accounting
-major financial news for current market reaction and fresh reporting
-financial portals only when they add clear market-reaction context
-commentary only as leads or sentiment context
-social/forum/video only when user asks about sentiment or online reaction
-```
-
-Do not let a low-quality recent source override a slightly older but stronger source.
-
-## 5. Event Extraction
-
-After stock-news event discovery, extract the current event internally:
-
-```text
-company or companies
-event date
-source date
-source type
-recency bucket
-event type
-affected product, segment, geography, customer, supplier, or business line
-claimed revenue, margin, cash-flow, cost, risk, valuation, or capital-allocation impact
-source confidence
-open questions
-unsupported claims
-ontology bridge brief
-```
-
-Do not expose internal fields such as event IDs, source tiers, recency buckets, or ontology bridge briefs.
-
-## 6. News-To-Ontology Mapping
-
-After the event is identified, search KRW ontology for the event's investment meaning.
-
-Map news events to ontology concepts such as:
-
-```text
-business combinations / acquisition cash outflow
-cash flow / FCF / capex
-share repurchases / dilution management
-SBC / R&D / talent investment
-cost of revenue / gross margin / operating margin
-revenue recognition / RPO / backlog
-product platform / customer demand
-segment commentary
-risk factors and direct exposure
-management discussion and notes
-```
-
-Do not run ontology search as a generic company overview unless the event is too vague to map. Search the specific financial or business channel implied by the event.
-
-## 7. Filing Vs News
-
-Direct filing evidence remains the baseline for:
-
-```text
-historical reported numbers
-accounting treatment
-segment definitions
-cash-flow classification
-annual mix
-latest reported period baseline
-```
-
-News evidence may update the baseline only when it is newer, reliable, and explicitly updates the same fact, metric, event, guidance, or transaction.
-
-Do not let article snippets override direct filing evidence for historical reported numbers or accounting classification.
-
-## 8. Conflict Handling
-
-If news evidence conflicts with ontology or filing evidence:
-
-```text
-check event date and filing period
-check source type and reliability
-check metric definition
-check GAAP vs non-GAAP
-check reported result vs guidance, estimate, or commentary
-prefer primary source for exact facts
-prefer direct filing evidence for historical classification
-state the conflict only when it changes the investment interpretation
-```
-
-If a news claim is plausible but not explicitly supported by direct evidence, frame it as an inference.
-
-## 9. No Useful Recent Event
-
-If the default news window has no useful high-quality current event:
-
-```text
-do not invent a catalyst
-do not over-weight stale commentary
-do not add a generic limitation section
-answer from the latest filing baseline
-briefly say that no material new recent event was confirmed if it matters
-```
-
-Good user-facing style:
-
-```text
-최근 며칠 보도 흐름만으로는 새로운 핵심 이벤트가 뚜렷하지 않습니다. 그래서 투자적으로는 최신 공시에서 보이는 수요/마진/현금흐름 흐름을 기준으로 보는 편이 맞습니다.
-```
-
-## 10. Final Answer Shape
-
-Write Korean investor prose:
-
-```text
-current event
--> company-specific baseline
--> financial channel
--> thesis/risk/valuation implication
--> what to watch next
-```
-
-Use source timing naturally when material:
-
-```text
-오늘 보도 이후
-전일 보도 기준
-최근 며칠 보도 흐름상
-공식 발표와 공시 기준으로 보면
-```
-
-Do not turn the final answer into a source-ranking report.
+Avoid source-audit labels, internal tool terminology, and article-replacement summaries.

@@ -335,6 +335,64 @@ def test_quality_repair_plan_records_v3_fingerprint_and_refuses_stale_run(
     assert "would run" in allowed.output
 
 
+def test_quality_repair_plan_details_and_json_are_serializable(tmp_path: Path, monkeypatch):
+    _patch_expected_filing_discovery(monkeypatch)
+    release_root = _write_v3_quality_release(tmp_path)
+    root = tmp_path / "running"
+
+    details = runner.invoke(
+        app,
+        [
+            "quality",
+            "repair",
+            "plan",
+            "--root",
+            str(root),
+            "--release-root",
+            str(release_root),
+            "--plan",
+            "qr_details",
+            "--details",
+            "--limit",
+            "1",
+        ],
+    )
+
+    assert details.exit_code == 0
+    assert "tickers=" in details.output
+    assert "documents=" in details.output
+    assert "executor=" in details.output
+    assert "sample:" in details.output
+
+    json_result = runner.invoke(
+        app,
+        [
+            "quality",
+            "repair",
+            "plan",
+            "--root",
+            str(root),
+            "--release-root",
+            str(release_root),
+            "--plan",
+            "qr_details_json",
+            "--json",
+            "--limit",
+            "1",
+        ],
+    )
+
+    assert json_result.exit_code == 0
+    payload = json.loads(json_result.output)
+    assert payload["job_details"]
+    assert all(len(detail["samples"]) <= 1 for detail in payload["job_details"])
+    assert all(
+        isinstance(sample, dict)
+        for detail in payload["job_details"]
+        for sample in detail["samples"]
+    )
+
+
 def test_quality_repair_plan_refuses_stale_shard_manifest(tmp_path: Path, monkeypatch):
     _patch_expected_filing_discovery(monkeypatch)
     release_root = _write_v3_quality_release(tmp_path)

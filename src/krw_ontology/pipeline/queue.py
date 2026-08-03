@@ -193,6 +193,7 @@ class PipelineQueue:
         self.worker_log_path = self.logs_dir / "worker.log"
         self.worker_lock_path = self.locks_dir / "worker.lock"
         self.publish_lock_path = self.locks_dir / "publish.lock"
+        self.source_mutation_lock_path = self.locks_dir / "source-mutation.lock"
 
     def ensure_dirs(self) -> None:
         self.jobs_dir.mkdir(parents=True, exist_ok=True)

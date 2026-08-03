@@ -130,6 +130,7 @@ from krw_ontology.quality.models import (
     SECTION_FAIL as QUALITY_SECTION_FAIL,
     SECTION_WARN as QUALITY_SECTION_WARN,
     SUCCEEDED as QUALITY_SUCCEEDED,
+    RepairJob,
     RepairPlan,
 )
 from krw_ontology.quality.queue import QualityRepairStore, default_plan_id
@@ -848,6 +849,7 @@ def quality_check_cmd(
     shards = report.get("shards") if isinstance(report.get("shards"), Mapping) else {}
     kind_counts = report["kind_counts"]
     severity_counts = report["severity_counts"]
+    metric_gap = report.get("metric_gap") if isinstance(report.get("metric_gap"), Mapping) else {}
     typer.echo(f"Release: {label}")
     typer.echo(f"Global spine: {report['global_spine_path']}")
     typer.echo(
@@ -863,6 +865,16 @@ def quality_check_cmd(
         f"available={shards.get('available_count', 0)} "
         f"missing={shards.get('missing_count', 0)}"
     )
+    metric_gap_summary = (
+        metric_gap.get("summary") if isinstance(metric_gap.get("summary"), Mapping) else {}
+    )
+    if metric_gap_summary:
+        typer.echo(
+            "Metric gap: "
+            f"eligible={metric_gap_summary.get('eligible', 0)} "
+            f"present={metric_gap_summary.get('present', 0)} "
+            f"blocked={metric_gap_summary.get('blocked', 0)}"
+        )
     for missing_shard in list(shards.get("missing") or [])[:10]:
         if isinstance(missing_shard, Mapping):
             typer.echo(
@@ -1176,6 +1188,17 @@ def quality_repair_plan_cmd(
     min_docs: int = typer.Option(5, "--min-docs", min=1),
     force: bool = typer.Option(False, "--force", help="Overwrite an existing plan id."),
     json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
+    details: bool = typer.Option(
+        False,
+        "--details",
+        help="Show representative jobs with ticker, document, stage, and reason.",
+    ),
+    limit: int = typer.Option(
+        10,
+        "--limit",
+        min=1,
+        help="Maximum representative jobs to show per repair kind with --details.",
+    ),
 ) -> None:
     """Create a reviewed repair plan from quality events."""
     try:
@@ -1218,11 +1241,16 @@ def quality_repair_plan_cmd(
         typer.echo(f"FAILED quality repair plan: {exc}")
         raise typer.Exit(1) from exc
 
+    planned_job_ids = set(plan.job_ids)
+    planned_jobs = [job for job in jobs if job.job_id in planned_job_ids]
+    job_details = _quality_plan_job_details(planned_jobs)
+
     if json_output:
         _echo_json(
             {
                 "plan": plan.to_dict(),
                 "queue_root": str(store.queue_dir),
+                "job_details": _quality_plan_job_details_json(job_details, limit=limit),
                 "deferred_excluded": dict(Counter(job.kind for job in deferred_jobs))
                 if not include_deferred
                 else {},
@@ -1233,8 +1261,22 @@ def quality_repair_plan_cmd(
     typer.echo(f"Release: {plan.release_label}")
     typer.echo(f"Queue: {store.queue_dir}")
     typer.echo(f"Jobs: {len(plan.job_ids)}")
-    for repair_kind, count in sorted(plan.summary.items()):
-        typer.echo(f"- {repair_kind}: {count}")
+    for detail in job_details:
+        parts = [
+            f"- {detail['kind']}: {detail['jobs']}",
+            f"tickers={detail['tickers']}",
+            f"documents={detail['documents']}",
+        ]
+        if detail["stages"]:
+            parts.append("stages=" + ", ".join(detail["stages"]))
+        if detail["executors"]:
+            parts.append("executor=" + ", ".join(detail["executors"]))
+        typer.echo("; ".join(parts))
+        if details:
+            for job in detail["samples"][:limit]:
+                reason = str(job.reason or "").replace("\n", " ")[:180]
+                suffix = f" reason={reason}" if reason else ""
+                typer.echo(f"  sample: {_quality_job_description(job)}{suffix}")
     if deferred_jobs and not include_deferred:
         typer.echo(
             "Deferred excluded: "
@@ -1245,6 +1287,89 @@ def quality_repair_plan_cmd(
             + " (use --include-deferred to inspect, not recommended for run)"
         )
     typer.echo("Nothing executed yet.")
+
+
+def _quality_plan_job_details(jobs: list[RepairJob]) -> list[dict[str, Any]]:
+    """Build a concise, human-readable plan summary without rescanning data."""
+    grouped: dict[str, list[RepairJob]] = {}
+    for job in jobs:
+        grouped.setdefault(job.kind, []).append(job)
+
+    details: list[dict[str, Any]] = []
+    for kind, kind_jobs in sorted(grouped.items()):
+        documents = {
+            (
+                str(job.ticker or "").upper(),
+                str(job.doc_type_key or job.document_type or ""),
+                str(job.period or ""),
+            )
+            for job in kind_jobs
+        }
+        stages = sorted({str(job.stage) for job in kind_jobs if job.stage})
+        executors = sorted(
+            {
+                str(
+                    job.payload.get("repair_strategy")
+                    or job.payload.get("action")
+                    or _quality_plan_default_executor(job.kind)
+                )
+                for job in kind_jobs
+            }
+        )
+        details.append(
+            {
+                "kind": kind,
+                "jobs": len(kind_jobs),
+                "tickers": len({str(job.ticker or "").upper() for job in kind_jobs}),
+                "documents": len(documents),
+                "stages": stages,
+                "executors": executors,
+                "samples": kind_jobs,
+            }
+        )
+    return details
+
+
+def _quality_plan_job_details_json(
+    details: list[dict[str, Any]],
+    *,
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Serialize plan details without exposing in-memory RepairJob instances."""
+    serialized: list[dict[str, Any]] = []
+    for detail in details:
+        serialized_detail = {key: value for key, value in detail.items() if key != "samples"}
+        serialized_detail["samples"] = [
+            {
+                "job_id": job.job_id,
+                "status": job.status,
+                "ticker": job.ticker,
+                "document_type": job.document_type,
+                "doc_type_key": job.doc_type_key,
+                "period": job.period,
+                "stage": job.stage,
+                "reason": job.reason,
+                "count": job.count,
+                "executor": (
+                    job.payload.get("repair_strategy")
+                    or job.payload.get("action")
+                    or _quality_plan_default_executor(job.kind)
+                ),
+            }
+            for job in detail["samples"][:limit]
+        ]
+        serialized.append(serialized_detail)
+    return serialized
+
+
+def _quality_plan_default_executor(kind: str) -> str:
+    return {
+        QUALITY_BATCH_FAILURE: "document_clean_rerun",
+        QUALITY_DOCS_MISSING: "pipeline_queue",
+        "repair_reference": "deterministic_reference_rebuild",
+        "direct_xbrl_metric_gap": "staged_direct_xbrl_metric_addition",
+        "normalize_numeric": "report_only_numeric_revalidation",
+    }.get(kind, "manual_review")
 
 
 @quality_repair_app.command("show")
@@ -2619,15 +2744,16 @@ def _release_publish_dev(
             "totals": None,
         }
 
-    result = _publish_root_as_local_release(
-        source_root=resolved_source_root,
-        releases_root=releases_root,
-        env=env,
-        release_id=release_id,
-        promote=promote,
-        force_release=True,
-        allow_prepared_release_root=allow_prepared_release_root,
-    )
+    with FileProcessLock(queue.source_mutation_lock_path):
+        result = _publish_root_as_local_release(
+            source_root=resolved_source_root,
+            releases_root=releases_root,
+            env=env,
+            release_id=release_id,
+            promote=promote,
+            force_release=True,
+            allow_prepared_release_root=allow_prepared_release_root,
+        )
     result["build_index"] = build_index
     result["global_spine_present"] = Path(str(result["global_spine_path"])).is_file()
     result["index_layout"] = result.get("layout") or "global-spine-and-company-shards"
@@ -4484,7 +4610,13 @@ def release_materialize_prod_cmd(
         return
 
     try:
-        promotion = promote_local_release(releases_root, env="prod", release_id=target_id)
+        promotion = promote_local_release(
+            releases_root,
+            env="prod",
+            release_id=target_id,
+            preverified=prod_verification,
+            preverified_report=verify_report,
+        )
     except Exception as exc:
         typer.echo(f"FAILED prod promote: {exc}")
         raise typer.Exit(1) from exc
@@ -6172,15 +6304,43 @@ def release_promote_cmd(
         min=0.1,
         help="Seconds to wait for the local health URL.",
     ),
+    lightweight: bool = typer.Option(
+        False,
+        "--lightweight",
+        help=(
+            "Use manifest, immutable-seal, and release-contract verification only. "
+            "Skips the default full deep scan of every shard."
+        ),
+    ),
 ) -> None:
-    """Atomically point env current to a verified release."""
+    """Atomically point env current to a verified release.
+
+    Default promotion performs a full deep verification.  --lightweight is an
+    explicit local-operator choice for a release whose immutable provenance is
+    already trusted; it still verifies the manifest, immutable seals, and v3
+    release contract before switching current.
+    """
     env_root = release_env_root(releases_root, env)
     previous_release_id = current_release_id(env_root)
     if previous_release_id == release_id:
         typer.echo(f"FAILED release promote: release {release_id} is already current")
         raise typer.Exit(1)
     try:
-        result = promote_local_release(releases_root, env=env, release_id=release_id)
+        preverified = None
+        if lightweight:
+            release_dir = release_env_root(releases_root, env) / release_id
+            preverified = verify_release_root(release_dir, env=env, deep=False)
+            if not preverified["ok"]:
+                raise ValueError(
+                    "Lightweight release verification failed: "
+                    + ", ".join(preverified["errors"])
+                )
+        result = promote_local_release(
+            releases_root,
+            env=env,
+            release_id=release_id,
+            preverified=preverified,
+        )
         hook_result = _run_local_release_post_switch_hooks(
             releases_root=releases_root,
             env=env,
@@ -7526,13 +7686,14 @@ def queue_run_cmd(
                     time.sleep(poll_interval)
                     continue
 
-                deferred_target = _process_queue_job(
-                    store,
-                    job,
-                    output_root,
-                    publish_prod=publish_prod,
-                    refresh_index=effective_refresh_index,
-                )
+                with FileProcessLock(store.source_mutation_lock_path):
+                    deferred_target = _process_queue_job(
+                        store,
+                        job,
+                        output_root,
+                        publish_prod=publish_prod,
+                        refresh_index=effective_refresh_index,
+                    )
                 if isinstance(deferred_target, _QueueReleasePublishTarget):
                     key = f"{deferred_target.env}:{deferred_target.releases_root}"
                     batch = pending_publish_targets.setdefault(

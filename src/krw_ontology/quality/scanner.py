@@ -17,8 +17,10 @@ from krw_ontology.agent_index.spine_verify import global_replica_consistency_err
 from krw_ontology.pipeline.queue import FAILED as QUEUE_FAILED
 from krw_ontology.pipeline.queue import PipelineQueue
 from krw_ontology.pipeline.research_plan import discover_research_filing_targets
+from krw_ontology.quality.metric_gap import discover_direct_xbrl_metric_gaps
 from krw_ontology.quality.models import (
     BATCH_FAILURE,
+    DIRECT_XBRL_METRIC_GAP,
     DOCS_MISSING,
     NORMALIZE_NUMERIC,
     REPAIR_REFERENCE,
@@ -174,6 +176,11 @@ class QualityShardScanner:
                 kind for ticker in tickers for kind in ticker.problem_kinds(min_docs=min_docs)
             )
             rejected_reasons = self.rejected_reason_summary(limit=20)
+            metric_gap = self._direct_xbrl_metric_gap_summary(conn)
+            if int((metric_gap.get("summary") or {}).get("eligible") or 0):
+                kind_counts[DIRECT_XBRL_METRIC_GAP] = int(
+                    (metric_gap.get("summary") or {}).get("eligible") or 0
+                )
         return {
             "shard_path": str(self.shard_path),
             "metadata": metadata,
@@ -184,6 +191,7 @@ class QualityShardScanner:
             "severity_counts": dict(severity_counts),
             "kind_counts": dict(kind_counts),
             "rejected_reasons": rejected_reasons,
+            "metric_gap": metric_gap,
             "ticker_quality": [_ticker_quality_payload(ticker) for ticker in tickers],
             "min_docs": min_docs,
         }
@@ -709,6 +717,67 @@ class QualityShardScanner:
                         )
                     )
 
+            if enabled(DIRECT_XBRL_METRIC_GAP):
+                for row in conn.execute(
+                    """
+                    SELECT ticker, document_type, doc_type_key, period,
+                           ontology_dir, artifact_index_path
+                    FROM documents
+                    ORDER BY ticker, doc_type_key, period
+                    """
+                ):
+                    raw_ontology_dir = row["ontology_dir"]
+                    if not raw_ontology_dir:
+                        continue
+                    ontology_dir = Path(str(raw_ontology_dir)).expanduser()
+                    if not ontology_dir.is_dir():
+                        continue
+                    try:
+                        gap = discover_direct_xbrl_metric_gaps(ontology_dir)
+                    except Exception:
+                        # This is a diagnostic candidate generator. A broken
+                        # source directory must not block other repair jobs.
+                        continue
+                    candidates = [
+                        item
+                        for item in gap.get("eligible") or []
+                        if isinstance(item, Mapping) and item.get("candidate_id")
+                    ]
+                    if not candidates:
+                        continue
+                    candidate_ids = [str(item["candidate_id"]) for item in candidates]
+                    jobs.append(
+                        self._job(
+                            plan_id=plan_id,
+                            kind=DIRECT_XBRL_METRIC_GAP,
+                            ticker=row["ticker"],
+                            document_type=row["document_type"],
+                            doc_type_key=row["doc_type_key"],
+                            period=row["period"],
+                            stage="metric_gap",
+                            source_event_id=str(gap.get("document_fingerprint") or ""),
+                            ontology_dir=str(ontology_dir),
+                            artifact_index_path=row["artifact_index_path"],
+                            reason="missing deterministic direct-XBRL MetricObservation",
+                            count=len(candidate_ids),
+                            payload={
+                                "repair_contract": gap.get("contract"),
+                                "repair_strategy": "direct_xbrl_metric_gap",
+                                "document_fingerprint": gap.get("document_fingerprint"),
+                                "candidate_ids": candidate_ids,
+                                "candidate_source_fact_ids": [
+                                    str(item.get("source_fact_id") or "")
+                                    for item in candidates
+                                ],
+                                "eligible_count": len(candidate_ids),
+                                "present_count": int((gap.get("summary") or {}).get("present") or 0),
+                                "blocked_count": int((gap.get("summary") or {}).get("blocked") or 0),
+                                "verification_required": True,
+                                "publish_required": True,
+                            },
+                        )
+                    )
+
         return self._dedupe_jobs(jobs)
 
     def _connect(self) -> sqlite3.Connection:
@@ -769,6 +838,42 @@ class QualityShardScanner:
             (ticker, doc_type_key, period),
         ).fetchone()
         return row["ontology_dir"] if row else None
+
+    def _direct_xbrl_metric_gap_summary(self, conn: sqlite3.Connection) -> dict[str, Any]:
+        summary = Counter({"documents_scanned": 0, "eligible": 0, "present": 0, "blocked": 0})
+        blocked_reasons: Counter[str] = Counter()
+        errors: list[str] = []
+        for row in conn.execute(
+            """
+            SELECT ticker, document_type, doc_type_key, period, ontology_dir
+            FROM documents
+            ORDER BY ticker, doc_type_key, period
+            """
+        ):
+            summary["documents_scanned"] += 1
+            raw_ontology_dir = row["ontology_dir"]
+            if not raw_ontology_dir or not Path(str(raw_ontology_dir)).is_dir():
+                summary["blocked"] += 1
+                blocked_reasons["ontology_dir_unavailable"] += 1
+                continue
+            try:
+                result = discover_direct_xbrl_metric_gaps(Path(str(raw_ontology_dir)))
+            except Exception as exc:
+                summary["blocked"] += 1
+                blocked_reasons["metric_gap_discovery_failed"] += 1
+                errors.append(f"{row['ticker']}:{row['doc_type_key']}:{row['period']}:{exc}")
+                continue
+            result_summary = result.get("summary") or {}
+            for key in ("eligible", "present", "blocked"):
+                summary[key] += int(result_summary.get(key) or 0)
+            for blocked in result.get("blocked") or []:
+                if isinstance(blocked, Mapping):
+                    blocked_reasons[str(blocked.get("reason") or "unknown")] += 1
+        return {
+            "summary": dict(summary),
+            "blocked_reasons": dict(blocked_reasons.most_common(20)),
+            "errors": errors[:20],
+        }
 
     @staticmethod
     def _actual_documents(conn: sqlite3.Connection, ticker: str) -> list[dict[str, str]]:
@@ -1255,6 +1360,11 @@ class QualityReleaseScanner:
         manifest_rollup_shards = 0
         shard_diagnostics: dict[str, dict[str, Any]] = {}
         scan_errors: list[str] = []
+        metric_gap_summary: Counter[str] = Counter(
+            {"documents_scanned": 0, "eligible": 0, "present": 0, "blocked": 0}
+        )
+        metric_gap_blocked_reasons: Counter[str] = Counter()
+        metric_gap_errors: list[str] = []
 
         for ticker, shard_path, entry in shard_entries:
             if not shard_path.is_file():
@@ -1298,6 +1408,17 @@ class QualityReleaseScanner:
                 if not isinstance(reason, Mapping):
                     continue
                 rejected_reasons[str(reason.get("reason") or "")] += int(reason.get("count") or 0)
+            shard_metric_gap = report.get("metric_gap") if isinstance(report.get("metric_gap"), Mapping) else {}
+            shard_metric_gap_summary = (
+                shard_metric_gap.get("summary")
+                if isinstance(shard_metric_gap.get("summary"), Mapping)
+                else {}
+            )
+            for key in ("documents_scanned", "eligible", "present", "blocked"):
+                metric_gap_summary[key] += int(shard_metric_gap_summary.get(key) or 0)
+            for reason, count in dict(shard_metric_gap.get("blocked_reasons") or {}).items():
+                metric_gap_blocked_reasons[str(reason)] += int(count or 0)
+            metric_gap_errors.extend(str(error) for error in (shard_metric_gap.get("errors") or []))
             ticker_rows.extend(
                 _ticker_quality_from_payload(row)
                 for row in report.get("ticker_quality") or []
@@ -1316,6 +1437,8 @@ class QualityReleaseScanner:
         kind_counts = Counter(
             kind for ticker in tickers for kind in ticker.problem_kinds(min_docs=min_docs)
         )
+        if metric_gap_summary["eligible"]:
+            kind_counts[DIRECT_XBRL_METRIC_GAP] = metric_gap_summary["eligible"]
         consistency = self.consistency_report(sample_limit=sample_limit, mode=resolved_mode)
         consistency_errors = list(consistency["errors"]) + scan_errors
         consistency = {
@@ -1364,6 +1487,11 @@ class QualityReleaseScanner:
                 {"reason": reason, "count": count}
                 for reason, count in rejected_reasons.most_common(20)
             ],
+            "metric_gap": {
+                "summary": dict(metric_gap_summary),
+                "blocked_reasons": dict(metric_gap_blocked_reasons.most_common(20)),
+                "errors": metric_gap_errors[:20],
+            },
             "consistency": consistency,
             "min_docs": min_docs,
         }

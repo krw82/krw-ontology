@@ -9,17 +9,26 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import shutil
 from pathlib import Path
 from typing import Any, Callable
 
 from krw_ontology.config.constants import normalize_doc_type
+from krw_ontology.pipeline.queue import FileProcessLock, PipelineQueue
 from krw_ontology.pipeline.stages.build_numeric_evidence import build_numeric_evidence
 from krw_ontology.pipeline.stages.generate_edges import generate_edges
 from krw_ontology.pipeline.stages.generate_support_links import generate_support_links
 from krw_ontology.pipeline.stages.validate_ontology import _load_metric_objects
+from krw_ontology.quality.metric_gap import (
+    apply_direct_xbrl_metric_gaps,
+    document_artifact_hashes,
+    document_fingerprint,
+    metric_observation_delta_errors,
+    unchanged_artifact_errors,
+)
 from krw_ontology.quality.models import RepairJob, utc_now
 from krw_ontology.utils.io import atomic_write_json, read_jsonl, write_jsonl
-from krw_ontology.validators.numeric_guard import validate_numeric
+from krw_ontology.validators.numeric_guard import numeric_support_objects, validate_numeric
 from krw_ontology.validators.reference_validator import validate_references
 from krw_ontology.validators.relation_validator import _load_relations, validate_edge
 
@@ -123,19 +132,7 @@ def run_numeric_revalidation(job: RepairJob, *, root: Path) -> dict[str, Any]:
     _with_rollback(mutable_paths, rebuild)
 
     lookup = _load_lookup(ontology_dir)
-    numeric_support = {
-        obj_id: obj
-        for obj_id, obj in lookup.items()
-        if obj.get("type")
-        in {
-            "XBRLFact",
-            "MetricObservation",
-            "FinancialMetricValue",
-            "DerivedMetricValue",
-            "CalculatedNumericSupport",
-            "NumericEvidence",
-        }
-    }
+    numeric_support = numeric_support_objects(lookup)
     candidates = _rejected_candidates(ontology_dir, NUMERIC_STAGES)
     valid_candidates: list[dict[str, Any]] = []
     unresolved: list[dict[str, Any]] = []
@@ -159,6 +156,152 @@ def run_numeric_revalidation(job: RepairJob, *, root: Path) -> dict[str, Any]:
     })
     report_path = write_repair_report(job, root=root, report=report)
     _attach_report_payload(job, report, report_path)
+    return report
+
+
+def run_direct_xbrl_metric_gap_repair(job: RepairJob, *, root: Path) -> dict[str, Any]:
+    """Atomically add only exact, dimensionless direct-XBRL metric observations.
+
+    The source document is copied to a transaction staging directory. No claim,
+    evidence quote, calculation, or reference artifact may change. A successful
+    repair updates only the running root; an index publish remains explicit.
+    """
+    ontology_dir = _resolve_ontology_dir(job, root=root)
+    candidate_ids = [str(value) for value in job.payload.get("candidate_ids") or []]
+    expected_fingerprint = str(job.payload.get("document_fingerprint") or "")
+    if not candidate_ids:
+        raise ValueError("direct_xbrl_metric_gap repair requires candidate_ids")
+    if not expected_fingerprint:
+        raise ValueError("direct_xbrl_metric_gap repair requires document_fingerprint")
+
+    queue = PipelineQueue(root)
+    queue.ensure_dirs()
+    if queue.worker_is_running():
+        raise RuntimeError("pipeline queue worker is running; stop it before direct metric repair")
+
+    transaction_dir = root / ".krw_pipeline" / "quality" / "transactions" / job.job_id
+    stage_dir = transaction_dir / "staged"
+    backup_dir = transaction_dir / "backup"
+    journal_path = transaction_dir / "journal.json"
+    report: dict[str, Any] = {
+        "policy": POLICY,
+        "job": _job_report_payload(job),
+        "ontology_dir": str(ontology_dir),
+        "operation": "direct_xbrl_metric_gap",
+        "started_at": utc_now(),
+        "auto_promoted_objects": AUTO_PROMOTED_OBJECTS,
+        "auto_modified_claims": AUTO_MODIFIED_CLAIMS,
+        "mutated_artifacts": ["metric_observations.jsonl"],
+        "publish_required": True,
+    }
+
+    with FileProcessLock(queue.source_mutation_lock_path):
+        if queue.worker_is_running():
+            raise RuntimeError("pipeline queue worker started while direct metric repair was waiting")
+        current_fingerprint = document_fingerprint(ontology_dir)
+        if current_fingerprint != expected_fingerprint:
+            raise RuntimeError("source document changed after repair planning; create a new quality plan")
+        if journal_path.exists():
+            raise RuntimeError(
+                f"existing direct metric transaction requires manual review: {transaction_dir}"
+            )
+
+        transaction_dir.mkdir(parents=True, exist_ok=False)
+        atomic_write_json(
+            journal_path,
+            {
+                "format": "krw-ontology-quality-transaction/v1",
+                "status": "preparing",
+                "job_id": job.job_id,
+                "ontology_dir": str(ontology_dir),
+                "expected_document_fingerprint": expected_fingerprint,
+                "candidate_ids": candidate_ids,
+                "started_at": utc_now(),
+            },
+        )
+        try:
+            shutil.copytree(ontology_dir, stage_dir)
+            before_hashes = document_artifact_hashes(stage_dir)
+            before_metrics = read_jsonl(stage_dir / "metric_observations.jsonl")
+            applied = apply_direct_xbrl_metric_gaps(
+                stage_dir,
+                candidate_ids=candidate_ids,
+                expected_document_fingerprint=expected_fingerprint,
+            )
+            after_metrics = read_jsonl(stage_dir / "metric_observations.jsonl")
+            after_hashes = document_artifact_hashes(stage_dir)
+            errors = unchanged_artifact_errors(
+                before_hashes,
+                after_hashes,
+                allowed_changes={"metric_observations.jsonl"},
+            )
+            errors.extend(
+                metric_observation_delta_errors(
+                    before_metrics,
+                    after_metrics,
+                    list(applied.get("added_observations") or []),
+                )
+            )
+            if errors:
+                raise RuntimeError("staged direct metric repair rejected: " + "; ".join(errors[:10]))
+            if document_fingerprint(ontology_dir) != expected_fingerprint:
+                raise RuntimeError("source document changed before transaction commit")
+
+            atomic_write_json(
+                journal_path,
+                {
+                    "format": "krw-ontology-quality-transaction/v1",
+                    "status": "prepared",
+                    "job_id": job.job_id,
+                    "ontology_dir": str(ontology_dir),
+                    "expected_document_fingerprint": expected_fingerprint,
+                    "candidate_ids": candidate_ids,
+                    "added_count": int(applied.get("added_count") or 0),
+                    "prepared_at": utc_now(),
+                },
+            )
+            ontology_dir.replace(backup_dir)
+            try:
+                stage_dir.replace(ontology_dir)
+            except Exception:
+                backup_dir.replace(ontology_dir)
+                raise
+            atomic_write_json(
+                journal_path,
+                {
+                    "format": "krw-ontology-quality-transaction/v1",
+                    "status": "committed",
+                    "job_id": job.job_id,
+                    "ontology_dir": str(ontology_dir),
+                    "expected_document_fingerprint": expected_fingerprint,
+                    "candidate_ids": candidate_ids,
+                    "added_count": int(applied.get("added_count") or 0),
+                    "committed_at": utc_now(),
+                },
+            )
+        except Exception:
+            # Staging is disposable. If the live directory was already moved,
+            # the inner recovery path restores it before this handler runs.
+            if stage_dir.exists():
+                shutil.rmtree(stage_dir, ignore_errors=True)
+            raise
+
+    report.update(
+        {
+            "candidate_count": len(candidate_ids),
+            "auto_created_metric_observations": int(applied.get("added_count") or 0),
+            "resolved_count": int(applied.get("added_count") or 0),
+            "repair_outcome": "committed_running_needs_publish",
+            "transaction_dir": str(transaction_dir),
+            "document_fingerprint_before": expected_fingerprint,
+            "document_fingerprint_after": str(applied.get("document_fingerprint_after") or ""),
+            "finished_at": utc_now(),
+        }
+    )
+    report_path = write_repair_report(job, root=root, report=report)
+    _attach_report_payload(job, report, report_path)
+    job.payload["auto_created_metric_observations"] = report["auto_created_metric_observations"]
+    job.payload["publish_required"] = True
     return report
 
 

@@ -52,31 +52,21 @@ runner = CliRunner()
 def _patch_expected_filing_discovery(monkeypatch) -> None:
     def fake_discover_research_filing_targets(ticker: str, *, years: int, config):
         del years, config
+        periods = (
+            ["CY2020", "CY2021", "CY2022", "CY2023", "CY2024"]
+            if ticker.upper() == "OK"
+            else ["CY2023", "CY2024", "CY2025"]
+        )
         return [
             SimpleNamespace(
                 ticker=ticker.upper(),
                 document_type="10-K",
-                period="CY2023",
-                accession_number="000-test-2023",
-                filing_date="2024-02-01",
-                report_date="2023-12-31",
-            ),
-            SimpleNamespace(
-                ticker=ticker.upper(),
-                document_type="10-K",
-                period="CY2024",
-                accession_number="000-test-2024",
-                filing_date="2025-02-01",
-                report_date="2024-12-31",
-            ),
-            SimpleNamespace(
-                ticker=ticker.upper(),
-                document_type="10-K",
-                period="CY2025",
-                accession_number="000-test-2025",
-                filing_date="2026-02-01",
-                report_date="2025-12-31",
-            ),
+                period=period,
+                accession_number=f"000-test-{period.removeprefix('CY')}",
+                filing_date=f"{int(period.removeprefix('CY')) + 1}-02-01",
+                report_date=f"{period.removeprefix('CY')}-12-31",
+            )
+            for period in periods
         ]
 
     monkeypatch.setattr(
@@ -709,6 +699,8 @@ def test_docs_missing_repair_uses_expected_filing_diff_for_targeted_update(tmp_p
     index_path = _write_quality_index(tmp_path)
 
     def expected_provider(ticker: str):
+        if ticker != "FCX":
+            return ([], None)
         return (
             [
                 {
@@ -827,17 +819,115 @@ def test_docs_missing_repair_skips_when_expected_filing_coverage_is_complete(tmp
     index_path = _write_quality_index(tmp_path)
 
     def expected_provider(ticker: str):
+        period = "CY2025" if ticker == "FCX" else "CY2024"
         return (
             [
                 {
                     "ticker": ticker,
                     "document_type": "10-K",
                     "doc_type_key": "10K",
-                    "period": "CY2025",
+                    "period": period,
                 },
             ],
             None,
         )
+
+    jobs = QualityShardScanner(index_path).build_repair_jobs(
+        plan_id="qr_test",
+        min_docs=5,
+        kinds=[DOCS_MISSING],
+        expected_filing_provider=expected_provider,
+    )
+
+    assert jobs == []
+
+
+def test_docs_missing_repair_detects_latest_sec_filing_above_document_threshold(
+    tmp_path: Path,
+):
+    index_path = _write_quality_index(tmp_path)
+    with sqlite3.connect(index_path) as conn:
+        for period in ["CY2021", "CY2022", "CY2023", "CY2024"]:
+            _insert_doc(
+                conn,
+                ticker="FCX",
+                period=period,
+                status="pass",
+                quality={"status": "pass", "missing_core_sections": [], "fail_reasons": []},
+                root=tmp_path,
+            )
+        conn.commit()
+
+    def expected_provider(ticker: str):
+        if ticker != "FCX":
+            return ([], None)
+        return (
+            [
+                {
+                    "ticker": ticker,
+                    "document_type": "10-K",
+                    "doc_type_key": "10K",
+                    "period": period,
+                }
+                for period in ["CY2021", "CY2022", "CY2023", "CY2024", "CY2025"]
+            ]
+            + [
+                {
+                    "ticker": ticker,
+                    "document_type": "10-Q",
+                    "doc_type_key": "10Q",
+                    "period": "CY2026Q2",
+                    "accession_number": "0000320193-26-000020",
+                    "filing_date": "2026-07-31",
+                    "report_date": "2026-06-27",
+                }
+            ],
+            None,
+        )
+
+    jobs = QualityShardScanner(index_path).build_repair_jobs(
+        plan_id="qr_test",
+        min_docs=5,
+        kinds=[DOCS_MISSING],
+        expected_filing_provider=expected_provider,
+    )
+
+    assert len(jobs) == 1
+    assert jobs[0].ticker == "FCX"
+    assert jobs[0].payload["action"] == "targeted_filing_update"
+    assert jobs[0].payload["actual_document_count"] == 5
+    assert jobs[0].payload["missing_documents"] == [
+        {
+            "ticker": "FCX",
+            "document_type": "10-Q",
+            "doc_type_key": "10Q",
+            "period": "CY2026Q2",
+            "accession_number": "0000320193-26-000020",
+            "filing_date": "2026-07-31",
+            "report_date": "2026-06-27",
+            "inference": "expected_filing_diff",
+        }
+    ]
+
+
+def test_docs_missing_repair_does_not_create_false_positive_on_sec_timeout_above_threshold(
+    tmp_path: Path,
+):
+    index_path = _write_quality_index(tmp_path)
+    with sqlite3.connect(index_path) as conn:
+        for period in ["CY2021", "CY2022", "CY2023", "CY2024"]:
+            _insert_doc(
+                conn,
+                ticker="FCX",
+                period=period,
+                status="pass",
+                quality={"status": "pass", "missing_core_sections": [], "fail_reasons": []},
+                root=tmp_path,
+            )
+        conn.commit()
+
+    def expected_provider(_ticker: str):
+        return ([], "SEC submissions timed out")
 
     jobs = QualityShardScanner(index_path).build_repair_jobs(
         plan_id="qr_test",

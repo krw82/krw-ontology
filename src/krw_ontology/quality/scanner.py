@@ -398,8 +398,6 @@ class QualityShardScanner:
             }
             if enabled(DOCS_MISSING):
                 for ticker, docs in docs_by_ticker.items():
-                    if docs >= min_docs:
-                        continue
                     actual_documents = self._actual_documents(conn, ticker)
                     expected_documents: list[dict[str, str]] | None = None
                     expected_discovery_error: str | None = None
@@ -411,6 +409,43 @@ class QualityShardScanner:
                         except Exception as exc:
                             expected_documents = []
                             expected_discovery_error = str(exc)
+
+                    # A document-count threshold is only a fallback heuristic.  When SEC
+                    # discovery is available, compare the expected filing set for every
+                    # ticker so a company with years of history still receives its newest
+                    # 10-K/10-Q.  A discovery failure must not turn a sufficiently covered
+                    # ticker into a false-positive repair job.
+                    if expected_documents is not None and not expected_discovery_error:
+                        payload = self._docs_missing_repair_payload(
+                            ticker=ticker,
+                            actual_documents=actual_documents,
+                            actual_count=docs,
+                            min_docs=min_docs,
+                            expected_documents=expected_documents,
+                            expected_discovery_error=expected_discovery_error,
+                        )
+                        if payload.get("action") == DOCS_MISSING_NO_REPAIR_ACTION:
+                            continue
+                        jobs.append(
+                            self._job(
+                                plan_id=plan_id,
+                                kind=DOCS_MISSING,
+                                ticker=ticker,
+                                reason=str(
+                                    payload.get("reason")
+                                    or f"ticker has {docs} documents; expected at least {min_docs}"
+                                ),
+                                count=max(
+                                    1,
+                                    int(payload.get("targeted_update_count") or min_docs - docs),
+                                ),
+                                payload=payload,
+                            )
+                        )
+                        continue
+
+                    if docs >= min_docs:
+                        continue
                     payload = self._docs_missing_repair_payload(
                         ticker=ticker,
                         actual_documents=actual_documents,
@@ -488,6 +523,11 @@ class QualityShardScanner:
                 ):
                     payload = self._loads(row["json"])
                     stage = str(row["stage"] or "")
+                    # The provider blocks these exact quote spans deterministically.
+                    # Retrying them would re-submit the same sensitive source text,
+                    # consume queue capacity, and still cannot create acceptable evidence.
+                    if self._batch_failure_is_provider_safety_block(stage, payload):
+                        continue
                     if self._batch_failure_uses_document_clean_rerun(stage, payload):
                         ontology_dir = self._document_ontology_dir(
                             conn,
@@ -1219,6 +1259,24 @@ class QualityShardScanner:
             seen.add(job.job_id)
             result.append(job)
         return result
+
+    @staticmethod
+    def _batch_failure_is_provider_safety_block(
+        stage: str, payload: Mapping[str, Any]
+    ) -> bool:
+        if stage != "extract_evidence_quotes":
+            return False
+        try:
+            provider_status = int(payload.get("provider_error_status"))
+        except (TypeError, ValueError):
+            return False
+        if provider_status != 400:
+            return False
+        error_message = str(payload.get("error_message") or payload.get("message") or "").lower()
+        return (
+            "[1301]" in error_message
+            or "system detected potentially unsafe or sensitive content" in error_message
+        )
 
     @staticmethod
     def _batch_failure_uses_document_clean_rerun(stage: str, payload: Mapping[str, Any]) -> bool:

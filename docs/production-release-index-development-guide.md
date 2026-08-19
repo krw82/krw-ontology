@@ -1060,8 +1060,16 @@ correctness와 복구성이 나쁘기 때문이다.
 - 실제 production ranking calibration 입력과 승인 threshold
 - Prometheus alert threshold
 - Alertmanager 실제 receiver URL과 secret
-- release와 failed candidate retention 기간
 - prod reload command와 health URL
+
+release와 failed candidate retention 기간은 2026-08-19에 확정했다. CLI config
+`release-keep-releases` 기본값 1로 최신 release와 current만 남기고, promote
+직후 자동 gc가 나머지 release와 참조되지 않는 index cache를 정리한다. 디스크
+사용량을 최우선으로 한 결정이므로 keep=1에서는 직전 release가 이미 삭제되어
+즉시 rollback이 불가능하다는 트레이드오프를 명시적으로 받아들인다. 롤백 여유가
+필요해지면 `krw-ontology config set release-keep-releases 2`로 다음 promote부터
+즉시 복원한다. 자동 gc 실행 자체는 config `release-auto-gc`(기본 on, env
+`KRW_RELEASE_AUTO_GC`)로 끌 수 있다.
 
 이 값들은 코드에 임시 default로 고정하지 않는다. 운영 환경에서 렌더링하고
 doctor 및 release verification 결과와 함께 승인한다.

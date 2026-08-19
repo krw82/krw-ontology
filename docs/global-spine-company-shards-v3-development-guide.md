@@ -1045,9 +1045,13 @@ export KRW_INDEX_COPY_MODE=copy
 수정하더라도 CoW가 변경된 SQLite page만 분리하므로 cache 원본은 불변이다.
 
 `krw-ontology index cache status|gc`의 reachability 계산은 artifact fragment,
-company shard, spine fragment 세 계층을 모두 포함한다. `gc`는 기본 dry-run이며
-`--yes`가 명시된 경우에만 현재 v2 build plan에서 참조되지 않는 SQLite cache를
-제거한다.
+company shard, spine fragment, router sidecar, global spine 다섯 계층을 모두
+포함한다. `gc`는 기본 dry-run이며 `--yes`가 명시된 경우에만 현재 v2 build
+plan에서 참조되지 않는 SQLite cache를 제거한다. promote 성공 직후에는 자동
+gc가 같은 reachability 판정으로 캐시와 이전 release를 정리한다(`release cache
+gc --keep current` + `release gc --keep N`). 자동 gc는 config
+`release-auto-gc`(기본 on, env `KRW_RELEASE_AUTO_GC`로 끌 수 있음)로 제어하고
+release 유지 개수 N은 config `release-keep-releases`(기본 1)가 정한다.
 
 ### 9.5 Spine fragment
 

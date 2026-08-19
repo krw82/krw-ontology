@@ -6385,14 +6385,28 @@ def _run_post_promote_gc(
                 output=env_root / ".index_fragment_cache",
                 details={"keep": keep},
             )
-            cache_result = _run_release_cache_gc_locked(env_root, yes=True)
-            release_result = _execute_release_gc(env_root, keep=keep, yes=True)
-            summary = {
-                "status": cache_result.get("status", "ok"),
-                "cache_deleted_bytes": cache_result.get("deleted_bytes", 0),
-                "release_deleted": release_result.get("deleted", []),
-                "keep": keep,
-            }
+            lock = FileProcessLock(env_root.expanduser().resolve() / "locks" / "cache_gc.lock")
+            try:
+                lock.acquire()
+            except LockHeldError:
+                summary = {
+                    "status": "skipped_lock_held",
+                    "env_root": str(env_root),
+                    "lock_path": str(lock.path),
+                    "keep": keep,
+                }
+            else:
+                try:
+                    cache_result = _execute_release_cache_gc(env_root, yes=True)
+                    release_result = _execute_release_gc(env_root, keep=keep, yes=True)
+                finally:
+                    lock.release()
+                summary = {
+                    "status": "ok",
+                    "cache_deleted_bytes": cache_result.get("deleted_bytes", 0),
+                    "release_deleted": release_result.get("deleted", []),
+                    "keep": keep,
+                }
             _append_release_progress_event(
                 progress_path,
                 release_root=release_root,

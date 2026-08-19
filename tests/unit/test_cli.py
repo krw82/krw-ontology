@@ -7,6 +7,7 @@ import json
 import shutil
 import sqlite3
 import tarfile
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -5267,7 +5268,7 @@ def test_release_publish_dev_runs_post_promote_gc(tmp_path: Path, monkeypatch):
         calls.append({"kind": "release", "keep": kwargs.get("keep")})
         return {"keep": kwargs.get("keep"), "protected": [], "deleted": [], "candidates": []}
 
-    monkeypatch.setattr(cli_main, "_run_release_cache_gc_locked", fake_cache_gc)
+    monkeypatch.setattr(cli_main, "_execute_release_cache_gc", fake_cache_gc)
     monkeypatch.setattr(cli_main, "_execute_release_gc", fake_release_gc)
 
     result = runner.invoke(
@@ -5290,7 +5291,7 @@ def test_release_publish_dev_survives_post_promote_gc_failure(tmp_path: Path, mo
     def boom(env_root, **kwargs):
         raise RuntimeError("gc boom")
 
-    monkeypatch.setattr(cli_main, "_run_release_cache_gc_locked", boom)
+    monkeypatch.setattr(cli_main, "_execute_release_cache_gc", boom)
     monkeypatch.setattr(cli_main, "_execute_release_gc", boom)
 
     result = runner.invoke(
@@ -5311,7 +5312,7 @@ def test_release_publish_dev_skips_post_promote_gc_when_disabled(tmp_path: Path,
     runner.invoke(app, ["config", "set", "running-root", str(running_root)])
     calls: list[str] = []
     monkeypatch.setattr(
-        cli_main, "_run_release_cache_gc_locked",
+        cli_main, "_execute_release_cache_gc",
         lambda env_root, **kwargs: calls.append("cache") or {"status": "ok"},
     )
 
@@ -5678,3 +5679,64 @@ def test_run_release_cache_gc_skips_when_lock_held(tmp_path: Path):
 
     assert result["status"] == "skipped_lock_held"
     assert (releases_root / "dev" / ".index_fragment_cache").exists()
+
+
+def test_run_post_promote_gc_composition_runs_real_gc_under_lock(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("KRW_ONTOLOGY_CLI_CONFIG", str(tmp_path / "config.json"))
+    releases_root = tmp_path / "releases"
+    cache_root = _write_release_cache_gc_fixture(releases_root)
+    env_root = releases_root / "dev"
+    release_root = env_root / "current-release"
+    progress_path = release_root / "indexes" / "build_progress.jsonl"
+
+    summary = cli_main._run_post_promote_gc(
+        releases_root=releases_root,
+        env="dev",
+        release_id="current-release",
+        env_root=env_root,
+        progress_path=progress_path,
+        release_root=release_root,
+        started_at=time.perf_counter(),
+    )
+
+    assert summary["status"] == "ok"
+    assert summary["keep"] == 1
+    assert "old-release" in summary["release_deleted"]
+    assert not (env_root / "old-release").exists()
+    assert (env_root / "current-release").exists()
+    assert (env_root / "current").is_symlink()
+    assert not (cache_root / "v3" / "company_shards" / "ff" / "stale.sqlite").exists()
+    assert not (env_root / "locks" / "cache_gc.lock").exists()
+    events = [
+        json.loads(line)
+        for line in progress_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    gc_statuses = [event["status"] for event in events if event["node_id"] == "post_promote_gc"]
+    assert gc_statuses == ["started", "complete"]
+
+
+def test_run_post_promote_gc_skips_when_lock_held(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("KRW_ONTOLOGY_CLI_CONFIG", str(tmp_path / "config.json"))
+    releases_root = tmp_path / "releases"
+    cache_root = _write_release_cache_gc_fixture(releases_root)
+    env_root = releases_root / "dev"
+    lock_path = env_root / "locks" / "cache_gc.lock"
+    lock_path.write_text(json.dumps({"pid": os.getpid(), "created_at": "now"}), encoding="utf-8")
+
+    summary = cli_main._run_post_promote_gc(
+        releases_root=releases_root,
+        env="dev",
+        release_id="current-release",
+        env_root=env_root,
+        progress_path=env_root / "current-release" / "indexes" / "build_progress.jsonl",
+        release_root=env_root / "current-release",
+        started_at=time.perf_counter(),
+    )
+
+    assert summary["status"] == "skipped_lock_held"
+    assert lock_path.exists()
+    assert (env_root / "old-release").exists()
+    assert (env_root / "current-release").exists()
+    assert (env_root / "current").is_symlink()
+    assert (cache_root / "v3" / "company_shards" / "ff" / "stale.sqlite").exists()

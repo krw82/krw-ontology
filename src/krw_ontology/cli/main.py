@@ -6230,6 +6230,8 @@ def _sqlite_cache_file_family(path: Path) -> tuple[Path, ...]:
             Path(f"{path}-wal"),
             Path(f"{path}-shm"),
             Path(f"{path}-journal"),
+            path.with_name(path.name + ".seal.json"),
+            path.with_name(path.name + ".verify.json"),
         )
     return (path,)
 
@@ -11396,6 +11398,7 @@ def index_cache_status_cmd(
     typer.echo(f"Company cache: referenced={snapshot['referenced_by_kind']['company_shard']}")
     typer.echo(f"Spine cache: referenced={snapshot['referenced_by_kind']['spine_fragment']}")
     typer.echo(f"Router cache: referenced={snapshot['referenced_by_kind']['router_sidecar']}")
+    typer.echo(f"Global spine cache: referenced={snapshot['referenced_by_kind']['global_spines']}")
     typer.echo(
         f"Artifact fragment cache: referenced={snapshot['referenced_by_kind']['artifact_fragment']}"
     )
@@ -11469,12 +11472,13 @@ def index_cache_gc_cmd(
         for entry in candidates:
             path = Path(str(entry["path"]))
             size = int(entry.get("size_bytes") or 0)
+            family_paths = _sqlite_cache_file_family(path)
             try:
-                path.unlink()
+                family_paths[0].unlink()
             except FileNotFoundError:
                 continue
-            if entry.get("kind") == "router_sidecar":
-                path.with_name(path.name + ".seal.json").unlink(missing_ok=True)
+            for family_path in family_paths[1:]:
+                family_path.unlink(missing_ok=True)
             deleted_count += 1
             deleted_bytes += size
     candidate_bytes = sum(int(entry.get("size_bytes") or 0) for entry in candidates)
@@ -11570,6 +11574,17 @@ def _v3_index_cache_snapshot(
                 "ticker": None,
                 "cache_key": router_key,
             }
+    global_spine_cache = plan.get("global_spine_cache")
+    if isinstance(global_spine_cache, Mapping):
+        global_spine_key = str(global_spine_cache.get("key") or "")
+        if global_spine_key:
+            referenced[
+                _v3_cache_path_from_key(resolved_cache_root, "global_spine", global_spine_key)
+            ] = {
+                "kind": "global_spines",
+                "ticker": None,
+                "cache_key": global_spine_key,
+            }
 
     entries: list[dict[str, Any]] = []
     referenced_existing_count = 0
@@ -11622,6 +11637,9 @@ def _v3_index_cache_snapshot(
         "router_sidecar": sum(
             1 for entry in entries if entry["kind"] == "router_sidecar" and entry["referenced"]
         ),
+        "global_spines": sum(
+            1 for entry in entries if entry["kind"] == "global_spines" and entry["referenced"]
+        ),
     }
     return {
         "cache_root": str(resolved_cache_root),
@@ -11642,6 +11660,7 @@ def _v3_cache_path_from_key(cache_root: Path, kind: str, cache_key: str) -> Path
         "company_shard": "company_shards",
         "spine_fragment": "spine_fragments",
         "router_sidecar": "router_sidecars",
+        "global_spine": "global_spines",
     }[kind]
     return cache_root / "v3" / directory / digest[:2] / f"{digest}.sqlite"
 
@@ -11653,6 +11672,7 @@ def _iter_v3_cache_files(cache_root: Path) -> list[Path]:
         cache_root / "v3" / "company_shards",
         cache_root / "v3" / "spine_fragments",
         cache_root / "v3" / "router_sidecars",
+        cache_root / "v3" / "global_spines",
     ):
         if directory.is_dir():
             paths.extend(path for path in directory.glob("*/*.sqlite") if path.is_file())
@@ -11672,4 +11692,6 @@ def _index_cache_kind(path: Path, cache_root: Path) -> str:
         return "spine_fragment"
     if "router_sidecars" in relative.parts:
         return "router_sidecar"
+    if "global_spines" in relative.parts:
+        return "global_spines"
     raise RuntimeError(f"unknown cache file kind: {path}")

@@ -4557,6 +4557,7 @@ class TestPublishTickerCommand:
         tmp_path: Path,
         monkeypatch,
     ):
+        monkeypatch.setenv("KRW_RELEASE_AUTO_GC", "0")
         running = tmp_path / "running"
         releases_root = tmp_path / "releases"
         base = releases_root / "dev" / "base"
@@ -5241,6 +5242,79 @@ def test_release_publish_dev_quarantines_new_release_candidate_when_index_build_
     assert failure["action"] == "publish_root"
     assert failure["error"] == "v3 index boom"
     assert not (releases_root / "dev" / "current").exists()
+
+
+def test_release_publish_dev_runs_post_promote_gc(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("KRW_ONTOLOGY_CLI_CONFIG", str(tmp_path / "config.json"))
+    monkeypatch.setattr(cli_main, "_default_release_id", lambda: "20260819_gc")
+    running_root = tmp_path / "running"
+    releases_root = tmp_path / "releases"
+    _write_minimal_source_artifact(running_root, "CVX")
+    runner.invoke(app, ["config", "set", "running-root", str(running_root)])
+    calls: list[dict] = []
+
+    def fake_cache_gc(env_root, **kwargs):
+        calls.append({"kind": "cache", "env_root": str(env_root)})
+        return {"status": "ok", "deleted_count": 0, "deleted_bytes": 0}
+
+    def fake_release_gc(env_root, **kwargs):
+        calls.append({"kind": "release", "keep": kwargs.get("keep")})
+        return {"keep": kwargs.get("keep"), "protected": [], "deleted": [], "candidates": []}
+
+    monkeypatch.setattr(cli_main, "_run_release_cache_gc_locked", fake_cache_gc)
+    monkeypatch.setattr(cli_main, "_execute_release_gc", fake_release_gc)
+
+    result = runner.invoke(
+        app, ["release", "publish-dev", "--foreground", "--releases-root", str(releases_root)]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert {"kind": "cache", "env_root": str((releases_root / "dev").resolve())} in calls
+    assert any(call["kind"] == "release" and call["keep"] == 1 for call in calls)
+
+
+def test_release_publish_dev_survives_post_promote_gc_failure(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("KRW_ONTOLOGY_CLI_CONFIG", str(tmp_path / "config.json"))
+    monkeypatch.setattr(cli_main, "_default_release_id", lambda: "20260819_gcfail")
+    running_root = tmp_path / "running"
+    releases_root = tmp_path / "releases"
+    _write_minimal_source_artifact(running_root, "CVX")
+    runner.invoke(app, ["config", "set", "running-root", str(running_root)])
+
+    def boom(env_root, **kwargs):
+        raise RuntimeError("gc boom")
+
+    monkeypatch.setattr(cli_main, "_run_release_cache_gc_locked", boom)
+    monkeypatch.setattr(cli_main, "_execute_release_gc", boom)
+
+    result = runner.invoke(
+        app, ["release", "publish-dev", "--foreground", "--releases-root", str(releases_root)]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert (releases_root / "dev" / "current").is_symlink()
+
+
+def test_release_publish_dev_skips_post_promote_gc_when_disabled(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("KRW_ONTOLOGY_CLI_CONFIG", str(tmp_path / "config.json"))
+    monkeypatch.setenv("KRW_RELEASE_AUTO_GC", "0")
+    monkeypatch.setattr(cli_main, "_default_release_id", lambda: "20260819_gcoff")
+    running_root = tmp_path / "running"
+    releases_root = tmp_path / "releases"
+    _write_minimal_source_artifact(running_root, "CVX")
+    runner.invoke(app, ["config", "set", "running-root", str(running_root)])
+    calls: list[str] = []
+    monkeypatch.setattr(
+        cli_main, "_run_release_cache_gc_locked",
+        lambda env_root, **kwargs: calls.append("cache") or {"status": "ok"},
+    )
+
+    result = runner.invoke(
+        app, ["release", "publish-dev", "--foreground", "--releases-root", str(releases_root)]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert calls == []
 
 
 def test_release_publish_dev_status_and_watch_use_configured_publish_root(

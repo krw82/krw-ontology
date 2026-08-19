@@ -2963,6 +2963,16 @@ def _publish_tickers_as_release(
                     details={"env": resolved_env},
                     started_at=promote_started_at,
                 )
+                if promoted:
+                    _run_post_promote_gc(
+                        releases_root=resolved_releases_root,
+                        env=resolved_env,
+                        release_id=release_id,
+                        env_root=env_root,
+                        progress_path=progress_path,
+                        release_root=release_root,
+                        started_at=promote_started_at,
+                    )
         except Exception as exc:
             if not promoted:
                 quarantine_local_release(
@@ -3208,6 +3218,16 @@ def _publish_root_as_local_release(
                     details={"env": resolved_env},
                     started_at=promote_started_at,
                 )
+                if promoted:
+                    _run_post_promote_gc(
+                        releases_root=resolved_releases_root,
+                        env=resolved_env,
+                        release_id=release_id,
+                        env_root=env_root,
+                        progress_path=progress_path,
+                        release_root=release_root,
+                        started_at=promote_started_at,
+                    )
         except Exception as exc:
             if not promoted:
                 quarantine_local_release(
@@ -6338,6 +6358,69 @@ def _run_release_cache_gc_locked(env_root: Path, **kwargs: Any) -> dict[str, Any
         lock.release()
     result["status"] = "ok"
     return result
+
+
+def _run_post_promote_gc(
+    *,
+    releases_root: Path,
+    env: str,
+    release_id: str,
+    env_root: Path,
+    progress_path: Path,
+    release_root: Path,
+    started_at: float,
+) -> dict[str, Any]:
+    """Run non-fatal cache/release GC immediately after a successful promote."""
+    summary: dict[str, Any] = {"status": "skipped_disabled"}
+    try:
+        if _release_auto_gc_enabled():
+            keep = _resolve_release_keep(None)
+            _append_release_progress_event(
+                progress_path,
+                release_root=release_root,
+                release_id=release_id,
+                node_id="post_promote_gc",
+                stage="gc",
+                status="started",
+                output=env_root / ".index_fragment_cache",
+                details={"keep": keep},
+            )
+            cache_result = _run_release_cache_gc_locked(env_root, yes=True)
+            release_result = _execute_release_gc(env_root, keep=keep, yes=True)
+            summary = {
+                "status": cache_result.get("status", "ok"),
+                "cache_deleted_bytes": cache_result.get("deleted_bytes", 0),
+                "release_deleted": release_result.get("deleted", []),
+                "keep": keep,
+            }
+            _append_release_progress_event(
+                progress_path,
+                release_root=release_root,
+                release_id=release_id,
+                node_id="post_promote_gc",
+                stage="gc",
+                status="complete",
+                output=env_root / ".index_fragment_cache",
+                details={"summary": summary},
+                started_at=started_at,
+            )
+    except Exception as exc:  # gc 절대 빌드 실패로 전파 금지
+        summary = {"status": "failed", "error": str(exc)}
+        try:
+            _append_release_progress_event(
+                progress_path,
+                release_root=release_root,
+                release_id=release_id,
+                node_id="post_promote_gc",
+                stage="gc",
+                status="failed",
+                output=env_root / ".index_fragment_cache",
+                details={"error": str(exc)},
+                started_at=started_at,
+            )
+        except Exception:
+            pass
+    return summary
 
 
 def _read_json_object(path: Path) -> dict[str, object] | None:

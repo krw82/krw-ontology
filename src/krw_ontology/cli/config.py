@@ -20,6 +20,8 @@ CONFIG_KEYS = {
     "prod-reload-command",
     "prod-health-url",
     "prod-keep-releases",
+    "release-keep-releases",
+    "release-auto-gc",
 }
 PATH_CONFIG_KEYS = {"running-root", "publish-root"}
 
@@ -33,6 +35,8 @@ class CliConfig:
     prod_reload_command: str | None = None
     prod_health_url: str | None = None
     prod_keep_releases: str | None = None
+    release_keep_releases: str | None = None
+    release_auto_gc: str | None = None
 
     @classmethod
     def from_dict(cls, payload: dict) -> "CliConfig":
@@ -44,6 +48,8 @@ class CliConfig:
             prod_reload_command=payload.get("prod_reload_command"),
             prod_health_url=payload.get("prod_health_url"),
             prod_keep_releases=payload.get("prod_keep_releases"),
+            release_keep_releases=payload.get("release_keep_releases"),
+            release_auto_gc=payload.get("release_auto_gc"),
         )
 
     def to_dict(self) -> dict:

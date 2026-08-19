@@ -2179,6 +2179,8 @@ def config_show_cmd() -> None:
     typer.echo(f"prod-reload-command: {config.prod_reload_command or '<unset>'}")
     typer.echo(f"prod-health-url: {config.prod_health_url or '<unset>'}")
     typer.echo(f"prod-keep-releases: {config.prod_keep_releases or '<unset>'}")
+    typer.echo(f"release-keep-releases: {config.release_keep_releases or '<unset>'}")
+    typer.echo(f"release-auto-gc: {config.release_auto_gc or '<unset>'}")
 
 
 @config_app.command("set")
@@ -8760,6 +8762,29 @@ def _resolve_prod_settings(
         "health_url": resolved_health_url,
         "keep_releases": keep_value,
     }
+
+
+def _resolve_release_keep(keep_releases: int | None) -> int:
+    config = load_cli_config()
+    keep_value = keep_releases
+    if keep_value is None and config.release_keep_releases:
+        try:
+            keep_value = int(config.release_keep_releases)
+        except ValueError as exc:
+            raise ValueError("release-keep-releases must be an integer") from exc
+    if keep_value is None:
+        keep_value = 1
+    if keep_value < 1:
+        raise ValueError("release keep releases must be at least 1")
+    return keep_value
+
+
+def _release_auto_gc_enabled() -> bool:
+    env_flag = os.environ.get("KRW_RELEASE_AUTO_GC", "").strip().lower()
+    if env_flag in {"0", "false", "no", "off"}:
+        return False
+    config = load_cli_config()
+    return (config.release_auto_gc or "1").strip().lower() not in {"0", "false", "no", "off"}
 
 
 def _bundle_filter(path: Path) -> bool:

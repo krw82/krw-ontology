@@ -35,7 +35,7 @@ from krw_ontology.agent_index.spine_schema import (
     write_global_spine_metadata,
     write_spine_verification_seal,
 )
-from krw_ontology.cli.config import load_cli_config
+from krw_ontology.cli.config import load_cli_config, set_config_value
 from krw_ontology.cli.main import app
 from krw_ontology.release import write_release_manifest_v3
 from krw_ontology.pipeline.research_plan import ResearchFilingTarget
@@ -1236,6 +1236,33 @@ class TestConfigCommand:
         assert "Set prod-host=ubuntu@prod" in set_result.output
         assert show_result.exit_code == 0
         assert "prod-host: ubuntu@prod" in show_result.output
+
+
+def test_config_supports_release_retention_keys(tmp_path: Path):
+    config_path = tmp_path / "config.json"
+    set_config_value("release-keep-releases", "2", path=config_path)
+    set_config_value("release-auto-gc", "0", path=config_path)
+    config = load_cli_config(config_path)
+    assert config.release_keep_releases == "2"
+    assert config.release_auto_gc == "0"
+
+
+def test_release_retention_resolution_defaults_to_one(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("KRW_ONTOLOGY_CLI_CONFIG", str(tmp_path / "config.json"))
+    assert cli_main._resolve_release_keep(None) == 1
+    assert cli_main._resolve_release_keep(3) == 3
+    runner.invoke(app, ["config", "set", "release-keep-releases", "2"])
+    assert cli_main._resolve_release_keep(None) == 2
+
+
+def test_release_auto_gc_env_and_config_kill_switch(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("KRW_ONTOLOGY_CLI_CONFIG", str(tmp_path / "config.json"))
+    assert cli_main._release_auto_gc_enabled() is True
+    monkeypatch.setenv("KRW_RELEASE_AUTO_GC", "0")
+    assert cli_main._release_auto_gc_enabled() is False
+    monkeypatch.delenv("KRW_RELEASE_AUTO_GC")
+    runner.invoke(app, ["config", "set", "release-auto-gc", "false"])
+    assert cli_main._release_auto_gc_enabled() is False
 
 
 def test_release_publish_config_infers_releases_root_from_prepared_release_root(tmp_path: Path):

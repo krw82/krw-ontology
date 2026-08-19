@@ -16,17 +16,27 @@ _NUMERIC_TEXT_FIELDS: dict[str, list[str]] = {
 }
 
 _NUMBER_RE = re.compile(
-    r"(?P<prefix>[$€£])?(?P<number>\d[\d,]*(?:\.\d+)?)(?P<plus>\+)?"
+    r"(?<![\w.])(?P<sign>[+-])?\s*(?P<prefix>[$€£])?\s*"
+    r"(?P<number>(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?)(?P<plus>\+)?"
     r"\s*(?P<unit>%|percent|percentage points?|basis points?|bps|thousand|million|billion|k|m|b)?"
-    r"(?![A-Za-z])",
+    r"(?!\w)",
     re.IGNORECASE,
 )
 
 _ACCOUNTING_AMOUNT_RE = re.compile(
-    r"(?P<prefix>[$€£])?\s*\((?P<number>\d[\d,]*(?:\.\d+)?)\)"
-    r"\s*(?P<unit>thousand|million|billion|k|m|b)?(?![A-Za-z])",
+    r"(?<![\w.])(?P<prefix>[$€£])?\s*\((?P<number>(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?)\)"
+    r"\s*(?P<unit>thousand|million|billion|k|m|b)?(?!\w)",
     re.IGNORECASE,
 )
+
+_NUMERIC_SUPPORT_TYPES = frozenset({
+    "XBRLFact",
+    "MetricObservation",
+    "FinancialMetricValue",
+    "DerivedMetricValue",
+    "CalculatedNumericSupport",
+    "NumericEvidence",
+})
 
 _PERCENT_UNITS = {
     "%",
@@ -102,7 +112,6 @@ def _extract_numbers(text: str) -> list[NumericToken]:
     tokens: list[NumericToken] = []
     consumed_spans: list[tuple[int, int]] = []
     context_multiplier = _context_amount_multiplier(text)
-    context_multipliers = _context_amount_multipliers(text)
 
     for match in _ACCOUNTING_AMOUNT_RE.finditer(text):
         value = _parse_float(match.group("number"))
@@ -114,7 +123,7 @@ def _extract_numbers(text: str) -> list[NumericToken]:
         if unit or prefix or context_multiplier:
             tokens.append(
                 _make_numeric_token(
-                    value,
+                    -value,
                     prefix or "$" if context_multiplier else prefix,
                     unit or _unit_for_multiplier(context_multiplier),
                     label,
@@ -128,17 +137,22 @@ def _extract_numbers(text: str) -> list[NumericToken]:
         value = _parse_float(match.group("number"))
         if value is None:
             continue
+        if match.group("sign") == "-":
+            value = -value
         unit = (match.group("unit") or "").lower()
         prefix = match.group("prefix") or ""
         if _should_ignore_number(text, match, value, unit):
             continue
+        if unit in _PERCENT_UNITS and not match.group("sign"):
+            direction = _percent_direction(text, match)
+            if direction is not None:
+                value = abs(value) * direction
         token = _make_numeric_token(value, prefix, unit, match.group(0))
         tokens.append(token)
-        if not unit and (prefix or "|" in text):
-            for multiplier in context_multipliers:
-                context_unit = _unit_for_multiplier(multiplier)
-                if context_unit:
-                    tokens.append(_make_numeric_token(value, prefix, context_unit, match.group(0)))
+        if not unit and context_multiplier:
+            context_unit = _unit_for_multiplier(context_multiplier)
+            if context_unit:
+                tokens.append(_make_numeric_token(value, prefix, context_unit, match.group(0)))
     return tokens
 
 
@@ -148,8 +162,10 @@ def _overlaps(span: tuple[int, int], consumed_spans: list[tuple[int, int]]) -> b
 
 
 def _context_amount_multiplier(text: str) -> int | None:
-    multipliers = _context_amount_multipliers(text)
-    return multipliers[0] if multipliers else None
+    # A table that mentions more than one unit has ambiguous scale. Do not make
+    # a best-effort conversion: an unsupported value is safer than a false one.
+    multipliers = list(dict.fromkeys(_context_amount_multipliers(text)))
+    return multipliers[0] if len(multipliers) == 1 else None
 
 
 def _context_amount_multipliers(text: str) -> list[int]:
@@ -247,6 +263,17 @@ def _is_duration_range_context(after: str) -> bool:
             after,
         )
     )
+
+
+def _percent_direction(text: str, match: re.Match) -> int | None:
+    """Infer an explicit percentage direction from the local wording only."""
+    start, end = match.span()
+    context = text[max(0, start - 80):min(len(text), end + 80)].lower()
+    if re.search(r"\b(?:decreased?|declined?|fell|reduced?|down)\b", context):
+        return -1
+    if re.search(r"\b(?:increased?|grew|rose|expanded?|up)\b", context):
+        return 1
+    return None
 
 
 def _is_enumeration_marker(text: str, match: re.Match, value: float) -> bool:
@@ -362,49 +389,19 @@ def _amount_rounding_tolerance(label: str, unit: str, multiplier: int) -> float 
 
 def _is_supported(required: NumericToken, supported: list[NumericToken]) -> bool:
     for candidate in supported:
-        candidate_value = candidate.value
         if required.kind != candidate.kind:
-            if required.kind == "percent" and candidate.kind == "number":
-                candidate_value = candidate.value
-            elif required.kind == "amount" and candidate.kind == "number":
-                if required.value >= 1_000_000_000:
-                    scaled_values = (candidate.value * 1_000, candidate.value * 1_000_000)
-                elif required.value >= 1_000_000:
-                    scaled_values = (candidate.value * 1_000_000,)
-                else:
-                    scaled_values = ()
-                tolerance = max(
-                    1_000_000,
-                    abs(required.value) * 0.00001,
-                    required.tolerance or 0,
-                    candidate.tolerance or 0,
-                )
-                if any(
-                    abs(required.value - scaled) <= tolerance
-                    for scaled in scaled_values
-                ):
-                    return True
-                continue
-            else:
-                continue
+            continue
         if required.kind == "amount":
             tolerance = max(
-                1_000_000,
-                abs(required.value) * 0.00001,
+                0.01,
                 required.tolerance or 0,
                 candidate.tolerance or 0,
             )
-            if abs(abs(required.value) - abs(candidate_value)) <= tolerance:
-                return True
         elif required.kind == "percent":
             tolerance = 0.05
         else:
             tolerance = max(0.01, abs(required.value) * 0.000001)
-            if required.value >= 1_000_000 and candidate.kind == "number":
-                scaled_values = (candidate.value * 1_000, candidate.value * 1_000_000)
-                if any(abs(required.value - scaled) <= tolerance for scaled in scaled_values):
-                    return True
-        if abs(required.value - candidate_value) <= tolerance:
+        if abs(required.value - candidate.value) <= tolerance:
             return True
     return False
 
@@ -491,56 +488,60 @@ def _unsupported_labels(required: list[NumericToken], supported: list[NumericTok
     }
 
 
+def numeric_support_objects(all_objects: dict[str, dict]) -> dict[str, dict]:
+    """Return the object subset that may be used as numeric support.
+
+    Callers use this shared filter so quality revalidation and pipeline
+    validation cannot accidentally validate against different evidence.
+    """
+    return {
+        object_id: obj
+        for object_id, obj in all_objects.items()
+        if obj.get("type") in _NUMERIC_SUPPORT_TYPES
+        or (not obj.get("type") and "value" in obj)
+    }
+
+
 def _build_numeric_support_index(xbrl_facts: dict[str, dict]) -> list[NumericToken]:
-    """Build quote-independent numeric support from facts and code-calculated values.
+    """Build quote-independent support from direct XBRL evidence only.
 
-    The guard accepts three numeric support sources:
-    - Raw XBRL facts and canonical financial metric values
-    - Explicit DerivedMetricValue rows written by code
-    - Additional deterministic YoY growth percentages computed from adjacent
-      FinancialMetricValue years
-
-    The last source handles claims such as "R&D expenses increased 10%" when
-    the filing provides 2025 and 2024 expense values but not the calculated
-    percentage itself.
+    Numeric claims must not become valid merely because unrelated numbers can
+    be combined. Derived metrics, generic calculated support and model output
+    remain report-only unless a future explicit, evidence-bound rule allows
+    them.
     """
     supported_numbers: list[NumericToken] = []
-    financial_values: list[dict] = []
     xbrl_values: list[dict] = []
 
     for fact in xbrl_facts.values():
-        fact_type = fact.get("type")
+        fact_type = fact.get("type") or "XBRLFact"
         if fact_type == "NumericEvidence":
-            # Quote-sourced evidence is only valid through a declared support
-            # path. Non-quote evidence comes from XBRL/metric/code rows and may
-            # support numeric claims independently.
-            if fact.get("source_method") != "quote_text":
+            # Quote values must flow through their declared quote support path.
+            # Other ledger rows are not an independent canonical source.
+            if fact.get("source_method") in {"xbrl_fact", "direct_xbrl"}:
                 supported_numbers.append(_numeric_token_from_evidence(fact))
             continue
 
-        value = _parse_float(str(fact["value"]))
+        if fact_type == "MetricObservation" and fact.get("source_type") != "xbrl":
+            continue
+        if fact_type not in {"XBRLFact", "MetricObservation"}:
+            continue
+
+        value = _parse_float(str(fact.get("value", "")))
         if value is None:
             continue
         unit = str(fact.get("unit", "")).lower()
         label = str(fact["value"])
         if unit == "percent":
             supported_numbers.append(NumericToken("percent", value, label))
-        elif unit in {"usd", "usd_per_share"} or fact_type in {
-            "XBRLFact",
-            "FinancialMetricValue",
-            "CalculatedNumericSupport",
-        }:
+        elif unit in {"usd", "usd_per_share"}:
             supported_numbers.append(NumericToken("amount", value, label))
-            supported_numbers.append(NumericToken("number", value, label))
         else:
             supported_numbers.append(NumericToken("number", value, label))
 
-        if fact_type == "FinancialMetricValue":
-            financial_values.append(fact)
-        elif fact_type == "XBRLFact":
+        if fact_type == "XBRLFact":
             xbrl_values.append(fact)
 
-    supported_numbers.extend(_compute_yoy_growth_support(financial_values))
     supported_numbers.extend(_compute_xbrl_yoy_growth_support(xbrl_values))
     return supported_numbers
 
@@ -593,8 +594,8 @@ def _compute_yoy_growth_support(financial_values: list[dict]) -> list[NumericTok
 
 
 def _compute_xbrl_yoy_growth_support(xbrl_values: list[dict]) -> list[NumericToken]:
-    """Compute YoY growth support for matching XBRL facts, including segments."""
-    by_group: dict[tuple[str, str, str, tuple[str, ...]], dict[int, float]] = {}
+    """Compute YoY support only for an unambiguous matching XBRL series."""
+    by_group: dict[tuple[str, str, str, str, str, tuple[str, ...]], dict[int, set[float]]] = {}
     for fact in xbrl_values:
         context = fact.get("context") or {}
         fiscal_year = context.get("fiscal_year")
@@ -605,28 +606,54 @@ def _compute_xbrl_yoy_growth_support(xbrl_values: list[dict]) -> list[NumericTok
             continue
         tag = str(fact.get("safe_taxonomy_tag") or fact.get("taxonomy_tag") or "")
         unit = str(fact.get("unit") or "").lower()
-        period_type = str(context.get("period_type") or "")
+        period_type = _xbrl_period_type(context)
         dimensions = tuple(sorted(str(item) for item in (context.get("dimensions") or [])))
         if not tag or not unit:
             continue
-        group = (tag, unit, period_type, dimensions)
-        by_group.setdefault(group, {}).setdefault(fiscal_year, value)
+        start = str(context.get("start_date") or "")
+        end = str(context.get("end_date") or context.get("instant") or "")
+        group = (tag, unit, period_type, _period_shape(start), _period_shape(end), dimensions)
+        by_group.setdefault(group, {}).setdefault(fiscal_year, set()).add(value)
 
     tokens: list[NumericToken] = []
-    for (tag, _unit, _period_type, dimensions), values_by_year in by_group.items():
+    for (tag, _unit, _period_type, _start, _end, dimensions), values_by_year in by_group.items():
         years = sorted(values_by_year)
         for current_year in years:
             prior_year = current_year - 1
             if prior_year not in values_by_year:
                 continue
-            prior_value = values_by_year[prior_year]
+            # Duplicate source facts for the same semantic period are not safe
+            # to choose between automatically.
+            if len(values_by_year[current_year]) != 1 or len(values_by_year[prior_year]) != 1:
+                continue
+            prior_value = next(iter(values_by_year[prior_year]))
             if prior_value == 0:
                 continue
-            growth = ((values_by_year[current_year] - prior_value) / abs(prior_value)) * 100
+            current_value = next(iter(values_by_year[current_year]))
+            growth = ((current_value - prior_value) / abs(prior_value)) * 100
             dimension_label = "_".join(dimensions) if dimensions else "consolidated"
             label = f"{tag}_{dimension_label}_growth_{current_year}_vs_{prior_year}"
             tokens.extend(_percent_support_variants(growth, label))
     return tokens
+
+
+def _xbrl_period_type(context: dict) -> str:
+    if context.get("instant"):
+        return "instant"
+    days = context.get("duration_days")
+    if isinstance(days, int):
+        if 70 <= days <= 115:
+            return "quarter"
+        if 160 <= days <= 300:
+            return "year_to_date"
+        if days >= 330:
+            return "annual"
+    return str(context.get("period_type") or "duration")
+
+
+def _period_shape(value: str) -> str:
+    """Compare equivalent fiscal windows across years without mixing quarters."""
+    return value[5:] if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value) else value
 
 
 def _percent_support_variants(value: float, label: str) -> list[NumericToken]:
@@ -635,15 +662,10 @@ def _percent_support_variants(value: float, label: str) -> list[NumericToken]:
     signed_ceil = math.copysign(math.ceil(abs(value)), value)
     values = {
         value,
-        abs(value),
         round(value, 1),
-        abs(round(value, 1)),
         round(value),
-        abs(round(value)),
         signed_floor,
-        abs(signed_floor),
         signed_ceil,
-        abs(signed_ceil),
     }
     return [
         NumericToken("percent", float(candidate), f"{label}:{candidate:g}%")
@@ -674,8 +696,6 @@ def validate_numeric(
         return True, None
 
     supported_numbers: list[NumericToken] = []
-    quote_numbers: list[NumericToken] = []
-
     # Collect numbers from supporting quotes
     quote_ids = obj.get("supported_by_quotes") or []
     for qid in quote_ids:
@@ -685,7 +705,6 @@ def validate_numeric(
             if not quote_tokens:
                 quote_tokens = _extract_numbers(quote.get("quote_text", ""))
             supported_numbers.extend(quote_tokens)
-            quote_numbers.extend(quote_tokens)
 
     # Also check ResearchClaim's supported_by_quotes for objects that have
     # supported_by_claims referencing claims with their own quotes
@@ -700,11 +719,8 @@ def validate_numeric(
                     if not quote_tokens:
                         quote_tokens = _extract_numbers(quote.get("quote_text", ""))
                     supported_numbers.extend(quote_tokens)
-                    quote_numbers.extend(quote_tokens)
 
-    supported_numbers.extend(_build_calculated_percent_support(quote_numbers, "quote"))
-    supported_numbers.extend(_build_calculated_amount_support(quote_numbers, "quote"))
-    supported_numbers.extend(_build_numeric_support_index(xbrl_facts))
+    supported_numbers.extend(_build_numeric_support_index(numeric_support_objects(xbrl_facts)))
 
     unsupported = _unsupported_labels(numbers, supported_numbers)
     if unsupported:

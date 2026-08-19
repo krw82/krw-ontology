@@ -2941,32 +2941,11 @@ def _chart_series_runtime_enabled() -> bool:
 
 def _should_attach_chart_series(question: str) -> bool:
     text = str(question or "").lower()
-    chart_terms = (
-        "chart",
-        "graph",
-        "trend",
-        "series",
-        "yoy",
-        "qoq",
-        "annual",
-        "quarterly",
-        "차트",
-        "그래프",
-        "추이",
-        "추세",
-        "시계열",
-        "비교",
-        "비중",
-        "구성",
-        "흐름",
-        "변화",
-        "연도별",
-        "분기별",
-        "제품별",
-        "지역별",
-        "전년",
-        "전분기",
-    )
+    # The presentation runtime, not the query router, decides whether a visual
+    # is warranted.  Attach a bounded verified metric pack for any question
+    # that names a supported metric so the agent can later choose prose, a
+    # table, or a visualization without a second retrieval pass.  Explicit
+    # trend/chart language still helps discovery, but is no longer required.
     metric_terms = (
         "revenue",
         "sales",
@@ -3004,7 +2983,7 @@ def _should_attach_chart_series(question: str) -> bool:
         "연구개발",
         "인수",
     )
-    return any(term in text for term in chart_terms) and any(term in text for term in metric_terms)
+    return any(term in text for term in metric_terms)
 
 
 def _merge_discovery_payloads(

@@ -946,10 +946,11 @@ def test_index_cache_status_reports_referenced_v3_entries(tmp_path: Path):
 
     assert result.exit_code == 0, result.output
     assert "V3 index cache: ok" in result.output
-    assert "Entries: total=4 referenced=4 missing_referenced=0 unreferenced=0" in result.output
+    assert "Entries: total=5 referenced=5 missing_referenced=0 unreferenced=0" in result.output
     assert "Artifact fragment cache: referenced=1" in result.output
     assert "Company cache: referenced=1" in result.output
     assert "Spine cache: referenced=1" in result.output
+    assert "Global spine cache: referenced=1" in result.output
     assert "Router cache: referenced=1" in result.output
     assert "Tickers: VG" in result.output
 
@@ -975,6 +976,7 @@ def test_index_cache_gc_removes_unreferenced_v3_entries_only_with_yes(tmp_path: 
     referenced_fragment = next((cache_root / "v3" / "spine_fragments").rglob("*.sqlite"))
     referenced_artifact = next((cache_root / "fragments").rglob("*.sqlite"))
     referenced_router = next((cache_root / "v3" / "router_sidecars").rglob("*.sqlite"))
+    referenced_global_spine = next((cache_root / "v3" / "global_spines").rglob("*.sqlite"))
     stale_company = cache_root / "v3" / "company_shards" / "ff" / "stale-company.sqlite"
     stale_company.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(referenced_company, stale_company)
@@ -989,6 +991,11 @@ def test_index_cache_gc_removes_unreferenced_v3_entries_only_with_yes(tmp_path: 
     shutil.copy2(referenced_router, stale_router)
     stale_router_seal = stale_router.with_name(stale_router.name + ".seal.json")
     stale_router_seal.write_text("{}", encoding="utf-8")
+    stale_global_spine = cache_root / "v3" / "global_spines" / "bb" / "stale-spine.sqlite"
+    stale_global_spine.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(referenced_global_spine, stale_global_spine)
+    stale_spine_seal = stale_global_spine.with_name(stale_global_spine.name + ".verify.json")
+    stale_spine_seal.write_text("{}", encoding="utf-8")
 
     dry_run = runner.invoke(
         app,
@@ -1005,12 +1012,14 @@ def test_index_cache_gc_removes_unreferenced_v3_entries_only_with_yes(tmp_path: 
 
     assert dry_run.exit_code == 0, dry_run.output
     assert "V3 index cache GC: dry-run" in dry_run.output
-    assert "Candidates: 4" in dry_run.output
+    assert "Candidates: 5" in dry_run.output
     assert stale_company.exists()
     assert stale_fragment.exists()
     assert stale_artifact.exists()
     assert stale_router.exists()
     assert stale_router_seal.exists()
+    assert stale_global_spine.exists()
+    assert stale_spine_seal.exists()
     assert referenced_company.exists()
     assert referenced_fragment.exists()
 
@@ -1030,16 +1039,19 @@ def test_index_cache_gc_removes_unreferenced_v3_entries_only_with_yes(tmp_path: 
 
     assert deleted.exit_code == 0, deleted.output
     assert "V3 index cache GC: deleted" in deleted.output
-    assert "Deleted: 4" in deleted.output
+    assert "Deleted: 5" in deleted.output
     assert not stale_company.exists()
     assert not stale_fragment.exists()
     assert not stale_artifact.exists()
     assert not stale_router.exists()
     assert not stale_router_seal.exists()
+    assert not stale_global_spine.exists()
+    assert not stale_spine_seal.exists()
     assert referenced_artifact.exists()
     assert referenced_company.exists()
     assert referenced_fragment.exists()
     assert referenced_router.exists()
+    assert referenced_global_spine.exists()
 
     status = runner.invoke(
         app,

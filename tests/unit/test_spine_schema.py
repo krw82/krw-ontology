@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import shutil
 import sqlite3
@@ -305,6 +306,27 @@ def test_spine_seal_survives_ctime_only_metadata_change(tmp_path: Path) -> None:
     assert sealed["ok"] is True, sealed["errors"]
     assert sealed["seal_status"] == "valid"
     assert sealed["integrity_source"] == "immutable_seal"
+    assert read_spine_verification_sha256(path) == "a" * 64
+
+
+def test_spine_seal_survives_device_id_change_after_volume_remount(tmp_path: Path) -> None:
+    path = tmp_path / "fragment.sqlite"
+    _write_minimal_fragment(path)
+    deep = verify_spine_fragment_schema(path, deep=True, trust_seal=False)
+    seal_path = write_spine_verification_seal(path, deep, sha256="a" * 64)
+    payload = json.loads(seal_path.read_text(encoding="utf-8"))
+    payload["database_identity"]["device"] += 1
+    payload["sha256_database_identity"]["device"] += 1
+    seal_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    sealed = verify_spine_fragment_schema(
+        path,
+        deep=False,
+        require_trusted_seal=True,
+    )
+
+    assert sealed["ok"] is True, sealed["errors"]
+    assert sealed["seal_status"] == "valid"
     assert read_spine_verification_sha256(path) == "a" * 64
 
 

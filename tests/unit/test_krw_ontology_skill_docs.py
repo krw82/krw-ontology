@@ -74,11 +74,19 @@ def test_krw_ontology_market_move_skill_is_separate_from_news_research() -> None
     ).read_text()
     discovery_text = (discovery_dir / "SKILL.md").read_text()
 
-    assert "use `krw-ontology-market-move-research` instead" in skill_text
+    assert "krw-ontology-market-move-research" in skill_text
     assert "recent stock moves" not in skill_text
     assert "app-provided market context" not in skill_text
     assert "route to `krw-ontology-market-move-research`" in news_policy_text
-    assert "Use stock-news event tools as the current-news discovery layer" in tool_policy_text
+    assert "Use KRW Feed first" in skill_text
+    assert "Never replace a selected feed issue" in skill_text
+    assert "one Yahoo Finance news lookup" in skill_text
+    assert "Treat every feed item as an observed market narrative" in skill_text
+    assert "Use KRW Feed first" in tool_policy_text
+    assert "get_feed_context" in tool_policy_text
+    assert "get_yahoo_finance_news" in tool_policy_text
+    assert "call with exactly {search_plan}" in tool_policy_text
+    assert "Do not use WebSearch, WebFetch, Stock News MCP" in tool_policy_text
     assert "name: krw-ontology-market-move-research" in market_move_skill_text
     assert "selected_news_event_context.version = market-move-context/v1" in market_move_skill_text
     assert "references/market-move-context-policy.md" in market_move_skill_text
@@ -92,8 +100,42 @@ def test_krw_ontology_market_move_skill_is_separate_from_news_research() -> None
     assert "default answer is lightweight" in market_move_output_text
     assert "Follow-ups must bridge the observed move/news candidate into filing-based research" in market_move_output_text
     assert "Do not invoke the bridge automatically" in market_move_bridge_text
-    assert "market-news discovery" in discovery_text
-    assert "app-normalized provider results" in discovery_text
+    assert "KRW Feed MCP first" in discovery_text
+    assert "selected feed issue" in discovery_text
+
+
+def test_source_filing_follow_up_skill_is_runtime_scoped() -> None:
+    skill_dir = Path("plugins/krw-ontology/skills/krw-ontology-filing-follow-up")
+
+    skill_text = (skill_dir / "SKILL.md").read_text()
+    agent_text = (skill_dir / "agents" / "openai.yaml").read_text()
+    scope_policy_text = (skill_dir / "references" / "source-filing-scope.md").read_text()
+    output_contract_text = (skill_dir / "references" / "output-contract.md").read_text()
+    normalized_skill_text = " ".join(skill_text.split())
+    normalized_output_contract_text = " ".join(output_contract_text.split())
+    normalized_scope_policy_text = " ".join(scope_policy_text.split())
+
+    assert "name: krw-ontology-filing-follow-up" in skill_text
+    assert "runtime-owned source filing context" in normalized_skill_text
+    assert "references/source-filing-scope.md" in skill_text
+    assert "references/output-contract.md" in skill_text
+    assert "Do not search for, substitute, or compare another filing" in normalized_skill_text
+    assert "For an 8-K or 6-K" in skill_text
+    assert "list this filing's" in skill_text
+    assert "EX-99.1" in skill_text
+    assert "For a Form 4" in skill_text
+    assert "For Form 4, do not infer an executive's intent" in normalized_skill_text
+    assert "Do not expose tool names, MCP names, runtime restrictions" in normalized_skill_text
+    assert "runtime, not the user or the model, owns the" in scope_policy_text
+    assert "Do not discover filings, search a filing catalog, compare filings" in scope_policy_text
+    assert "8-K, 8-K/A, 6-K, or 6-K/A" in scope_policy_text
+    assert "Form 4 or 4/A" in scope_policy_text
+    assert "verified documents and read only the returned text exhibit" in scope_policy_text
+    assert "never guess a filename, compose a SEC URL" in normalized_scope_policy_text
+    assert "Do not reveal tool names, MCP names, runtime restrictions" in output_contract_text
+    assert "Do not give personalized buy, sell, hold, position-size, or target-price advice" in normalized_output_contract_text
+    assert "KRW Ontology Filing Follow-up" in agent_text
+    assert "verified SEC filing card" in agent_text
 
 
 def test_krw_ontology_router_skill_is_thin_and_market_move_aware() -> None:

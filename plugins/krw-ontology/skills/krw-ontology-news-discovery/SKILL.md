@@ -1,181 +1,56 @@
 ---
 name: krw-ontology-news-discovery
-description: Use for news-mode discovery only. Curate recent market-news event cards that a user can choose before KRW Ontology filing analysis. Do not write final investment analysis.
+description: Use when the user wants to find recent company or market issues. Start from the stored KRW Feed, then use one bounded current-market-news cross-check only when the feed is incomplete or needs corroboration.
 ---
 
-# KRW Ontology News Discovery Skill
+# KRW Feed Discovery
 
-This skill is only for the first step of news mode: finding user-selectable market-news event candidates.
-
-It is not a final-answer skill.
+Use this skill to find issues from the product's stored KRW Feed. The feed is the primary source; one bounded current-market-news read may supplement it. This is not an open-web search and not a final company-research report.
 
 ```text
-market-news discovery -> Korean event cards -> hidden ontology bridge brief
+user question
+-> stored X-feed issues
+-> compact Korean issue orientation
+-> optional follow-up into event or filing analysis
 ```
 
-The selected card will later be analyzed by the normal news-research workflow. Do not call KRW Ontology tools in this skill.
+## Source Boundary
 
-## Operating Contract
+- Use KRW Feed MCP first for news/event discovery.
+- Use at most one current-market-news lookup for the same ticker only when the feed has no usable direct item, is materially incomplete, or needs a narrow cross-check.
+- Feed items are stored X-based market observations. They may describe a company, sector, rumor, or market narrative; they are not company-confirmed facts.
+- Supplementary market reporting is also observation, not company-confirmed fact. Keep it visibly separate from feed findings.
+- Do not use WebSearch, WebFetch, Stock News MCP, or model memory to fill a gap.
+- If neither the feed nor the bounded supplementary check has a relevant item, say that no relevant item was found in the available sources. Do not imply that no event occurred anywhere.
 
-Default visible output is one short Korean 안내문 only.
+## Tool Workflow
 
-Good:
+1. If the user names one or more tickers, call `list_feed_items` with those tickers.
+2. If the app provides selected issue IDs, call `get_feed_items` or `get_feed_context` for those IDs rather than rediscovering the event.
+3. Read only enough feed-post context to distinguish direct company items from sector or market context.
+4. If needed, call `get_yahoo_finance_news` once for the same ticker and a narrow recent window. It may add context but must not replace a selected feed issue.
+5. Do not call KRW Ontology filing tools in this discovery step.
+6. Do not create synthetic event cards. The product feed already owns card rendering and selection.
 
-```text
-최근 시장 뉴스에서 분석할 만한 후보를 추렸습니다. 하나를 선택하면 공시 기준으로 연결해 분석하겠습니다.
-```
+The current feed lookup is ticker and recency bounded. If the user gives neither a ticker nor a selected feed item, ask for a company/ticker or direct them to select an item from the feed.
 
-If the search result has zero usable `cards` after filtering, say that directly:
+## Interpretation Rules
 
-```text
-최근 시장 뉴스에서 분석할 만한 후보를 찾지 못했습니다. 더 구체적인 기업명이나 기간을 넣어 다시 시도해주세요.
-```
-
-Do not write a long answer, investment conclusion, valuation judgment, filing baseline, or final Markdown report.
-
-## Source Priority
-
-Discovery cards must be based on market-news, financial-news, or app-normalized provider results. Provider names and raw API payloads are internal implementation details, not visible card content.
-
-Prefer:
-
-```text
-Yahoo Finance
-Google News-like aggregated market results
-Reuters
-Bloomberg
-CNBC
-WSJ
-MarketWatch
-AP
-Barron's
-Financial Times
-major financial portals and market-news sites
-```
-
-Never show these as user-facing discovery cards:
-
-```text
-SEC Filings
-Form 8-K
-Form 10-Q
-Form 10-K
-Investor Relations
-company IR pages
-annual reports
-quarterly reports
-old filing pages
-standalone company press-release pages
-```
-
-Filings and IR are verification material for the later analysis step, not discovery cards.
-
-## Tool Policy
-
-Allowed tools:
-
-```text
-route_news_question
-resolve_news_entities
-search_company_news_events
-search_market_news_events
-build_news_timeline
-audit_news_sources
-```
-
-Forbidden tools:
-
-```text
-read_news_sources
-search_news_by_domain
-krw_ontology_query_context
-krw_ontology_query
-krw_ontology_retrieve
-krw_ontology_trace
-krw_ontology_chain
-krw_ontology_compare
-```
-
-For company/ticker questions, use the app-provided market/news card pipeline when available. If this skill is running with stock-news tools instead, call `search_company_news_events` with market-news discovery intent:
-
-```json
-{
-  "mode": "market_narrative_discovery",
-  "exclude_official_sources": true,
-  "price_move_direction": "down | up | unknown"
-}
-```
-
-Use `price_move_direction: "down"` for Korean/English wording such as:
-
-```text
-왜 떨어져, 왜 빠져, 하락, 조정, 급락, 약세, why down, why falling, stock drops
-```
-
-Use `price_move_direction: "up"` for:
-
-```text
-왜 올라, 상승, 급등, 강세, why up, rally, jumps, gains
-```
-
-Use `"unknown"` for neutral latest-news questions.
-
-## Card Quality
-
-Each card should describe a market narrative, not a raw page title.
-
-Bad:
-
-```text
-SEC Filings - Apple Investor Relations
-Form 8-K - SEC.gov
-Apple shares rise after ...
-```
-
-Good:
-
-```text
-중국 경쟁과 아이폰 판매 둔화 우려가 AAPL 약세 요인으로 부각
-AI 투자 부담과 서비스 성장 기대가 엇갈리며 밸류에이션 논쟁
-```
-
-Cards are market narrative candidates. Use cautious wording:
-
-```text
-시장 뉴스는 ... 요인으로 언급했습니다.
-... 우려가 투자심리에 부담으로 부각됐습니다.
-```
-
-Do not state a news narrative as confirmed company fact.
-
-## Required Hidden Brief
-
-Every card must carry an internal English ontology bridge brief for the later filing-analysis step.
-
-Required meaning:
-
-```text
-ticker
-company_name
-market narrative
-source URLs
-likely financial axes
-likely business/risk axes
-suggested ontology questions
-```
-
-If the card is generated from an app-normalized provider result, the hidden brief must also preserve:
-
-```text
-candidate explanation
-source timing when available
-whether the event appears company-specific, market-driven, sector-driven, mixed, or unknown
-```
-
-Do not expose the English brief in visible chat text.
+- Rank items by recency, company specificity, and whether they describe a material business or financial channel.
+- Keep direct company items separate from sector-wide or market-wide discussion.
+- Do not claim that a post caused a price move solely because it is recent.
+- Do not turn a feed summary into an earnings, valuation, or buy/sell conclusion.
 
 ## Final Output
 
-Write only the short Korean 안내문. The web runtime will create structured cards from the market/news provider or stock-news tool result.
+Write a compact Korean Markdown orientation for the investor:
 
-Do not print JSON or Markdown cards yourself.
+```text
+최근 피드에서 확인된 이슈
+추가 시장 보도에서 확인된 맥락
+회사 직접 관련 내용
+시장/섹터 맥락
+다음으로 확인할 것
+```
+
+When the user has not selected an item yet, end by inviting a specific stored issue to be examined further. Do not expose X, MCP, tool names, issue IDs, raw payloads, or internal retrieval details unless the user explicitly asks for debug provenance.

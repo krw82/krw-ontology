@@ -522,6 +522,55 @@ class MetricPoint(ContractModel):
     conflict_value_count: int = Field(default=1, ge=1)
 
 
+class VisualizationMetricPoint(ContractModel):
+    """A chart-safe numeric observation with an immutable evidence anchor."""
+
+    period: str
+    value: float
+    formatted_value: str | None = None
+    object_id: str
+
+
+class VisualizationMetricScope(ContractModel):
+    """Stable semantic ownership for one renderer-neutral metric series.
+
+    The chart sidecar already indexes company totals, geographic segments,
+    products, and other dimensions separately.  Preserve that distinction in
+    the public MCP contract so presentation code can choose a total or a
+    breakdown without parsing a technical ``series_key``.
+    """
+
+    kind: str
+    key: str
+    label: str | None = None
+
+
+class VisualizationMetricSeries(ContractModel):
+    """One bounded, renderer-neutral metric series from the verified sidecar."""
+
+    series_key: str
+    label: str
+    ticker: str | None = None
+    metric_name: str | None = None
+    canonical_metric: str | None = None
+    unit: str | None = None
+    period_type: str | None = None
+    duration: str | None = None
+    scope: VisualizationMetricScope
+    points: list[VisualizationMetricPoint] = Field(default_factory=list, max_length=12)
+
+
+class VisualizationMetricSeriesPack(ContractModel):
+    """Public, bounded projection of chart-series sidecar data.
+
+    This intentionally excludes filing text and sidecar internals.  The
+    renderer receives only numbers, labels, units, periods, and evidence ids.
+    """
+
+    mode: Literal["chart_series_sidecar"] = "chart_series_sidecar"
+    series: list[VisualizationMetricSeries] = Field(default_factory=list, max_length=8)
+
+
 class ClauseEvidenceMatch(ContractModel):
     """Clause-specific relevance and directness for one deduplicated unit."""
 
@@ -673,6 +722,7 @@ class ResearchState(ContractModel):
     clause_coverage: list[ClauseCoverage]
     evidence_units: list[EvidenceUnit]
     computed_values: list[ComputedValue] = Field(default_factory=list)
+    metric_series_pack: VisualizationMetricSeriesPack | None = None
     calculation_coverage: list[CalculationCoverage] = Field(default_factory=list)
     missing_parts: list[MissingPart] = Field(default_factory=list)
     recommended_actions: list[RecommendedAction] = Field(default_factory=list)
@@ -1058,6 +1108,7 @@ def compile_research_state(
     # derives every model-visible numeric value from selected, complete-lineage
     # metric evidence below.
     raw_computed_values: list[ComputedValue] = []
+    metric_series_pack = _compact_visualization_metric_series_pack(raw)
     warnings = _warnings(raw)
     while True:
         source_anchors = _source_anchors(raw, evidence_units)
@@ -1129,6 +1180,7 @@ def compile_research_state(
             clause_coverage=coverage,
             evidence_units=evidence_units,
             computed_values=computed_values,
+            metric_series_pack=metric_series_pack,
             calculation_coverage=calculation_coverage,
             missing_parts=missing_parts,
             recommended_actions=actions,
@@ -1140,6 +1192,11 @@ def compile_research_state(
             and research_state_wire_bytes(state) <= MAX_RESEARCH_STATE_WIRE_BYTES
         ):
             return state
+        if metric_series_pack is not None:
+            metric_series_pack = None
+            if "visualization_metric_series_omitted_for_size" not in warnings:
+                warnings.append("visualization_metric_series_omitted_for_size")
+            continue
         removable_index = next(
             (
                 index
@@ -1153,6 +1210,70 @@ def compile_research_state(
                 "research_state_too_large: required-clause evidence exceeds the 180KB MCP wire budget"
             )
         evidence_units.pop(removable_index)
+
+
+def _compact_visualization_metric_series_pack(
+    raw: Mapping[str, Any],
+) -> VisualizationMetricSeriesPack | None:
+    """Return only the chart-safe slice of an internal metric sidecar pack."""
+    research_pack = _mapping(raw.get("research_pack"))
+    raw_pack = _mapping(research_pack.get("metric_series_pack"))
+    if raw_pack.get("mode") != "chart_series_sidecar":
+        return None
+
+    series: list[VisualizationMetricSeries] = []
+    for raw_series in _mapping_list(raw_pack.get("series"))[:8]:
+        series_key = _first_text(raw_series, "series_key")
+        if not series_key:
+            continue
+        raw_scope = _mapping(raw_series.get("scope"))
+        scope = VisualizationMetricScope(
+            kind=_first_text(raw_scope, "kind") or "unspecified",
+            key=_first_text(raw_scope, "key") or series_key,
+            label=_first_text(raw_scope, "label"),
+        )
+        canonical_metric = _first_text(raw_series, "canonical_metric")
+        label = _first_text(raw_series, "label") or canonical_metric or series_key
+        points: list[VisualizationMetricPoint] = []
+        for raw_point in _mapping_list(raw_series.get("points"))[:12]:
+            period = _first_text(raw_point, "period")
+            object_id = _first_text(raw_point, "object_id")
+            value = raw_point.get("value")
+            if not period or not object_id or isinstance(value, bool):
+                continue
+            try:
+                numeric_value = float(value)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(numeric_value):
+                continue
+            points.append(
+                VisualizationMetricPoint(
+                    period=period,
+                    value=numeric_value,
+                    formatted_value=_first_text(raw_point, "formatted_value"),
+                    object_id=object_id,
+                )
+            )
+        if not points:
+            continue
+        series.append(
+            VisualizationMetricSeries(
+                series_key=series_key,
+                label=label,
+                ticker=_first_text(raw_series, "ticker"),
+                metric_name=_first_text(raw_series, "metric_name"),
+                canonical_metric=canonical_metric,
+                unit=_first_text(raw_series, "unit"),
+                period_type=_first_text(raw_series, "period_type"),
+                duration=_first_text(raw_series, "duration"),
+                scope=scope,
+                points=points,
+            )
+        )
+    if not series:
+        return None
+    return VisualizationMetricSeriesPack(series=series)
 
 
 def research_state_model_bytes(state: ResearchState) -> int:

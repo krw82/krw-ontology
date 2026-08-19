@@ -171,6 +171,13 @@ cleanup_or_retention
 
 CLI가 달라도 내부 publish primitive는 하나여야 한다.
 
+`cleanup_or_retention`은 promote 성공 직후 실행되는 자동 GC로 구현했다:
+`release cache gc --keep current`(cache 열거 범위는 아래 Fragment cache 규칙)와
+`release gc --keep N`(N은 CLI config `release-keep-releases`, 기본 1)을
+`cache_gc.lock` 보호 아래 실행한다. 이 자동 GC는 config `release-auto-gc`
+(기본 on, env `KRW_RELEASE_AUTO_GC`로도 끌 수 있음)로 제어하며, 실패해도
+promote 결과에는 영향을 주지 않는다(non-fatal).
+
 적용 대상:
 
 - `build-research-pipeline --publish-root`
@@ -291,6 +298,11 @@ MCP tool contract는 유지한다. monolith/shard 차이는 serving router가 �
       20260611T042000Z_bad99999.failed/
     .index_fragment_cache/
       fragments/
+      v3/
+        company_shards/
+        spine_fragments/
+        router_sidecars/
+        global_spines/
       manifests/
       locks/
     locks/
@@ -310,6 +322,8 @@ Notes:
 - shard outputs are declared in `manifest.json`; serving router decides which index file to open.
 - candidate roots are never served.
 - failed candidates are not promoted and can be inspected.
+- `locks/cache_gc.lock` — 구현됨: `FileProcessLock` 기반이며 `release cache gc`,
+  `release gc`, promote 후 자동 gc가 이 lock을 공유한다.
 
 ## 4. Release transaction lifecycle
 
@@ -568,8 +582,8 @@ Fragment cache 운영 규칙:
 - Corrupt cache는 build 실패가 아니라 해당 artifact fragment 재compile로 복구한다.
 - `krw-ontology index cache status --root <release>`는 현재 build plan이 참조하는 fragment와 cache에 남은 unreferenced fragment를 함께 보여 준다.
 - `krw-ontology index cache gc --root <release>`는 dry-run이다.
-- 실제 삭제는 `krw-ontology index cache gc --root <release> --yes`에서만 수행한다.
-- GC 삭제 범위는 `<cache-root>/fragments/**/*.sqlite`와 해당 `-wal`, `-shm` sidecar로 제한한다.
+- 실제 삭제는 `--yes`가 명시된 실행(`index cache gc --yes`, `release cache gc --yes`)과 promote 후 자동 gc에서만 수행한다.
+- GC 삭제 범위는 `<cache-root>/fragments/**`, `v3/company_shards/**`, `v3/spine_fragments/**`, `v3/router_sidecars/**`, `v3/global_spines/**`의 `.sqlite`와 그 `-wal`/`-shm`/`-journal`, `.seal.json`, `.verify.json` sidecar로 제한한다. 글로벌 스파인 캐시(빌드당 1개, 콘텐츠 해시 키)는 현재 빌드 플랜이 참조하는 세대만 유지한다.
 - GC는 release candidate, current release, final index output을 삭제하지 않는다.
 
 Worker scheduling:

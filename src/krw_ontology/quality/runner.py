@@ -38,6 +38,7 @@ from krw_ontology.pipeline.stages.generate_support_links import generate_support
 from krw_ontology.pipeline.stages.validate_ontology import run_validate_ontology
 from krw_ontology.quality.models import (
     BATCH_FAILURE,
+    DIRECT_XBRL_METRIC_GAP,
     DOCS_MISSING,
     EXECUTABLE_REPAIR_KINDS,
     NORMALIZE_NUMERIC,
@@ -49,6 +50,7 @@ from krw_ontology.quality.models import (
 )
 from krw_ontology.quality.queue import QualityRepairStore
 from krw_ontology.quality.safe_repair import (
+    run_direct_xbrl_metric_gap_repair,
     run_numeric_revalidation,
     run_reference_rebuild,
 )
@@ -211,6 +213,9 @@ def _run_one(
         return
     if job.kind == REPAIR_REFERENCE:
         run_reference_rebuild(job, root=root)
+        return
+    if job.kind == DIRECT_XBRL_METRIC_GAP:
+        run_direct_xbrl_metric_gap_repair(job, root=root)
         return
     if job.kind in {SECTION_FAIL, SECTION_WARN}:
         job.payload["repair_outcome"] = "section_repair_disabled"

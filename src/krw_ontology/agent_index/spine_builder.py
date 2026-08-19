@@ -18,6 +18,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from krw_ontology.agent_index.cross_company_links import (
@@ -1527,6 +1528,32 @@ def plan_spine_shard_release_outputs(
             router_cache_errors = (f"{type(exc).__name__}:{exc}",)
     router_cache_hit = not no_cache and not router_cache_errors
 
+    global_spine_cache_key: str | None = None
+    global_spine_cache_path_value: Path | None = None
+    global_spine_cache_errors: tuple[str, ...] = ("no_cache",) if no_cache else ()
+    if not no_cache:
+        try:
+            ordered_fragment_standins = [
+                SimpleNamespace(
+                    ticker=str(row["ticker"]), cache_key=str(row["spine_fragment_cache_key"])
+                )
+                for row in companies
+            ]
+            global_spine_cache_key = _global_spine_semantic_cache_key(
+                ordered_fragment_standins,
+                source_manifest_hash=plan.source_manifest_hash,
+                generate_links=generate_links,
+            )
+            global_spine_cache_path_value = _global_spine_cache_path(
+                plan.cache_root, global_spine_cache_key
+            )
+            global_spine_cache_errors = _verify_global_spine_cache(
+                global_spine_cache_path_value, cache_key=global_spine_cache_key
+            )
+        except (OSError, TypeError, ValueError, sqlite3.Error) as exc:
+            global_spine_cache_errors = (f"{type(exc).__name__}:{exc}",)
+    global_spine_cache_hit = not no_cache and not global_spine_cache_errors
+
     company_nodes = [
         {
             "id": f"company_shard:{row['ticker']}",
@@ -1617,8 +1644,13 @@ def plan_spine_shard_release_outputs(
             "stage": "global_spine_merge",
             "depends_on": ["semantic_preflight"],
             "output": _path_label(resolved_root, global_spine_path),
-            "cache_hit": False,
-            "status": "rebuild",
+            "cache_key": global_spine_cache_key,
+            "cache_path": str(global_spine_cache_path_value)
+            if global_spine_cache_path_value is not None
+            else None,
+            "cache_hit": global_spine_cache_hit,
+            "cache_errors": list(global_spine_cache_errors),
+            "status": "cached" if global_spine_cache_hit else "rebuild",
         },
         {
             "id": "cross_company_links",
@@ -1719,6 +1751,14 @@ def plan_spine_shard_release_outputs(
             "key": router_cache_key,
             "path": str(router_cache_path_value) if router_cache_path_value is not None else None,
             "errors": list(router_cache_errors),
+        },
+        "global_spine_cache": {
+            "hit": global_spine_cache_hit,
+            "key": global_spine_cache_key,
+            "path": str(global_spine_cache_path_value)
+            if global_spine_cache_path_value is not None
+            else None,
+            "errors": list(global_spine_cache_errors),
         },
         "outputs": {
             "build_plan": _path_label(resolved_root, build_plan_path),
@@ -3133,7 +3173,7 @@ def _spine_fragment_cache_key(
             "global_spine_builder_version": GLOBAL_SPINE_BUILDER_VERSION,
             "ticker": ticker,
             "company_cache_key": company_cache_key,
-            "source_manifest_hash": source_manifest_hash,
+            "metric_dictionary": metric_dictionary_binding(),
         }
     )
 

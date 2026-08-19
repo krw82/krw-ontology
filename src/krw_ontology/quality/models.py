@@ -21,11 +21,13 @@ BATCH_FAILURE = "batch_failure"
 COVERAGE_GAP = "coverage_gap"
 REPAIR_REFERENCE = "repair_reference"
 NORMALIZE_NUMERIC = "normalize_numeric"
+DIRECT_XBRL_METRIC_GAP = "direct_xbrl_metric_gap"
 
 EXECUTABLE_REPAIR_KINDS = {
     BATCH_FAILURE,
     DOCS_MISSING,
     REPAIR_REFERENCE,
+    DIRECT_XBRL_METRIC_GAP,
 }
 
 DEFERRED_REPAIR_KINDS = {

@@ -7,6 +7,7 @@ import json
 import shutil
 import sqlite3
 import tarfile
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -35,7 +36,7 @@ from krw_ontology.agent_index.spine_schema import (
     write_global_spine_metadata,
     write_spine_verification_seal,
 )
-from krw_ontology.cli.config import load_cli_config
+from krw_ontology.cli.config import load_cli_config, set_config_value
 from krw_ontology.cli.main import app
 from krw_ontology.release import write_release_manifest_v3
 from krw_ontology.pipeline.research_plan import ResearchFilingTarget
@@ -1238,6 +1239,33 @@ class TestConfigCommand:
         assert "prod-host: ubuntu@prod" in show_result.output
 
 
+def test_config_supports_release_retention_keys(tmp_path: Path):
+    config_path = tmp_path / "config.json"
+    set_config_value("release-keep-releases", "2", path=config_path)
+    set_config_value("release-auto-gc", "0", path=config_path)
+    config = load_cli_config(config_path)
+    assert config.release_keep_releases == "2"
+    assert config.release_auto_gc == "0"
+
+
+def test_release_retention_resolution_defaults_to_one(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("KRW_ONTOLOGY_CLI_CONFIG", str(tmp_path / "config.json"))
+    assert cli_main._resolve_release_keep(None) == 1
+    assert cli_main._resolve_release_keep(3) == 3
+    runner.invoke(app, ["config", "set", "release-keep-releases", "2"])
+    assert cli_main._resolve_release_keep(None) == 2
+
+
+def test_release_auto_gc_env_and_config_kill_switch(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("KRW_ONTOLOGY_CLI_CONFIG", str(tmp_path / "config.json"))
+    assert cli_main._release_auto_gc_enabled() is True
+    monkeypatch.setenv("KRW_RELEASE_AUTO_GC", "0")
+    assert cli_main._release_auto_gc_enabled() is False
+    monkeypatch.delenv("KRW_RELEASE_AUTO_GC")
+    runner.invoke(app, ["config", "set", "release-auto-gc", "false"])
+    assert cli_main._release_auto_gc_enabled() is False
+
+
 def test_release_publish_config_infers_releases_root_from_prepared_release_root(tmp_path: Path):
     releases_root = tmp_path / "releases"
     prepared_release = releases_root / "dev" / "prepared"
@@ -2341,6 +2369,9 @@ class TestReleaseCommand:
         (env_root / "current").symlink_to(current_release.name)
         (env_root / "locks").mkdir()
         (env_root / "events").mkdir()
+        # Stray publish-dev leftover (release_id="status"): reserved, never a release.
+        (env_root / "status" / "logs").mkdir(parents=True)
+        os.utime(env_root / "status", (0, 0))
         failed = env_root / "failed" / "failed-one"
         failed.mkdir(parents=True)
         (failed / "failure.json").write_text(
@@ -2370,6 +2401,7 @@ class TestReleaseCommand:
         assert "locks" not in payload["releases"]
         assert "events" not in payload["releases"]
         assert "failed" not in payload["releases"]
+        assert "status" not in payload["releases"]
 
         inspected = runner.invoke(
             app,
@@ -2406,6 +2438,7 @@ class TestReleaseCommand:
         )
         assert dry_run.exit_code == 0, dry_run.output
         assert "Release GC: dry-run" in dry_run.output
+        assert "status" not in dry_run.output
         assert old.exists()
         assert current_release.exists()
         assert newest.exists()
@@ -2432,6 +2465,7 @@ class TestReleaseCommand:
         assert newest.exists()
         assert not failed.exists()
         assert (env_root / "events").exists()
+        assert (env_root / "status" / "logs").is_dir()
         assert os.readlink(env_root / "current") == current_release.name
 
     def test_release_manifest_verify_promote_and_rollback(self, tmp_path: Path):
@@ -2690,6 +2724,40 @@ class TestReleaseCommand:
 
         assert os.readlink(releases_root / "dev" / "current") == target.name
         assert result["verify_report"] == str(target / "verify" / "release_verify.json")
+
+    def test_release_promote_lightweight_uses_lightweight_preverification(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+    ):
+        releases_root = tmp_path / "releases"
+        target = releases_root / "prod" / "new-release"
+        _write_minimal_v3_release(target, release_id=target.name, env="prod")
+        calls: list[bool] = []
+        original_verify = cli_main.verify_release_root
+
+        def observe_verify(*args, **kwargs):
+            calls.append(bool(kwargs.get("deep")))
+            return original_verify(*args, **kwargs)
+
+        monkeypatch.setattr(cli_main, "verify_release_root", observe_verify)
+        result = runner.invoke(
+            app,
+            [
+                "release",
+                "promote",
+                target.name,
+                "--releases-root",
+                str(releases_root),
+                "--env",
+                "prod",
+                "--lightweight",
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert calls == [False]
+        assert os.readlink(releases_root / "prod" / "current") == target.name
 
     def test_release_promote_rejects_preverification_for_another_release(
         self,
@@ -3430,6 +3498,37 @@ class TestReleaseCommand:
         assert "Prod startup-check: ok" in result.output
         assert "startup_release_id: 20260528_080000" in result.output
         assert "krw-ontology release promote 20260528_080000" not in result.output
+
+    def test_release_materialize_prod_reuses_verified_candidate_for_promotion(
+        self, tmp_path: Path, monkeypatch
+    ):
+        releases_root = tmp_path / "releases"
+        source = releases_root / "dev" / "20260528_081000"
+        _write_minimal_v3_release(source, release_id=source.name, env="dev", ticker="VG")
+        original_promote = cli_main.promote_local_release
+
+        def observe_promote(*args, **kwargs):
+            verification = kwargs.get("preverified")
+            report = kwargs.get("preverified_report")
+            assert verification is not None and verification["ok"] is True
+            assert verification["deep"] is False
+            assert report is not None and report["ok"] is True
+            return original_promote(*args, **kwargs)
+
+        monkeypatch.setattr(cli_main, "promote_local_release", observe_promote)
+        result = runner.invoke(
+            app,
+            [
+                "release",
+                "materialize-prod",
+                source.name,
+                "--releases-root",
+                str(releases_root),
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert os.readlink(releases_root / "prod" / "current") == source.name
 
     def test_release_materialize_prod_no_promote_keeps_copy_only_behavior(self, tmp_path: Path):
         releases_root = tmp_path / "releases"
@@ -4465,6 +4564,7 @@ class TestPublishTickerCommand:
         tmp_path: Path,
         monkeypatch,
     ):
+        monkeypatch.setenv("KRW_RELEASE_AUTO_GC", "0")
         running = tmp_path / "running"
         releases_root = tmp_path / "releases"
         base = releases_root / "dev" / "base"
@@ -5151,6 +5251,79 @@ def test_release_publish_dev_quarantines_new_release_candidate_when_index_build_
     assert not (releases_root / "dev" / "current").exists()
 
 
+def test_release_publish_dev_runs_post_promote_gc(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("KRW_ONTOLOGY_CLI_CONFIG", str(tmp_path / "config.json"))
+    monkeypatch.setattr(cli_main, "_default_release_id", lambda: "20260819_gc")
+    running_root = tmp_path / "running"
+    releases_root = tmp_path / "releases"
+    _write_minimal_source_artifact(running_root, "CVX")
+    runner.invoke(app, ["config", "set", "running-root", str(running_root)])
+    calls: list[dict] = []
+
+    def fake_cache_gc(env_root, **kwargs):
+        calls.append({"kind": "cache", "env_root": str(env_root)})
+        return {"status": "ok", "deleted_count": 0, "deleted_bytes": 0}
+
+    def fake_release_gc(env_root, **kwargs):
+        calls.append({"kind": "release", "keep": kwargs.get("keep")})
+        return {"keep": kwargs.get("keep"), "protected": [], "deleted": [], "candidates": []}
+
+    monkeypatch.setattr(cli_main, "_execute_release_cache_gc", fake_cache_gc)
+    monkeypatch.setattr(cli_main, "_execute_release_gc", fake_release_gc)
+
+    result = runner.invoke(
+        app, ["release", "publish-dev", "--foreground", "--releases-root", str(releases_root)]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert {"kind": "cache", "env_root": str((releases_root / "dev").resolve())} in calls
+    assert any(call["kind"] == "release" and call["keep"] == 1 for call in calls)
+
+
+def test_release_publish_dev_survives_post_promote_gc_failure(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("KRW_ONTOLOGY_CLI_CONFIG", str(tmp_path / "config.json"))
+    monkeypatch.setattr(cli_main, "_default_release_id", lambda: "20260819_gcfail")
+    running_root = tmp_path / "running"
+    releases_root = tmp_path / "releases"
+    _write_minimal_source_artifact(running_root, "CVX")
+    runner.invoke(app, ["config", "set", "running-root", str(running_root)])
+
+    def boom(env_root, **kwargs):
+        raise RuntimeError("gc boom")
+
+    monkeypatch.setattr(cli_main, "_execute_release_cache_gc", boom)
+    monkeypatch.setattr(cli_main, "_execute_release_gc", boom)
+
+    result = runner.invoke(
+        app, ["release", "publish-dev", "--foreground", "--releases-root", str(releases_root)]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert (releases_root / "dev" / "current").is_symlink()
+
+
+def test_release_publish_dev_skips_post_promote_gc_when_disabled(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("KRW_ONTOLOGY_CLI_CONFIG", str(tmp_path / "config.json"))
+    monkeypatch.setenv("KRW_RELEASE_AUTO_GC", "0")
+    monkeypatch.setattr(cli_main, "_default_release_id", lambda: "20260819_gcoff")
+    running_root = tmp_path / "running"
+    releases_root = tmp_path / "releases"
+    _write_minimal_source_artifact(running_root, "CVX")
+    runner.invoke(app, ["config", "set", "running-root", str(running_root)])
+    calls: list[str] = []
+    monkeypatch.setattr(
+        cli_main, "_execute_release_cache_gc",
+        lambda env_root, **kwargs: calls.append("cache") or {"status": "ok"},
+    )
+
+    result = runner.invoke(
+        app, ["release", "publish-dev", "--foreground", "--releases-root", str(releases_root)]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert calls == []
+
+
 def test_release_publish_dev_status_and_watch_use_configured_publish_root(
     tmp_path: Path, monkeypatch
 ):
@@ -5450,3 +5623,120 @@ def test_release_force_defaults_to_background_worker_with_devnull_stdin(
     assert (release_root / "logs" / "release-build.log").exists()
     assert "Started release worker pid=34567" in result.output
     assert "watch: krw-ontology release watch 20260603_130000" in result.output
+
+
+def _write_release_cache_gc_fixture(releases_root: Path) -> Path:
+    env_root = releases_root / "dev"
+    _write_minimal_v3_release(env_root / "current-release", release_id="current-release")
+    _write_minimal_v3_release(env_root / "old-release", release_id="old-release")
+    os.utime(env_root / "old-release", (1_000_000_000, 1_000_000_000))
+    (env_root / "current").symlink_to("current-release")
+    (env_root / "locks").mkdir(parents=True, exist_ok=True)
+    cache_root = env_root / ".index_fragment_cache"
+    stale = cache_root / "v3" / "company_shards" / "ff" / "stale.sqlite"
+    stale.parent.mkdir(parents=True, exist_ok=True)
+    stale.write_bytes(b"stale")
+    stale.with_name(stale.name + ".verify.json").write_text("{}", encoding="utf-8")
+    return cache_root
+
+
+def test_execute_release_cache_gc_removes_unreferenced(tmp_path: Path):
+    releases_root = tmp_path / "releases"
+    cache_root = _write_release_cache_gc_fixture(releases_root)
+    env_root = releases_root / "dev"
+
+    dry = cli_main._execute_release_cache_gc(env_root, yes=False)
+    assert dry["candidate_count"] == 1
+    assert (cache_root / "v3" / "company_shards" / "ff" / "stale.sqlite").exists()
+
+    deleted = cli_main._execute_release_cache_gc(env_root, yes=True)
+    assert deleted["deleted_count"] == 1
+    assert not (cache_root / "v3" / "company_shards" / "ff" / "stale.sqlite").exists()
+    assert not (cache_root / "v3" / "company_shards" / "ff" / "stale.sqlite.verify.json").exists()
+    assert (env_root / "current").is_symlink()
+
+
+def test_execute_release_gc_keeps_current_and_newest(tmp_path: Path):
+    releases_root = tmp_path / "releases"
+    _write_release_cache_gc_fixture(releases_root)
+    env_root = releases_root / "dev"
+
+    result = cli_main._execute_release_gc(env_root, keep=1, yes=True)
+    assert "old-release" in result["deleted"]
+    assert not (env_root / "old-release").exists()
+    assert (env_root / "current-release").exists()
+    assert (env_root / "current").is_symlink()
+
+
+def test_run_release_cache_gc_skips_when_lock_held(tmp_path: Path):
+    releases_root = tmp_path / "releases"
+    _write_release_cache_gc_fixture(releases_root)
+    lock_path = releases_root / "dev" / "locks" / "cache_gc.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path.write_text(json.dumps({"pid": os.getpid(), "created_at": "now"}), encoding="utf-8")
+
+    result = cli_main._run_release_cache_gc_locked(releases_root / "dev", yes=True)
+
+    assert result["status"] == "skipped_lock_held"
+    assert (releases_root / "dev" / ".index_fragment_cache").exists()
+
+
+def test_run_post_promote_gc_composition_runs_real_gc_under_lock(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("KRW_ONTOLOGY_CLI_CONFIG", str(tmp_path / "config.json"))
+    releases_root = tmp_path / "releases"
+    cache_root = _write_release_cache_gc_fixture(releases_root)
+    env_root = releases_root / "dev"
+    release_root = env_root / "current-release"
+    progress_path = release_root / "indexes" / "build_progress.jsonl"
+
+    summary = cli_main._run_post_promote_gc(
+        releases_root=releases_root,
+        env="dev",
+        release_id="current-release",
+        env_root=env_root,
+        progress_path=progress_path,
+        release_root=release_root,
+        started_at=time.perf_counter(),
+    )
+
+    assert summary["status"] == "ok"
+    assert summary["keep"] == 1
+    assert "old-release" in summary["release_deleted"]
+    assert not (env_root / "old-release").exists()
+    assert (env_root / "current-release").exists()
+    assert (env_root / "current").is_symlink()
+    assert not (cache_root / "v3" / "company_shards" / "ff" / "stale.sqlite").exists()
+    assert not (env_root / "locks" / "cache_gc.lock").exists()
+    events = [
+        json.loads(line)
+        for line in progress_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    gc_statuses = [event["status"] for event in events if event["node_id"] == "post_promote_gc"]
+    assert gc_statuses == ["started", "complete"]
+
+
+def test_run_post_promote_gc_skips_when_lock_held(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("KRW_ONTOLOGY_CLI_CONFIG", str(tmp_path / "config.json"))
+    releases_root = tmp_path / "releases"
+    cache_root = _write_release_cache_gc_fixture(releases_root)
+    env_root = releases_root / "dev"
+    lock_path = env_root / "locks" / "cache_gc.lock"
+    lock_path.write_text(json.dumps({"pid": os.getpid(), "created_at": "now"}), encoding="utf-8")
+
+    summary = cli_main._run_post_promote_gc(
+        releases_root=releases_root,
+        env="dev",
+        release_id="current-release",
+        env_root=env_root,
+        progress_path=env_root / "current-release" / "indexes" / "build_progress.jsonl",
+        release_root=env_root / "current-release",
+        started_at=time.perf_counter(),
+    )
+
+    assert summary["status"] == "skipped_lock_held"
+    assert lock_path.exists()
+    assert (env_root / "old-release").exists()
+    assert (env_root / "current-release").exists()
+    assert (env_root / "current").is_symlink()
+    assert (cache_root / "v3" / "company_shards" / "ff" / "stale.sqlite").exists()

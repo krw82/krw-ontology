@@ -6,6 +6,7 @@ import asyncio
 from datetime import datetime, timezone
 import json
 import logging
+import os
 import random
 import re
 import time
@@ -133,12 +134,7 @@ class ExtractionWorker:
         started_monotonic = time.monotonic()
         metadata = dict(call_metadata or {})
         log_path = self._agent_call_log_path(stage_name, metadata)
-        cli_path = await asyncio.to_thread(
-            lambda: SubprocessCLITransport(
-                prompt=prompt_text,
-                options=ClaudeAgentOptions(model=self.model, cwd=str(self.cwd)),
-            )._find_cli()
-        )
+        cli_path = await asyncio.to_thread(self._resolve_cli_path, prompt_text)
         cmd = [
             cli_path,
             "-p",
@@ -167,6 +163,7 @@ class ExtractionWorker:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=str(self.cwd),
+            env=self._agent_environment(),
         )
         proc_pid = getattr(proc, "pid", None)
         self._write_agent_call_log(
@@ -178,6 +175,7 @@ class ExtractionWorker:
                 "attempt": attempt,
                 "max_retries": self.max_retries,
                 "pid": proc_pid,
+                "cli_path": cli_path,
                 "timeout_seconds": self.call_timeout_s,
                 "max_turns": self.max_turns,
                 **metadata,
@@ -320,6 +318,36 @@ class ExtractionWorker:
         if "result" in data:
             return data["result"]
         return data
+
+    def _resolve_cli_path(self, prompt_text: str) -> str:
+        configured_path = os.environ.get("KRW_CLAUDE_CLI_PATH", "").strip()
+        if configured_path:
+            path = Path(configured_path).expanduser()
+            if not path.is_file() or not os.access(path, os.X_OK):
+                raise ExtractionError(
+                    "KRW_CLAUDE_CLI_PATH must point to an executable Claude CLI: "
+                    f"{path}"
+                )
+            return str(path)
+
+        return SubprocessCLITransport(
+            prompt=prompt_text,
+            options=ClaudeAgentOptions(model=self.model, cwd=str(self.cwd)),
+        )._find_cli()
+
+    @staticmethod
+    def _agent_environment() -> dict[str, str]:
+        """Use the default Claude Code configuration, not inherited credentials."""
+        env = dict(os.environ)
+        for key in (
+            "ANTHROPIC_AUTH_TOKEN",
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_BASE_URL",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "CLAUDE_CONFIG_DIR",
+        ):
+            env.pop(key, None)
+        return env
 
     def _agent_call_log_path(self, stage_name: str, metadata: dict[str, Any]) -> Path | None:
         job_id = str(metadata.get("job_id") or "").strip()

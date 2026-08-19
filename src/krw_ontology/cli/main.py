@@ -130,6 +130,7 @@ from krw_ontology.quality.models import (
     SECTION_FAIL as QUALITY_SECTION_FAIL,
     SECTION_WARN as QUALITY_SECTION_WARN,
     SUCCEEDED as QUALITY_SUCCEEDED,
+    RepairJob,
     RepairPlan,
 )
 from krw_ontology.quality.queue import QualityRepairStore, default_plan_id
@@ -848,6 +849,7 @@ def quality_check_cmd(
     shards = report.get("shards") if isinstance(report.get("shards"), Mapping) else {}
     kind_counts = report["kind_counts"]
     severity_counts = report["severity_counts"]
+    metric_gap = report.get("metric_gap") if isinstance(report.get("metric_gap"), Mapping) else {}
     typer.echo(f"Release: {label}")
     typer.echo(f"Global spine: {report['global_spine_path']}")
     typer.echo(
@@ -863,6 +865,16 @@ def quality_check_cmd(
         f"available={shards.get('available_count', 0)} "
         f"missing={shards.get('missing_count', 0)}"
     )
+    metric_gap_summary = (
+        metric_gap.get("summary") if isinstance(metric_gap.get("summary"), Mapping) else {}
+    )
+    if metric_gap_summary:
+        typer.echo(
+            "Metric gap: "
+            f"eligible={metric_gap_summary.get('eligible', 0)} "
+            f"present={metric_gap_summary.get('present', 0)} "
+            f"blocked={metric_gap_summary.get('blocked', 0)}"
+        )
     for missing_shard in list(shards.get("missing") or [])[:10]:
         if isinstance(missing_shard, Mapping):
             typer.echo(
@@ -1176,6 +1188,17 @@ def quality_repair_plan_cmd(
     min_docs: int = typer.Option(5, "--min-docs", min=1),
     force: bool = typer.Option(False, "--force", help="Overwrite an existing plan id."),
     json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
+    details: bool = typer.Option(
+        False,
+        "--details",
+        help="Show representative jobs with ticker, document, stage, and reason.",
+    ),
+    limit: int = typer.Option(
+        10,
+        "--limit",
+        min=1,
+        help="Maximum representative jobs to show per repair kind with --details.",
+    ),
 ) -> None:
     """Create a reviewed repair plan from quality events."""
     try:
@@ -1218,11 +1241,16 @@ def quality_repair_plan_cmd(
         typer.echo(f"FAILED quality repair plan: {exc}")
         raise typer.Exit(1) from exc
 
+    planned_job_ids = set(plan.job_ids)
+    planned_jobs = [job for job in jobs if job.job_id in planned_job_ids]
+    job_details = _quality_plan_job_details(planned_jobs)
+
     if json_output:
         _echo_json(
             {
                 "plan": plan.to_dict(),
                 "queue_root": str(store.queue_dir),
+                "job_details": _quality_plan_job_details_json(job_details, limit=limit),
                 "deferred_excluded": dict(Counter(job.kind for job in deferred_jobs))
                 if not include_deferred
                 else {},
@@ -1233,8 +1261,22 @@ def quality_repair_plan_cmd(
     typer.echo(f"Release: {plan.release_label}")
     typer.echo(f"Queue: {store.queue_dir}")
     typer.echo(f"Jobs: {len(plan.job_ids)}")
-    for repair_kind, count in sorted(plan.summary.items()):
-        typer.echo(f"- {repair_kind}: {count}")
+    for detail in job_details:
+        parts = [
+            f"- {detail['kind']}: {detail['jobs']}",
+            f"tickers={detail['tickers']}",
+            f"documents={detail['documents']}",
+        ]
+        if detail["stages"]:
+            parts.append("stages=" + ", ".join(detail["stages"]))
+        if detail["executors"]:
+            parts.append("executor=" + ", ".join(detail["executors"]))
+        typer.echo("; ".join(parts))
+        if details:
+            for job in detail["samples"][:limit]:
+                reason = str(job.reason or "").replace("\n", " ")[:180]
+                suffix = f" reason={reason}" if reason else ""
+                typer.echo(f"  sample: {_quality_job_description(job)}{suffix}")
     if deferred_jobs and not include_deferred:
         typer.echo(
             "Deferred excluded: "
@@ -1245,6 +1287,89 @@ def quality_repair_plan_cmd(
             + " (use --include-deferred to inspect, not recommended for run)"
         )
     typer.echo("Nothing executed yet.")
+
+
+def _quality_plan_job_details(jobs: list[RepairJob]) -> list[dict[str, Any]]:
+    """Build a concise, human-readable plan summary without rescanning data."""
+    grouped: dict[str, list[RepairJob]] = {}
+    for job in jobs:
+        grouped.setdefault(job.kind, []).append(job)
+
+    details: list[dict[str, Any]] = []
+    for kind, kind_jobs in sorted(grouped.items()):
+        documents = {
+            (
+                str(job.ticker or "").upper(),
+                str(job.doc_type_key or job.document_type or ""),
+                str(job.period or ""),
+            )
+            for job in kind_jobs
+        }
+        stages = sorted({str(job.stage) for job in kind_jobs if job.stage})
+        executors = sorted(
+            {
+                str(
+                    job.payload.get("repair_strategy")
+                    or job.payload.get("action")
+                    or _quality_plan_default_executor(job.kind)
+                )
+                for job in kind_jobs
+            }
+        )
+        details.append(
+            {
+                "kind": kind,
+                "jobs": len(kind_jobs),
+                "tickers": len({str(job.ticker or "").upper() for job in kind_jobs}),
+                "documents": len(documents),
+                "stages": stages,
+                "executors": executors,
+                "samples": kind_jobs,
+            }
+        )
+    return details
+
+
+def _quality_plan_job_details_json(
+    details: list[dict[str, Any]],
+    *,
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Serialize plan details without exposing in-memory RepairJob instances."""
+    serialized: list[dict[str, Any]] = []
+    for detail in details:
+        serialized_detail = {key: value for key, value in detail.items() if key != "samples"}
+        serialized_detail["samples"] = [
+            {
+                "job_id": job.job_id,
+                "status": job.status,
+                "ticker": job.ticker,
+                "document_type": job.document_type,
+                "doc_type_key": job.doc_type_key,
+                "period": job.period,
+                "stage": job.stage,
+                "reason": job.reason,
+                "count": job.count,
+                "executor": (
+                    job.payload.get("repair_strategy")
+                    or job.payload.get("action")
+                    or _quality_plan_default_executor(job.kind)
+                ),
+            }
+            for job in detail["samples"][:limit]
+        ]
+        serialized.append(serialized_detail)
+    return serialized
+
+
+def _quality_plan_default_executor(kind: str) -> str:
+    return {
+        QUALITY_BATCH_FAILURE: "document_clean_rerun",
+        QUALITY_DOCS_MISSING: "pipeline_queue",
+        "repair_reference": "deterministic_reference_rebuild",
+        "direct_xbrl_metric_gap": "staged_direct_xbrl_metric_addition",
+        "normalize_numeric": "report_only_numeric_revalidation",
+    }.get(kind, "manual_review")
 
 
 @quality_repair_app.command("show")
@@ -2054,6 +2179,8 @@ def config_show_cmd() -> None:
     typer.echo(f"prod-reload-command: {config.prod_reload_command or '<unset>'}")
     typer.echo(f"prod-health-url: {config.prod_health_url or '<unset>'}")
     typer.echo(f"prod-keep-releases: {config.prod_keep_releases or '<unset>'}")
+    typer.echo(f"release-keep-releases: {config.release_keep_releases or '<unset>'}")
+    typer.echo(f"release-auto-gc: {config.release_auto_gc or '<unset>'}")
 
 
 @config_app.command("set")
@@ -2619,15 +2746,16 @@ def _release_publish_dev(
             "totals": None,
         }
 
-    result = _publish_root_as_local_release(
-        source_root=resolved_source_root,
-        releases_root=releases_root,
-        env=env,
-        release_id=release_id,
-        promote=promote,
-        force_release=True,
-        allow_prepared_release_root=allow_prepared_release_root,
-    )
+    with FileProcessLock(queue.source_mutation_lock_path):
+        result = _publish_root_as_local_release(
+            source_root=resolved_source_root,
+            releases_root=releases_root,
+            env=env,
+            release_id=release_id,
+            promote=promote,
+            force_release=True,
+            allow_prepared_release_root=allow_prepared_release_root,
+        )
     result["build_index"] = build_index
     result["global_spine_present"] = Path(str(result["global_spine_path"])).is_file()
     result["index_layout"] = result.get("layout") or "global-spine-and-company-shards"
@@ -2835,6 +2963,16 @@ def _publish_tickers_as_release(
                     details={"env": resolved_env},
                     started_at=promote_started_at,
                 )
+                if promoted:
+                    _run_post_promote_gc(
+                        releases_root=resolved_releases_root,
+                        env=resolved_env,
+                        release_id=release_id,
+                        env_root=env_root,
+                        progress_path=progress_path,
+                        release_root=release_root,
+                        started_at=promote_started_at,
+                    )
         except Exception as exc:
             if not promoted:
                 quarantine_local_release(
@@ -3080,6 +3218,16 @@ def _publish_root_as_local_release(
                     details={"env": resolved_env},
                     started_at=promote_started_at,
                 )
+                if promoted:
+                    _run_post_promote_gc(
+                        releases_root=resolved_releases_root,
+                        env=resolved_env,
+                        release_id=release_id,
+                        env_root=env_root,
+                        progress_path=progress_path,
+                        release_root=release_root,
+                        started_at=promote_started_at,
+                    )
         except Exception as exc:
             if not promoted:
                 quarantine_local_release(
@@ -4484,7 +4632,13 @@ def release_materialize_prod_cmd(
         return
 
     try:
-        promotion = promote_local_release(releases_root, env="prod", release_id=target_id)
+        promotion = promote_local_release(
+            releases_root,
+            env="prod",
+            release_id=target_id,
+            preverified=prod_verification,
+            preverified_report=verify_report,
+        )
     except Exception as exc:
         typer.echo(f"FAILED prod promote: {exc}")
         raise typer.Exit(1) from exc
@@ -5837,28 +5991,26 @@ def release_gc_cmd(
     """Garbage-collect old local releases while always preserving current."""
     resolved_env = normalize_ontology_env(env)
     env_root = release_env_root(releases_root, resolved_env).expanduser().resolve()
-    current_id = current_release_id(env_root)
-    releases = list_release_ids(env_root)
-    protected = set(releases[:keep])
-    if current_id:
-        protected.add(current_id)
-    candidates = [env_root / release_id for release_id in releases if release_id not in protected]
-    failed_root = env_root / FAILED_RELEASE_DIRNAME
-    if include_failed and failed_root.is_dir():
-        candidates.extend(path for path in failed_root.iterdir() if path.is_dir())
+    lock = FileProcessLock(env_root / "locks" / "cache_gc.lock")
+    try:
+        lock.acquire()
+    except LockHeldError as exc:
+        typer.echo(str(exc))
+        raise typer.Exit(1) from exc
+    try:
+        result = _execute_release_gc(env_root, keep=keep, include_failed=include_failed, yes=yes)
+    finally:
+        lock.release()
+    candidates = result["candidates"]
     typer.echo(f"Release GC: {'delete' if yes else 'dry-run'} env={resolved_env}")
-    typer.echo(f"current: {current_id or '<missing>'}")
-    typer.echo(f"protected: {len(protected)}")
+    typer.echo(f"current: {result['current'] or '<missing>'}")
+    typer.echo(f"protected: {len(result['protected'])}")
     typer.echo(f"candidates: {len(candidates)}")
     for path in candidates:
         typer.echo(f"candidate: {path}")
     if not yes:
         return
-    for path in candidates:
-        if path.is_symlink() or not path.is_dir():
-            raise RuntimeError(f"Refusing to delete non-directory release candidate: {path}")
-        shutil.rmtree(path)
-    typer.echo(f"deleted: {len(candidates)}")
+    typer.echo(f"deleted: {result['candidate_count']}")
 
 
 @release_cache_app.command("status")
@@ -5946,72 +6098,36 @@ def release_cache_gc_cmd(
     limit: int = typer.Option(50, "--limit", min=0, help="Maximum candidate entries to print."),
 ) -> None:
     """Garbage-collect release index caches while preserving the selected release generation."""
-    target = _release_cache_target(releases_root=releases_root, env=env, keep=keep)
-    snapshot = _v3_index_cache_snapshot(
-        target["release_root"],
-        target["cache_root"],
+    resolved_env = normalize_ontology_env(env)
+    resolved_releases_root = _resolve_configured_releases_root(releases_root, env=resolved_env)
+    env_root = release_env_root(resolved_releases_root, resolved_env).expanduser().resolve()
+    result = _run_release_cache_gc_locked(
+        env_root,
+        keep_label=keep,
+        include_unreferenced=include_unreferenced,
+        include_tmp=include_tmp,
+        tmp_minutes=tmp_minutes,
+        yes=yes,
         workers=workers,
-        source_manifest_path=None,
     )
-    candidates: list[dict[str, Any]] = []
-    if include_unreferenced:
-        candidates.extend(
-            {
-                **entry,
-                "reason": "unreferenced",
-            }
-            for entry in snapshot["entries"]
-            if entry.get("referenced") is False and not entry.get("missing")
-        )
-    if include_tmp:
-        now = time.time()
-        minimum_age_seconds = tmp_minutes * 60
-        for path in _iter_release_cache_tmp_files(target["cache_root"]):
-            try:
-                stat = path.stat()
-            except OSError:
-                continue
-            age_seconds = max(0, int(now - stat.st_mtime))
-            if age_seconds < minimum_age_seconds:
-                continue
-            candidates.append(
-                {
-                    "kind": "tmp",
-                    "ticker": None,
-                    "cache_key": None,
-                    "path": str(path),
-                    "referenced": False,
-                    "missing": False,
-                    "size_bytes": stat.st_size,
-                    "reason": f"tmp_older_than_{tmp_minutes}m",
-                }
-            )
-
-    deleted_count = 0
-    deleted_bytes = 0
-    if yes:
-        for entry in candidates:
-            path = Path(str(entry["path"]))
-            removed_bytes = _delete_release_cache_candidate(path, target["cache_root"])
-            deleted_count += 1 if removed_bytes >= 0 else 0
-            deleted_bytes += max(0, removed_bytes)
-        _prune_empty_release_cache_dirs(target["cache_root"])
-
-    candidate_bytes = sum(int(entry.get("size_bytes") or 0) for entry in candidates)
+    if result.get("status") == "skipped_lock_held":
+        typer.echo(f"Release cache GC skipped: {result['lock_path']} is held by another gc run.")
+        raise typer.Exit(1)
+    candidates = result["candidates"]
     typer.echo(f"Release cache GC: {'deleted' if yes else 'dry-run'}")
-    typer.echo(f"env: {target['env']}")
-    typer.echo(f"keep: {target['keep']} release={target['release_id']}")
-    typer.echo(f"release_root: {target['release_root']}")
-    typer.echo(f"cache_root: {snapshot['cache_root']}")
+    typer.echo(f"env: {result['env']}")
+    typer.echo(f"keep: {result['keep']} release={result['release_id']}")
+    typer.echo(f"release_root: {result['release_root']}")
+    typer.echo(f"cache_root: {result['cache_root']}")
     typer.echo(
         "entries: "
-        f"total={snapshot['entry_count']} "
-        f"referenced={snapshot['referenced_existing_count']} "
-        f"missing_referenced={snapshot['missing_referenced_count']} "
-        f"unreferenced={snapshot['unreferenced_count']}"
+        f"total={result['entry_count']} "
+        f"referenced={result['referenced_existing_count']} "
+        f"missing_referenced={result['missing_referenced_count']} "
+        f"unreferenced={result['unreferenced_count']}"
     )
-    typer.echo(f"candidates: {len(candidates)} bytes={candidate_bytes}")
-    typer.echo(f"deleted: {deleted_count} bytes={deleted_bytes}")
+    typer.echo(f"candidates: {result['candidate_count']} bytes={result['candidate_bytes']}")
+    typer.echo(f"deleted: {result['deleted_count']} bytes={result['deleted_bytes']}")
     for entry in candidates[:limit]:
         typer.echo(
             f"candidate: {entry.get('reason')} {entry['kind']} "
@@ -6098,6 +6214,8 @@ def _sqlite_cache_file_family(path: Path) -> tuple[Path, ...]:
             Path(f"{path}-wal"),
             Path(f"{path}-shm"),
             Path(f"{path}-journal"),
+            path.with_name(path.name + ".seal.json"),
+            path.with_name(path.name + ".verify.json"),
         )
     return (path,)
 
@@ -6121,6 +6239,202 @@ def _path_inside(path: Path, parent: Path) -> bool:
     except ValueError:
         return False
     return True
+
+
+def _execute_release_gc(
+    env_root: Path, *, keep: int, include_failed: bool = False, yes: bool
+) -> dict[str, Any]:
+    env_root = env_root.expanduser().resolve()
+    current_id = current_release_id(env_root)
+    releases = list_release_ids(env_root)
+    protected = set(releases[:keep])
+    if current_id:
+        protected.add(current_id)
+    candidates = [env_root / release_id for release_id in releases if release_id not in protected]
+    if include_failed and (env_root / FAILED_RELEASE_DIRNAME).is_dir():
+        candidates.extend(
+            path for path in (env_root / FAILED_RELEASE_DIRNAME).iterdir() if path.is_dir()
+        )
+    deleted: list[str] = []
+    if yes:
+        for path in candidates:
+            if path.is_symlink() or not path.is_dir():
+                raise RuntimeError(f"Refusing to delete non-directory release candidate: {path}")
+            shutil.rmtree(path)
+            deleted.append(path.name)
+    return {
+        "keep": keep,
+        "current": current_id,
+        "protected": sorted(protected),
+        "candidates": [str(path) for path in candidates],
+        "candidate_count": len(candidates),
+        "deleted": deleted,
+    }
+
+
+def _execute_release_cache_gc(
+    env_root: Path,
+    *,
+    keep_label: str = "current",
+    include_unreferenced: bool = True,
+    include_tmp: bool = True,
+    tmp_minutes: int = 60,
+    yes: bool,
+    workers: int | None = None,
+) -> dict[str, Any]:
+    env_root = env_root.expanduser().resolve()
+    # Layout is <releases_root>/<env>, so the releases root is the env root's parent.
+    releases_root = env_root.parent
+    target = _release_cache_target(releases_root=releases_root, env=env_root.name, keep=keep_label)
+    snapshot = _v3_index_cache_snapshot(
+        target["release_root"], target["cache_root"], workers=workers, source_manifest_path=None
+    )
+    candidates: list[dict[str, Any]] = []
+    if include_unreferenced:
+        candidates.extend(
+            {**entry, "reason": "unreferenced"}
+            for entry in snapshot["entries"]
+            if entry.get("referenced") is False and not entry.get("missing")
+        )
+    if include_tmp:
+        now = time.time()
+        minimum_age_seconds = tmp_minutes * 60
+        for path in _iter_release_cache_tmp_files(target["cache_root"]):
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            if max(0, int(now - stat.st_mtime)) < minimum_age_seconds:
+                continue
+            candidates.append(
+                {
+                    "kind": "tmp",
+                    "path": str(path),
+                    "size_bytes": stat.st_size,
+                    "reason": f"tmp_older_than_{tmp_minutes}m",
+                }
+            )
+    deleted_count = 0
+    deleted_bytes = 0
+    if yes:
+        for entry in candidates:
+            removed = _delete_release_cache_candidate(
+                Path(str(entry["path"])), target["cache_root"]
+            )
+            deleted_count += 1 if removed >= 0 else 0
+            deleted_bytes += max(0, removed)
+        _prune_empty_release_cache_dirs(target["cache_root"])
+    return {
+        "env": target["env"],
+        "keep": target["keep"],
+        "release_id": target["release_id"],
+        "release_root": str(target["release_root"]),
+        "cache_root": str(target["cache_root"]),
+        "entry_count": snapshot["entry_count"],
+        "referenced_existing_count": snapshot["referenced_existing_count"],
+        "missing_referenced_count": snapshot["missing_referenced_count"],
+        "unreferenced_count": snapshot["unreferenced_count"],
+        "candidate_count": len(candidates),
+        "candidate_bytes": sum(int(entry.get("size_bytes") or 0) for entry in candidates),
+        "deleted_count": deleted_count,
+        "deleted_bytes": deleted_bytes,
+        "candidates": candidates,
+    }
+
+
+def _run_release_cache_gc_locked(env_root: Path, **kwargs: Any) -> dict[str, Any]:
+    lock = FileProcessLock(env_root.expanduser().resolve() / "locks" / "cache_gc.lock")
+    try:
+        lock.acquire()
+    except LockHeldError:
+        return {
+            "status": "skipped_lock_held",
+            "env_root": str(env_root),
+            "lock_path": str(lock.path),
+        }
+    try:
+        result = _execute_release_cache_gc(env_root, **kwargs)
+    finally:
+        lock.release()
+    result["status"] = "ok"
+    return result
+
+
+def _run_post_promote_gc(
+    *,
+    releases_root: Path,
+    env: str,
+    release_id: str,
+    env_root: Path,
+    progress_path: Path,
+    release_root: Path,
+    started_at: float,
+) -> dict[str, Any]:
+    """Run non-fatal cache/release GC immediately after a successful promote."""
+    summary: dict[str, Any] = {"status": "skipped_disabled"}
+    try:
+        if _release_auto_gc_enabled():
+            keep = _resolve_release_keep(None)
+            _append_release_progress_event(
+                progress_path,
+                release_root=release_root,
+                release_id=release_id,
+                node_id="post_promote_gc",
+                stage="gc",
+                status="started",
+                output=env_root / ".index_fragment_cache",
+                details={"keep": keep},
+            )
+            lock = FileProcessLock(env_root.expanduser().resolve() / "locks" / "cache_gc.lock")
+            try:
+                lock.acquire()
+            except LockHeldError:
+                summary = {
+                    "status": "skipped_lock_held",
+                    "env_root": str(env_root),
+                    "lock_path": str(lock.path),
+                    "keep": keep,
+                }
+            else:
+                try:
+                    cache_result = _execute_release_cache_gc(env_root, yes=True)
+                    release_result = _execute_release_gc(env_root, keep=keep, yes=True)
+                finally:
+                    lock.release()
+                summary = {
+                    "status": "ok",
+                    "cache_deleted_bytes": cache_result.get("deleted_bytes", 0),
+                    "release_deleted": release_result.get("deleted", []),
+                    "keep": keep,
+                }
+            _append_release_progress_event(
+                progress_path,
+                release_root=release_root,
+                release_id=release_id,
+                node_id="post_promote_gc",
+                stage="gc",
+                status="complete",
+                output=env_root / ".index_fragment_cache",
+                details={"summary": summary},
+                started_at=started_at,
+            )
+    except Exception as exc:  # gc 절대 빌드 실패로 전파 금지
+        summary = {"status": "failed", "error": str(exc)}
+        try:
+            _append_release_progress_event(
+                progress_path,
+                release_root=release_root,
+                release_id=release_id,
+                node_id="post_promote_gc",
+                stage="gc",
+                status="failed",
+                output=env_root / ".index_fragment_cache",
+                details={"error": str(exc)},
+                started_at=started_at,
+            )
+        except Exception:
+            pass
+    return summary
 
 
 def _read_json_object(path: Path) -> dict[str, object] | None:
@@ -6172,15 +6486,43 @@ def release_promote_cmd(
         min=0.1,
         help="Seconds to wait for the local health URL.",
     ),
+    lightweight: bool = typer.Option(
+        False,
+        "--lightweight",
+        help=(
+            "Use manifest, immutable-seal, and release-contract verification only. "
+            "Skips the default full deep scan of every shard."
+        ),
+    ),
 ) -> None:
-    """Atomically point env current to a verified release."""
+    """Atomically point env current to a verified release.
+
+    Default promotion performs a full deep verification.  --lightweight is an
+    explicit local-operator choice for a release whose immutable provenance is
+    already trusted; it still verifies the manifest, immutable seals, and v3
+    release contract before switching current.
+    """
     env_root = release_env_root(releases_root, env)
     previous_release_id = current_release_id(env_root)
     if previous_release_id == release_id:
         typer.echo(f"FAILED release promote: release {release_id} is already current")
         raise typer.Exit(1)
     try:
-        result = promote_local_release(releases_root, env=env, release_id=release_id)
+        preverified = None
+        if lightweight:
+            release_dir = release_env_root(releases_root, env) / release_id
+            preverified = verify_release_root(release_dir, env=env, deep=False)
+            if not preverified["ok"]:
+                raise ValueError(
+                    "Lightweight release verification failed: "
+                    + ", ".join(preverified["errors"])
+                )
+        result = promote_local_release(
+            releases_root,
+            env=env,
+            release_id=release_id,
+            preverified=preverified,
+        )
         hook_result = _run_local_release_post_switch_hooks(
             releases_root=releases_root,
             env=env,
@@ -7526,13 +7868,14 @@ def queue_run_cmd(
                     time.sleep(poll_interval)
                     continue
 
-                deferred_target = _process_queue_job(
-                    store,
-                    job,
-                    output_root,
-                    publish_prod=publish_prod,
-                    refresh_index=effective_refresh_index,
-                )
+                with FileProcessLock(store.source_mutation_lock_path):
+                    deferred_target = _process_queue_job(
+                        store,
+                        job,
+                        output_root,
+                        publish_prod=publish_prod,
+                        refresh_index=effective_refresh_index,
+                    )
                 if isinstance(deferred_target, _QueueReleasePublishTarget):
                     key = f"{deferred_target.env}:{deferred_target.releases_root}"
                     batch = pending_publish_targets.setdefault(
@@ -8597,6 +8940,29 @@ def _resolve_prod_settings(
         "health_url": resolved_health_url,
         "keep_releases": keep_value,
     }
+
+
+def _resolve_release_keep(keep_releases: int | None) -> int:
+    config = load_cli_config()
+    keep_value = keep_releases
+    if keep_value is None and config.release_keep_releases:
+        try:
+            keep_value = int(config.release_keep_releases)
+        except ValueError as exc:
+            raise ValueError("release-keep-releases must be an integer") from exc
+    if keep_value is None:
+        keep_value = 1
+    if keep_value < 1:
+        raise ValueError("release keep releases must be at least 1")
+    return keep_value
+
+
+def _release_auto_gc_enabled() -> bool:
+    env_flag = os.environ.get("KRW_RELEASE_AUTO_GC", "").strip().lower()
+    if env_flag in {"0", "false", "no", "off"}:
+        return False
+    config = load_cli_config()
+    return (config.release_auto_gc or "1").strip().lower() not in {"0", "false", "no", "off"}
 
 
 def _bundle_filter(path: Path) -> bool:
@@ -11235,6 +11601,7 @@ def index_cache_status_cmd(
     typer.echo(f"Company cache: referenced={snapshot['referenced_by_kind']['company_shard']}")
     typer.echo(f"Spine cache: referenced={snapshot['referenced_by_kind']['spine_fragment']}")
     typer.echo(f"Router cache: referenced={snapshot['referenced_by_kind']['router_sidecar']}")
+    typer.echo(f"Global spine cache: referenced={snapshot['referenced_by_kind']['global_spines']}")
     typer.echo(
         f"Artifact fragment cache: referenced={snapshot['referenced_by_kind']['artifact_fragment']}"
     )
@@ -11308,12 +11675,13 @@ def index_cache_gc_cmd(
         for entry in candidates:
             path = Path(str(entry["path"]))
             size = int(entry.get("size_bytes") or 0)
+            family_paths = _sqlite_cache_file_family(path)
             try:
-                path.unlink()
+                family_paths[0].unlink()
             except FileNotFoundError:
                 continue
-            if entry.get("kind") == "router_sidecar":
-                path.with_name(path.name + ".seal.json").unlink(missing_ok=True)
+            for family_path in family_paths[1:]:
+                family_path.unlink(missing_ok=True)
             deleted_count += 1
             deleted_bytes += size
     candidate_bytes = sum(int(entry.get("size_bytes") or 0) for entry in candidates)
@@ -11409,6 +11777,17 @@ def _v3_index_cache_snapshot(
                 "ticker": None,
                 "cache_key": router_key,
             }
+    global_spine_cache = plan.get("global_spine_cache")
+    if isinstance(global_spine_cache, Mapping):
+        global_spine_key = str(global_spine_cache.get("key") or "")
+        if global_spine_key:
+            referenced[
+                _v3_cache_path_from_key(resolved_cache_root, "global_spine", global_spine_key)
+            ] = {
+                "kind": "global_spines",
+                "ticker": None,
+                "cache_key": global_spine_key,
+            }
 
     entries: list[dict[str, Any]] = []
     referenced_existing_count = 0
@@ -11461,6 +11840,9 @@ def _v3_index_cache_snapshot(
         "router_sidecar": sum(
             1 for entry in entries if entry["kind"] == "router_sidecar" and entry["referenced"]
         ),
+        "global_spines": sum(
+            1 for entry in entries if entry["kind"] == "global_spines" and entry["referenced"]
+        ),
     }
     return {
         "cache_root": str(resolved_cache_root),
@@ -11481,6 +11863,7 @@ def _v3_cache_path_from_key(cache_root: Path, kind: str, cache_key: str) -> Path
         "company_shard": "company_shards",
         "spine_fragment": "spine_fragments",
         "router_sidecar": "router_sidecars",
+        "global_spine": "global_spines",
     }[kind]
     return cache_root / "v3" / directory / digest[:2] / f"{digest}.sqlite"
 
@@ -11492,6 +11875,7 @@ def _iter_v3_cache_files(cache_root: Path) -> list[Path]:
         cache_root / "v3" / "company_shards",
         cache_root / "v3" / "spine_fragments",
         cache_root / "v3" / "router_sidecars",
+        cache_root / "v3" / "global_spines",
     ):
         if directory.is_dir():
             paths.extend(path for path in directory.glob("*/*.sqlite") if path.is_file())
@@ -11511,4 +11895,6 @@ def _index_cache_kind(path: Path, cache_root: Path) -> str:
         return "spine_fragment"
     if "router_sidecars" in relative.parts:
         return "router_sidecar"
+    if "global_spines" in relative.parts:
+        return "global_spines"
     raise RuntimeError(f"unknown cache file kind: {path}")

@@ -1095,12 +1095,18 @@ def _spine_database_identity(path: Path) -> dict[str, int] | None:
 
 
 def _spine_database_identity_matches(sealed: Any, current: Mapping[str, int] | None) -> bool:
-    """Ignore metadata-only ctime drift while preserving content stat checks."""
+    """Match immutable bytes across a volume remount without trusting replacement.
+
+    ``st_dev`` is an identifier for the currently mounted filesystem, not the
+    file's bytes. APFS can change it after a restart or a volume remount while
+    keeping the same immutable inode, size, and nanosecond mtime. Those three
+    fields still reject normal replacement, truncation, and in-place writes.
+    """
     return bool(
         isinstance(sealed, Mapping)
         and current is not None
         and all(
             sealed.get(field) == current.get(field)
-            for field in ("device", "inode", "size", "mtime_ns")
+            for field in ("inode", "size", "mtime_ns")
         )
     )

@@ -5971,28 +5971,26 @@ def release_gc_cmd(
     """Garbage-collect old local releases while always preserving current."""
     resolved_env = normalize_ontology_env(env)
     env_root = release_env_root(releases_root, resolved_env).expanduser().resolve()
-    current_id = current_release_id(env_root)
-    releases = list_release_ids(env_root)
-    protected = set(releases[:keep])
-    if current_id:
-        protected.add(current_id)
-    candidates = [env_root / release_id for release_id in releases if release_id not in protected]
-    failed_root = env_root / FAILED_RELEASE_DIRNAME
-    if include_failed and failed_root.is_dir():
-        candidates.extend(path for path in failed_root.iterdir() if path.is_dir())
+    lock = FileProcessLock(env_root / "locks" / "cache_gc.lock")
+    try:
+        lock.acquire()
+    except LockHeldError as exc:
+        typer.echo(str(exc))
+        raise typer.Exit(1) from exc
+    try:
+        result = _execute_release_gc(env_root, keep=keep, include_failed=include_failed, yes=yes)
+    finally:
+        lock.release()
+    candidates = result["candidates"]
     typer.echo(f"Release GC: {'delete' if yes else 'dry-run'} env={resolved_env}")
-    typer.echo(f"current: {current_id or '<missing>'}")
-    typer.echo(f"protected: {len(protected)}")
+    typer.echo(f"current: {result['current'] or '<missing>'}")
+    typer.echo(f"protected: {len(result['protected'])}")
     typer.echo(f"candidates: {len(candidates)}")
     for path in candidates:
         typer.echo(f"candidate: {path}")
     if not yes:
         return
-    for path in candidates:
-        if path.is_symlink() or not path.is_dir():
-            raise RuntimeError(f"Refusing to delete non-directory release candidate: {path}")
-        shutil.rmtree(path)
-    typer.echo(f"deleted: {len(candidates)}")
+    typer.echo(f"deleted: {result['candidate_count']}")
 
 
 @release_cache_app.command("status")
@@ -6080,72 +6078,36 @@ def release_cache_gc_cmd(
     limit: int = typer.Option(50, "--limit", min=0, help="Maximum candidate entries to print."),
 ) -> None:
     """Garbage-collect release index caches while preserving the selected release generation."""
-    target = _release_cache_target(releases_root=releases_root, env=env, keep=keep)
-    snapshot = _v3_index_cache_snapshot(
-        target["release_root"],
-        target["cache_root"],
+    resolved_env = normalize_ontology_env(env)
+    resolved_releases_root = _resolve_configured_releases_root(releases_root, env=resolved_env)
+    env_root = release_env_root(resolved_releases_root, resolved_env).expanduser().resolve()
+    result = _run_release_cache_gc_locked(
+        env_root,
+        keep_label=keep,
+        include_unreferenced=include_unreferenced,
+        include_tmp=include_tmp,
+        tmp_minutes=tmp_minutes,
+        yes=yes,
         workers=workers,
-        source_manifest_path=None,
     )
-    candidates: list[dict[str, Any]] = []
-    if include_unreferenced:
-        candidates.extend(
-            {
-                **entry,
-                "reason": "unreferenced",
-            }
-            for entry in snapshot["entries"]
-            if entry.get("referenced") is False and not entry.get("missing")
-        )
-    if include_tmp:
-        now = time.time()
-        minimum_age_seconds = tmp_minutes * 60
-        for path in _iter_release_cache_tmp_files(target["cache_root"]):
-            try:
-                stat = path.stat()
-            except OSError:
-                continue
-            age_seconds = max(0, int(now - stat.st_mtime))
-            if age_seconds < minimum_age_seconds:
-                continue
-            candidates.append(
-                {
-                    "kind": "tmp",
-                    "ticker": None,
-                    "cache_key": None,
-                    "path": str(path),
-                    "referenced": False,
-                    "missing": False,
-                    "size_bytes": stat.st_size,
-                    "reason": f"tmp_older_than_{tmp_minutes}m",
-                }
-            )
-
-    deleted_count = 0
-    deleted_bytes = 0
-    if yes:
-        for entry in candidates:
-            path = Path(str(entry["path"]))
-            removed_bytes = _delete_release_cache_candidate(path, target["cache_root"])
-            deleted_count += 1 if removed_bytes >= 0 else 0
-            deleted_bytes += max(0, removed_bytes)
-        _prune_empty_release_cache_dirs(target["cache_root"])
-
-    candidate_bytes = sum(int(entry.get("size_bytes") or 0) for entry in candidates)
+    if result.get("status") == "skipped_lock_held":
+        typer.echo(f"Release cache GC skipped: {result['lock_path']} is held by another gc run.")
+        raise typer.Exit(1)
+    candidates = result["candidates"]
     typer.echo(f"Release cache GC: {'deleted' if yes else 'dry-run'}")
-    typer.echo(f"env: {target['env']}")
-    typer.echo(f"keep: {target['keep']} release={target['release_id']}")
-    typer.echo(f"release_root: {target['release_root']}")
-    typer.echo(f"cache_root: {snapshot['cache_root']}")
+    typer.echo(f"env: {result['env']}")
+    typer.echo(f"keep: {result['keep']} release={result['release_id']}")
+    typer.echo(f"release_root: {result['release_root']}")
+    typer.echo(f"cache_root: {result['cache_root']}")
     typer.echo(
         "entries: "
-        f"total={snapshot['entry_count']} "
-        f"referenced={snapshot['referenced_existing_count']} "
-        f"missing_referenced={snapshot['missing_referenced_count']} "
-        f"unreferenced={snapshot['unreferenced_count']}"
+        f"total={result['entry_count']} "
+        f"referenced={result['referenced_existing_count']} "
+        f"missing_referenced={result['missing_referenced_count']} "
+        f"unreferenced={result['unreferenced_count']}"
     )
-    typer.echo(f"candidates: {len(candidates)} bytes={candidate_bytes}")
-    typer.echo(f"deleted: {deleted_count} bytes={deleted_bytes}")
+    typer.echo(f"candidates: {result['candidate_count']} bytes={result['candidate_bytes']}")
+    typer.echo(f"deleted: {result['deleted_count']} bytes={result['deleted_bytes']}")
     for entry in candidates[:limit]:
         typer.echo(
             f"candidate: {entry.get('reason')} {entry['kind']} "
@@ -6257,6 +6219,125 @@ def _path_inside(path: Path, parent: Path) -> bool:
     except ValueError:
         return False
     return True
+
+
+def _execute_release_gc(
+    env_root: Path, *, keep: int, include_failed: bool = False, yes: bool
+) -> dict[str, Any]:
+    env_root = env_root.expanduser().resolve()
+    current_id = current_release_id(env_root)
+    releases = list_release_ids(env_root)
+    protected = set(releases[:keep])
+    if current_id:
+        protected.add(current_id)
+    candidates = [env_root / release_id for release_id in releases if release_id not in protected]
+    if include_failed and (env_root / FAILED_RELEASE_DIRNAME).is_dir():
+        candidates.extend(
+            path for path in (env_root / FAILED_RELEASE_DIRNAME).iterdir() if path.is_dir()
+        )
+    deleted: list[str] = []
+    if yes:
+        for path in candidates:
+            if path.is_symlink() or not path.is_dir():
+                raise RuntimeError(f"Refusing to delete non-directory release candidate: {path}")
+            shutil.rmtree(path)
+            deleted.append(path.name)
+    return {
+        "keep": keep,
+        "current": current_id,
+        "protected": sorted(protected),
+        "candidates": [str(path) for path in candidates],
+        "candidate_count": len(candidates),
+        "deleted": deleted,
+    }
+
+
+def _execute_release_cache_gc(
+    env_root: Path,
+    *,
+    keep_label: str = "current",
+    include_unreferenced: bool = True,
+    include_tmp: bool = True,
+    tmp_minutes: int = 60,
+    yes: bool,
+    workers: int | None = None,
+) -> dict[str, Any]:
+    env_root = env_root.expanduser().resolve()
+    # Layout is <releases_root>/<env>, so the releases root is the env root's parent.
+    releases_root = env_root.parent
+    target = _release_cache_target(releases_root=releases_root, env=env_root.name, keep=keep_label)
+    snapshot = _v3_index_cache_snapshot(
+        target["release_root"], target["cache_root"], workers=workers, source_manifest_path=None
+    )
+    candidates: list[dict[str, Any]] = []
+    if include_unreferenced:
+        candidates.extend(
+            {**entry, "reason": "unreferenced"}
+            for entry in snapshot["entries"]
+            if entry.get("referenced") is False and not entry.get("missing")
+        )
+    if include_tmp:
+        now = time.time()
+        minimum_age_seconds = tmp_minutes * 60
+        for path in _iter_release_cache_tmp_files(target["cache_root"]):
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            if max(0, int(now - stat.st_mtime)) < minimum_age_seconds:
+                continue
+            candidates.append(
+                {
+                    "kind": "tmp",
+                    "path": str(path),
+                    "size_bytes": stat.st_size,
+                    "reason": f"tmp_older_than_{tmp_minutes}m",
+                }
+            )
+    deleted_count = 0
+    deleted_bytes = 0
+    if yes:
+        for entry in candidates:
+            removed = _delete_release_cache_candidate(
+                Path(str(entry["path"])), target["cache_root"]
+            )
+            deleted_count += 1 if removed >= 0 else 0
+            deleted_bytes += max(0, removed)
+        _prune_empty_release_cache_dirs(target["cache_root"])
+    return {
+        "env": target["env"],
+        "keep": target["keep"],
+        "release_id": target["release_id"],
+        "release_root": str(target["release_root"]),
+        "cache_root": str(target["cache_root"]),
+        "entry_count": snapshot["entry_count"],
+        "referenced_existing_count": snapshot["referenced_existing_count"],
+        "missing_referenced_count": snapshot["missing_referenced_count"],
+        "unreferenced_count": snapshot["unreferenced_count"],
+        "candidate_count": len(candidates),
+        "candidate_bytes": sum(int(entry.get("size_bytes") or 0) for entry in candidates),
+        "deleted_count": deleted_count,
+        "deleted_bytes": deleted_bytes,
+        "candidates": candidates,
+    }
+
+
+def _run_release_cache_gc_locked(env_root: Path, **kwargs: Any) -> dict[str, Any]:
+    lock = FileProcessLock(env_root.expanduser().resolve() / "locks" / "cache_gc.lock")
+    try:
+        lock.acquire()
+    except LockHeldError:
+        return {
+            "status": "skipped_lock_held",
+            "env_root": str(env_root),
+            "lock_path": str(lock.path),
+        }
+    try:
+        result = _execute_release_cache_gc(env_root, **kwargs)
+    finally:
+        lock.release()
+    result["status"] = "ok"
+    return result
 
 
 def _read_json_object(path: Path) -> dict[str, object] | None:

@@ -5542,3 +5542,59 @@ def test_release_force_defaults_to_background_worker_with_devnull_stdin(
     assert (release_root / "logs" / "release-build.log").exists()
     assert "Started release worker pid=34567" in result.output
     assert "watch: krw-ontology release watch 20260603_130000" in result.output
+
+
+def _write_release_cache_gc_fixture(releases_root: Path) -> Path:
+    env_root = releases_root / "dev"
+    _write_minimal_v3_release(env_root / "current-release", release_id="current-release")
+    _write_minimal_v3_release(env_root / "old-release", release_id="old-release")
+    os.utime(env_root / "old-release", (1_000_000_000, 1_000_000_000))
+    (env_root / "current").symlink_to("current-release")
+    (env_root / "locks").mkdir(parents=True, exist_ok=True)
+    cache_root = env_root / ".index_fragment_cache"
+    stale = cache_root / "v3" / "company_shards" / "ff" / "stale.sqlite"
+    stale.parent.mkdir(parents=True, exist_ok=True)
+    stale.write_bytes(b"stale")
+    stale.with_name(stale.name + ".verify.json").write_text("{}", encoding="utf-8")
+    return cache_root
+
+
+def test_execute_release_cache_gc_removes_unreferenced(tmp_path: Path):
+    releases_root = tmp_path / "releases"
+    cache_root = _write_release_cache_gc_fixture(releases_root)
+    env_root = releases_root / "dev"
+
+    dry = cli_main._execute_release_cache_gc(env_root, yes=False)
+    assert dry["candidate_count"] == 1
+    assert (cache_root / "v3" / "company_shards" / "ff" / "stale.sqlite").exists()
+
+    deleted = cli_main._execute_release_cache_gc(env_root, yes=True)
+    assert deleted["deleted_count"] == 1
+    assert not (cache_root / "v3" / "company_shards" / "ff" / "stale.sqlite").exists()
+    assert not (cache_root / "v3" / "company_shards" / "ff" / "stale.sqlite.verify.json").exists()
+    assert (env_root / "current").is_symlink()
+
+
+def test_execute_release_gc_keeps_current_and_newest(tmp_path: Path):
+    releases_root = tmp_path / "releases"
+    _write_release_cache_gc_fixture(releases_root)
+    env_root = releases_root / "dev"
+
+    result = cli_main._execute_release_gc(env_root, keep=1, yes=True)
+    assert "old-release" in result["deleted"]
+    assert not (env_root / "old-release").exists()
+    assert (env_root / "current-release").exists()
+    assert (env_root / "current").is_symlink()
+
+
+def test_run_release_cache_gc_skips_when_lock_held(tmp_path: Path):
+    releases_root = tmp_path / "releases"
+    _write_release_cache_gc_fixture(releases_root)
+    lock_path = releases_root / "dev" / "locks" / "cache_gc.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path.write_text(json.dumps({"pid": os.getpid(), "created_at": "now"}), encoding="utf-8")
+
+    result = cli_main._run_release_cache_gc_locked(releases_root / "dev", yes=True)
+
+    assert result["status"] == "skipped_lock_held"
+    assert (releases_root / "dev" / ".index_fragment_cache").exists()

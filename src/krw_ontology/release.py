@@ -80,6 +80,9 @@ RELEASE_ENV_RESERVED_DIRNAMES = frozenset(
         "incoming",
         "locks",
         RELEASE_EVENTS_DIRNAME,
+        # Reserve "status" so a stray publish-dev run with release_id="status"
+        # can never become a release gc deletion candidate.
+        "status",
     }
 )
 ALLOWED_ONTOLOGY_ENVS = {"dev", "staging", "prod"}

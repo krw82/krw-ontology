@@ -2368,6 +2368,9 @@ class TestReleaseCommand:
         (env_root / "current").symlink_to(current_release.name)
         (env_root / "locks").mkdir()
         (env_root / "events").mkdir()
+        # Stray publish-dev leftover (release_id="status"): reserved, never a release.
+        (env_root / "status" / "logs").mkdir(parents=True)
+        os.utime(env_root / "status", (0, 0))
         failed = env_root / "failed" / "failed-one"
         failed.mkdir(parents=True)
         (failed / "failure.json").write_text(
@@ -2397,6 +2400,7 @@ class TestReleaseCommand:
         assert "locks" not in payload["releases"]
         assert "events" not in payload["releases"]
         assert "failed" not in payload["releases"]
+        assert "status" not in payload["releases"]
 
         inspected = runner.invoke(
             app,
@@ -2433,6 +2437,7 @@ class TestReleaseCommand:
         )
         assert dry_run.exit_code == 0, dry_run.output
         assert "Release GC: dry-run" in dry_run.output
+        assert "status" not in dry_run.output
         assert old.exists()
         assert current_release.exists()
         assert newest.exists()
@@ -2459,6 +2464,7 @@ class TestReleaseCommand:
         assert newest.exists()
         assert not failed.exists()
         assert (env_root / "events").exists()
+        assert (env_root / "status" / "logs").is_dir()
         assert os.readlink(env_root / "current") == current_release.name
 
     def test_release_manifest_verify_promote_and_rollback(self, tmp_path: Path):

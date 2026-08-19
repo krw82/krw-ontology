@@ -2329,3 +2329,17 @@ def test_verify_spine_shard_release_rejects_stale_quality_summary(tmp_path: Path
 
     assert result["ok"] is False
     assert "shard:AAPL:quality_summary_mismatch" in result["errors"]
+
+
+def test_spine_fragment_cache_key_ignores_source_manifest_hash():
+    key_a = spine_builder._spine_fragment_cache_key(
+        ticker="VG", company_cache_key="company-key-1", source_manifest_hash="manifest-a"
+    )
+    key_b = spine_builder._spine_fragment_cache_key(
+        ticker="VG", company_cache_key="company-key-1", source_manifest_hash="manifest-b"
+    )
+    key_c = spine_builder._spine_fragment_cache_key(
+        ticker="VG", company_cache_key="company-key-2", source_manifest_hash="manifest-a"
+    )
+    assert key_a == key_b
+    assert key_a != key_c

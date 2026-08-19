@@ -3173,7 +3173,7 @@ def _spine_fragment_cache_key(
             "global_spine_builder_version": GLOBAL_SPINE_BUILDER_VERSION,
             "ticker": ticker,
             "company_cache_key": company_cache_key,
-            "source_manifest_hash": source_manifest_hash,
+            "metric_dictionary": metric_dictionary_binding(),
         }
     )
 

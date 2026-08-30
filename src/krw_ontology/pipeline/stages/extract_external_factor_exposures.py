@@ -386,12 +386,12 @@ def _attach_scenario_and_quality(exposure: dict[str, Any]) -> None:
         str(exposure.get("evidence_grade") or "").lower(),
         0.0,
     )
-    ranking = max(0.0, min(1.0, specificity + grade_bonus - boilerplate * 0.25))
     exposure["specificity_score"] = round(specificity, 3)
     exposure["boilerplate_score"] = round(boilerplate, 3)
-    exposure["ranking_score"] = round(ranking, 3)
     if not exposure.get("materiality") or exposure.get("materiality") == "unknown":
-        exposure["materiality"] = _materiality_from_score(ranking)
+        exposure["materiality"] = _materiality_from_score(
+            max(0.0, min(1.0, specificity + grade_bonus - boilerplate * 0.25))
+        )
 
 
 def _scenario_effects(*, channel: str, factor: str, category: str) -> list[dict[str, Any]]:

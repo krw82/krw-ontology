@@ -232,7 +232,6 @@ class ResearchClaim(BaseModel):
     materiality_basis: list[str] | None = None
     specificity_score: float | None = None
     boilerplate_score: float | None = None
-    ranking_score: float | None = None
     confidence: str
     review_status: str = "accepted"
     schema_version: str = SCHEMA_VERSION
@@ -259,7 +258,6 @@ class ResearchObject(BaseModel):
     materiality_basis: list[str] | None = None
     specificity_score: float | None = None
     boilerplate_score: float | None = None
-    ranking_score: float | None = None
     confidence: str
     review_status: str = "accepted"
     schema_version: str = SCHEMA_VERSION
@@ -312,7 +310,6 @@ class ExternalFactorExposure(BaseModel):
     materiality_basis: list[str] | None = None
     specificity_score: float | None = None
     boilerplate_score: float | None = None
-    ranking_score: float | None = None
     supported_by_claims: list[str] | None = None
     supported_by_quotes: list[str] | None = None
     confidence: str
@@ -712,7 +709,6 @@ class BusinessFactor(BaseModel):
     materiality_basis: list[str] | None = None
     specificity_score: float | None = None
     boilerplate_score: float | None = None
-    ranking_score: float | None = None
     confidence: str = "medium"
     review_status: str = "accepted"
     schema_version: str = SCHEMA_VERSION

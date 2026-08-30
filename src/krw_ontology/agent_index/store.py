@@ -1267,7 +1267,25 @@ class OntologyStore:
             "SELECT * FROM objects WHERE id = ?",
             (object_id,),
         ).fetchone()
-        return _object_from_row(row) if row else None
+        if row:
+            return _object_from_row(row)
+        return self._support_link_object(object_id)
+
+    def _support_link_object(self, object_id: str) -> dict[str, Any] | None:
+        """Resolve a SupportLink id through the derived support_links table."""
+        row = self.conn.execute(
+            "SELECT json FROM support_links WHERE object_id = ?",
+            (object_id,),
+        ).fetchone()
+        if not row:
+            return None
+        try:
+            link = json.loads(row["json"])
+        except (TypeError, json.JSONDecodeError):
+            return None
+        if isinstance(link, dict) and link.get("id"):
+            return link
+        return None
 
     def find_object_ids(self, prefix: str, *, limit: int = 20) -> list[dict[str, Any]]:
         """Return object id candidates whose ids start with a caller-provided prefix."""
@@ -2711,9 +2729,9 @@ class OntologyStore:
     def trace(self, object_id: str) -> dict[str, Any] | None:
         """Trace an object back to supporting evidence and document metadata."""
         row = self.conn.execute("SELECT * FROM objects WHERE id = ?", (object_id,)).fetchone()
-        if not row:
+        obj = _object_from_row(row) if row else self._support_link_object(object_id)
+        if not obj:
             return None
-        obj = _object_from_row(row)
         evidence = self._expand_evidence(obj)
         return {
             "object": obj,
@@ -5021,21 +5039,14 @@ class OntologyStore:
         rows = self.conn.execute(
             """
             SELECT support.*
-            FROM objects AS links
+            FROM support_links AS links
             JOIN objects AS support
-              ON support.id = COALESCE(
-                    json_extract(links.json, '$.support_object_id'),
-                    json_extract(links.json, '$.from_id')
-                 )
-            WHERE links.type = 'SupportLink'
-              AND (
-                    json_extract(links.json, '$.target_object_id') = ?
-                 OR json_extract(links.json, '$.to_id') = ?
-              )
+              ON support.id = links.from_id
+            WHERE links.to_id = ?
               AND (support.review_status IS NULL OR support.review_status != 'rejected')
             ORDER BY support.type, support.id
             """,
-            (object_id, object_id),
+            (object_id,),
         ).fetchall()
         return [
             obj
@@ -5052,21 +5063,14 @@ class OntologyStore:
         rows = self.conn.execute(
             """
             SELECT target.*
-            FROM objects AS links
+            FROM support_links AS links
             JOIN objects AS target
-              ON target.id = COALESCE(
-                    json_extract(links.json, '$.target_object_id'),
-                    json_extract(links.json, '$.to_id')
-                 )
-            WHERE links.type = 'SupportLink'
-              AND (
-                    json_extract(links.json, '$.support_object_id') = ?
-                 OR json_extract(links.json, '$.from_id') = ?
-              )
+              ON target.id = links.to_id
+            WHERE links.from_id = ?
               AND (target.review_status IS NULL OR target.review_status != 'rejected')
             ORDER BY target.type, target.id
             """,
-            (support_id, support_id),
+            (support_id,),
         ).fetchall()
         return [
             obj

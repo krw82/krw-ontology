@@ -66,7 +66,7 @@ DEFAULT_INDEX_BUILD_WORKER_CAP = 12
 INDEX_BUILD_PLAN_FORMAT_VERSION = "krw-agent-index-build-plan/v1"
 SOURCE_ARTIFACT_MANIFEST_FORMAT_VERSION = "krw-agent-index-source-manifest/v1"
 INDEX_BUILD_GRAPH_FORMAT_VERSION = "krw-agent-index-build-graph/v1"
-INDEX_FRAGMENT_CACHE_FORMAT_VERSION = "krw-agent-index-fragment/v1"
+INDEX_FRAGMENT_CACHE_FORMAT_VERSION = "krw-agent-index-fragment/v2"
 INDEX_COMPANY_CACHE_FORMAT_VERSION = "krw-agent-index-company-cache/v1"
 INDEX_LAYOUT_VERSION = "krw-agent-index-layout/v1"
 SUPPORTED_INDEX_LAYOUTS = frozenset({"monolith", "monolith-and-shards", "shards"})
@@ -264,6 +264,7 @@ OBJECT_FILE_KEYS = {
 BASE_FRAGMENT_TABLES = (
     "documents",
     "objects",
+    "support_links",
     "edges",
     "quality_events",
     "object_fts",
@@ -445,6 +446,7 @@ TYPED_PROJECTION_OBJECT_TYPES = {
 INDEX_SHARD_TABLES = (
     "documents",
     "objects",
+    "support_links",
     "edges",
     "quality_events",
     "object_fts",
@@ -829,6 +831,7 @@ def verify_agent_index(index_path: Path, *, trust_seal: bool = True) -> dict[str
         "metadata",
         "documents",
         "objects",
+        "support_links",
         "edges",
         "quality_events",
         "object_fts",
@@ -941,7 +944,7 @@ def verify_agent_index(index_path: Path, *, trust_seal: bool = True) -> dict[str
                         errors.append(
                             f"metric_lookup_observation_context_invalid:{invalid_contexts}"
                         )
-            for table_name in ("documents", "objects", "edges", "quality_events"):
+            for table_name in ("documents", "objects", "support_links", "edges", "quality_events"):
                 if table_name in existing_tables:
                     counts[table_name] = int(
                         conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
@@ -4132,6 +4135,22 @@ def _create_schema(conn: sqlite3.Connection) -> None:
             artifact_path TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS support_links (
+            object_id TEXT PRIMARY KEY,
+            ticker TEXT NOT NULL,
+            from_id TEXT NOT NULL,
+            to_id TEXT NOT NULL,
+            support_type TEXT,
+            support_role TEXT,
+            stance TEXT,
+            support_strength TEXT,
+            inference_level TEXT,
+            requires_inference INTEGER DEFAULT 0,
+            evidence_grade TEXT,
+            evidence_strength TEXT,
+            json TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS quality_events (
             id TEXT PRIMARY KEY,
             ticker TEXT NOT NULL,
@@ -4480,6 +4499,10 @@ def _create_base_secondary_indexes(conn: sqlite3.Connection) -> None:
             ON edges(from_id, relation_id);
         CREATE INDEX IF NOT EXISTS idx_edges_to
             ON edges(to_id, relation_id);
+        CREATE INDEX IF NOT EXISTS idx_support_links_from
+            ON support_links(from_id);
+        CREATE INDEX IF NOT EXISTS idx_support_links_to
+            ON support_links(to_id);
         CREATE INDEX IF NOT EXISTS idx_quality_scope
             ON quality_events(ticker, doc_type_key, period, category);
         CREATE INDEX IF NOT EXISTS idx_object_search_text_ticker
@@ -4617,7 +4640,7 @@ def _index_artifact(
         ),
     )
 
-    stats = {"documents": 1, "objects": 0, "edges": 0, "quality_events": 0}
+    stats = {"documents": 1, "objects": 0, "support_links": 0, "edges": 0, "quality_events": 0}
     if section_quality.get("status") in {"warn", "fail"}:
         _insert_quality_event(
             conn,
@@ -4649,6 +4672,15 @@ def _index_artifact(
         elif artifact_key == "quality_events":
             stats["quality_events"] += _index_quality_events(
                 conn, path, ticker, document_type, doc_type_key, period
+            )
+        elif artifact_key == "support_links":
+            # SupportLink is a deterministic projection: it rides in the
+            # derived support_links table instead of the objects table.
+            stats["support_links"] += _index_support_links(
+                conn,
+                path,
+                ticker,
+                rows=object_rows_by_key.get(artifact_key),
             )
         elif artifact_key in OBJECT_FILE_KEYS:
             stats["objects"] += _index_objects(
@@ -4777,6 +4809,72 @@ def _index_objects(
     return count
 
 
+def _index_support_links(
+    conn: sqlite3.Connection,
+    path: Path | None,
+    ticker: str,
+    *,
+    rows: list[dict[str, Any]] | None = None,
+) -> int:
+    """Index SupportLink artifacts into the derived support_links shard table.
+
+    ``from_id``/``to_id`` columns store the same resolved endpoints the old
+    objects-table queries computed via COALESCE(support_object_id, from_id) and
+    COALESCE(target_object_id, to_id), so serving joins keep their semantics.
+    """
+    if not path and rows is None:
+        return 0
+    count = 0
+    link_rows: list[tuple[Any, ...]] = []
+    for link in rows if rows is not None else read_jsonl(path):
+        object_id = link.get("id")
+        if not object_id or link.get("type") != "SupportLink":
+            continue
+        from_id = link.get("support_object_id") or link.get("from_id")
+        to_id = link.get("target_object_id") or link.get("to_id")
+        if not from_id or not to_id:
+            continue
+        link_rows.append(
+            (
+                object_id,
+                link.get("ticker", ticker),
+                from_id,
+                to_id,
+                link.get("support_type"),
+                link.get("support_role"),
+                link.get("stance"),
+                link.get("support_strength"),
+                link.get("inference_level"),
+                1 if link.get("requires_inference") else 0,
+                link.get("evidence_grade"),
+                link.get("evidence_strength"),
+                json.dumps(link, ensure_ascii=False),
+            )
+        )
+        count += 1
+        if len(link_rows) >= BULK_INSERT_CHUNK_SIZE:
+            _flush_support_link_batch(conn, link_rows)
+    _flush_support_link_batch(conn, link_rows)
+    return count
+
+
+def _flush_support_link_batch(conn: sqlite3.Connection, rows: list[tuple[Any, ...]]) -> None:
+    if not rows:
+        return
+    conn.executemany(
+        """
+        INSERT OR REPLACE INTO support_links(
+            object_id, ticker, from_id, to_id, support_type, support_role,
+            stance, support_strength, inference_level, requires_inference,
+            evidence_grade, evidence_strength, json
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        rows,
+    )
+    rows.clear()
+
+
 def _index_quality_events(
     conn: sqlite3.Connection,
     path: Path | None,
@@ -4828,12 +4926,14 @@ def _rebuild_object_traceability(conn: sqlite3.Connection) -> int:
 
     incoming_support: dict[str, list[dict[str, Any]]] = defaultdict(list)
     calculations_by_output: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for link_row in conn.execute("SELECT from_id, to_id, json FROM support_links"):
+        try:
+            link = json.loads(link_row["json"])
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if link_row["from_id"] in objects and link_row["to_id"] in objects:
+            incoming_support[str(link_row["to_id"])].append(link)
     for obj in objects.values():
-        if obj.get("type") == "SupportLink":
-            support_id = obj.get("support_object_id") or obj.get("from_id")
-            target_id = obj.get("target_object_id") or obj.get("to_id")
-            if support_id in objects and target_id in objects:
-                incoming_support[str(target_id)].append(obj)
         if obj.get("type") == "Calculation" and obj.get("output_metric_id"):
             calculations_by_output[str(obj["output_metric_id"])].append(obj)
 

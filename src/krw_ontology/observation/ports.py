@@ -20,8 +20,9 @@ class RawObservation:
 
     phenomenon_time: ISO 8601 date/datetime string for the period the value
         describes (the trading day, the CPI reference month, ...).
-    value: the observed number, or None when the provider emitted the row
-        without a usable numeric value.
+    value: the observed number. Adapters skip rows whose value is missing or
+        unparseable rather than emitting them with None; None stays in the
+        contract for future sparse providers.
     result_time: ISO 8601 date string for when the value became known. This is
         the FRED/ALFRED vintage date; None for providers without a vintage
         concept (FMP and Polygon publish current values only).

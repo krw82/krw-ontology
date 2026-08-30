@@ -1,9 +1,11 @@
 """FRED observation adapter: series observations and ALFRED vintages.
 
 Fetches ``fred/series/observations``; with ``include_vintages=True`` the
-request becomes the ALFRED real-time view (real-time window plus
-``vintage_dates``) so first releases and revisions coexist as separate
-RawObservation rows. The "." missing-value sentinel is skipped, never stored.
+adapter requests the ALFRED all-vintages view (no real-time or
+``vintage_dates`` bounds are sent) and applies the requested observation
+window client-side, so first releases and revisions coexist as separate
+RawObservation rows — even when a first release was published before
+``request.start``. The "." missing-value sentinel is skipped, never stored.
 Every external failure collapses to ``status="unavailable"`` without raising.
 Values are advisory-only macro context, never filing evidence.
 """
@@ -37,10 +39,6 @@ from ._common import (
 
 _FRED_BASE_URL = "https://api.stlouisfed.org/fred"
 _MISSING_VALUE_SENTINELS = frozenset({".", ""})
-# FRED documented default real-time bounds; passing them explicitly selects
-# the ALFRED all-vintages window (every known revision row, real-time tagged).
-_REALTIME_EARLIEST = "1776-07-04"
-_REALTIME_LATEST = "9999-12-31"
 
 
 class FredProvider:
@@ -68,7 +66,10 @@ class FredProvider:
     def fetch_series(self, request: SeriesFetchRequest) -> SeriesFetchResult:
         try:
             return self._fetch(request)
-        except Exception:  # noqa: BLE001 - external failures never cross the port
+        # Transport (OSError family: URLError/HTTPError/timeout) plus bounded
+        # read and JSON/decode failures (ValueError family) stay unavailable;
+        # programmer errors (TypeError/NameError/...) must surface in tests.
+        except (OSError, ValueError):
             return self._unavailable(request)
 
     def _fetch(self, request: SeriesFetchRequest) -> SeriesFetchResult:
@@ -84,13 +85,12 @@ class FredProvider:
             params["observation_start"] = request.start
         if request.end:
             params["observation_end"] = request.end
-        if self._include_vintages:
-            # ALFRED vintage view: the real-time window spans the requested
-            # observation window, plus vintage_dates at the window boundaries.
-            params["realtime_start"] = request.start or _REALTIME_EARLIEST
-            params["realtime_end"] = request.end or _REALTIME_LATEST
-            if request.start and request.end:
-                params["vintage_dates"] = f"{request.start},{request.end}"
+        # Vintage mode deliberately sends NO realtime_start/realtime_end and
+        # NO vintage_dates: the real-time window is not the observation
+        # window, so bounding it by request.start would silently exclude first
+        # releases published before the window, and vintage_dates boundary
+        # values would drop intermediate revisions. All vintages are fetched
+        # and the observation window is applied client-side below.
 
         endpoint = "series/observations"
         url = f"{_FRED_BASE_URL}/{endpoint}?{urlencode(params)}"
@@ -136,6 +136,11 @@ class FredProvider:
             value = safe_observation_value(raw_value)
             if value is None:
                 continue
+            if self._include_vintages and not self._in_observation_window(date, request):
+                # Vintage mode filters client-side on the phenomenon_time only;
+                # a first release published before request.start is KEPT
+                # because its phenomenon_time is inside the window.
+                continue
             vintage = self._vintage_of(row)
             observations.append(
                 RawObservation(
@@ -148,6 +153,16 @@ class FredProvider:
                 )
             )
         return observations
+
+    @staticmethod
+    def _in_observation_window(phenomenon_time: str, request: SeriesFetchRequest) -> bool:
+        """ISO date window check on the phenomenon_time only (never vintages)."""
+
+        if request.start and phenomenon_time < request.start:
+            return False
+        if request.end and phenomenon_time > request.end:
+            return False
+        return True
 
     def _vintage_of(self, row: dict[str, Any]) -> str | None:
         """Resolve the vintage date: explicit ``vintage`` key first, else the

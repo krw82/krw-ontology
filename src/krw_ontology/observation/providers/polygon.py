@@ -65,7 +65,10 @@ class PolygonDailyProvider:
     def fetch_series(self, request: SeriesFetchRequest) -> SeriesFetchResult:
         try:
             return self._fetch(request)
-        except Exception:  # noqa: BLE001 - external failures never cross the port
+        # Transport (OSError family: URLError/HTTPError/timeout) plus bounded
+        # read and JSON/decode failures (ValueError family) stay unavailable;
+        # programmer errors (TypeError/NameError/...) must surface in tests.
+        except (OSError, ValueError):
             return self._unavailable(request)
 
     def _fetch(self, request: SeriesFetchRequest) -> SeriesFetchResult:

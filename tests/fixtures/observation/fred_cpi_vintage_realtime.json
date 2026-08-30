@@ -1,0 +1,23 @@
+{
+  "_comment": "Shape source: live ALFRED API rows for fred/series/observations real-time requests (https://alfred.stlouisfed.org/help/api) — each revision row carries {date, realtime_start, realtime_end, value}; the adapter maps realtime_start to vintage/result_time in vintage mode. synthetic; verify against live API before first production collection run.",
+  "observations": [
+    {
+      "date": "2026-05-01",
+      "realtime_start": "2026-06-10",
+      "realtime_end": "2026-07-09",
+      "value": "322.4"
+    },
+    {
+      "date": "2026-05-01",
+      "realtime_start": "2026-07-10",
+      "realtime_end": "9999-12-31",
+      "value": "322.8"
+    },
+    {
+      "date": "2026-06-01",
+      "realtime_start": "2026-07-10",
+      "realtime_end": "9999-12-31",
+      "value": "323.1"
+    }
+  ]
+}

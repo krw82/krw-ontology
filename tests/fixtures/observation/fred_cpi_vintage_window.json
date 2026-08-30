@@ -1,0 +1,25 @@
+{
+  "_comment": "Shape source: FRED/ALFRED vintage view of fred/series/observations, compact {date, value, vintage} shape. Crafted window-filter fixture: the in-window period 2026-06-01 has a first vintage published BEFORE the 2026-06-01 window start, and out-of-window phenomenon_times (2026-05-01, 2026-07-01) must be dropped while every vintage of the in-window period is kept. synthetic; verify against live API before first production collection run.",
+  "observations": [
+    {
+      "date": "2026-05-01",
+      "value": "322.8",
+      "vintage": "2026-06-10"
+    },
+    {
+      "date": "2026-06-01",
+      "value": "322.9",
+      "vintage": "2026-05-20"
+    },
+    {
+      "date": "2026-06-01",
+      "value": "323.1",
+      "vintage": "2026-07-10"
+    },
+    {
+      "date": "2026-07-01",
+      "value": "323.5",
+      "vintage": "2026-08-10"
+    }
+  ]
+}

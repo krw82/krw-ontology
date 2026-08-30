@@ -57,6 +57,10 @@ def raising_opener(request: Any, timeout: float | None = None) -> Any:
     raise OSError("simulated transport failure")
 
 
+def runtime_error_opener(request: Any, timeout: float | None = None) -> Any:
+    raise RuntimeError("programmer error must surface")
+
+
 def load_fixture(name: str) -> str:
     return (FIXTURES_DIR / name).read_text(encoding="utf-8")
 
@@ -193,7 +197,29 @@ def test_fred_adapter_parses_vintage_observations():
     assert all(o.result_time == o.vintage for o in obs)
 
 
-def test_fred_vintage_mode_requests_realtime_window_and_vintage_dates():
+def test_fred_vintage_mode_parses_realtime_start_shaped_rows():
+    provider = FredProvider(
+        api_key="test",
+        include_vintages=True,
+        opener=fixture_opener(load_fixture("fred_cpi_vintage_realtime.json")),
+    )
+    result = provider.fetch_series(_fred_request())
+
+    assert result.status == "available"
+    obs = result.observations
+    # Vintages are extracted from realtime_start on the live ALFRED row shape.
+    assert {(o.phenomenon_time, o.vintage, o.value) for o in obs} == {
+        ("2026-05-01", "2026-06-10", 322.4),
+        ("2026-05-01", "2026-07-10", 322.8),
+        ("2026-06-01", "2026-07-10", 323.1),
+    }
+    # Two vintages of the same phenomenon_time survive as separate rows.
+    same_period = [o for o in obs if o.phenomenon_time == "2026-05-01"]
+    assert len(same_period) == 2
+    assert all(o.result_time == o.vintage for o in obs)
+
+
+def test_fred_vintage_mode_requests_all_vintages_without_realtime_bounds():
     requests: list[Any] = []
     provider = FredProvider(
         api_key="test",
@@ -205,8 +231,8 @@ def test_fred_vintage_mode_requests_realtime_window_and_vintage_dates():
             series_key="cpi_yoy",
             provider_series_id="CPIAUCSL",
             ticker=None,
-            start="2026-06-01",
-            end="2026-07-01",
+            start="2026-05-01",
+            end="2026-06-01",
         )
     )
 
@@ -214,9 +240,47 @@ def test_fred_vintage_mode_requests_realtime_window_and_vintage_dates():
     assert len(requests) == 1
     url = requests[0].full_url
     assert "series_id=CPIAUCSL" in url
-    assert "realtime_start=2026-06-01" in url
-    assert "realtime_end=2026-07-01" in url
-    assert "vintage_dates=2026-06-01%2C2026-07-01" in url
+    assert "observation_start=2026-05-01" in url
+    assert "observation_end=2026-06-01" in url
+    # The real-time window must NOT be bounded by the observation window, and
+    # vintage_dates boundary values would drop intermediate revisions.
+    assert "realtime_start" not in url
+    assert "realtime_end" not in url
+    assert "vintage_dates" not in url
+    # Client-side window filter: 2026-04-01 dropped, both 2026-05-01 vintages kept.
+    assert [o.phenomenon_time for o in result.observations] == [
+        "2026-05-01",
+        "2026-05-01",
+        "2026-06-01",
+    ]
+    kept = [o for o in result.observations if o.phenomenon_time == "2026-05-01"]
+    assert {o.vintage for o in kept} == {"2026-06-01", "2026-07-01"}
+
+
+def test_fred_vintage_mode_keeps_first_release_published_before_window_start():
+    provider = FredProvider(
+        api_key="test",
+        include_vintages=True,
+        opener=fixture_opener(load_fixture("fred_cpi_vintage_window.json")),
+    )
+    result = provider.fetch_series(
+        SeriesFetchRequest(
+            series_key="cpi_yoy",
+            provider_series_id="CPIAUCSL",
+            ticker=None,
+            start="2026-06-01",
+            end="2026-06-30",
+        )
+    )
+
+    assert result.status == "available"
+    obs = result.observations
+    # Only the in-window phenomenon_time survives; out-of-window periods drop.
+    assert {o.phenomenon_time for o in obs} == {"2026-06-01"}
+    # BOTH vintages of the in-window period are kept — including the first
+    # release published (2026-05-20) BEFORE request.start (2026-06-01).
+    assert {o.vintage for o in obs} == {"2026-05-20", "2026-07-10"}
+    assert {o.value for o in obs} == {322.9, 323.1}
 
 
 def test_polygon_adapter_converts_ms_epoch_to_iso_dates():
@@ -249,6 +313,16 @@ def test_provider_reports_unavailable_when_transport_fails(vendor: str):
     assert result.status == "unavailable"
     assert result.provider == vendor
     assert result.observations == ()
+
+
+@pytest.mark.parametrize("vendor", ["fmp", "fred", "polygon"])
+def test_provider_propagates_programmer_errors_from_opener(vendor: str):
+    # Only transport/HTTP/timeout/JSON/oversize failures collapse to
+    # "unavailable"; adapter bugs (non-OSError/ValueError) must surface.
+    provider = _make_provider(vendor, opener=runtime_error_opener)
+
+    with pytest.raises(RuntimeError, match="programmer error must surface"):
+        provider.fetch_series(_requests_by_vendor()[vendor])
 
 
 @pytest.mark.parametrize("vendor", ["fmp", "fred", "polygon"])

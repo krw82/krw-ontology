@@ -385,6 +385,8 @@ def test_period_validation_accepts_monthly_and_rejects_garbage() -> None:
         "CY2026M13",  # month out of range
         "CY2026M0",
         "CY2026M7",  # zero-padded months only
+        "2026M07",  # monthly buckets REQUIRE the CY prefix
+        "FY2026M07",  # fiscal + month is semantically invalid
         "2026-Q3!",
         "",
         "CY2026Q5",
@@ -476,3 +478,157 @@ def test_pack_serves_monthly_price_series_for_ticker(tmp_path: Path) -> None:
     assert price["ticker"] == "AAPL"
     assert [point["period"] for point in price["points"]] == ["CY2026M06", "CY2026M07"]
     assert [point["value"] for point in price["points"]] == [120.0, 130.0]
+
+
+# ---------------------------------------------------------------------------
+# B4 review fix: ticker-less packs are clamped to macro observation rows only
+# ---------------------------------------------------------------------------
+
+
+def _insert_filing_revenue_series(chart_path: Path, ticker: str) -> None:
+    """One minimal synthetic annual revenue series (filing source_class)."""
+
+    series_key = (
+        f"{ticker}|revenue|company_total:company_total|USD|annual|"
+        "company_reported|period|company_reported_metric"
+    )
+    with sqlite3.connect(chart_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO chart_series (
+                series_key, ticker, canonical_metric, metric_name, label, unit,
+                scope_kind, scope_key, scope_label, period_type, basis, duration,
+                source_class, statement_family, point_count, first_period,
+                last_period, first_sort_key, last_sort_key, quality_flags_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                series_key,
+                ticker,
+                "revenue",
+                "revenue",
+                "Revenue",
+                "USD",
+                "company_total",
+                "company_total",
+                "Company total",
+                "annual",
+                "company_reported",
+                "period",
+                "company_reported_metric",
+                "income_statement",
+                2,
+                "CY2024",
+                "CY2025",
+                20240,
+                20250,
+                "[]",
+            ),
+        )
+        for period, sort_key, value in (("CY2024", 20240, 100.0), ("CY2025", 20250, 110.0)):
+            conn.execute(
+                """
+                INSERT INTO chart_series_points (
+                    series_key, ticker, period, fiscal_year, fiscal_quarter,
+                    period_sort_key, document_type, document_period,
+                    source_document_id, source_sort_key, value, formatted_value,
+                    object_id, trace_status, metric_lineage_status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    series_key,
+                    ticker,
+                    period,
+                    int(period[2:6]),
+                    None,
+                    sort_key,
+                    "10-K",
+                    period,
+                    None,
+                    sort_key,
+                    value,
+                    f"${value:.0f}",
+                    f"obj:fixture:{ticker}:revenue:{period}",
+                    None,
+                    None,
+                ),
+            )
+        conn.commit()
+
+
+def _build_mixed_chart(tmp_path: Path) -> Path:
+    """CPI macro series + AAPL/MSFT monthly price series + filing revenue rows."""
+
+    cpi_rows = [
+        ("2026-05-01", 296.1, None, None),
+        ("2026-06-01", 297.0, None, None),
+        ("2026-07-01", 297.8, None, None),
+    ]
+    root = _release_root(
+        tmp_path,
+        [
+            _macro_result("macro_cpi_yoy", cpi_rows),
+            _price_result("AAPL", [("2026-06-30", 120.0), ("2026-07-31", 130.0)]),
+            _price_result("MSFT", [("2026-06-30", 480.0), ("2026-07-31", 490.0)]),
+        ],
+    )
+    result = build_chart_series_index(root)
+    assert result.verification["ok"] is True
+    for ticker in ("AAPL", "MSFT"):
+        _insert_filing_revenue_series(result.path, ticker)
+    return result.path
+
+
+def test_tickerless_pack_serves_macro_observation_rows_only(tmp_path: Path) -> None:
+    """A ticker-less question naming a macro AND a filing metric must not fan
+    out to every company's filing series (B4 review: pre-fix this served
+    (revenue, MSFT) + (revenue, AAPL) + (cpi_yoy, ''))."""
+
+    chart_path = _build_mixed_chart(tmp_path)
+    pack = query_chart_series_pack(
+        chart_path,
+        question="CPI와 매출 추이",
+        tickers=[],
+    )
+    assert pack is not None
+    assert [(series["canonical_metric"], series["ticker"]) for series in pack["series"]] == [
+        ("cpi_yoy", "")
+    ]
+
+    # Same clamp for per-ticker observation rows: without a ticker scope,
+    # every ticker's last_price_monthly must stay invisible.
+    price_pack = query_chart_series_pack(
+        chart_path,
+        question="CPI와 주가 추이",
+        tickers=[],
+    )
+    assert price_pack is not None
+    assert [(series["canonical_metric"], series["ticker"]) for series in price_pack["series"]] == [
+        ("cpi_yoy", "")
+    ]
+
+
+def test_ticker_scoped_pack_still_serves_filing_and_macro_together(tmp_path: Path) -> None:
+    chart_path = _build_mixed_chart(tmp_path)
+
+    filing_pack = query_chart_series_pack(
+        chart_path,
+        question="CPI와 매출 추이",
+        tickers=["MSFT"],
+    )
+    assert filing_pack is not None
+    served = {(series["canonical_metric"], series["ticker"]) for series in filing_pack["series"]}
+    assert ("cpi_yoy", "") in served
+    assert ("revenue", "MSFT") in served
+    assert ("revenue", "AAPL") not in served  # ticker scope still gates filings
+
+    price_pack = query_chart_series_pack(
+        chart_path,
+        question="CPI와 주가 추이",
+        tickers=["AAPL"],
+    )
+    assert price_pack is not None
+    served_price = {
+        (series["canonical_metric"], series["ticker"]) for series in price_pack["series"]
+    }
+    assert served_price == {("cpi_yoy", ""), ("last_price_monthly", "AAPL")}

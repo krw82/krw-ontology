@@ -112,8 +112,12 @@ CHART_SAFE_CANONICAL_METRICS = frozenset(
 )
 
 # Period grammar: FY/CY annual, CY quarter, and (B4) CY monthly —
-# ``CY2026M07``.  Zero-padded months only; anything else is garbage.
-_CHART_PERIOD_PATTERN = re.compile(r"^(?:FY|CY)?(?:19|20)\d{2}(?:Q[1-4]|M(?:0[1-9]|1[0-2]))?$")
+# ``CY2026M07``.  Monthly buckets REQUIRE the CY prefix and reject the FY
+# prefix (fiscal+month is semantically invalid): the writer only ever emits
+# ``CY{year}M{month}``.  Zero-padded months only; anything else is garbage.
+_CHART_PERIOD_PATTERN = re.compile(
+    r"^(?:(?:FY|CY)?(?:19|20)\d{2}(?:Q[1-4])?|CY(?:19|20)\d{2}M(?:0[1-9]|1[0-2]))$"
+)
 
 
 def is_valid_chart_period(period: str) -> bool:
@@ -481,6 +485,12 @@ def query_chart_series_pack(
                     )
                     params[len(ticker_values) : len(ticker_values)] = macro_metric_candidates
                 where.append(ticker_clause)
+            else:
+                # Ticker-less questions are clamped to macro observation rows
+                # ONLY: without a ticker scope, the metric clause must never
+                # fan out to filing series of every company or to per-ticker
+                # observation (price/valuation) rows of every ticker.
+                where.append("(source_class = 'observation' AND ticker = '')")
             if metric_candidates:
                 where.append(
                     "canonical_metric IN (" + ",".join("?" for _ in metric_candidates) + ")"

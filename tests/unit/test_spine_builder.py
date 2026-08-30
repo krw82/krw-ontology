@@ -633,18 +633,6 @@ def test_occurrence_objects_with_unknown_source_ticker_are_namespaced_and_relink
                 """,
                 (raw_validation_id,),
             )
-            conn.execute(
-                """
-                INSERT INTO object_fts(
-                    object_id, type, ticker, document_type, period,
-                    text_self, text_support, text_related, text_entities,
-                    text_aliases, compact_text
-                )
-                VALUES(?, 'ValidationReport', 'UNKNOWN', 'UNKNOWN', 'UNKNOWN',
-                       'validation report', '', '', '', '', 'validation report')
-                """,
-                (raw_validation_id,),
-            )
             if ticker == "KR":
                 conn.execute(
                     """
@@ -671,6 +659,10 @@ def test_occurrence_objects_with_unknown_source_ticker_are_namespaced_and_relink
                 """,
                 (raw_validation_id,),
             )
+            # object_fts is external content over object_search_text: rebuild
+            # the index instead of hand-inserting rows (direct FTS inserts get
+            # rowids that no longer match the content table).
+            conn.execute("INSERT INTO object_fts(object_fts) VALUES('rebuild')")
 
         emit_spine_fragment_from_company_shard(
             shard_path,

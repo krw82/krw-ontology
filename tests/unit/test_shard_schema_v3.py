@@ -302,6 +302,202 @@ def test_shard_versions_bumped_and_spine_locator_excludes_support_links(tmp_path
     assert json.loads(str(metadata_json))["spine_projection_version"] == "spine-projection/v7"
 
 
+def _query_fts(store: OntologyStore, term: str) -> list[str]:
+    rows = store._query_fts(
+        term,
+        tickers=None,
+        document_types=None,
+        periods=None,
+        object_types=(),
+        include_rejected=False,
+        limit=20,
+    )
+    return [str(row["id"]) for row in rows]
+
+
+def test_object_text_table_is_gone_and_fts_is_external_content(tmp_path):
+    shard = build_minimal_shard_with_one_claim_and_quote(tmp_path)
+    with sqlite3.connect(f"file:{shard}?mode=ro", uri=True) as conn:
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        sql = conn.execute("SELECT sql FROM sqlite_master WHERE name='object_fts'").fetchone()[0]
+        search_text_columns = {
+            str(row[1]) for row in conn.execute("PRAGMA table_info(object_search_text)")
+        }
+        # The proof term for the support-only MATCH lives in no compact_text.
+        compact_hits = conn.execute(
+            "SELECT COUNT(*) FROM object_search_text WHERE compact_text LIKE '%item7%'"
+        ).fetchone()[0]
+        support_hits = conn.execute(
+            "SELECT COUNT(*) FROM object_search_text WHERE text_support LIKE '%item7%'"
+        ).fetchone()[0]
+        # External content rowid mapping: every FTS row must read its columns
+        # back from the matching object_search_text row.
+        content_rows = conn.execute("SELECT COUNT(*) FROM object_search_text").fetchone()[0]
+        matched_rows = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM object_fts
+            JOIN object_search_text ON object_search_text.rowid = object_fts.rowid
+            WHERE object_search_text.object_id = object_fts.object_id
+            """
+        ).fetchone()[0]
+        fts_rows = conn.execute("SELECT COUNT(*) FROM object_fts").fetchone()[0]
+    assert "object_text" not in tables
+    assert "content='object_search_text'" in sql
+    # object_search_text keeps all 11 columns: it is now the FTS content source.
+    assert search_text_columns == {
+        "object_id",
+        "type",
+        "ticker",
+        "document_type",
+        "period",
+        "text_self",
+        "text_support",
+        "text_related",
+        "text_entities",
+        "text_aliases",
+        "compact_text",
+    }
+    assert compact_hits == 0
+    assert support_hits >= 1
+    assert fts_rows == content_rows
+    assert matched_rows == content_rows
+    # retrieval still works through FTS
+    with open_store(shard) as store:
+        hits = _query_fts(store, "margin")
+        assert hits  # FTS 결과 유지 = 품질 불변 확인
+        assert CLAIM_ID in hits
+        assert QUOTE_ID in hits
+        # "item7" only reaches the index through the non-compact text columns
+        # (the claim's text_support); the six-column external-content index
+        # must still match it.
+        support_only_hits = _query_fts(store, "item7")
+        assert CLAIM_ID in support_only_hits
+
+
+def test_external_content_fts_stores_retrieval_text_once(tmp_path):
+    """Byte-level sanity: dropping object_text + contentless FTS halves text storage."""
+    row_count = 200
+    rows = []
+    paragraph = "Data center demand increased operating margin expansion pressure. "
+    for index in range(row_count):
+        text = paragraph * 12  # ~1.6KB per text column value
+        rows.append(
+            (
+                f"claim:TEST:CY2023:10K:{index:04d}",
+                "ResearchClaim",
+                "TEST",
+                "10-K",
+                "CY2023",
+                text,
+                text,
+                text,
+                text,
+                text,
+                text,
+            )
+        )
+
+    def _populate(conn: sqlite3.Connection) -> None:
+        conn.executemany(
+            """
+            INSERT INTO object_search_text(
+                object_id, type, ticker, document_type, period,
+                text_self, text_support, text_related, text_entities,
+                text_aliases, compact_text
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+
+    pre_a4_path = tmp_path / "pre_a4.sqlite"
+    with sqlite3.connect(pre_a4_path) as conn:
+        # Pre-A4 shape: object_search_text + byte-identical object_text
+        # duplicate + contentless FTS carrying full copies of all texts.
+        conn.execute(
+            """
+            CREATE TABLE object_search_text (
+                object_id TEXT PRIMARY KEY, type TEXT NOT NULL,
+                ticker TEXT NOT NULL, document_type TEXT NOT NULL,
+                period TEXT NOT NULL, text_self TEXT, text_support TEXT,
+                text_related TEXT, text_entities TEXT, text_aliases TEXT,
+                compact_text TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE object_text (
+                object_id TEXT PRIMARY KEY, type TEXT NOT NULL,
+                ticker TEXT NOT NULL, document_type TEXT NOT NULL,
+                period TEXT NOT NULL, text_self TEXT, text_support TEXT,
+                text_related TEXT, text_entities TEXT, text_aliases TEXT,
+                compact_text TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE VIRTUAL TABLE object_fts USING fts5(
+                object_id UNINDEXED, type UNINDEXED, ticker UNINDEXED,
+                document_type UNINDEXED, period UNINDEXED,
+                text_self, text_support, text_related, text_entities,
+                text_aliases, compact_text, tokenize = 'unicode61'
+            )
+            """
+        )
+        _populate(conn)
+        conn.execute(
+            """
+            INSERT INTO object_text(
+                object_id, type, ticker, document_type, period,
+                text_self, text_support, text_related, text_entities,
+                text_aliases, compact_text
+            )
+            SELECT object_id, type, ticker, document_type, period,
+                   text_self, text_support, text_related, text_entities,
+                   text_aliases, compact_text
+            FROM object_search_text
+            """
+        )
+        conn.executemany("INSERT INTO object_fts(object_id, type, ticker, document_type, period,"
+                         " text_self, text_support, text_related, text_entities, text_aliases,"
+                         " compact_text) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
+        conn.commit()
+
+    post_a4_path = tmp_path / "post_a4.sqlite"
+    with sqlite3.connect(post_a4_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE object_search_text (
+                object_id TEXT PRIMARY KEY, type TEXT NOT NULL,
+                ticker TEXT NOT NULL, document_type TEXT NOT NULL,
+                period TEXT NOT NULL, text_self TEXT, text_support TEXT,
+                text_related TEXT, text_entities TEXT, text_aliases TEXT,
+                compact_text TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE VIRTUAL TABLE object_fts USING fts5(
+                object_id UNINDEXED, type UNINDEXED, ticker UNINDEXED,
+                document_type UNINDEXED, period UNINDEXED,
+                text_self, text_support, text_related, text_entities,
+                text_aliases, compact_text, tokenize = 'unicode61',
+                content='object_search_text'
+            )
+            """
+        )
+        _populate(conn)
+        conn.execute("INSERT INTO object_fts(object_fts) VALUES('rebuild')")
+        fts_rows = conn.execute("SELECT COUNT(*) FROM object_fts").fetchone()[0]
+        conn.commit()
+    assert fts_rows == row_count
+    assert post_a4_path.stat().st_size < pre_a4_path.stat().st_size
+
+
 def test_router_trace_resolves_support_link_ids(tmp_path):
     shard, global_spine = build_minimal_release(tmp_path)
     assert shard.is_file()

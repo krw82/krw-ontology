@@ -269,7 +269,6 @@ BASE_FRAGMENT_TABLES = (
     "quality_events",
     "object_fts",
     "object_search_text",
-    "object_text",
 )
 
 ANSWER_CANDIDATE_TYPES = {
@@ -451,7 +450,6 @@ INDEX_SHARD_TABLES = (
     "quality_events",
     "object_fts",
     "object_search_text",
-    "object_text",
     "object_traceability",
     "metric_lookup",
     "metric_dimension_lookup",
@@ -835,7 +833,6 @@ def verify_agent_index(index_path: Path, *, trust_seal: bool = True) -> dict[str
         "edges",
         "quality_events",
         "object_fts",
-        "object_text",
         "object_search_text",
         "object_traceability",
         "metric_lookup",
@@ -911,6 +908,16 @@ def verify_agent_index(index_path: Path, *, trust_seal: bool = True) -> dict[str
             existing_tables = {str(row[0]) for row in table_rows}
             for table_name in sorted(required_tables - existing_tables):
                 errors.append(f"table_missing:{table_name}")
+            if "object_text" in existing_tables:
+                errors.append("object_text_table_present")
+            if "object_fts" in existing_tables:
+                fts_sql_row = conn.execute(
+                    "SELECT sql FROM sqlite_master WHERE name = 'object_fts'"
+                ).fetchone()
+                if fts_sql_row is None or "content='object_search_text'" not in str(
+                    fts_sql_row[0]
+                ):
+                    errors.append("object_fts_external_content_missing")
             if "metric_lookup" in existing_tables:
                 metric_columns = {
                     str(row[1])
@@ -1712,6 +1719,7 @@ def _build_company_index_shard(
             with conn:
                 for table_name in INDEX_SHARD_TABLES:
                     _copy_company_shard_table(conn, table_name, ticker)
+                _rebuild_object_fts(conn)
                 _create_base_secondary_indexes(conn)
                 _create_serving_secondary_indexes(conn)
                 row_counts = {
@@ -1823,6 +1831,11 @@ def _copy_global_topic_table(conn: sqlite3.Connection, table_name: str) -> None:
 
 
 def _copy_company_shard_table(conn: sqlite3.Connection, table_name: str, ticker: str) -> None:
+    if table_name == "object_fts":
+        # External-content FTS index: copied shard rows get fresh content-table
+        # rowids, so the index is rebuilt from the copied object_search_text
+        # rows by _rebuild_object_fts after the table copy loop instead.
+        return
     columns = _table_columns(conn, "main", table_name)
     if not columns:
         return
@@ -2006,6 +2019,15 @@ def _expected_shard_counts(source_conn: sqlite3.Connection, ticker: str) -> dict
                         WHERE ticker = ?
                     )
                     """,
+                    (ticker,),
+                ).fetchone()[0]
+            )
+        elif table_name == "object_fts":
+            # External-content FTS: shard rows are rebuilt from the content
+            # table, so the expectation is the ticker's object_search_text rows.
+            counts[table_name] = int(
+                source_conn.execute(
+                    "SELECT COUNT(*) FROM object_search_text WHERE ticker = ?",
                     (ticker,),
                 ).fetchone()[0]
             )
@@ -3605,7 +3627,13 @@ def merge_fragments(
     conn: sqlite3.Connection,
     fragments: Sequence[Path],
 ) -> dict[str, int]:
-    """Merge base rows from verified SQLite fragments into the open index DB."""
+    """Merge base rows from verified SQLite fragments into the open index DB.
+
+    object_fts rows are never copied: fragments keep an empty external-content
+    index and the caller rebuilds it once from the merged object_search_text
+    rows (see _rebuild_object_fts), so FTS rowids always match the content
+    table in the destination database.
+    """
     stats = {"documents": 0, "objects": 0, "edges": 0, "quality_events": 0}
     for fragment_number, fragment_path in enumerate(fragments, start=1):
         schema_name = f"frag_{fragment_number}"
@@ -3627,26 +3655,22 @@ def merge_fragments(
 
 
 def _merge_fragment_table(conn: sqlite3.Connection, schema_name: str, table_name: str) -> None:
+    if table_name == "object_fts":
+        # External-content FTS index: derived via _rebuild_object_fts after the
+        # merge loop, never row-copied across databases (rowids would not match
+        # the destination content table).
+        return
     columns = _table_columns(conn, "main", table_name)
     if not columns:
         return
     column_sql = ", ".join(columns)
-    if table_name == "object_fts":
-        conn.execute(
-            f"""
-            INSERT INTO {table_name}({column_sql})
-            SELECT {column_sql}
-            FROM {schema_name}.{table_name}
-            """
-        )
-    else:
-        conn.execute(
-            f"""
-            INSERT OR REPLACE INTO {table_name}({column_sql})
-            SELECT {column_sql}
-            FROM {schema_name}.{table_name}
-            """
-        )
+    conn.execute(
+        f"""
+        INSERT OR REPLACE INTO {table_name}({column_sql})
+        SELECT {column_sql}
+        FROM {schema_name}.{table_name}
+        """
+    )
 
 
 def _table_columns(conn: sqlite3.Connection, schema_name: str, table_name: str) -> list[str]:
@@ -3813,6 +3837,17 @@ def _build_agent_index_direct(
                 stats=stats,
                 totals=totals,
             )
+
+        fts_started_at = time.perf_counter()
+        _log_build_phase("object_fts_rebuild_start", totals=totals)
+        with conn:
+            totals["object_fts"] = _rebuild_object_fts(conn)
+        _checkpoint_wal(conn)
+        _log_build_phase(
+            "object_fts_rebuild_done",
+            elapsed_seconds=_elapsed(fts_started_at),
+            object_fts=totals["object_fts"],
+        )
 
         secondary_started_at = time.perf_counter()
         _log_build_phase("create_base_secondary_indexes_start", totals=totals)
@@ -4166,8 +4201,8 @@ def _create_schema(conn: sqlite3.Connection) -> None:
         );
 
         DROP TABLE IF EXISTS object_fts;
-        DROP TABLE IF EXISTS object_text;
         DROP TABLE IF EXISTS object_search_text;
+        DROP TABLE IF EXISTS object_text;
         DROP TABLE IF EXISTS object_traceability;
         DROP TABLE IF EXISTS metric_lookup;
         DROP TABLE IF EXISTS metric_dimension_lookup;
@@ -4179,21 +4214,6 @@ def _create_schema(conn: sqlite3.Connection) -> None:
         DROP TABLE IF EXISTS company_topic_source_objects;
         DROP TABLE IF EXISTS company_topic_fts;
         DROP TABLE IF EXISTS company_topic_index;
-
-        CREATE VIRTUAL TABLE object_fts USING fts5(
-            object_id UNINDEXED,
-            type UNINDEXED,
-            ticker UNINDEXED,
-            document_type UNINDEXED,
-            period UNINDEXED,
-            text_self,
-            text_support,
-            text_related,
-            text_entities,
-            text_aliases,
-            compact_text,
-            tokenize = 'unicode61'
-        );
 
         CREATE TABLE IF NOT EXISTS object_search_text (
             object_id TEXT PRIMARY KEY,
@@ -4209,18 +4229,20 @@ def _create_schema(conn: sqlite3.Connection) -> None:
             compact_text TEXT
         );
 
-        CREATE TABLE IF NOT EXISTS object_text (
-            object_id TEXT PRIMARY KEY,
-            type TEXT NOT NULL,
-            ticker TEXT NOT NULL,
-            document_type TEXT NOT NULL,
-            period TEXT NOT NULL,
-            text_self TEXT,
-            text_support TEXT,
-            text_related TEXT,
-            text_entities TEXT,
-            text_aliases TEXT,
-            compact_text TEXT
+        CREATE VIRTUAL TABLE object_fts USING fts5(
+            object_id UNINDEXED,
+            type UNINDEXED,
+            ticker UNINDEXED,
+            document_type UNINDEXED,
+            period UNINDEXED,
+            text_self,
+            text_support,
+            text_related,
+            text_entities,
+            text_aliases,
+            compact_text,
+            tokenize = 'unicode61',
+            content='object_search_text'
         );
 
         CREATE TABLE IF NOT EXISTS object_traceability (
@@ -5340,28 +5362,15 @@ def _flush_object_insert_batch(
         )
     if fts_rows:
         fts_rows = [_object_fts_row_with_scope_tokens(row) for row in fts_rows]
+        # object_fts is an external-content FTS5 index over object_search_text:
+        # rows land in the content table here, and the immutable build runs
+        # INSERT INTO object_fts(object_fts) VALUES('rebuild') once after all
+        # fragments are merged (see _rebuild_object_fts). No direct FTS writes.
         if replace_fts_entries:
-            conn.executemany(
-                "DELETE FROM object_fts WHERE object_id = ?", ((row[0],) for row in fts_rows)
-            )
             conn.executemany(
                 "DELETE FROM object_search_text WHERE object_id = ?",
                 ((row[0],) for row in fts_rows),
             )
-            conn.executemany(
-                "DELETE FROM object_text WHERE object_id = ?", ((row[0],) for row in fts_rows)
-            )
-        conn.executemany(
-            """
-            INSERT INTO object_fts(
-                object_id, type, ticker, document_type, period,
-                text_self, text_support, text_related, text_entities,
-                text_aliases, compact_text
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            fts_rows,
-        )
         conn.executemany(
             """
             INSERT OR REPLACE INTO object_search_text(
@@ -5373,19 +5382,20 @@ def _flush_object_insert_batch(
             """,
             fts_rows,
         )
-        conn.executemany(
-            """
-            INSERT OR REPLACE INTO object_text(
-                object_id, type, ticker, document_type, period,
-                text_self, text_support, text_related, text_entities,
-                text_aliases, compact_text
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            fts_rows,
-        )
     object_rows.clear()
     fts_rows.clear()
+
+
+def _rebuild_object_fts(conn: sqlite3.Connection) -> int:
+    """Rebuild the external-content object_fts index from object_search_text.
+
+    Shards are immutable builds, so no triggers keep the FTS index in sync:
+    each build populates object_search_text first, then invokes the FTS5
+    'rebuild' command exactly once. This also renumbers FTS rowids to match
+    the content table after fragments or shard tables were merged in.
+    """
+    conn.execute("INSERT INTO object_fts(object_fts) VALUES('rebuild')")
+    return _table_count(conn, "main", "object_search_text")
 
 
 def _rebuild_metric_lookup(conn: sqlite3.Connection) -> int:

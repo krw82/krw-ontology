@@ -16,6 +16,11 @@ from krw_ontology.agent_index.chart_series import (
     CHART_SERIES_SCHEMA_VERSION,
     verify_chart_series_index,
 )
+from krw_ontology.observation.store import (
+    OBSERVATIONS_RELATIVE_PATH,
+    OBSERVATIONS_SCHEMA_VERSION,
+    verify_observations_schema,
+)
 from krw_ontology.agent_index.cache_seal import (
     read_immutable_sqlite_cache_seal,
     read_immutable_sqlite_cache_sha256,
@@ -488,6 +493,23 @@ def _build_release_index_outputs_v3(
             "counts": chart_verification.get("counts") or {},
             "verification_ok": bool(chart_verification.get("ok")),
         }
+    # The observation sidecar is collected ahead of time by the standalone
+    # `observation build` step (the release build itself stays network-free);
+    # it joins the release artifacts when present, chart_series-style.  The
+    # observation canonical metrics ride the same bound metric dictionary
+    # (B2 extended it to 48 canonicals), so the binding is pinned here too.
+    observations_path = root_path / OBSERVATIONS_RELATIVE_PATH
+    if observations_path.is_file():
+        observations_verification = verify_observations_schema(observations_path)
+        outputs["observations"] = {
+            "path": _relative_or_absolute(observations_path, root_path),
+            "sha256": _file_sha256(observations_path),
+            "schema_version": OBSERVATIONS_SCHEMA_VERSION,
+            "required": False,
+            "counts": observations_verification.get("counts") or {},
+            "metric_dictionary": dictionary_binding,
+            "verification_ok": bool(observations_verification.get("ok")),
+        }
     return outputs
 
 
@@ -720,6 +742,12 @@ def _verify_release_root_v3(
             "router_coherence_verification"
         ),
         "chart_series_verification": spine_shard_verification.get("chart_series_verification"),
+        "observations_path": spine_shard_verification.get("observations_path"),
+        "observations_present": bool(
+            spine_shard_verification.get("observations_path")
+            and Path(str(spine_shard_verification["observations_path"])).exists()
+        ),
+        "observations_verification": spine_shard_verification.get("observations_verification"),
         "spine_shard_verification": spine_shard_verification,
         "smoke_verification": None,
         "current_symlink": _is_current_symlink_path(supplied_root),
@@ -762,6 +790,7 @@ def verify_release_startup_v3(
     router_sidecar_path = _resolve_v3_router_sidecar_path(root_path, manifest)
     router_coherence_path = _resolve_optional_router_coherence_path(root_path, manifest)
     chart_series_path = _resolve_optional_chart_series_path(root_path, manifest)
+    observations_path = _resolve_optional_observations_path(root_path, manifest)
     index_outputs = manifest.get("indexes") if isinstance(manifest.get("indexes"), Mapping) else {}
     global_spine_output = (
         index_outputs.get("global_spine")
@@ -942,6 +971,33 @@ def verify_release_startup_v3(
         elif chart_series_required:
             errors.append("chart_series_missing")
 
+    observations_verification: dict[str, Any] | None = None
+    observations_output = (
+        ((manifest.get("indexes") or {}).get("observations") or {}) if manifest else {}
+    )
+    observations_required = bool(
+        isinstance(observations_output, Mapping) and observations_output.get("required") is True
+    )
+    if observations_path is not None:
+        if observations_path.exists() and observations_path.is_file():
+            if check_sqlite:
+                observations_verification = verify_observations_schema(observations_path)
+                if observations_required and not observations_verification.get("ok"):
+                    errors.extend(
+                        f"observations:{error}"
+                        for error in observations_verification.get("errors") or []
+                    )
+            else:
+                observations_verification = {
+                    "ok": True,
+                    "errors": [],
+                    "path": str(observations_path),
+                    "sqlite_checked": False,
+                    "verification_mode": "startup",
+                }
+        elif observations_required:
+            errors.append("observations_missing")
+
     return {
         "ok": not errors,
         "errors": errors,
@@ -968,6 +1024,9 @@ def verify_release_startup_v3(
         "chart_series_path": str(chart_series_path) if chart_series_path is not None else None,
         "chart_series_present": bool(chart_series_path is not None and chart_series_path.exists()),
         "chart_series_verification": chart_series_verification,
+        "observations_path": str(observations_path) if observations_path is not None else None,
+        "observations_present": bool(observations_path is not None and observations_path.exists()),
+        "observations_verification": observations_verification,
         "current_symlink": _is_current_symlink_path(supplied_root),
         "verification_mode": "startup-v3",
     }
@@ -1102,6 +1161,26 @@ def _release_manifest_startup_errors_v3(root_path: Path, manifest: Mapping[str, 
         elif isinstance(raw_path, str) and raw_path:
             errors.extend(
                 _release_manifest_relative_optional_file_errors(root_path, "chart_series", raw_path)
+            )
+    observations = outputs.get("observations")
+    if isinstance(observations, Mapping):
+        errors.extend(
+            "manifest_indexes_observations_" + error
+            for error in metric_dictionary_binding_errors(observations.get("metric_dictionary"))
+        )
+        raw_path = observations.get("path")
+        if observations.get("required") is True:
+            if not isinstance(raw_path, str) or not raw_path:
+                errors.append("manifest_indexes_observations_path_missing")
+            else:
+                errors.extend(
+                    _release_manifest_relative_file_startup_errors(
+                        root_path, "observations", raw_path
+                    )
+                )
+        elif isinstance(raw_path, str) and raw_path:
+            errors.extend(
+                _release_manifest_relative_optional_file_errors(root_path, "observations", raw_path)
             )
     debug_monolith = outputs.get("debug_monolith")
     if isinstance(debug_monolith, Mapping) and debug_monolith.get("required") is True:
@@ -1285,6 +1364,28 @@ def _resolve_optional_chart_series_path(
         default_path = root_path / CHART_SERIES_RELATIVE_PATH
         return default_path.resolve() if default_path.exists() else None
     raw_path = chart_series.get("path")
+    if not isinstance(raw_path, str) or not raw_path:
+        return None
+    candidate = Path(raw_path)
+    return (
+        candidate.expanduser().resolve()
+        if candidate.is_absolute()
+        else (root_path / candidate).resolve()
+    )
+
+
+def _resolve_optional_observations_path(
+    root_path: Path, manifest: Mapping[str, Any]
+) -> Path | None:
+    outputs = manifest.get("indexes")
+    if not isinstance(outputs, Mapping):
+        default_path = root_path / OBSERVATIONS_RELATIVE_PATH
+        return default_path.resolve() if default_path.exists() else None
+    observations = outputs.get("observations")
+    if not isinstance(observations, Mapping):
+        default_path = root_path / OBSERVATIONS_RELATIVE_PATH
+        return default_path.resolve() if default_path.exists() else None
+    raw_path = observations.get("path")
     if not isinstance(raw_path, str) or not raw_path:
         return None
     candidate = Path(raw_path)

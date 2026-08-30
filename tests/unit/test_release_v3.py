@@ -348,3 +348,75 @@ def test_verify_release_startup_v3_rejects_appended_router_sidecar_bytes(
         "router_sidecar:router_sidecar_verification_seal_required:identity_mismatch"
         in result["errors"]
     )
+
+
+def _write_observations_sidecar(root: Path) -> None:
+    from krw_ontology.observation.builder import build_observations_store
+    from krw_ontology.observation.ports import RawObservation, SeriesFetchResult
+    from krw_ontology.observation.seed import load_series_seed
+
+    seed = load_series_seed()
+    rows = [
+        RawObservation(
+            "macro_cpi_yoy",
+            "2026-05-01",
+            296.1,
+            "2026-06-10",
+            "2026-06-10",
+            {"endpoint": "series/observations", "params_hash": "t", "fetched_at": "t"},
+        ),
+        RawObservation(
+            "macro_cpi_yoy",
+            "2026-05-01",
+            296.4,
+            "2026-07-15",
+            "2026-07-15",
+            {"endpoint": "series/observations", "params_hash": "t", "fetched_at": "t"},
+        ),
+    ]
+    result = SeriesFetchResult(
+        series_key="macro_cpi_yoy",
+        provider="fred",
+        observations=tuple(rows),
+        status="available",
+    )
+    build = build_observations_store(root / "indexes" / "observations.sqlite", seed, [result])
+    assert build.verification["ok"] is True
+
+
+def test_write_release_manifest_v3_includes_observations_sidecar(tmp_path: Path) -> None:
+    from krw_ontology.observation.store import OBSERVATIONS_SCHEMA_VERSION
+
+    release_root = tmp_path / "dev" / "20260630_observations"
+    _write_v3_release_files(release_root)
+    _write_observations_sidecar(release_root)
+
+    manifest = write_release_manifest_v3(release_root, release_id=release_root.name, env="dev")
+
+    observations = manifest["indexes"]["observations"]
+    assert observations["schema_version"] == OBSERVATIONS_SCHEMA_VERSION
+    assert observations["required"] is False
+    assert observations["verification_ok"] is True
+    assert observations["path"] == "indexes/observations.sqlite"
+    assert observations["sha256"]
+    assert observations["counts"]["observations"] == 2
+    # Observation canonical metrics ride the bound metric dictionary (B2).
+    assert observations["metric_dictionary"]["canonical_metric_count"] == 48
+    assert observations["metric_dictionary"]["sha256"].startswith("ffc8f3c1")
+
+    startup = verify_release_startup_v3(release_root, env="dev", check_sqlite=True)
+    assert startup["ok"] is True, startup["errors"]
+    assert startup["observations_present"] is True
+    assert startup["observations_verification"]["ok"] is True
+
+
+def test_write_release_manifest_v3_without_observations_sidecar(tmp_path: Path) -> None:
+    release_root = tmp_path / "dev" / "20260630_no_observations"
+    _write_v3_release_files(release_root)
+
+    manifest = write_release_manifest_v3(release_root, release_id=release_root.name, env="dev")
+
+    assert "observations" not in manifest["indexes"]
+    startup = verify_release_startup_v3(release_root, env="dev", check_sqlite=False)
+    assert startup["ok"] is True
+    assert startup["observations_present"] is False

@@ -314,6 +314,21 @@ quality_repair_app = typer.Typer(
     ),
     no_args_is_help=True,
 )
+observation_app = typer.Typer(
+    name="observation",
+    help=(
+        "Collect and verify the advisory-only observation sidecar "
+        "(indexes/observations.sqlite). Collection is a separate step: the "
+        "main release build never fetches."
+    ),
+    epilog=(
+        "Typical flow:\n"
+        "  krw-ontology observation build --root /data/running --ticker AAPL MSFT\n"
+        "  krw-ontology observation verify --path /data/running/indexes/observations.sqlite\n"
+        "  krw-ontology release build --from-root /data/running --releases-root /data/releases --env dev"
+    ),
+    no_args_is_help=True,
+)
 app.add_typer(queue_app, name="queue")
 app.add_typer(config_app, name="config")
 app.add_typer(prod_app, name="prod")
@@ -326,6 +341,7 @@ app.add_typer(observability_app, name="observability")
 app.add_typer(guru_app, name="guru")
 quality_app.add_typer(quality_repair_app, name="repair")
 app.add_typer(quality_app, name="quality")
+app.add_typer(observation_app, name="observation")
 
 ACCEPTED_DOC_TYPES = {"10-K", "10-Q"}
 DEFAULT_E2E_TICKERS = ["AAPL", "NVDA", "JPM", "XOM"]
@@ -3354,6 +3370,18 @@ def _materialize_release_root_from_source(
                     mode = clone_or_copy_immutable_file(
                         source_manifest_path,
                         target_path / source_manifest_path.name,
+                    )
+                    copy_modes[mode] += 1
+                # The observation sidecar is collected ahead of time by the
+                # standalone `observation build` step; carry it into the
+                # release candidate when present (the release build itself
+                # never fetches). chart_series is rebuilt from shards instead.
+                observations_source_path = source_path / "observations.sqlite"
+                if observations_source_path.is_file():
+                    target_path.mkdir(parents=True, exist_ok=True)
+                    mode = clone_or_copy_immutable_file(
+                        observations_source_path,
+                        target_path / observations_source_path.name,
                     )
                     copy_modes[mode] += 1
                 continue
@@ -11898,3 +11926,152 @@ def _index_cache_kind(path: Path, cache_root: Path) -> str:
     if "global_spines" in relative.parts:
         return "global_spines"
     raise RuntimeError(f"unknown cache file kind: {path}")
+
+
+# ---------------------------------------------------------------------------
+# Observation collection (advisory-only market/macro sidecar).
+#
+# `observation build` is a STANDALONE collection step: it talks to providers
+# and must never be part of the main release build (releases stay
+# network-free). The built indexes/observations.sqlite is carried into
+# releases when present, exactly like the chart_series sidecar.
+# ---------------------------------------------------------------------------
+
+
+@observation_app.command("build")
+def observation_build_cmd(
+    root: Optional[Path] = typer.Option(
+        None,
+        "--root",
+        help=(
+            "Ontology output root; the store is written to "
+            "<root>/indexes/observations.sqlite. Defaults to KRW_ONTOLOGY_ROOT."
+        ),
+    ),
+    output: Optional[Path] = typer.Option(
+        None,
+        "--output",
+        help="Explicit store path (overrides --root resolution).",
+    ),
+    seed_path: Optional[Path] = typer.Option(
+        None,
+        "--seed",
+        help="Series seed YAML (defaults to the packaged ontology seed).",
+    ),
+    ticker: Optional[list[str]] = typer.Option(
+        None,
+        "--ticker",
+        help="Equity ticker for per-ticker price/valuation families (repeatable).",
+    ),
+    start: Optional[str] = typer.Option(
+        None, "--start", help="Observation window start (ISO date)."
+    ),
+    end: Optional[str] = typer.Option(None, "--end", help="Observation window end (ISO date)."),
+    include_vintages: bool = typer.Option(
+        True,
+        "--include-vintages/--no-vintages",
+        help="Fetch all vintages (first releases plus revisions) for macro series.",
+    ),
+) -> None:
+    """Fetch observation series and build the verified observation store."""
+    from krw_ontology.observation.builder import build_observations_store, collect_observations
+    from krw_ontology.observation.providers.fmp import FmpHistoryProvider
+    from krw_ontology.observation.providers.fred import FredProvider
+    from krw_ontology.observation.providers.polygon import build_polygon_provider
+    from krw_ontology.observation.seed import load_series_seed, series_seed_path
+    from krw_ontology.observation.store import (
+        OBSERVATIONS_RELATIVE_PATH,
+        verify_observations_schema,
+    )
+
+    target_path = (
+        output.expanduser().resolve()
+        if output is not None
+        else resolve_ontology_root(root) / OBSERVATIONS_RELATIVE_PATH
+    )
+    seed = load_series_seed(seed_path.expanduser() if seed_path is not None else series_seed_path())
+
+    # Provider construction is credential-gated: a provider whose API key is
+    # absent is not constructed and its series degrade to unavailable status.
+    providers: list[Any] = []
+    if os.getenv("FRED_API_KEY", "").strip():
+        providers.append(FredProvider(include_vintages=include_vintages))
+    else:
+        typer.echo("FRED_API_KEY not set: macro series will be unavailable")
+    if os.getenv("FMP_API_KEY", "").strip():
+        providers.append(FmpHistoryProvider())
+    else:
+        typer.echo("FMP_API_KEY not set: per-ticker FMP families will be unavailable")
+    polygon_provider = build_polygon_provider()
+    if polygon_provider is not None:
+        providers.append(polygon_provider)
+    else:
+        typer.echo("POLYGON_API_KEY not set: polygon_ohlcv family will be unavailable")
+
+    tickers = [item.upper() for item in (ticker or [])]
+    results = collect_observations(
+        seed,
+        providers=providers,
+        tickers=tickers,
+        start=start,
+        end=end,
+    )
+    available = sum(1 for result in results if result.status == "available")
+    typer.echo(
+        f"Collected {available}/{len(results)} series "
+        f"({len(tickers)} ticker(s), vintage mode "
+        f"{'on' if include_vintages else 'off'})"
+    )
+    try:
+        build = build_observations_store(target_path, seed, results)
+    except (OSError, RuntimeError, ValueError) as exc:
+        typer.echo(f"Observation store build failed: {exc}")
+        raise typer.Exit(1) from exc
+
+    verification = verify_observations_schema(build.path)
+    if not verification.get("ok"):
+        typer.echo(
+            "Observation store verification failed: "
+            + ", ".join(str(error) for error in verification.get("errors") or [])
+        )
+        raise typer.Exit(1)
+    counts = dict(build.counts)
+    typer.echo(f"Observation store verified: {build.path}")
+    typer.echo("Counts: " + ", ".join(f"{key}={value}" for key, value in sorted(counts.items())))
+    typer.echo("Doctrine: advisory_only=true, source_usage=research_only (no vendor names served)")
+
+
+@observation_app.command("verify")
+def observation_verify_cmd(
+    path: Optional[Path] = typer.Option(
+        None,
+        "--path",
+        help="Observation store path (defaults to <root>/indexes/observations.sqlite).",
+    ),
+    root: Optional[Path] = typer.Option(
+        None, "--root", help="Ontology output root used when --path is omitted."
+    ),
+) -> None:
+    """Verify a built observation store against the schema-v1 contract."""
+    from krw_ontology.observation.store import (
+        OBSERVATIONS_RELATIVE_PATH,
+        verify_observations_schema,
+    )
+
+    resolved = (
+        path.expanduser().resolve()
+        if path is not None
+        else resolve_ontology_root(root) / OBSERVATIONS_RELATIVE_PATH
+    )
+    verification = verify_observations_schema(resolved)
+    if not verification.get("ok"):
+        typer.echo(
+            "Observation store verification failed: "
+            + ", ".join(str(error) for error in verification.get("errors") or [])
+        )
+        raise typer.Exit(1)
+    typer.echo(f"Observation store OK: {resolved}")
+    typer.echo(
+        "Counts: "
+        + ", ".join(f"{key}={value}" for key, value in sorted(verification["counts"].items()))
+    )

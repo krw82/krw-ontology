@@ -13,6 +13,10 @@ from krw_ontology.agent_index.chart_series import (
     CHART_SERIES_RELATIVE_PATH,
     verify_chart_series_index,
 )
+from krw_ontology.observation.store import (
+    OBSERVATIONS_RELATIVE_PATH,
+    verify_observations_schema,
+)
 from krw_ontology.agent_index.router_sidecar import (
     ROUTER_SIDECAR_RELATIVE_PATH,
     immutable_file_sha256,
@@ -109,6 +113,12 @@ def verify_spine_shard_release(
         "chart_series",
         default=CHART_SERIES_RELATIVE_PATH.as_posix(),
     )
+    observations_path = _optional_manifest_file_path(
+        root,
+        manifest,
+        "observations",
+        default=OBSERVATIONS_RELATIVE_PATH.as_posix(),
+    )
 
     if manifest and deep:
         errors.extend(_manifest_file_digest_errors(manifest, "global_spine", global_spine_path))
@@ -150,6 +160,31 @@ def verify_spine_shard_release(
                 errors.extend(f"chart_series:{issue}" for issue in chart_series_issues)
             else:
                 warnings.extend(f"chart_series:{issue}" for issue in chart_series_issues)
+    observations_verification: dict[str, Any] | None = None
+    observations_output = (
+        ((manifest.get("indexes") or {}).get("observations") or {}) if manifest else {}
+    )
+    observations_required = bool(
+        isinstance(observations_output, Mapping) and observations_output.get("required") is True
+    )
+    if observations_path is not None:
+        observations_issues: list[str] = []
+        if manifest and deep and isinstance(observations_output, Mapping):
+            observations_issues.extend(
+                _optional_manifest_file_digest_errors(manifest, "observations", observations_path)
+            )
+        if observations_path.is_file():
+            observations_verification = verify_observations_schema(observations_path)
+            observations_issues.extend(
+                str(error) for error in observations_verification.get("errors") or []
+            )
+        elif observations_required:
+            observations_issues.append("observations_missing")
+        if observations_issues:
+            if observations_required:
+                errors.extend(f"observations:{issue}" for issue in observations_issues)
+            else:
+                warnings.extend(f"observations:{issue}" for issue in observations_issues)
     spine_verification = (
         verify_global_spine_schema(global_spine_path)
         if deep
@@ -325,6 +360,8 @@ def verify_spine_shard_release(
         "router_sidecar_verification": router_sidecar_verification,
         "router_coherence_verification": router_coherence_verification,
         "chart_series_verification": chart_series_verification,
+        "observations_path": str(observations_path) if observations_path is not None else None,
+        "observations_verification": observations_verification,
         "shards": shard_results,
         "verification_mode": "spine-shard-release-deep" if deep else "spine-shard-release-light",
         "manifest_required": require_manifest,

@@ -19,6 +19,7 @@ from krw_ontology.agent_index.chart_series import (
     CHART_SERIES_SCHEMA_VERSION,
     ChartSeriesBuildResult,
     build_chart_series_index,
+    names_macro_observation_metric,
     query_chart_series_pack,
     verify_chart_series_index,
 )
@@ -118,6 +119,7 @@ __all__ = [
     "plan_spine_shard_release_outputs",
     "preflight_spine_fragments",
     "preflight_company_shard_identities",
+    "names_macro_observation_metric",
     "query_chart_series_pack",
     "read_global_spine_metadata",
     "refresh_global_key_stats",

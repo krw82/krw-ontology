@@ -22,6 +22,7 @@ from krw_ontology.agent_index import (
     CHART_SERIES_RELATIVE_PATH,
     GLOBAL_SPINE_RELATIVE_PATH,
     QueryPlan,
+    names_macro_observation_metric,
     open_ontology_store,
     query_chart_series_pack,
 )
@@ -2024,7 +2025,9 @@ def _attach_chart_series_sidecar_to_search_plan_payload(
             ],
         ]
     )
-    if not resolved_tickers:
+    # Macro observation series carry no ticker: a question naming their metric
+    # (e.g. a bare CPI trend question) still deserves a chart pack.
+    if not resolved_tickers and not names_macro_observation_metric(question):
         return
 
     chart_series_path = _runtime_root() / CHART_SERIES_RELATIVE_PATH

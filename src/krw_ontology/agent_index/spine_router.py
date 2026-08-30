@@ -3012,6 +3012,20 @@ def _should_attach_chart_series(question: str) -> bool:
         "주식보상",
         "연구개발",
         "인수",
+        # Observation (B4) chart clauses — vendor-neutral concept terms only.
+        "cpi",
+        "물가",
+        "인플레이션",
+        "금리",
+        "실업",
+        "고용",
+        "gdp",
+        "주가",
+        "주택",
+        "vix",
+        "p/e",
+        "pbr",
+        "거시",
     )
     return any(term in text for term in metric_terms)
 

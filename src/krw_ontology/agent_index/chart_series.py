@@ -18,9 +18,13 @@ from krw_ontology.agent_index.semantic_identity import (
     project_local_identity,
     project_object_identity,
 )
+from krw_ontology.observation.store import (
+    OBSERVATIONS_RELATIVE_PATH,
+    VINTAGE_ORDER_SQL,
+)
 
 CHART_SERIES_SCHEMA_VERSION = "krw-ontology-chart-series/v1"
-CHART_SERIES_BUILDER_VERSION = "chart-series-builder/v2"
+CHART_SERIES_BUILDER_VERSION = "chart-series-builder/v3"
 CHART_SERIES_RELATIVE_PATH = Path("indexes") / "chart_series.sqlite"
 CHART_SERIES_TABLES = (
     "chart_series_metadata",
@@ -55,7 +59,68 @@ _POINT_IN_TIME_METRICS = {
     "total_debt",
     "total_liabilities",
 }
-CHART_SAFE_CANONICAL_METRICS = frozenset(_PERIODIC_METRICS | _POINT_IN_TIME_METRICS)
+# Observation canonical metrics (B4): the 20 macro families of the P1 seed
+# plus the monthly-aggregated per-ticker price/valuation families.  Macro
+# series are ticker-less (the pack lookup serves them metric-gated); the
+# per-ticker families ride the normal ticker gate.  Values are advisory_only
+# market/macro context — never filing evidence.
+MACRO_OBSERVATION_CHART_METRICS = frozenset(
+    {
+        "breakeven_inflation_10y",
+        "cpi_yoy",
+        "core_cpi_yoy",
+        "core_pce_yoy",
+        "dgs2_yield",
+        "dgs10_yield",
+        "dgs30_yield",
+        "fed_funds_rate",
+        "fed_funds_target_upper",
+        "housing_starts",
+        "industrial_production_index",
+        "initial_jobless_claims",
+        "nominal_gdp",
+        "nonfarm_payrolls",
+        "real_gdp",
+        "retail_sales",
+        "sp500_index",
+        "treasury_10y2y_spread",
+        "unemployment_rate",
+        "vix",
+    }
+)
+PER_TICKER_OBSERVATION_CHART_METRICS = frozenset(
+    {
+        # Daily ``last_price`` closes aggregated to month-end (see
+        # ``_observation_period_bucket``): the monthly aggregation gets its own
+        # canonical key so a daily price feed can never masquerade as a
+        # filing-period series.
+        "last_price_monthly",
+        "price_to_book_ttm",
+        "trailing_pe_ttm",
+    }
+)
+OBSERVATION_CHART_METRICS = frozenset(
+    MACRO_OBSERVATION_CHART_METRICS | PER_TICKER_OBSERVATION_CHART_METRICS
+)
+OBSERVATION_SOURCE_CLASS = "observation"
+# The seed's per-ticker price family (canonical_metric ``last_price``) is
+# projected under the monthly-aggregated key above.
+OBSERVATION_PRICE_METRIC = "last_price"
+OBSERVATION_PRICE_MONTHLY_METRIC = "last_price_monthly"
+CHART_SAFE_CANONICAL_METRICS = frozenset(
+    _PERIODIC_METRICS | _POINT_IN_TIME_METRICS | OBSERVATION_CHART_METRICS
+)
+
+# Period grammar: FY/CY annual, CY quarter, and (B4) CY monthly —
+# ``CY2026M07``.  Zero-padded months only; anything else is garbage.
+_CHART_PERIOD_PATTERN = re.compile(r"^(?:FY|CY)?(?:19|20)\d{2}(?:Q[1-4]|M(?:0[1-9]|1[0-2]))?$")
+
+
+def is_valid_chart_period(period: str) -> bool:
+    """Validate one chart-period string against the FY/CY/Q/M grammar."""
+
+    return bool(_CHART_PERIOD_PATTERN.match(str(period or "").strip()))
+
 
 _DEFAULT_METRICS = (
     "revenue",
@@ -84,8 +149,14 @@ def build_chart_series_index(
     output_path: Path | str | None = None,
     release_id: str | None = None,
     source_manifest_hash: str | None = None,
+    observations_path: Path | str | None = None,
 ) -> ChartSeriesBuildResult:
-    """Build indexes/chart_series.sqlite from company shard metric_lookup tables."""
+    """Build indexes/chart_series.sqlite from company shard metric_lookup tables.
+
+    When the release carries ``indexes/observations.sqlite`` (B3 store), its
+    series are projected alongside the filing series with
+    ``source_class = 'observation'``; an absent store is a no-op.
+    """
     started_at = time.perf_counter()
     root = Path(release_root).expanduser().resolve()
     manifest_path = (
@@ -97,6 +168,11 @@ def build_chart_series_index(
         Path(output_path).expanduser().resolve()
         if output_path is not None
         else root / CHART_SERIES_RELATIVE_PATH
+    )
+    observations_store_path = (
+        Path(observations_path).expanduser().resolve()
+        if observations_path is not None
+        else root / OBSERVATIONS_RELATIVE_PATH
     )
     shard_manifest = _read_json(manifest_path)
     shards = (
@@ -127,12 +203,21 @@ def build_chart_series_index(
                     series_meta=series_meta,
                     series_points=series_points,
                 )
+            _collect_observation_chart_points(
+                observations_store_path,
+                series_meta=series_meta,
+                series_points=series_points,
+            )
             _write_chart_series_rows(conn, series_meta=series_meta, series_points=series_points)
             counts = {
                 "series": _count(conn, "chart_series"),
                 "points": _count(conn, "chart_series_points"),
+                # Macro observation series carry an empty ticker sentinel;
+                # they are not companies and must not inflate this count.
                 "tickers": int(
-                    conn.execute("SELECT COUNT(DISTINCT ticker) FROM chart_series").fetchone()[0]
+                    conn.execute(
+                        "SELECT COUNT(DISTINCT ticker) FROM chart_series WHERE ticker != ''"
+                    ).fetchone()[0]
                 ),
             }
             _write_metadata(
@@ -282,12 +367,21 @@ def verify_chart_series_index(path: Path | str, *, deep: bool = True) -> dict[st
                     "series": _count(conn, "chart_series"),
                     "points": _count(conn, "chart_series_points"),
                     "tickers": int(
-                        conn.execute("SELECT COUNT(DISTINCT ticker) FROM chart_series").fetchone()[
-                            0
-                        ]
+                        conn.execute(
+                            "SELECT COUNT(DISTINCT ticker) FROM chart_series WHERE ticker != ''"
+                        ).fetchone()[0]
                     ),
                 }
                 if deep:
+                    invalid_periods = sorted(
+                        str(row[0])
+                        for row in conn.execute(
+                            "SELECT DISTINCT period FROM chart_series_points"
+                        ).fetchall()
+                        if not is_valid_chart_period(str(row[0]))
+                    )
+                    if invalid_periods:
+                        errors.append(f"invalid_period:{','.join(invalid_periods[:5])}")
                     orphan_points = int(
                         conn.execute(
                             """
@@ -356,16 +450,37 @@ def query_chart_series_pack(
     if not resolved.is_file():
         return None
     ticker_values = [str(ticker).upper() for ticker in tickers if str(ticker or "").strip()]
-    if not ticker_values:
-        return None
     metric_candidates = _metric_candidates_for_question(question)
+    macro_metric_candidates = [
+        metric for metric in metric_candidates if metric in MACRO_OBSERVATION_CHART_METRICS
+    ]
+    # Macro observation series carry no ticker: a chart clause naming their
+    # metric is enough to serve them.  Filing series and per-ticker
+    # observation series (price/valuation) still require a ticker scope.
+    if not ticker_values and not macro_metric_candidates:
+        return None
     scope_candidates = _scope_candidates_for_question(question)
     dimension_requested = _dimension_series_requested(question, scope_candidates)
     try:
         with sqlite3.connect(resolved) as conn:
             conn.row_factory = sqlite3.Row
-            where = ["ticker IN (" + ",".join("?" for _ in ticker_values) + ")"]
-            params: list[Any] = list(ticker_values)
+            where: list[str] = []
+            params: list[Any] = []
+            if ticker_values:
+                ticker_clause = "ticker IN (" + ",".join("?" for _ in ticker_values) + ")"
+                params.extend(ticker_values)
+                if macro_metric_candidates:
+                    # Observation macro rows pass the ticker gate only when
+                    # the question explicitly names their metric.
+                    ticker_clause = (
+                        "("
+                        + ticker_clause
+                        + " OR (source_class = 'observation' AND canonical_metric IN ("
+                        + ",".join("?" for _ in macro_metric_candidates)
+                        + ")))"
+                    )
+                    params[len(ticker_values) : len(ticker_values)] = macro_metric_candidates
+                where.append(ticker_clause)
             if metric_candidates:
                 where.append(
                     "canonical_metric IN (" + ",".join("?" for _ in metric_candidates) + ")"
@@ -464,6 +579,20 @@ def chart_series_index_status(path: Path | str) -> dict[str, Any]:
     }
 
 
+def names_macro_observation_metric(question: str) -> bool:
+    """True when the question's metric clause names a macro observation metric.
+
+    Macro observation series carry no ticker, so MCP-side attach paths use
+    this to decide whether a ticker-less question may still serve a chart
+    pack (e.g. a bare "CPI 추이" question).
+    """
+
+    return any(
+        metric in MACRO_OBSERVATION_CHART_METRICS
+        for metric in _metric_candidates_for_question(question)
+    )
+
+
 def _collect_shard_chart_points(
     shard_path: Path,
     *,
@@ -510,6 +639,225 @@ def _collect_shard_chart_points(
         series_key = point["series_key"]
         period = point["period"]
         series_meta.setdefault(series_key, point["series"])
+        point_key = (series_key, period)
+        existing = series_points.get(point_key)
+        if existing is None or _point_quality_score(point) > _point_quality_score(existing):
+            series_points[point_key] = point
+
+
+def _collect_observation_chart_points(
+    observations_path: Path,
+    *,
+    series_meta: dict[str, dict[str, Any]],
+    series_points: dict[tuple[str, str], dict[str, Any]],
+) -> None:
+    """Project observations.sqlite series into chart rows (no-op when absent).
+
+    Reads the store read-only and resolves each phenomenon time to its latest
+    vintage under the store's shared ordering (``VINTAGE_ORDER_SQL``), so the
+    chart projection and the store's served payloads can never crown
+    different rows.  Served payloads stay vendor-scrubbed: only catalog
+    metadata (canonical metric, unit, frequency, domain) and observation
+    values/ids cross into the chart sidecar.
+    """
+
+    if not observations_path.is_file():
+        return
+    try:
+        conn = sqlite3.connect(f"file:{observations_path}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return
+    try:
+        conn.row_factory = sqlite3.Row
+        tables = {
+            str(row[0])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type IN ('table', 'view')"
+            ).fetchall()
+        }
+        if not {"series_catalog", "observations"}.issubset(tables):
+            return
+        rows = conn.execute(
+            f"""
+            SELECT current.series_key, current.phenomenon_time, current.value,
+                   current.observation_id, catalog.domain, catalog.canonical_metric,
+                   catalog.unit, catalog.frequency, catalog.ticker
+            FROM observations AS current
+            JOIN series_catalog AS catalog ON catalog.series_key = current.series_key
+            WHERE current.observation_id = (
+                SELECT prior.observation_id
+                FROM observations AS prior
+                WHERE prior.series_key = current.series_key
+                  AND prior.phenomenon_time = current.phenomenon_time
+                ORDER BY {VINTAGE_ORDER_SQL} DESC, prior.vintage DESC
+                LIMIT 1
+            )
+            ORDER BY current.series_key, current.phenomenon_time
+            """
+        ).fetchall()
+    except sqlite3.Error:
+        return
+    finally:
+        conn.close()
+
+    rows_by_series: dict[str, list[sqlite3.Row]] = {}
+    for row in rows:
+        rows_by_series.setdefault(str(row["series_key"]), []).append(row)
+    for store_series_key, series_rows in sorted(rows_by_series.items()):
+        _project_observation_series(
+            store_series_key,
+            series_rows,
+            series_meta=series_meta,
+            series_points=series_points,
+        )
+
+
+def _observation_period_bucket(frequency: str) -> str | None:
+    """Map a catalog frequency onto a chart period bucket.
+
+    P1 chart axis: daily and weekly phenomenon dates do not fit the filing
+    period grammar (FY/CY annual + CY quarter), so they are AGGREGATED TO
+    MONTHLY points — one point per calendar month carrying the month-end
+    (last observed date) reading.  Monthly series map one-to-one onto the
+    same monthly axis; quarterly macro series keep the existing CY<year>Q<q>
+    grammar.  This is a presentation-layer choice only: the observation store
+    keeps every daily bar untouched.
+    """
+
+    normalized = str(frequency or "").strip().lower()
+    if normalized in {"daily", "weekly", "monthly"}:
+        return "monthly"
+    if normalized == "quarterly":
+        return "quarterly"
+    return None
+
+
+def _observation_period_info(phenomenon_time: str, bucket: str) -> dict[str, Any] | None:
+    match = re.match(r"^((?:19|20)\d{2})-(\d{2})", str(phenomenon_time or ""))
+    if not match:
+        return None
+    year = int(match.group(1))
+    month = int(match.group(2))
+    if not 1 <= month <= 12:
+        return None
+    if bucket == "quarterly":
+        quarter = (month - 1) // 3 + 1
+        period = f"CY{year}Q{quarter}"
+        return {
+            "period": period,
+            "fiscal_year": year,
+            "fiscal_quarter": quarter,
+            "sort_key": _period_sort_key(period),
+        }
+    period = f"CY{year}M{month:02d}"
+    return {
+        "period": period,
+        "fiscal_year": year,
+        "fiscal_quarter": None,
+        "sort_key": _period_sort_key(period),
+    }
+
+
+def _observation_chart_metric(domain: str, canonical_metric: str) -> str:
+    """Chart-side canonical metric for one observation catalog entry."""
+
+    if domain == "price" and canonical_metric == OBSERVATION_PRICE_METRIC:
+        return OBSERVATION_PRICE_MONTHLY_METRIC
+    return canonical_metric
+
+
+def _project_observation_series(
+    store_series_key: str,
+    rows: Sequence[sqlite3.Row],
+    *,
+    series_meta: dict[str, dict[str, Any]],
+    series_points: dict[tuple[str, str], dict[str, Any]],
+) -> None:
+    first = rows[0]
+    domain = str(first["domain"] or "")
+    canonical_metric = _observation_chart_metric(domain, str(first["canonical_metric"] or ""))
+    # The allow-list stays the single chart gate: a future seed family is
+    # invisible to charts until it is explicitly allow-listed here.
+    if canonical_metric not in OBSERVATION_CHART_METRICS:
+        return
+    bucket = _observation_period_bucket(str(first["frequency"] or ""))
+    if bucket is None:
+        return
+    ticker = str(first["ticker"] or "").strip().upper()
+    unit = str(first["unit"] or "").strip() or None
+
+    # Month-end aggregation: rows arrive phenomenon-time ascending, so the
+    # last write per period bucket is the month's last observed reading.
+    bucketed: dict[str, tuple[sqlite3.Row, dict[str, Any]]] = {}
+    for row in rows:
+        info = _observation_period_info(str(row["phenomenon_time"]), bucket)
+        if info is None or not is_valid_chart_period(info["period"]):
+            continue
+        bucketed[info["period"]] = (row, info)
+    if not bucketed:
+        return
+
+    period_type = "quarterly" if bucket == "quarterly" else "monthly"
+    basis = "advisory_market_data"
+    duration = "point_in_time" if domain in {"price", "valuation"} else "period"
+    if ticker:
+        scope_kind, scope_key, scope_label = "company_total", "company_total", "Company total"
+    else:
+        scope_kind, scope_key, scope_label = "macro", "macro", "Macro"
+    series_key = "|".join(
+        [
+            ticker,
+            canonical_metric,
+            f"{scope_kind}:{scope_key}",
+            unit or "unitless",
+            period_type,
+            basis,
+            duration,
+            OBSERVATION_SOURCE_CLASS,
+        ]
+    )
+    label = _series_label(canonical_metric, scope_kind, scope_label)
+    series_row = {
+        "series_key": series_key,
+        "ticker": ticker,
+        "canonical_metric": canonical_metric,
+        "metric_name": canonical_metric,
+        "label": label,
+        "unit": unit,
+        "scope_kind": scope_kind,
+        "scope_key": scope_key,
+        "scope_label": scope_label,
+        "period_type": period_type,
+        "basis": basis,
+        "duration": duration,
+        "source_class": OBSERVATION_SOURCE_CLASS,
+        "statement_family": OBSERVATION_SOURCE_CLASS,
+        "quality_flags": ["advisory_only"],
+    }
+    for period, (row, info) in sorted(bucketed.items(), key=lambda item: item[1][1]["sort_key"]):
+        value = _number(row["value"])
+        if value is None:
+            continue
+        point = {
+            "series_key": series_key,
+            "period": period,
+            "fiscal_year": info["fiscal_year"],
+            "fiscal_quarter": info["fiscal_quarter"],
+            "period_sort_key": info["sort_key"],
+            "document_type": None,
+            "document_period": str(row["phenomenon_time"]),
+            "source_document_id": None,
+            "source_sort_key": _period_sort_key(str(row["phenomenon_time"])),
+            "value": value,
+            "formatted_value": _format_value(value, unit),
+            # observation_id pointer contract: the plan's evidence pointer for
+            # observation series is the store's observation_id, verbatim.
+            "object_id": str(row["observation_id"]),
+            "trace_status": None,
+            "metric_lineage_status": None,
+            "series": series_row,
+        }
+        series_meta.setdefault(series_key, series_row)
         point_key = (series_key, period)
         existing = series_points.get(point_key)
         if existing is None or _point_quality_score(point) > _point_quality_score(existing):
@@ -933,6 +1281,45 @@ def _metric_candidates_for_question(question: str) -> list[str]:
             ("ma_cash_outflow", "ma_related_costs"),
         ),
         (("adjusted", "조정"), ("adjusted_free_cash_flow",)),
+        # Observation (B4) chart clauses — vendor-neutral terms only: the
+        # routing vocabulary describes concepts (CPI, yields, payrolls), never
+        # provider series ids.
+        (("cpi", "소비자물가"), ("cpi_yoy", "core_cpi_yoy")),
+        (
+            ("인플레이션", "inflation", "물가", "breakeven"),
+            ("cpi_yoy", "core_cpi_yoy", "core_pce_yoy", "breakeven_inflation_10y"),
+        ),
+        (("pce",), ("core_pce_yoy",)),
+        (("기준금리", "정책금리", "fed funds"), ("fed_funds_rate", "fed_funds_target_upper")),
+        (("금리", "이자율", "interest rate"), ("fed_funds_rate", "dgs10_yield")),
+        (("10년물", "10년", "10-year", "10y"), ("dgs10_yield",)),
+        (("2년물", "2년", "2-year", "2y"), ("dgs2_yield",)),
+        (("30년물", "30년", "30-year", "30y"), ("dgs30_yield",)),
+        (("장단기", "spread"), ("treasury_10y2y_spread",)),
+        (("실업률", "실업", "unemployment"), ("unemployment_rate",)),
+        (("고용", "payroll", "비농", "jobless"), ("nonfarm_payrolls", "initial_jobless_claims")),
+        (("gdp", "국내총생산"), ("nominal_gdp", "real_gdp")),
+        (
+            ("산업생산", "industrial production"),
+            ("industrial_production_index",),
+        ),
+        (("소매", "retail sales"), ("retail_sales",)),
+        (("주택", "housing"), ("housing_starts",)),
+        (("vix", "변동성지수"), ("vix",)),
+        (("s&p 500", "sp500", "s&p500"), ("sp500_index",)),
+        (
+            ("주가", "주가추이", "share price", "stock price"),
+            ("last_price_monthly",),
+        ),
+        (
+            ("p/e", "pe ratio", "trailing pe", "주가수익비율", "밸류에이션", "valuation"),
+            ("trailing_pe_ttm",),
+        ),
+        (("p/b", "pbr", "price to book", "주가순자산비율"), ("price_to_book_ttm",)),
+        (
+            ("거시", "macro"),
+            ("cpi_yoy", "fed_funds_rate", "unemployment_rate", "dgs10_yield"),
+        ),
     )
     for needles, metrics in rules:
         if any(needle in text for needle in needles):
@@ -1175,8 +1562,34 @@ def _series_label(metric: str, scope_kind: str, scope_label: str) -> str:
         "total_assets": "Total assets",
         "total_debt": "Total debt",
         "total_liabilities": "Total liabilities",
+        # Observation metrics (B4): advisory market/macro context.
+        "breakeven_inflation_10y": "10-year breakeven inflation",
+        "cpi_yoy": "CPI (YoY)",
+        "core_cpi_yoy": "Core CPI (YoY)",
+        "core_pce_yoy": "Core PCE (YoY)",
+        "dgs2_yield": "2-year Treasury yield",
+        "dgs10_yield": "10-year Treasury yield",
+        "dgs30_yield": "30-year Treasury yield",
+        "fed_funds_rate": "Fed funds rate",
+        "fed_funds_target_upper": "Fed funds target (upper)",
+        "housing_starts": "Housing starts",
+        "industrial_production_index": "Industrial production",
+        "initial_jobless_claims": "Initial jobless claims",
+        "last_price_monthly": "Month-end share price",
+        "nominal_gdp": "Nominal GDP",
+        "nonfarm_payrolls": "Nonfarm payrolls",
+        "price_to_book_ttm": "Price / book (TTM)",
+        "real_gdp": "Real GDP",
+        "retail_sales": "Retail sales",
+        "sp500_index": "S&P 500 index",
+        "trailing_pe_ttm": "P/E (TTM)",
+        "treasury_10y2y_spread": "10Y–2Y Treasury spread",
+        "unemployment_rate": "Unemployment rate",
+        "vix": "Volatility index (VIX)",
     }.get(metric, metric.replace("_", " ").title())
     if scope_kind == "company_total":
+        return metric_label
+    if scope_kind == "macro":
         return metric_label
     return f"{scope_label} {metric_label}"
 
@@ -1301,10 +1714,18 @@ def _quarter_from_period(value: str) -> int | None:
 
 
 def _period_sort_key(period: str) -> int:
-    match = re.search(r"(?:CY|FY)?((?:19|20)\d{2})(?:Q([1-4]))?", period.upper())
+    # Monthly buckets (B4) sort at year*100 + month so they order within a
+    # year; FY/CY/Q keys keep their historical year*10 + quarter values so
+    # existing filing series sort identically to pre-observation builds.
+    match = re.search(r"(?:CY|FY)?((?:19|20)\d{2})(?:Q([1-4])|M(0[1-9]|1[0-2]))?", period.upper())
     if not match:
         return 0
-    return int(match.group(1)) * 10 + int(match.group(2) or 0)
+    year = int(match.group(1))
+    if match.group(2):
+        return year * 10 + int(match.group(2))
+    if match.group(3):
+        return year * 100 + int(match.group(3))
+    return year * 10
 
 
 def _slug(value: Any) -> str:

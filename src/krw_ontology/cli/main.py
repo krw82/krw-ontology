@@ -323,9 +323,14 @@ observation_app = typer.Typer(
     ),
     epilog=(
         "Typical flow:\n"
-        "  krw-ontology observation build --root /data/running --ticker AAPL MSFT\n"
+        "  krw-ontology observation build --root /data/running\n"
+        "  krw-ontology observation build --root /data/running --ticker AAPL MSFT "
+        "--include-on-demand-series\n"
         "  krw-ontology observation verify --path /data/running/indexes/observations.sqlite\n"
-        "  krw-ontology release build --from-root /data/running --releases-root /data/releases --env dev"
+        "  krw-ontology release build --from-root /data/running --releases-root /data/releases --env dev\n"
+        "\n"
+        "D13/D14: by default only weekly-or-slower macro releases are collected; "
+        "daily macro series and per-ticker families need --include-on-demand-series."
     ),
     no_args_is_help=True,
 )
@@ -11935,6 +11940,10 @@ def _index_cache_kind(path: Path, cache_root: Path) -> str:
 # and must never be part of the main release build (releases stay
 # network-free). The built indexes/observations.sqlite is carried into
 # releases when present, exactly like the chart_series sidecar.
+#
+# D13/D14 policy: the default run collects ONLY weekly-or-slower macro
+# releases (seed.default_collection_series); daily macro series and
+# per-ticker families need the --include-on-demand-series opt-in.
 # ---------------------------------------------------------------------------
 
 # Release trees are immutable published artifacts; collecting observations
@@ -11988,6 +11997,16 @@ def observation_build_cmd(
         "--include-vintages/--no-vintages",
         help="Fetch all vintages (first releases plus revisions) for macro series.",
     ),
+    include_on_demand_series: bool = typer.Option(
+        False,
+        "--include-on-demand-series",
+        help=(
+            "Collect the FULL seed: daily macro series and per-ticker price/"
+            "valuation families (D13/D14: these are on-demand, for future "
+            "event-anchored backfills). Default OFF — the default policy "
+            "collects weekly-or-slower macro releases only."
+        ),
+    ),
 ) -> None:
     """Fetch observation series and build the verified observation store."""
     from krw_ontology.observation.builder import (
@@ -11998,7 +12017,11 @@ def observation_build_cmd(
     from krw_ontology.observation.providers.fmp import FmpHistoryProvider
     from krw_ontology.observation.providers.fred import FredProvider
     from krw_ontology.observation.providers.polygon import build_polygon_provider
-    from krw_ontology.observation.seed import load_series_seed, series_seed_path
+    from krw_ontology.observation.seed import (
+        default_collection_series,
+        load_series_seed,
+        series_seed_path,
+    )
     from krw_ontology.observation.store import (
         OBSERVATIONS_RELATIVE_PATH,
         verify_observations_schema,
@@ -12015,6 +12038,18 @@ def observation_build_cmd(
         else resolve_ontology_root(root) / OBSERVATIONS_RELATIVE_PATH
     )
     seed = load_series_seed(seed_path.expanduser() if seed_path is not None else series_seed_path())
+    # D13/D14: the default collection policy registers ONLY weekly-or-slower
+    # macro releases; the full seed (daily macro series + per-ticker price/
+    # valuation families) is an explicit opt-in for event-anchored backfills.
+    # The store build still receives the full seed so excluded families keep
+    # their explicit "unavailable" catalog rows (B4 doctrine).
+    collection_seed = seed if include_on_demand_series else default_collection_series(seed)
+    policy_note = (
+        "--include-on-demand-series: full seed"
+        if include_on_demand_series
+        else "default policy: weekly+ macro only"
+    )
+    typer.echo(f"collecting {len(collection_seed)}/{len(seed)} series ({policy_note})")
 
     # Provider construction is credential-gated: a provider whose API key is
     # absent is not constructed and its series degrade to unavailable status.
@@ -12040,8 +12075,13 @@ def observation_build_cmd(
     except ValueError as exc:
         typer.echo(f"Invalid --ticker value: {exc}")
         raise typer.Exit(1) from exc
+    if tickers and not include_on_demand_series:
+        typer.echo(
+            "Note: per-ticker price/valuation families are on-demand (D13/D14); "
+            "--ticker has no effect without --include-on-demand-series"
+        )
     results = collect_observations(
-        seed,
+        collection_seed,
         providers=providers,
         tickers=tickers,
         start=start,

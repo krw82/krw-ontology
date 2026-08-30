@@ -4,8 +4,10 @@ The seed YAML is the single static description of the observation series
 families: which provider series feed which canonical metric, in what unit and
 frequency, under which provisional factor label.  The builder (B3) consumes
 ``load_series_seed()`` to plan collection; nothing here talks to a network.
-Observation values are advisory_only research context: never filing evidence,
-never strong-claim support, never recommendation or price-target grounds.
+``default_collection_series()`` narrows a loaded seed to the D13/D14 default
+collection policy (weekly-or-slower macro releases only).  Observation values
+are advisory_only research context: never filing evidence, never strong-claim
+support, never recommendation or price-target grounds.
 """
 
 from __future__ import annotations
@@ -31,6 +33,14 @@ KNOWN_FACTOR_LABELS = frozenset(
 _KNOWN_DOMAINS = frozenset({"macro", "price", "valuation"})
 _KNOWN_PROVIDERS = frozenset({"fred", "fmp", "polygon"})
 _PLACEHOLDER_PROVIDER_SERIES_ID = "ticker"
+
+# D13/D14 collection policy: the default `observation build` run registers
+# ONLY weekly-or-slower macro releases.  Daily macro series (DGS*/T10Y*/
+# VIXCLS/SP500/DFEDTARU) and every per-ticker price/valuation family are
+# on-demand: they are collected only through the CLI's
+# --include-on-demand-series opt-in (future P2 event-anchored backfills).
+DEFAULT_COLLECTION_DOMAIN = "macro"
+DEFAULT_COLLECTION_FREQUENCIES = frozenset({"weekly", "monthly", "quarterly"})
 
 _REPO_SEED_PATH = (
     Path(__file__).resolve().parents[3] / "ontology" / "observation" / "series_seed.yaml"
@@ -199,3 +209,28 @@ def load_series_seed(path: Path | None = None) -> dict[str, SeriesDefinition]:
             raise ValueError(f"series {series_key!r}: entry must be a mapping")
         definitions[series_key] = _definition_from_entry(series_key, raw_entry)
     return definitions
+
+
+def default_collection_series(
+    seed: Mapping[str, SeriesDefinition],
+) -> dict[str, SeriesDefinition]:
+    """Apply the D13/D14 default collection policy to a loaded seed.
+
+    Eligibility is exactly ``domain == "macro"`` AND ``frequency``
+    (case-insensitive) in {"weekly", "monthly", "quarterly"}: weekly-or-slower
+    macro releases only.  A missing or empty frequency is ineligible, and
+    every price/valuation family (daily, per-ticker) is ineligible by
+    definition.  Daily macro series (yields, VIX, SP500, the fed funds
+    target upper bound) stay in the seed and in the store catalog — they are
+    collected only via the CLI's ``--include-on-demand-series`` opt-in.
+    """
+
+    eligible: dict[str, SeriesDefinition] = {}
+    for series_key, definition in seed.items():
+        frequency = (getattr(definition, "frequency", None) or "").strip().lower()
+        if (
+            getattr(definition, "domain", None) == DEFAULT_COLLECTION_DOMAIN
+            and frequency in DEFAULT_COLLECTION_FREQUENCIES
+        ):
+            eligible[series_key] = definition
+    return eligible

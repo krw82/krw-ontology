@@ -3404,12 +3404,29 @@ def _materialize_release_root_from_source(
     return copy_modes
 
 
+def _release_disk_preflight_multiplier() -> float:
+    """Worst-case copy multiplier for the release disk preflight.
+
+    Defaults to the 3x copy-fallback guard (staging + release copy + work
+    room). ``KRW_RELEASE_DISK_PREFLIGHT_MULTIPLIER`` lets an operator lower it
+    toward the 1x floor for cache-hot rebuilds whose release materialization
+    is known to use filesystem clones (APFS ``cp -c``) instead of full copies.
+    """
+    raw = os.environ.get("KRW_RELEASE_DISK_PREFLIGHT_MULTIPLIER")
+    if raw:
+        try:
+            return max(1.0, float(raw))
+        except ValueError:
+            pass
+    return 3.0
+
+
 def _release_disk_preflight(*, source_root: Path, release_root: Path) -> None:
     release_root.parent.mkdir(parents=True, exist_ok=True)
     free_bytes = shutil.disk_usage(str(release_root.parent)).free
     source_bytes = _estimate_materialized_source_size(source_root)
     reserve_bytes = _release_min_free_bytes()
-    required_bytes = max(source_bytes * 3, reserve_bytes)
+    required_bytes = max(int(source_bytes * _release_disk_preflight_multiplier()), reserve_bytes)
     if free_bytes < required_bytes:
         raise RuntimeError(
             "release_disk_preflight_failed: "

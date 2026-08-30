@@ -5494,6 +5494,50 @@ def test_release_force_preflight_quarantines_stale_candidate(tmp_path: Path, mon
     assert (releases_root / "dev" / "new-rel" / "worker.pid").exists()
 
 
+def test_release_disk_preflight_multiplier_override(tmp_path: Path, monkeypatch):
+    """Operator escape hatch for cache-hot, clone-verified rebuilds.
+
+    Default keeps the 3x worst-case copy-fallback guard. The env override is
+    floored at 1x so it can never drop the source-size term entirely, and the
+    max(reserve) floor still applies. Needed when every heavy artifact is
+    already cached and release materialization uses APFS clones (task A5
+    repair rebuild on a 97%-full disk).
+    """
+    monkeypatch.delenv("KRW_RELEASE_DISK_PREFLIGHT_MULTIPLIER", raising=False)
+    assert cli_main._release_disk_preflight_multiplier() == 3.0
+
+    monkeypatch.setenv("KRW_RELEASE_DISK_PREFLIGHT_MULTIPLIER", "1")
+    assert cli_main._release_disk_preflight_multiplier() == 1.0
+
+    monkeypatch.setenv("KRW_RELEASE_DISK_PREFLIGHT_MULTIPLIER", "0.5")
+    assert cli_main._release_disk_preflight_multiplier() == 1.0
+
+    monkeypatch.setenv("KRW_RELEASE_DISK_PREFLIGHT_MULTIPLIER", "not-a-number")
+    assert cli_main._release_disk_preflight_multiplier() == 3.0
+
+    source_root = tmp_path / "running"
+    source_root.mkdir()
+    (source_root / "big.bin").write_bytes(b"x" * 1000)
+    release_root = tmp_path / "releases" / "dev" / "rel"
+    monkeypatch.setenv("KRW_ONTOLOGY_RELEASE_MIN_FREE_BYTES", "1")
+
+    low = shutil._ntuple_diskusage(total=10_000, used=9_500, free=500)
+    monkeypatch.setattr(cli_main.shutil, "disk_usage", lambda _path: low)
+    # Default 3x: 3_000 required > 500 free -> blocked.
+    with pytest.raises(RuntimeError, match="release_disk_preflight_failed"):
+        cli_main._release_disk_preflight(source_root=source_root, release_root=release_root)
+
+    monkeypatch.setenv("KRW_RELEASE_DISK_PREFLIGHT_MULTIPLIER", "1")
+    # 1x: 1_000 required > 500 free -> still blocked below the source floor.
+    with pytest.raises(RuntimeError, match="release_disk_preflight_failed"):
+        cli_main._release_disk_preflight(source_root=source_root, release_root=release_root)
+
+    ok = shutil._ntuple_diskusage(total=10_000, used=9_000, free=1_000)
+    monkeypatch.setattr(cli_main.shutil, "disk_usage", lambda _path: ok)
+    # 1x with exactly source-size free -> allowed.
+    cli_main._release_disk_preflight(source_root=source_root, release_root=release_root)
+
+
 def test_release_force_disk_preflight_blocks_low_space(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("KRW_ONTOLOGY_CLI_CONFIG", str(tmp_path / "config.json"))
     monkeypatch.setenv("KRW_ONTOLOGY_RELEASE_MIN_FREE_BYTES", "100")

@@ -22,3 +22,5 @@ build/
 companies/
 debug/
 *.log
+
+logs/

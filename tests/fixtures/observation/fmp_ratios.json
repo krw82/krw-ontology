@@ -1,0 +1,44 @@
+[
+  {
+    "_comment": "Shape source: FMP stable /stable/ratios-ttm?period=quarter (bare JSON array of quarterly TTM ratio rows {symbol, date, priceToEarningsRatioTTM, priceToBookRatioTTM, ...}; field names reused from the market snapshot adapter in services/krw-ontology-runtime market/snapshot.py); other TTM fields are a plausible subset. synthetic; verify against live API before first production collection run."
+  },
+  {
+    "symbol": "AAPL",
+    "date": "2025-09-30",
+    "currentRatioTTM": 0.92,
+    "quickRatioTTM": 0.89,
+    "grossMarginTTM": 46.86,
+    "operatingProfitMarginTTM": 31.82,
+    "netProfitMarginTTM": 26.44,
+    "returnOnAssetsTTM": 29.12,
+    "returnOnEquityTTM": 152.71,
+    "priceToEarningsRatioTTM": 33.12,
+    "priceToBookRatioTTM": 51.40
+  },
+  {
+    "symbol": "AAPL",
+    "date": "2025-12-31",
+    "currentRatioTTM": 0.88,
+    "quickRatioTTM": 0.85,
+    "grossMarginTTM": 47.21,
+    "operatingProfitMarginTTM": 32.05,
+    "netProfitMarginTTM": 26.91,
+    "returnOnAssetsTTM": 30.04,
+    "returnOnEquityTTM": 155.30,
+    "priceToEarningsRatioTTM": 34.05,
+    "priceToBookRatioTTM": 52.77
+  },
+  {
+    "symbol": "AAPL",
+    "date": "2026-03-31",
+    "currentRatioTTM": 0.90,
+    "quickRatioTTM": 0.87,
+    "grossMarginTTM": 47.63,
+    "operatingProfitMarginTTM": 32.41,
+    "netProfitMarginTTM": 27.18,
+    "returnOnAssetsTTM": 30.55,
+    "returnOnEquityTTM": 150.02,
+    "priceToEarningsRatioTTM": 31.88,
+    "priceToBookRatioTTM": 49.63
+  }
+]

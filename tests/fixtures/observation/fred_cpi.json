@@ -1,0 +1,29 @@
+{
+  "_comment": "Shape source: FRED fred/series/observations (api.stlouisfed.org/fred/series/observations, file_type=json) — {observations: [{date, realtime_start, realtime_end, value}]}; value is a string and '.' is the missing-value sentinel. synthetic; verify against live API before first production collection run.",
+  "observations": [
+    {
+      "date": "2026-02-01",
+      "realtime_start": "2026-03-11",
+      "realtime_end": "2026-04-10",
+      "value": "321.7"
+    },
+    {
+      "date": "2026-03-01",
+      "realtime_start": "2026-04-10",
+      "realtime_end": "2026-05-12",
+      "value": "322.1"
+    },
+    {
+      "date": "2026-04-01",
+      "realtime_start": "2026-05-12",
+      "realtime_end": "2026-06-10",
+      "value": "."
+    },
+    {
+      "date": "2026-05-01",
+      "realtime_start": "2026-06-10",
+      "realtime_end": "9999-12-31",
+      "value": "322.4"
+    }
+  ]
+}

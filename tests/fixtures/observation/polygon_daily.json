@@ -1,0 +1,59 @@
+{
+  "_comment": "Shape source: Polygon v2/aggs/ticker/{ticker}/range/1/day/{from}/{to} (api.polygon.io v2 aggregates) — {ticker, status, request_id, resultsCount, results: [{t (ms epoch UTC), o, h, l, c, v, vw, n}]}. synthetic; verify against live API before first production collection run.",
+  "ticker": "AAPL",
+  "status": "OK",
+  "request_id": "synthetic-fixture",
+  "resultsCount": 5,
+  "results": [
+    {
+      "t": 1782086400000,
+      "o": 200.85,
+      "h": 201.94,
+      "l": 200.11,
+      "c": 201.10,
+      "v": 48213100,
+      "vw": 201.22,
+      "n": 390412
+    },
+    {
+      "t": 1782172800000,
+      "o": 201.30,
+      "h": 202.98,
+      "l": 201.05,
+      "c": 202.44,
+      "v": 51047600,
+      "vw": 202.10,
+      "n": 401655
+    },
+    {
+      "t": 1782259200000,
+      "o": 202.50,
+      "h": 203.41,
+      "l": 201.88,
+      "c": 202.71,
+      "v": 46998200,
+      "vw": 202.63,
+      "n": 387904
+    },
+    {
+      "t": 1782345600000,
+      "o": 203.02,
+      "h": 203.77,
+      "l": 202.63,
+      "c": 203.05,
+      "v": 44773500,
+      "vw": 203.14,
+      "n": 372318
+    },
+    {
+      "t": 1782432000000,
+      "o": 203.10,
+      "h": 203.55,
+      "l": 202.21,
+      "c": 202.68,
+      "v": 52368900,
+      "vw": 202.77,
+      "n": 412047
+    }
+  ]
+}

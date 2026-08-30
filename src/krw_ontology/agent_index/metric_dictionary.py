@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import unicodedata
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -43,6 +44,24 @@ def normalize_dimension_key(value: Any) -> str:
     text = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", text)
     text = re.sub(r"[^0-9A-Za-z]+", "_", text)
     return re.sub(r"_+", "_", text).strip("_").casefold()
+
+
+def _unicode_alias_key(value: Any) -> str:
+    """Fallback alias key for non-ASCII (for example Korean) aliases.
+
+    ``_identity_key`` reduces any script that is not ASCII alphanumeric to an
+    empty string, which would silently drop every Korean alias.  Unicode-only
+    aliases are therefore keyed by their NFC-normalized, case-folded text so
+    ``canonicalize`` keeps working across scripts.  Mixed-script aliases must
+    not rely on this: their ASCII residue (for example ``실질GDP`` -> ``gdp``)
+    is ambiguous by construction, so the dictionary keeps Korean aliases pure.
+    """
+
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    text = unicodedata.normalize("NFC", text).casefold()
+    return re.sub(r"\s+", " ", text)
 
 
 def _xbrl_keys(value: Any) -> tuple[str, ...]:
@@ -79,7 +98,10 @@ class MetricDictionaryCatalog:
         }
 
     def canonicalize(self, value: Any) -> str | None:
-        return self.aliases.get(_identity_key(value))
+        canonical = self.aliases.get(_identity_key(value))
+        if canonical is not None:
+            return canonical
+        return self.aliases.get(_unicode_alias_key(value))
 
     def canonicalize_xbrl_tag(self, value: Any) -> str | None:
         for key in _xbrl_keys(value):
@@ -126,6 +148,10 @@ def _load_catalog(path_text: str, size: int, mtime_ns: int) -> MetricDictionaryC
         alias_values = [raw_canonical, entry.get("display_name"), *(entry.get("aliases") or [])]
         for alias in alias_values:
             key = _identity_key(alias)
+            if not key:
+                # Non-ASCII aliases (Korean display terms) survive only under a
+                # Unicode key; anything empty under both schemes is skipped.
+                key = _unicode_alias_key(alias)
             if not key:
                 continue
             previous = aliases.setdefault(key, canonical)

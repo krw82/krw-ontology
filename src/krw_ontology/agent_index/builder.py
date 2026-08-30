@@ -4721,22 +4721,33 @@ def _index_artifact(
 
     rejected_path = _resolve_artifact_path(root, files.get("rejected_objects"))
     rejected_objects = read_jsonl(rejected_path) if rejected_path else []
-    for obj in rejected_objects:
-        _insert_object(
-            conn,
-            obj,
-            artifact_key="rejected_objects",
-            artifact_path=rejected_path or ontology_dir / "rejected_objects.jsonl",
-            ticker=ticker,
-            document_type=document_type,
-            doc_type_key=doc_type_key,
-            period=period,
-            forced_review_status="rejected",
-            replace_fts_entries=replace_fts_entries,
-            retrieval_lookup=None,
-            taxonomy_by_id=None,
+    rejected_support_links = [obj for obj in rejected_objects if obj.get("type") == "SupportLink"]
+    if rejected_support_links:
+        # Schema v3 demotion holds for rejected rows too: SupportLink is a
+        # deterministic projection and must never re-enter the objects table
+        # (and through it the spine locator), even when reference validation
+        # rejected its endpoints. Rejected links stay auditable in the
+        # derived support_links table plus the quality ledger below.
+        stats["support_links"] += _index_support_links(
+            conn, None, ticker, rows=rejected_support_links
         )
-        stats["objects"] += 1
+    for obj in rejected_objects:
+        if obj.get("type") != "SupportLink":
+            _insert_object(
+                conn,
+                obj,
+                artifact_key="rejected_objects",
+                artifact_path=rejected_path or ontology_dir / "rejected_objects.jsonl",
+                ticker=ticker,
+                document_type=document_type,
+                doc_type_key=doc_type_key,
+                period=period,
+                forced_review_status="rejected",
+                replace_fts_entries=replace_fts_entries,
+                retrieval_lookup=None,
+                taxonomy_by_id=None,
+            )
+            stats["objects"] += 1
         _insert_quality_event(
             conn,
             ticker=ticker,

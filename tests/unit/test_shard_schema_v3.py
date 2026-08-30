@@ -526,3 +526,132 @@ def test_router_trace_resolves_support_link_ids(tmp_path):
         assert router.trace("support_link:SO:CY2023:10K:direct_quote_support:deadbeef") is None
         assert router.trace("support_link:ZZZ:CY2023:10K:direct_quote_support:deadbeef") is None
         assert router.trace(f"claim:{TICKER}:{PERIOD}:{DOC_TYPE_KEY}:missing") is None
+
+
+REJECTED_SUPPORT_LINK_ID = "support_link:SO:CY2023:10K:direct_quote_support:rejected7f3d21"
+REJECTED_CLAIM_ID = f"claim:{TICKER}:{PERIOD}:{DOC_TYPE_KEY}:rejected-claim"
+DANGLING_QUOTE_ID = f"quote:{TICKER}:{PERIOD}:{DOC_TYPE_KEY}:9999"
+DANGLING_CLAIM_ID = f"claim:{TICKER}:{PERIOD}:{DOC_TYPE_KEY}:missing-target"
+
+
+def _append_rejected_objects(root: Path) -> None:
+    """Mirror production reference_validation rejections.
+
+    Real corpora (e.g. GRMN 10-K CY2025: ~41k rows) reject large SupportLink
+    batches at reference validation because their endpoints are themselves
+    rejected; the links then ride in ``rejected_objects.jsonl`` with dangling
+    from_id/to_id. The v3 demotion must hold for those rows too.
+    """
+    ontology_dir = root / "companies" / TICKER / "ontology" / DOC_TYPE_KEY / PERIOD
+    sources_dir = root / "companies" / TICKER / "sources" / DOC_TYPE_KEY / PERIOD
+    rejected_link = {
+        "id": REJECTED_SUPPORT_LINK_ID,
+        "type": "SupportLink",
+        "ticker": TICKER,
+        "source_document_id": SOURCE_DOCUMENT_ID,
+        "document_type": DOCUMENT_TYPE,
+        "period": PERIOD,
+        "from_id": DANGLING_QUOTE_ID,
+        "to_id": DANGLING_CLAIM_ID,
+        "support_object_id": DANGLING_QUOTE_ID,
+        "support_object_type": "EvidenceQuote",
+        "target_object_id": DANGLING_CLAIM_ID,
+        "target_object_type": "ResearchClaim",
+        "support_type": "direct_quote_support",
+        "support_role": "quote_support",
+        "stance": "supports",
+        "support_strength": "direct",
+        "inference_level": "direct_quote",
+        "evidence_grade": "direct",
+        "evidence_strength": "direct",
+        "requires_inference": False,
+        "created_by": "deterministic_projection",
+        "confidence": "high",
+        "review_status": "accepted",
+        "schema_version": "0.1.0",
+        "rejection_reason": f"Dangling references: [('from_id', '{DANGLING_QUOTE_ID}')]",
+        "rejection_stage": "reference_validation",
+    }
+    rejected_claim = {
+        "id": REJECTED_CLAIM_ID,
+        "type": "ResearchClaim",
+        "ticker": TICKER,
+        "source_document_id": SOURCE_DOCUMENT_ID,
+        "document_type": DOCUMENT_TYPE,
+        "period": PERIOD,
+        "claim_text": "Rejected claim keeps its objects-table audit row.",
+        "claim_type": "factual",
+        "supported_by_quotes": [QUOTE_ID],
+        "review_status": "accepted",
+        "schema_version": "0.1.0",
+        "rejection_reason": "Unsupported numeric values: {'12'}",
+        "rejection_stage": "numeric_guard",
+    }
+    write_jsonl(ontology_dir / "rejected_objects.jsonl", [rejected_link, rejected_claim])
+    build_indexes(
+        ticker=TICKER,
+        period=PERIOD,
+        doc_type_key=DOC_TYPE_KEY,
+        ontology_dir=ontology_dir,
+        sources_dir=sources_dir,
+        output_dir=root,
+        document_type=DOCUMENT_TYPE,
+    )
+
+
+def test_rejected_support_links_stay_out_of_objects_table(tmp_path):
+    """Regression: rejected SupportLink rows must not re-enter ``objects``.
+
+    The demotion in shard schema v3 diverted only the ``support_links``
+    artifact key; SupportLink rows inside ``rejected_objects.jsonl`` were
+    still inserted into ``objects`` by the rejected-object audit path, which
+    reintroduced SupportLink rows (GRMN: 41,622) into 118 company shards and
+    1.3M rows into the spine locator (task A5 parity failure).
+    """
+    _write_minimal_artifacts(tmp_path)
+    _append_rejected_objects(tmp_path)
+    result = build_spine_shard_release_outputs(
+        tmp_path,
+        release_id="test-shard-schema-v3-rejected-links",
+        workers=1,
+        no_cache=True,
+    )
+    shard_path = result.global_spine_path.parent / "companies" / f"{TICKER}.sqlite"
+    assert shard_path.is_file()
+
+    with sqlite3.connect(f"file:{shard_path}?mode=ro", uri=True) as conn:
+        support_link_objects = conn.execute(
+            "SELECT COUNT(*) FROM objects WHERE type = 'SupportLink'"
+        ).fetchone()[0]
+        derived_row = conn.execute(
+            """
+            SELECT from_id, to_id FROM support_links WHERE object_id = ?
+            """,
+            (REJECTED_SUPPORT_LINK_ID,),
+        ).fetchone()
+        rejected_claim_status = conn.execute(
+            "SELECT review_status FROM objects WHERE id = ?", (REJECTED_CLAIM_ID,)
+        ).fetchone()
+        rejection_event = conn.execute(
+            """
+            SELECT COUNT(*) FROM quality_events
+            WHERE category = 'rejected_object' AND object_id = ?
+            """,
+            (REJECTED_SUPPORT_LINK_ID,),
+        ).fetchone()[0]
+
+    assert support_link_objects == 0
+    assert derived_row is not None
+    assert derived_row[0] == DANGLING_QUOTE_ID
+    assert derived_row[1] == DANGLING_CLAIM_ID
+    # Non-SupportLink rejected objects keep their audit row in objects.
+    assert rejected_claim_status is not None
+    assert rejected_claim_status[0] == "rejected"
+    # The rejection stays visible in the quality ledger.
+    assert rejection_event >= 1
+
+    with sqlite3.connect(f"file:{result.global_spine_path}?mode=ro", uri=True) as conn:
+        locator_support_links = conn.execute(
+            "SELECT COUNT(*) FROM global_object_locator WHERE object_type = 'SupportLink'"
+        ).fetchone()[0]
+    assert locator_support_links == 0

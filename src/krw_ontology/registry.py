@@ -23,6 +23,17 @@ class OntologyRegistry:
     def canonical_artifacts(self) -> dict[str, str]:
         return dict(self.object_files)
 
+    def artifact_files(self) -> set[str]:
+        """Artifact keys (JSONL filename stems) declared in registry.yaml.
+
+        registry.yaml is the single schema-file authority: the stems must
+        match agent_index builder object-file keys exactly.
+        """
+        return {
+            artifact.removesuffix(".jsonl")
+            for artifact in self.object_files.values()
+        }
+
 
 def repo_root() -> Path:
     return Path(__file__).resolve().parents[2]

@@ -8,6 +8,8 @@ from pathlib import Path
 
 import yaml
 
+from krw_ontology.agent_index.builder import OBJECT_FILE_KEYS
+from krw_ontology.registry import load_ontology_registry
 from krw_ontology.schema.id_utils import generate_metric_id
 from krw_ontology.schema.objects import SCHEMA_VERSION
 from krw_ontology.utils.io import find_project_root, read_jsonl, write_jsonl
@@ -102,6 +104,25 @@ _ACCEPTED_FILES: dict[str, str] = {
     "OntologyRegistrySnapshot": "ontology_registry_snapshots.jsonl",
     "ValidationReport": "validation_reports.jsonl",
 }
+
+
+def assert_registry_matches_object_file_keys() -> None:
+    """Cross-check registry.yaml artifact authority against builder keys.
+
+    registry.yaml is the single artifact-file authority. If its artifact
+    ``artifact_file`` set ever drifts from the agent-index builder's
+    OBJECT_FILE_KEYS, fail loudly instead of silently building a partial
+    index. This is the contract gate for artifact key-set changes.
+    """
+    registry_files = load_ontology_registry().artifact_files()
+    builder_keys = set(OBJECT_FILE_KEYS)
+    if registry_files != builder_keys:
+        raise AssertionError(
+            "ontology/registry.yaml and agent_index builder.OBJECT_FILE_KEYS "
+            "drifted: "
+            f"only-registry={sorted(registry_files - builder_keys)} "
+            f"only-builder={sorted(builder_keys - registry_files)}"
+        )
 
 
 def _load_all_objects(ontology_dir: Path, *, include_edges: bool = True) -> dict[str, dict]:
@@ -207,6 +228,8 @@ def run_validate_ontology(ontology_dir: Path, *, include_edges: bool = True) -> 
 
     Returns dict with keys: accepted (type -> count), rejected (list), stats.
     """
+    assert_registry_matches_object_file_keys()
+
     schema_root = Path(__file__).resolve().parents[4] / "ontology" / "schema"
 
     # Load config files

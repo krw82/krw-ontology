@@ -1,4 +1,4 @@
-"""Pydantic v2 models for all 12 object types matching objects.yaml."""
+"""Pydantic v2 object models; artifact files are governed by ontology/registry.yaml."""
 
 from __future__ import annotations
 

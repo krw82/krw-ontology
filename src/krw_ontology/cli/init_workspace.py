@@ -6,238 +6,8 @@ from pathlib import Path
 
 import typer
 
+from krw_ontology.registry import registry_path
 
-OBJECTS_YAML_TEMPLATE = """\
-schema_version: "0.1.0"
-
-types:
-  SourceDocument:
-    id_pattern: "source:{ticker}:{period}:{doc_type_key}"
-    fields:
-      id: {type: string, required: true}
-      type: {type: string, enum: ["SourceDocument"], required: true}
-      ticker: {type: string, required: true}
-      source_document_id: {type: string, required: false}
-      document_type: {type: string, required: true}
-      period: {type: string, required: true}
-      metadata_ref: {type: string, description: "path to metadata.json", required: false}
-      schema_version: {type: string, required: true}
-
-  SourceSpan:
-    id_pattern: "span:{ticker}:{period}:{doc_type_key}:{section}:{seq:04d}"
-    fields:
-      id: {type: string, required: true}
-      type: {type: string, enum: ["SourceSpan"], required: true}
-      ticker: {type: string, required: true}
-      source_document_id: {type: string, required: true}
-      document_type: {type: string, required: true}
-      period: {type: string, required: true}
-      section_name: {type: string, required: true}
-      section_number: {type: string, required: true}
-      span_index: {type: integer, required: true}
-      start_char: {type: integer, required: true, description: "Absolute offset within clean.md"}
-      end_char: {type: integer, required: true, description: "Absolute offset within clean.md"}
-      text: {type: string, required: true}
-      text_hash: {type: string, required: true, description: "sha256 hash of normalized span text"}
-      char_count: {type: integer, required: true}
-      section_detection_confidence: {type: string, enum: ["high", "medium", "low"], required: true}
-      section_detection_method: {type: string, required: true}
-      schema_version: {type: string, required: true}
-
-  EvidenceQuote:
-    id_pattern: "quote:{ticker}:{period}:{doc_type_key}:{section}:{seq:04d}:{quote_seq:03d}"
-    fields:
-      id: {type: string, required: true}
-      type: {type: string, enum: ["EvidenceQuote"], required: true}
-      ticker: {type: string, required: true}
-      source_document_id: {type: string, required: true}
-      document_type: {type: string, required: true}
-      period: {type: string, required: true}
-      source_span_id: {type: string, required: true}
-      quote_text: {type: string, required: true}
-      quote_type: {type: string, enum_ref: "quote_types.yaml", required: true}
-      section_name: {type: string, required: true}
-      start_char: {type: integer, required: false, description: "Optional offset within SourceSpan.text"}
-      end_char: {type: integer, required: false, description: "Optional offset within SourceSpan.text"}
-      absolute_start_char: {type: integer, required: false, description: "Optional derived offset within clean.md"}
-      absolute_end_char: {type: integer, required: false, description: "Optional derived offset within clean.md"}
-      confidence: {type: string, enum: ["high", "medium", "low"], required: true}
-      review_status: {type: string, enum: ["accepted", "needs_review", "rejected"], default: "accepted"}
-      language_signals: {type: array, items: LanguageSignal, required: false, description: "Optional. Embedded during quote extraction."}
-      schema_version: {type: string, required: true}
-
-  LanguageSignal:
-    id_pattern: "signal:{ticker}:{period}:{doc_type_key}:{section}:{seq:04d}:{signal_seq:03d}"
-    fields:
-      id: {type: string, required: true}
-      type: {type: string, enum: ["LanguageSignal"], required: true}
-      ticker: {type: string, required: true}
-      source_document_id: {type: string, required: true}
-      document_type: {type: string, required: true}
-      period: {type: string, required: true}
-      source_quote_id: {type: string, required: true}
-      signal_text: {type: string, required: true}
-      signal_type: {type: string, enum_ref: "language_signals.yaml", required: true}
-      strength: {type: string, enum: ["strong", "medium", "weak"], required: true}
-      direction: {type: string, enum: ["positive", "negative", "neutral", "risk"], required: true}
-      certainty: {type: string, enum: ["observed", "conditional", "expected", "uncertain", "structural"], required: true}
-      temporal_scope: {type: string, enum: ["historical", "current", "future_or_potential", "ongoing"], required: true}
-      exact_match_verified: {type: boolean, required: true}
-      schema_version: {type: string, required: true}
-
-  ResearchClaim:
-    id_pattern: "claim:{ticker}:{period}:{doc_type_key}:{slug}"
-    fields:
-      id: {type: string, required: true}
-      type: {type: string, enum: ["ResearchClaim"], required: true}
-      ticker: {type: string, required: true}
-      source_document_id: {type: string, required: true}
-      document_type: {type: string, required: true}
-      period: {type: string, required: true}
-      claim_text: {type: string, required: true}
-      claim_type: {type: string, enum_ref: "claim_types.yaml", required: true}
-      supported_by_quotes: {type: array, items: string, required: true, min_items: 1}
-      related_metrics: {type: array, items: string, required: false}
-      confidence: {type: string, enum: ["high", "medium", "low"], required: true}
-      review_status: {type: string, enum: ["accepted", "needs_review", "rejected"], default: "accepted"}
-      schema_version: {type: string, required: true}
-
-  ResearchObject:
-    description: "Shared schema for RiskFactor, GrowthDriver, Headwind. Type field discriminates."
-    id_pattern: "{type_key}:{ticker}:{period}:{doc_type_key}:{slug}"
-    type_key: "risk|growth_driver|headwind"
-    fields:
-      id: {type: string, required: true}
-      type: {type: string, enum: ["RiskFactor", "GrowthDriver", "Headwind"], required: true}
-      ticker: {type: string, required: true}
-      source_document_id: {type: string, required: true}
-      document_type: {type: string, required: true}
-      period: {type: string, required: true}
-      name: {type: string, required: true}
-      category: {type: string, required: true}
-      description: {type: string, required: true}
-      supported_by_claims: {type: array, items: string, required: false}
-      supported_by_quotes: {type: array, items: string, required: false}
-      affects: {type: array, items: string, required: false}
-      unmapped_impacts: {type: array, items: string, required: false}
-      unmapped_metrics: {type: array, items: string, required: false}
-      qualitative_impact: {type: string, required: true}
-      confidence: {type: string, enum: ["high", "medium", "low"], required: true}
-      review_status: {type: string, enum: ["accepted", "needs_review", "rejected"], default: "accepted"}
-      schema_version: {type: string, required: true}
-
-  AssumptionCandidate:
-    id_pattern: "assumption:{ticker}:{period}:{doc_type_key}:{slug}"
-    fields:
-      id: {type: string, required: true}
-      type: {type: string, enum: ["AssumptionCandidate"], required: true}
-      ticker: {type: string, required: true}
-      source_document_id: {type: string, required: true}
-      document_type: {type: string, required: true}
-      period: {type: string, required: true}
-      name: {type: string, required: true}
-      assumption_text: {type: string, required: true}
-      assumption_type: {type: string, enum: ["growth_rate", "margin", "capex", "tax_rate", "wacc", "other"], required: true}
-      value_hint: {type: string, required: false}
-      supported_by_claims: {type: array, items: string, required: false}
-      supported_by_quotes: {type: array, items: string, required: false}
-      related_metrics: {type: array, items: string, required: false}
-      unmapped_metrics: {type: array, items: string, required: false}
-      confidence: {type: string, enum: ["high", "medium", "low"], required: true}
-      review_status: {type: string, enum: ["accepted", "needs_review", "rejected"], default: "needs_review"}
-      schema_version: {type: string, required: true}
-
-  Metric:
-    id_pattern: "metric:{canonical_name}"
-    fields:
-      id: {type: string, required: true}
-      type: {type: string, enum: ["Metric"], required: true}
-      name: {type: string, required: true}
-      category: {type: string, required: true}
-      unit: {type: string, required: true}
-      description: {type: string, required: true}
-      schema_version: {type: string, required: true}
-
-  XBRLFact:
-    id_pattern: "xbrl:{ticker}:{period}:{doc_type_key}:{safe_taxonomy_tag}:{hash8}"
-    fields:
-      id: {type: string, required: true}
-      type: {type: string, enum: ["XBRLFact"], required: true}
-      ticker: {type: string, required: true}
-      source_document_id: {type: string, required: true}
-      document_type: {type: string, required: true}
-      period: {type: string, required: true}
-      taxonomy_tag: {type: string, required: true}
-      safe_taxonomy_tag: {type: string, required: true}
-      value: {type: number, required: true}
-      unit: {type: string, required: true}
-      context_ref: {type: string, required: true}
-      source_filing_detail: {type: string, required: true}
-      decimals: {type: integer, required: false}
-      schema_version: {type: string, required: true}
-
-  FinancialMetricValue:
-    id_pattern: "financial_metric:{ticker}:{period}:{doc_type_key}:{hash12}"
-    fields:
-      id: {type: string, required: true}
-      type: {type: string, enum: ["FinancialMetricValue"], required: true}
-      ticker: {type: string, required: true}
-      source_document_id: {type: string, required: true}
-      document_type: {type: string, required: true}
-      period: {type: string, required: true}
-      metric_name: {type: string, required: true}
-      value: {type: number, required: true}
-      unit: {type: string, required: true}
-      fiscal_year: {type: integer, required: false}
-      fiscal_period: {type: string, required: false}
-      period_type: {type: string, required: false}
-      start_date: {type: string, required: false}
-      end_date: {type: string, required: false}
-      source_xbrl_fact_id: {type: string, required: true}
-      source: {type: string, required: true}
-      schema_version: {type: string, required: true}
-
-  DerivedMetricValue:
-    id_pattern: "derived_metric:{ticker}:{period}:{doc_type_key}:{hash12}"
-    fields:
-      id: {type: string, required: true}
-      type: {type: string, enum: ["DerivedMetricValue"], required: true}
-      ticker: {type: string, required: true}
-      source_document_id: {type: string, required: true}
-      document_type: {type: string, required: true}
-      period: {type: string, required: true}
-      metric_name: {type: string, required: true}
-      value: {type: number, required: true}
-      unit: {type: string, required: true}
-      fiscal_year: {type: integer, required: false}
-      fiscal_period: {type: string, required: false}
-      period_type: {type: string, required: false}
-      formula: {type: string, required: true}
-      input_metric_ids: {type: array, items: string, required: true}
-      source: {type: string, required: true}
-      schema_version: {type: string, required: true}
-
-  Edge:
-    id_pattern: "edge:{ticker}:{period}:{doc_type_key}:{relation_id}:{hash10}"
-    fields:
-      id: {type: string, required: true}
-      type: {type: string, enum: ["Edge"], required: true}
-      ticker: {type: string, required: true}
-      source_document_id: {type: string, required: true}
-      document_type: {type: string, required: true}
-      period: {type: string, required: true}
-      from_id: {type: string, required: true}
-      to_id: {type: string, required: true}
-      relation_name: {type: string, required: true}
-      relation_id: {type: string, required: true}
-      edge_class: {type: string, required: true}
-      evidence_level: {type: string, required: true}
-      generation_method: {type: string, required: true}
-      rationale: {type: string, required: true}
-      confidence: {type: string, enum: ["high", "medium", "low"], required: true}
-      review_status: {type: string, enum: ["accepted", "needs_review", "rejected"], default: "accepted"}
-      schema_version: {type: string, required: true}
-"""
 
 RELATIONS_YAML_TEMPLATE = """\
 schema_version: "0.1.0"
@@ -271,27 +41,6 @@ relations:
     edge_class: evidence
     evidence_level: direct
 
-  - id: describes_risk
-    name: describes_risk
-    from: ResearchClaim
-    to: RiskFactor
-    edge_class: interpretation
-    evidence_level: derived
-
-  - id: describes_driver
-    name: describes_driver
-    from: ResearchClaim
-    to: GrowthDriver
-    edge_class: interpretation
-    evidence_level: derived
-
-  - id: describes_headwind
-    name: describes_headwind
-    from: ResearchClaim
-    to: Headwind
-    edge_class: interpretation
-    evidence_level: derived
-
   - id: describes_activity
     name: describes_activity
     from: ResearchClaim
@@ -309,10 +58,7 @@ relations:
   - id: manifests_as
     name: manifests_as
     from: ExternalFactorExposure
-    to:
-      - RiskFactor
-      - GrowthDriver
-      - Headwind
+    to: BusinessFactor
     edge_class: exposure_link
     evidence_level: derived
 
@@ -335,15 +81,11 @@ relations:
     from:
       - BusinessActivity
       - ExternalFactorExposure
-      - RiskFactor
-      - GrowthDriver
-      - Headwind
+      - BusinessFactor
     to:
       - BusinessActivity
       - ExternalFactorExposure
-      - RiskFactor
-      - GrowthDriver
-      - Headwind
+      - BusinessFactor
     same_type_required: true
     edge_class: temporal
     evidence_level: inferred
@@ -361,9 +103,7 @@ relations:
     to:
       - BusinessActivity
       - ExternalFactorExposure
-      - RiskFactor
-      - GrowthDriver
-      - Headwind
+      - BusinessFactor
     edge_class: event
     evidence_level: derived
 
@@ -705,7 +445,6 @@ canonical_metrics:
 """
 
 YAML_TEMPLATES = {
-    "objects.yaml": OBJECTS_YAML_TEMPLATE,
     "relations.yaml": RELATIONS_YAML_TEMPLATE,
     "quote_types.yaml": QUOTE_TYPES_YAML_TEMPLATE,
     "language_signals.yaml": LANGUAGE_SIGNALS_YAML_TEMPLATE,
@@ -716,7 +455,11 @@ YAML_TEMPLATES = {
 
 
 def init_workspace(schema_dir: Path | None = None) -> None:
-    """Create ontology schema directory with starter YAML configs."""
+    """Create ontology schema directory with starter YAML configs.
+
+    registry.yaml is the single artifact-file authority: the workspace gets a
+    copy of the project registry instead of a duplicated object-schema file.
+    """
     if schema_dir is None:
         schema_dir = Path("ontology/schema")
 
@@ -731,6 +474,10 @@ def init_workspace(schema_dir: Path | None = None) -> None:
             filepath.write_text(source_path.read_text())
         else:
             filepath.write_text(template)
+
+    source_registry = registry_path()
+    if source_registry.exists():
+        (schema_dir.parent / "registry.yaml").write_text(source_registry.read_text())
 
     if source_taxonomy_dir.exists():
         taxonomy_dir = schema_dir.parent / "taxonomy"

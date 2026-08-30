@@ -110,28 +110,6 @@ class ClaimExtractionOutput(BaseModel):
         return value
 
 
-class ObjectExtractionOutput(BaseModel):
-    """AI output model for RiskFactor/GrowthDriver/Headwind extraction."""
-
-    id: str
-    type: str
-    name: str
-    category: str
-    description: str
-    supported_by_claims: list[str] | None = None
-    supported_by_quotes: list[str] | None = None
-    affects: list[str] | None = None
-    unmapped_impacts: list[str] | None = None
-    unmapped_metrics: list[str] | None = None
-    qualitative_impact: str
-    confidence: str
-
-    @field_validator("confidence", mode="before")
-    @classmethod
-    def _normalize_confidence(cls, value):
-        return _coerce_confidence(value)
-
-
 class AssumptionExtractionOutput(BaseModel):
     """AI output model for assumption candidate extraction."""
 
@@ -172,7 +150,6 @@ class EdgeGenerationOutput(BaseModel):
 STAGE_OUTPUT_MODELS = {
     "extract_evidence_quotes": QuoteExtractionOutput,
     "extract_research_claims": ClaimExtractionOutput,
-    "extract_risks_drivers_headwinds": ObjectExtractionOutput,
     "extract_assumption_candidates": AssumptionExtractionOutput,
     "generate_edges": EdgeGenerationOutput,
 }

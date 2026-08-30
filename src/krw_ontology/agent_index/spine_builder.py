@@ -3587,6 +3587,7 @@ def _filter_plan_for_company(
             "company_shard_schema_version": COMPANY_SHARD_SCHEMA_VERSION,
             "company_shard_cache_format_version": COMPANY_SHARD_CACHE_FORMAT_VERSION,
             "index_layout": GLOBAL_SPINE_LAYOUT,
+            "metric_dictionary": metric_dictionary_binding(),
         }
     )
     cache_key = _stable_hash(

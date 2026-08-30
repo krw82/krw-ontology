@@ -2335,3 +2335,89 @@ def test_spine_fragment_cache_key_ignores_source_manifest_hash():
     )
     assert key_a == key_b
     assert key_a != key_c
+
+
+def _binding_fixture(*, sha256: str, count: int) -> dict[str, object]:
+    return {
+        "format": "krw-metric-dictionary-binding/v1",
+        "schema_version": "1",
+        "sha256": sha256,
+        "canonical_metric_count": count,
+    }
+
+
+def _company_shard_filter_plan(tmp_path: Path) -> spine_builder.SourceArtifactSqlitePlan:
+    item = agent_index_builder.ArtifactPlanItem(
+        artifact_index_path=tmp_path / "artifacts" / "AAPL.json",
+        relative_path="artifacts/AAPL.json",
+        ticker="AAPL",
+        document_type="10-K",
+        doc_type_key="10-K",
+        period="CY2025",
+        content_hash="sha256:aaa",
+        cache_key="sha256:bbb",
+        fragment_path=tmp_path / "fragments" / "AAPL.sqlite",
+        cache_hit=False,
+        estimated_bytes=1,
+        estimated_rows=1,
+        input_paths=(),
+        missing_inputs=(),
+        cache_errors=(),
+    )
+    return agent_index_builder.IndexBuildPlan(
+        root=tmp_path,
+        index_path=tmp_path / "indexes" / "global_spine.sqlite",
+        cache_root=tmp_path / "cache",
+        artifact_manifest_path=tmp_path / "indexes" / "artifact_manifest.json",
+        source_manifest_path=None,
+        source_manifest_hash=None,
+        discovery_mode="registry",
+        items=(item,),
+        dirty_items=(item,),
+        cached_items=(),
+        company_items=(),
+        dirty_company_items=(),
+        cached_company_items=(),
+        dirty_tickers=("AAPL",),
+        workers=1,
+        layout="shards",
+        build_settings={},
+    )
+
+
+def test_company_shard_cache_key_changes_with_metric_dictionary_binding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Shard metadata records the dictionary binding, so the shard cache key must too.
+
+    Regression: extending the metric dictionary yaml (e.g. 25 -> 48 canonical
+    metrics, commit b98384c) without any schema/format bump used to leave stale
+    old-binding shards cache-hittable; the mismatch only surfaced at the very
+    end in _write_v3_shard_manifest.
+    """
+    plan = _company_shard_filter_plan(tmp_path)
+
+    def shard_path() -> Path:
+        return tmp_path / "indexes" / "companies" / "AAPL.sqlite"
+
+    binding_25 = _binding_fixture(sha256="a" * 64, count=25)
+    binding_48 = _binding_fixture(sha256="b" * 64, count=48)
+
+    monkeypatch.setattr(spine_builder, "metric_dictionary_binding", lambda: dict(binding_25))
+    first = spine_builder._filter_plan_for_company(
+        plan, ticker="AAPL", shard_path=shard_path(), no_cache=False
+    )
+    first_repeat = spine_builder._filter_plan_for_company(
+        plan, ticker="AAPL", shard_path=shard_path(), no_cache=False
+    )
+
+    monkeypatch.setattr(spine_builder, "metric_dictionary_binding", lambda: dict(binding_48))
+    second = spine_builder._filter_plan_for_company(
+        plan, ticker="AAPL", shard_path=shard_path(), no_cache=False
+    )
+
+    first_item = first.company_items[0]
+    assert first_item.input_hash == first_repeat.company_items[0].input_hash
+    assert first_item.cache_key == first_repeat.company_items[0].cache_key
+    assert first_item.input_hash != second.company_items[0].input_hash
+    assert first_item.cache_key != second.company_items[0].cache_key

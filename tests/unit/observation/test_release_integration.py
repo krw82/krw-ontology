@@ -11,6 +11,8 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
+import pytest
+
 from krw_ontology.observation.builder import (
     PROVIDER_REQUEST_SERIES_KEY,
     build_observations_store,
@@ -141,3 +143,88 @@ def test_materialize_release_root_without_sidecar_stays_clean(tmp_path: Path) ->
 def test_observation_provider_protocol_is_satisfied_by_fixture() -> None:
     provider: ObservationProvider = _FixturePriceProvider()
     assert provider.provider_name == "fmp"
+
+
+# ---------------------------------------------------------------------------
+# Review round 1: ticker charset guard, bridge fail-fast, release-tree refusal
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_ticker_uppercases_then_validates() -> None:
+    from krw_ontology.observation.builder import normalize_ticker
+
+    # Lowercase input is normalized (upper-cased, then validated).
+    assert normalize_ticker("aapl") == "AAPL"
+    assert normalize_ticker(" brk.b ") == "BRK.B"
+    assert normalize_ticker("BF-B") == "BF-B"
+    # The series-key separator and every other symbol are rejected.
+    for bad in ("A|B", "", "   ", "BRK B", "AAPL/BTC", "테슬라"):
+        with pytest.raises(ValueError, match="invalid_ticker"):
+            normalize_ticker(bad)
+
+
+def test_collect_observations_rejects_malformed_ticker() -> None:
+    seed = load_series_seed()
+    with pytest.raises(ValueError, match="invalid_ticker"):
+        collect_observations(seed, providers=[], tickers=["A|B"])
+
+
+def test_collect_observations_fails_fast_on_bridge_gap() -> None:
+    """A per-ticker seed family without a provider request key is a hard error."""
+
+    from krw_ontology.observation.builder import assert_provider_bridge_covers_seed
+    from krw_ontology.observation.seed import SeriesDefinition
+
+    seed = load_series_seed()
+    poisoned = dict(seed)
+    poisoned["ghost_family"] = SeriesDefinition(
+        series_key="ghost_family",
+        domain="price",
+        provider="fmp",
+        provider_series_id="ticker",
+        canonical_metric="last_price",
+        unit="USD_per_share",
+        frequency="daily",
+        adjustment="none",
+        factor=None,
+        is_per_ticker=True,
+    )
+
+    with pytest.raises(ValueError, match="provider_bridge_missing_families:ghost_family"):
+        collect_observations(poisoned, providers=[], tickers=["AAPL"])
+    with pytest.raises(ValueError, match="provider_bridge_missing_families"):
+        assert_provider_bridge_covers_seed(poisoned)
+    # The healthy seed passes the same check.
+    assert_provider_bridge_covers_seed(seed)
+
+
+def test_observation_build_refuses_release_tree_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from typer.testing import CliRunner
+
+    from krw_ontology.cli.main import app
+
+    for key in ("FRED_API_KEY", "FMP_API_KEY", "POLYGON_API_KEY"):
+        monkeypatch.delenv(key, raising=False)
+    runner = CliRunner()
+
+    release_root = tmp_path / "releases" / "dev" / "20260830_000000"
+    for args in (
+        ["--output", str(release_root / "indexes" / "observations.sqlite")],
+        ["--root", str(release_root)],
+        ["--output", str(tmp_path / "prod" / "observations.sqlite")],
+    ):
+        result = runner.invoke(app, ["observation", "build", *args])
+        assert result.exit_code == 1, args
+        assert "Refusing" in result.output
+        assert not (tmp_path / "prod").exists() or not any(
+            (tmp_path / "prod").rglob("observations.sqlite")
+        )
+
+    # A clean running root still passes the guard (no keys → degraded build).
+    clean_root = tmp_path / "running" / "workspace"
+    ok = runner.invoke(app, ["observation", "build", "--root", str(clean_root)])
+    assert ok.exit_code == 0, ok.output
+    assert (clean_root / "indexes" / "observations.sqlite").is_file()
+    assert "Refusing" not in ok.output

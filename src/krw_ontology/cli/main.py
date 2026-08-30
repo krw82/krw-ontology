@@ -11937,6 +11937,22 @@ def _index_cache_kind(path: Path, cache_root: Path) -> str:
 # releases when present, exactly like the chart_series sidecar.
 # ---------------------------------------------------------------------------
 
+# Release trees are immutable published artifacts; collecting observations
+# into them (or anywhere beneath a releases/prod root) is refused — collect
+# into the running root and let the release pipeline carry the sidecar.
+_RELEASE_TREE_DIR_NAMES = frozenset({"releases", "prod"})
+
+
+def _exit_if_observation_path_in_release_tree(path: Path, label: str) -> None:
+    resolved = path.expanduser().resolve()
+    if any(part in _RELEASE_TREE_DIR_NAMES for part in resolved.parts):
+        typer.echo(
+            f"Refusing {label}={path}: releases/prod trees are immutable release "
+            "artifacts. Collect into the running root; the release build carries "
+            "indexes/observations.sqlite into release candidates when present."
+        )
+        raise typer.Exit(1)
+
 
 @observation_app.command("build")
 def observation_build_cmd(
@@ -11974,7 +11990,11 @@ def observation_build_cmd(
     ),
 ) -> None:
     """Fetch observation series and build the verified observation store."""
-    from krw_ontology.observation.builder import build_observations_store, collect_observations
+    from krw_ontology.observation.builder import (
+        build_observations_store,
+        collect_observations,
+        normalize_ticker,
+    )
     from krw_ontology.observation.providers.fmp import FmpHistoryProvider
     from krw_ontology.observation.providers.fred import FredProvider
     from krw_ontology.observation.providers.polygon import build_polygon_provider
@@ -11984,6 +12004,11 @@ def observation_build_cmd(
         verify_observations_schema,
     )
 
+    # Never collect into immutable release trees: refuse before any work.
+    if output is not None:
+        _exit_if_observation_path_in_release_tree(output, "--output")
+    else:
+        _exit_if_observation_path_in_release_tree(resolve_ontology_root(root), "--root")
     target_path = (
         output.expanduser().resolve()
         if output is not None
@@ -12008,7 +12033,13 @@ def observation_build_cmd(
     else:
         typer.echo("POLYGON_API_KEY not set: polygon_ohlcv family will be unavailable")
 
-    tickers = [item.upper() for item in (ticker or [])]
+    try:
+        # Lowercase input is normalized to uppercase; malformed symbols
+        # ("A|B", spaces, symbols) are rejected by the canonical charset rule.
+        tickers = [normalize_ticker(item) for item in (ticker or [])]
+    except ValueError as exc:
+        typer.echo(f"Invalid --ticker value: {exc}")
+        raise typer.Exit(1) from exc
     results = collect_observations(
         seed,
         providers=providers,

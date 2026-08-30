@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -39,6 +40,7 @@ from krw_ontology.observation.store import (
     create_observations_schema,
     iso_utc_observation_now,
     observation_id_for,
+    observation_sort_key,
     temporary_sqlite_path,
     verify_observations_schema,
     write_observation_metadata,
@@ -57,6 +59,44 @@ PROVIDER_REQUEST_SERIES_KEY: dict[str, str] = {
 
 _OHLCV_PROVENANCE_FIELDS = ("open", "high", "low", "volume")
 _PRICE_DOMAIN = "price"
+
+# Canonical market-symbol charset: uppercase A-Z and 0-9, with "." and "-"
+# allowed after an alphanumeric first character. Tickers are embedded in
+# per-ticker store keys ("family|ticker"), so the "|" separator (and every
+# other symbol) must be rejected.
+_TICKER_PATTERN = re.compile(r"^[A-Z0-9][A-Z0-9.\-]*$")
+
+
+def normalize_ticker(raw: str) -> str:
+    """Normalize and validate one equity ticker for per-ticker series keys.
+
+    The input is trimmed and upper-cased first (``aapl`` → ``AAPL``), then
+    must match the canonical market-symbol charset above. Anything else —
+    ``A|B`` (the series-key separator), empty strings, ``BRK B`` — raises
+    ValueError so a malformed ticker can never forge or split a store key.
+    """
+
+    ticker = str(raw or "").strip().upper()
+    if not _TICKER_PATTERN.match(ticker):
+        raise ValueError(f"invalid_ticker:{raw!r}")
+    return ticker
+
+
+def assert_provider_bridge_covers_seed(seed: Mapping[str, SeriesDefinition]) -> None:
+    """Fail fast when a per-ticker seed family lacks a provider request key.
+
+    A family missing from PROVIDER_REQUEST_SERIES_KEY would silently degrade
+    to unavailable on every collection run, so the mismatch is a hard build
+    error listing the offending families.
+    """
+
+    missing = sorted(
+        family
+        for family, definition in seed.items()
+        if definition.is_per_ticker and family not in PROVIDER_REQUEST_SERIES_KEY
+    )
+    if missing:
+        raise ValueError("provider_bridge_missing_families:" + ",".join(missing))
 
 
 @dataclass(frozen=True)
@@ -107,8 +147,16 @@ def _resolve_series_row(series_key: str, seed: Mapping[str, SeriesDefinition]) -
     raise ValueError(f"unknown_series:{series_key}")
 
 
-def _order_key(observation: RawObservation) -> str:
-    return observation.result_time or observation.vintage or VINTAGE_NULL_SENTINEL
+def _observation_order(observation: RawObservation) -> tuple[str, str]:
+    """Shared latest-vintage ordering (store.observation_sort_key).
+
+    The SAME ordering must crown the builder's artifacts (supersede chains,
+    release_events.latest_value, the OHLCV current view) and the query
+    layer's latest resolution; any divergence here would let the builder and
+    the served points disagree on which vintage is current.
+    """
+
+    return observation_sort_key(observation.result_time, observation.vintage)
 
 
 def _ohlcv_value(provenance: Mapping[str, Any], field: str) -> float | None:
@@ -255,8 +303,7 @@ def _write_store_rows(
             rows_by_series[series_key],
             key=lambda observation: (
                 observation.phenomenon_time,
-                _order_key(observation),
-                observation.vintage or VINTAGE_NULL_SENTINEL,
+                _observation_order(observation),
             ),
         )
         catalog_row = catalog_rows[series_key]
@@ -267,9 +314,9 @@ def _write_store_rows(
                 (observation.phenomenon_time, observation.vintage or VINTAGE_NULL_SENTINEL)
             ] = observation
 
-        grouped: dict[str, list[tuple[str, RawObservation]]] = {}
-        for (phenomenon_time, vintage), observation in sorted(deduplicated.items()):
-            grouped.setdefault(phenomenon_time, []).append((vintage, observation))
+        grouped: dict[str, list[RawObservation]] = {}
+        for (_phenomenon_time, _vintage), observation in sorted(deduplicated.items()):
+            grouped.setdefault(_phenomenon_time, []).append(observation)
 
         first_time: str | None = None
         last_time: str | None = None
@@ -277,7 +324,10 @@ def _write_store_rows(
         stored_count = 0
 
         for phenomenon_time in sorted(grouped):
-            vintages = grouped[phenomenon_time]
+            # Chain vintages under the shared ordering so the builder's
+            # crowned "latest" (last element) is exactly the row the query
+            # layer's latest resolution serves.
+            vintages = sorted(grouped[phenomenon_time], key=_observation_order)
             if first_time is None:
                 first_time = phenomenon_time
             last_time = phenomenon_time
@@ -286,7 +336,7 @@ def _write_store_rows(
             latest_value: float | None = None
             first_result_time: str | None = None
             latest_result_time: str | None = None
-            for _vintage, observation in vintages:
+            for observation in vintages:
                 vintage_sentinel = observation.vintage or VINTAGE_NULL_SENTINEL
                 observation_id = observation_id_for(
                     series_key, phenomenon_time, observation.vintage
@@ -350,7 +400,7 @@ def _write_store_rows(
 
             # OHLCV current view: latest vintage of price-domain series only.
             if catalog_row.definition.domain == _PRICE_DOMAIN and catalog_row.ticker:
-                latest_observation = vintages[-1][1]
+                latest_observation = vintages[-1]
                 trade_date = latest_observation.phenomenon_time
                 ohlcv_rows[(catalog_row.ticker, trade_date)] = (
                     catalog_row.ticker,
@@ -458,11 +508,13 @@ def collect_observations(
     Providers are supplied by the caller (CLI constructs them from ambient
     credentials; tests inject fixtures).  Series whose provider is missing
     collapse to ``status='unavailable'`` results so their catalog rows exist
-    without observations, matching the B1 degradation doctrine.
+    without observations, matching the B1 degradation doctrine.  Malformed
+    tickers and seed/bridge mismatches fail fast instead of degrading.
     """
 
+    assert_provider_bridge_covers_seed(seed)
     providers_by_name = {provider.provider_name: provider for provider in providers}
-    normalized_tickers = [str(ticker).strip().upper() for ticker in tickers if str(ticker).strip()]
+    normalized_tickers = [normalize_ticker(ticker) for ticker in tickers]
 
     results: list[SeriesFetchResult] = []
     for series_key, definition in sorted(seed.items()):
@@ -519,6 +571,8 @@ def collect_observations(
 __all__ = [
     "ObservationsBuildResult",
     "PROVIDER_REQUEST_SERIES_KEY",
+    "assert_provider_bridge_covers_seed",
     "build_observations_store",
     "collect_observations",
+    "normalize_ticker",
 ]

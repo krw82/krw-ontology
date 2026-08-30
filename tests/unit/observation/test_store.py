@@ -402,6 +402,13 @@ def test_query_macro_series_unknown_metric_is_no_data(tmp_path: Path) -> None:
     assert payload["status"] == "no_data"
     assert payload["points"] == []
     assert payload["advisory_only"] is True
+    # One stable shape: the no-data payload keeps every populated-payload key.
+    assert payload["series_key"] is None
+    assert payload["ticker"] is None
+    assert payload["unit"] is None
+    assert payload["currency"] is None
+    assert payload["frequency"] is None
+    assert payload["factor"] is None
 
 
 def test_query_market_series_periods_bound(tmp_path: Path) -> None:
@@ -432,6 +439,142 @@ def test_query_market_series_prefers_latest_as_of(tmp_path: Path) -> None:
     missing = store.query_market_series("MSFT", "last_price", periods=10)
     assert missing["status"] == "no_data"
     assert missing["points"] == []
+    # Same stable shape as the macro no-data payload, with the requested ticker.
+    assert missing["ticker"] == "MSFT"
+    assert missing["unit"] is None
+    assert missing["frequency"] is None
+
+
+# ---------------------------------------------------------------------------
+# Shared latest-vintage ordering: builder artifacts and served points agree
+# ---------------------------------------------------------------------------
+
+
+def _vintage_rows_result(rows: list[tuple[str, str, str, float]]) -> SeriesFetchResult:
+    """(vintage, result_time, phenomenon_time, value) → one macro CPI result."""
+
+    series_key = "macro_cpi_yoy"
+    return SeriesFetchResult(
+        series_key=series_key,
+        provider="fred",
+        observations=tuple(
+            RawObservation(
+                series_key=series_key,
+                phenomenon_time=phenomenon_time,
+                value=value,
+                result_time=result_time,
+                vintage=vintage,
+                provenance={
+                    "endpoint": "series/observations",
+                    "params_hash": "fixture000000",
+                    "fetched_at": "2026-08-30T00:00:00Z",
+                },
+            )
+            for vintage, result_time, phenomenon_time, value in rows
+        ),
+        status="available",
+    )
+
+
+def test_result_time_tie_emits_exactly_one_point_per_date(tmp_path: Path) -> None:
+    """Two vintages sharing the max order key must not duplicate a date."""
+
+    store = build_store_from_results(
+        tmp_path,
+        [
+            _vintage_rows_result(
+                [
+                    ("2026-06-10", "2026-07-01", "2026-05-01", 296.1),
+                    ("2026-07-15", "2026-07-01", "2026-05-01", 296.4),
+                ]
+            )
+        ],
+    )
+    payload = store.query_macro_series("cpi_yoy", limit=24)
+    dates = [point["date"] for point in payload["points"]]
+    assert dates == ["2026-05-01"]  # one row per date, never two
+    # Tie broken by vintage DESC: the 2026-07-15 vintage wins.
+    assert payload["points"][0]["value"] == 296.4
+    latest = store.latest_observation("macro_cpi_yoy", "2026-05-01")
+    assert latest is not None and latest.value == 296.4 and latest.vintage == "2026-07-15"
+
+
+def test_supersede_chain_links_consecutive_vintages(tmp_path: Path) -> None:
+    """A→B→C: two edges, each vintage superseding exactly its predecessor."""
+
+    store = build_store_from_results(
+        tmp_path,
+        [
+            _vintage_rows_result(
+                [
+                    ("2026-06-10", "2026-06-10", "2026-05-01", 296.1),
+                    ("2026-07-15", "2026-07-15", "2026-05-01", 296.4),
+                    ("2026-08-15", "2026-08-15", "2026-05-01", 296.8),
+                ]
+            )
+        ],
+    )
+    with sqlite3.connect(store.path) as conn:
+        chain_ids = [
+            row[0]
+            for row in conn.execute(
+                """
+                SELECT observation_id FROM observations
+                WHERE series_key = 'macro_cpi_yoy' AND phenomenon_time = '2026-05-01'
+                ORDER BY vintage
+                """
+            ).fetchall()
+        ]
+    assert len(chain_ids) == 3
+    revisions = store.revisions_for("macro_cpi_yoy", "2026-05-01")
+    assert len(revisions) == 2
+    assert all(edge.revision_kind == "revision" for edge in revisions)
+    by_new = {edge.new_observation_id: edge.prior_observation_id for edge in revisions}
+    assert by_new == {chain_ids[1]: chain_ids[0], chain_ids[2]: chain_ids[1]}
+    # The final edge crowns the same row the query layer serves as latest.
+    latest = store.latest_observation("macro_cpi_yoy", "2026-05-01")
+    assert latest is not None and latest.observation_id == chain_ids[2]
+    assert chain_ids[2] in by_new
+
+
+def test_builder_and_serving_crown_same_latest_on_divergence(tmp_path: Path) -> None:
+    """Divergent (result_time, vintage) orderings must not split the crown.
+
+    vintage 2026-06-10 was republished at result_time 2026-09-01 (value
+    300.0); vintage 2026-07-15 was published at result_time 2026-07-01
+    (value 296.4). Knowledge recency (result_time first) crowns the 06-10
+    vintage — on BOTH the builder's artifacts and the served points.
+    """
+
+    rows = [
+        ("2026-06-10", "2026-09-01", "2026-05-01", 300.0),
+        ("2026-07-15", "2026-07-01", "2026-05-01", 296.4),
+    ]
+    store = build_store_from_results(tmp_path, [_vintage_rows_result(rows)])
+
+    latest = store.latest_observation("macro_cpi_yoy", "2026-05-01")
+    assert latest is not None
+    assert latest.value == 300.0
+    assert latest.result_time == "2026-09-01"
+    assert latest.vintage == "2026-06-10"
+
+    payload = store.query_macro_series("cpi_yoy", limit=24)
+    assert [point["value"] for point in payload["points"]] == [300.0]
+
+    with sqlite3.connect(store.path) as conn:
+        event = conn.execute(
+            """
+            SELECT release_time, latest_time, first_value, latest_value
+            FROM release_events
+            WHERE series_key = 'macro_cpi_yoy' AND phenomenon_time = '2026-05-01'
+            """
+        ).fetchone()
+    assert event == ("2026-07-01", "2026-09-01", 296.4, 300.0)
+
+    # The supersede edge crowns the same row: new == the served latest.
+    revisions = store.revisions_for("macro_cpi_yoy", "2026-05-01")
+    assert len(revisions) == 1
+    assert revisions[0].new_observation_id == latest.observation_id
 
 
 # ---------------------------------------------------------------------------

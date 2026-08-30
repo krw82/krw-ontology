@@ -62,6 +62,29 @@ MAX_RELEASE_EVENTS = 260
 # an empty-string vintage so the composite primary key stays NOT NULL-safe.
 VINTAGE_NULL_SENTINEL = ""
 
+# The ONE shared latest-vintage ordering. ``result_time`` (falling back to
+# ``vintage``, then the PK sentinel) orders knowledge recency; ``vintage``
+# breaks ties deterministically. This exact ordering must be used by BOTH the
+# builder's supersede-chain construction and the query layer's latest
+# resolution (see observation_sort_key) so builder artifacts
+# (release_events.latest_value, revision edges) and served points can never
+# crown different rows.
+VINTAGE_ORDER_SQL = "COALESCE(result_time, vintage, '')"
+
+
+def observation_sort_key(result_time: str | None, vintage: str | None) -> tuple[str, str]:
+    """Single source of truth for "which vintage is latest".
+
+    Mirrors ``ORDER BY COALESCE(result_time, vintage, '') DESC, vintage
+    DESC`` in SQL: the Python twin is used by the builder (supersede chains,
+    release events, OHLCV current view) and this module's queries, so a
+    divergent (result_time, vintage) pair — e.g. an old vintage republished
+    late — resolves identically on both sides.
+    """
+
+    resolved_vintage = vintage or VINTAGE_NULL_SENTINEL
+    return (result_time or resolved_vintage or VINTAGE_NULL_SENTINEL, resolved_vintage)
+
 
 def create_observations_schema(conn: sqlite3.Connection) -> None:
     """Create the schema-v1 tables (idempotent)."""
@@ -262,19 +285,18 @@ class ObservationsStore:
         """Return the latest-vintage observation for one phenomenon time."""
 
         row = self._conn.execute(
-            """
+            f"""
             SELECT current.*
             FROM observations AS current
             WHERE current.series_key = ? AND current.phenomenon_time = ?
-              AND COALESCE(current.result_time, current.vintage, '') = (
-                  SELECT MAX(COALESCE(prior.result_time, prior.vintage, ''))
+              AND current.observation_id = (
+                  SELECT prior.observation_id
                   FROM observations AS prior
                   WHERE prior.series_key = current.series_key
                     AND prior.phenomenon_time = current.phenomenon_time
+                  ORDER BY {VINTAGE_ORDER_SQL} DESC, prior.vintage DESC
+                  LIMIT 1
               )
-            ORDER BY COALESCE(current.result_time, current.vintage, '') DESC,
-                     current.vintage DESC
-            LIMIT 1
             """,
             (series_key, phenomenon_time),
         ).fetchone()
@@ -445,16 +467,22 @@ class ObservationsStore:
         return rows[0] if rows else None
 
     def _latest_vintage_points(self, series_key: str, limit: int) -> list[dict[str, Any]]:
+        # Exactly one row per phenomenon_time: a correlated top-1 pick under
+        # the shared vintage ordering (VINTAGE_ORDER_SQL, then vintage DESC).
+        # A plain MAX(...) comparison would match every row sharing the max
+        # key and emit duplicate same-date points with superseded values.
         rows = self._conn.execute(
-            """
-            SELECT *
+            f"""
+            SELECT current.*
             FROM observations AS current
             WHERE current.series_key = ?
-              AND COALESCE(current.result_time, current.vintage, '') = (
-                  SELECT MAX(COALESCE(prior.result_time, prior.vintage, ''))
+              AND current.observation_id = (
+                  SELECT prior.observation_id
                   FROM observations AS prior
                   WHERE prior.series_key = current.series_key
                     AND prior.phenomenon_time = current.phenomenon_time
+                  ORDER BY {VINTAGE_ORDER_SQL} DESC, prior.vintage DESC
+                  LIMIT 1
               )
             ORDER BY current.phenomenon_time DESC
             LIMIT ?
@@ -477,9 +505,18 @@ class ObservationsStore:
         ticker: str | None = None,
         canonical_metric: str | None = None,
     ) -> dict[str, Any]:
-        payload: dict[str, Any] = {
+        # One stable shape for the no-data case: the union of the populated
+        # market-series/v1 and macro-series/v1 keys, with unknown fields as
+        # None, so downstream consumers never branch on payload shape.
+        return {
             "format": format_id,
+            "series_key": None,
+            "ticker": ticker,
             "canonical_metric": canonical_metric,
+            "unit": None,
+            "currency": None,
+            "frequency": None,
+            "factor": None,
             "status": "no_data",
             "source_usage": SOURCE_USAGE_RESEARCH_ONLY,
             "advisory_only": True,
@@ -487,9 +524,6 @@ class ObservationsStore:
             "as_of": None,
             "points": [],
         }
-        if ticker is not None:
-            payload["ticker"] = ticker
-        return payload
 
     def _point_from_row(self, row: sqlite3.Row) -> ObservationPoint:
         vintage = str(row["vintage"] or "")
@@ -799,6 +833,7 @@ __all__ = [
     "create_observations_schema",
     "iso_utc_observation_now",
     "observation_id_for",
+    "observation_sort_key",
     "observations_store_status",
     "query_macro_series",
     "query_market_series",

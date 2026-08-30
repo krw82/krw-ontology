@@ -2,8 +2,8 @@
   "format": "krw-ontology-router-query-gold/v2",
   "contract": "agent-authored-english-retrieval-query",
   "source_release": {
-    "release_id": "20260711_121636",
-    "source_manifest_hash": "sha256:61846e490ade39983384a10a48c250b4fcffe6696deea05c6192da0409c3c22e"
+    "release_id": "20260830_193811",
+    "source_manifest_hash": "sha256:5c2f0c14cc86c0bc825c9440f9c741f20fc5da73fe8b6c33491b64b565edc71c"
   },
   "queries": [
     {

@@ -1155,7 +1155,7 @@ class OntologySpineRouter:
                 )
         ticker = self._ticker_for_object(object_id, preferred_ticker=ticker)
         if ticker is None:
-            return None
+            return self._support_link_trace_fallback(object_id)
         index_object_id = self._index_object_id(object_id, ticker=ticker)
         if index_object_id is None:
             return None
@@ -1173,6 +1173,36 @@ class OntologySpineRouter:
             payload = self._project_shard_payload(payload, ticker=ticker)
             payload.setdefault("routing", self._route_payload("object_locator", [ticker]))
             payload.setdefault("object_locator", locator)
+        return payload
+
+    def _support_link_trace_fallback(self, object_id: str) -> dict[str, Any] | None:
+        """Trace SupportLink ids through the owning shard's derived table.
+
+        SupportLink rows are intentionally absent from the spine locator
+        (shard schema v3 demotion). ``support_link:<TICKER>:...`` ids carry
+        their owning ticker as the second id segment, so the locator miss can
+        fall back to that ticker's shard store, which resolves the id through
+        the derived support_links table.
+        """
+        parts = str(object_id or "").split(":")
+        if len(parts) < 3 or parts[0] != "support_link":
+            return None
+        ticker = parts[1].strip().upper()
+        if not ticker:
+            return None
+        if ticker in self._missing_shard_paths:
+            payload = self._missing_shard_payload(ticker, operation="trace")
+            payload["object_id"] = object_id
+            return payload
+        try:
+            store = self._store_for_ticker(ticker)
+        except KeyError:
+            return None
+        payload = store.trace(object_id)
+        if payload is None:
+            return None
+        payload = self._project_shard_payload(payload, ticker=ticker)
+        payload.setdefault("routing", self._route_payload("object_locator", [ticker]))
         return payload
 
     def chain(

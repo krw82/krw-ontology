@@ -11,6 +11,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
+from krw_ontology.agent_index.router import open_ontology_store
 from krw_ontology.agent_index.spine_builder import (
     COMPANY_SHARD_SCHEMA_VERSION,
     SPINE_PROJECTION_VERSION,
@@ -128,8 +129,8 @@ def _write_minimal_artifacts(root: Path) -> None:
     )
 
 
-def build_minimal_shard_with_one_claim_and_quote(tmp_path: Path) -> Path:
-    """Build one v3 company shard holding claim+quote+support_link artifacts."""
+def build_minimal_release(tmp_path: Path) -> tuple[Path, Path]:
+    """Build v3 release outputs; return (company_shard_path, global_spine_path)."""
     _write_minimal_artifacts(tmp_path)
     result = build_spine_shard_release_outputs(
         tmp_path,
@@ -139,7 +140,12 @@ def build_minimal_shard_with_one_claim_and_quote(tmp_path: Path) -> Path:
     )
     shard_path = result.global_spine_path.parent / "companies" / f"{TICKER}.sqlite"
     assert shard_path.is_file()
-    return shard_path
+    return shard_path, result.global_spine_path
+
+
+def build_minimal_shard_with_one_claim_and_quote(tmp_path: Path) -> Path:
+    """Build one v3 company shard holding claim+quote+support_link artifacts."""
+    return build_minimal_release(tmp_path)[0]
 
 
 def open_store(shard: Path) -> OntologyStore:
@@ -294,3 +300,33 @@ def test_shard_versions_bumped_and_spine_locator_excludes_support_links(tmp_path
     assert replica_rows == 0
     assert claim_rows == 1
     assert json.loads(str(metadata_json))["spine_projection_version"] == "spine-projection/v7"
+
+
+def test_router_trace_resolves_support_link_ids(tmp_path):
+    shard, global_spine = build_minimal_release(tmp_path)
+    assert shard.is_file()
+    with open_ontology_store(global_spine) as router:
+        # Locator carries no SupportLink rows; the router must fall back to
+        # the owning shard's derived support_links table.
+        traced = router.trace(SUPPORT_LINK_ID)
+        assert traced is not None
+        support_link = traced["object"]
+        assert support_link["id"] == SUPPORT_LINK_ID
+        assert support_link["type"] == "SupportLink"
+        assert support_link["from_id"].startswith(f"quote:{TICKER}:")
+        assert support_link["to_id"].startswith(f"claim:{TICKER}:")
+        assert support_link["stance"] == "supports"
+        assert support_link["evidence_strength"] == "direct"
+        assert traced["document"]["ticker"] == TICKER
+        assert traced["routing"]["tickers"] == [TICKER]
+
+        # Explicit ticker param must resolve through the same fallback.
+        traced_with_ticker = router.trace(SUPPORT_LINK_ID, ticker=TICKER)
+        assert traced_with_ticker is not None
+        assert traced_with_ticker["object"]["id"] == SUPPORT_LINK_ID
+        assert traced_with_ticker["object"]["type"] == "SupportLink"
+
+        # Unknown support-link ids and non-support-link misses stay not_found.
+        assert router.trace("support_link:SO:CY2023:10K:direct_quote_support:deadbeef") is None
+        assert router.trace("support_link:ZZZ:CY2023:10K:direct_quote_support:deadbeef") is None
+        assert router.trace(f"claim:{TICKER}:{PERIOD}:{DOC_TYPE_KEY}:missing") is None

@@ -219,7 +219,7 @@ def test_fred_vintage_mode_parses_realtime_start_shaped_rows():
     assert all(o.result_time == o.vintage for o in obs)
 
 
-def test_fred_vintage_mode_requests_all_vintages_without_realtime_bounds():
+def test_fred_vintage_mode_requests_all_vintages_with_early_realtime_start():
     requests: list[Any] = []
     provider = FredProvider(
         api_key="test",
@@ -242,9 +242,10 @@ def test_fred_vintage_mode_requests_all_vintages_without_realtime_bounds():
     assert "series_id=CPIAUCSL" in url
     assert "observation_start=2026-05-01" in url
     assert "observation_end=2026-06-01" in url
-    # The real-time window must NOT be bounded by the observation window, and
-    # vintage_dates boundary values would drop intermediate revisions.
-    assert "realtime_start" not in url
+    # All-vintages view REQUIRES an explicit early realtime_start: FRED
+    # defaults the real-time window to *today* when omitted, which would
+    # collapse every series to a single fetch-date vintage (no revisions).
+    assert "realtime_start=1776-07-04" in url
     assert "realtime_end" not in url
     assert "vintage_dates" not in url
     # Client-side window filter: 2026-04-01 dropped, both 2026-05-01 vintages kept.
@@ -255,6 +256,21 @@ def test_fred_vintage_mode_requests_all_vintages_without_realtime_bounds():
     ]
     kept = [o for o in result.observations if o.phenomenon_time == "2026-05-01"]
     assert {o.vintage for o in kept} == {"2026-06-01", "2026-07-01"}
+
+
+def test_fred_latest_mode_sends_no_realtime_bounds():
+    requests: list[Any] = []
+    provider = FredProvider(
+        api_key="test",
+        include_vintages=False,
+        opener=fixture_opener(load_fixture("fred_cpi_vintage.json"), requests=requests),
+    )
+    provider.fetch_series(_fred_request())
+    url = requests[0].full_url
+    # Latest-value mode relies on FRED's realtime-default (today) by design;
+    # only the vintage view pins an early realtime_start.
+    assert "realtime_start" not in url
+    assert "realtime_end" not in url
 
 
 def test_fred_vintage_mode_keeps_first_release_published_before_window_start():

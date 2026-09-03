@@ -1,8 +1,9 @@
 """FRED observation adapter: series observations and ALFRED vintages.
 
 Fetches ``fred/series/observations``; with ``include_vintages=True`` the
-adapter requests the ALFRED all-vintages view (no real-time or
-``vintage_dates`` bounds are sent) and applies the requested observation
+adapter requests the ALFRED all-vintages view (an explicit early
+``realtime_start`` bound selects every vintage; ``realtime_end`` and
+``vintage_dates`` are never sent) and applies the requested observation
 window client-side, so first releases and revisions coexist as separate
 RawObservation rows — even when a first release was published before
 ``request.start``. The "." missing-value sentinel is skipped, never stored.
@@ -85,12 +86,17 @@ class FredProvider:
             params["observation_start"] = request.start
         if request.end:
             params["observation_end"] = request.end
-        # Vintage mode deliberately sends NO realtime_start/realtime_end and
-        # NO vintage_dates: the real-time window is not the observation
-        # window, so bounding it by request.start would silently exclude first
-        # releases published before the window, and vintage_dates boundary
-        # values would drop intermediate revisions. All vintages are fetched
-        # and the observation window is applied client-side below.
+        if self._include_vintages:
+            # All-vintages (ALFRED) view: FRED defaults the real-time window
+            # to *today* when realtime_start is omitted, which would collapse
+            # every series to one fetch-date vintage and collect zero revision
+            # history. The documented earliest bound selects every vintage;
+            # observation_start/end (the phenomenon window) stay untouched and
+            # are still applied client-side below, so a first release
+            # published before request.start survives. realtime_end is left
+            # out (defaults to today) and vintage_dates is never sent because
+            # its boundary values would drop intermediate revisions.
+            params["realtime_start"] = "1776-07-04"
 
         endpoint = "series/observations"
         url = f"{_FRED_BASE_URL}/{endpoint}?{urlencode(params)}"

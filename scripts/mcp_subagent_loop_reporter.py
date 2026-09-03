@@ -300,7 +300,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--release-root", default=None, help="v3 release root to read.")
     parser.add_argument("--global-spine-path", default=None, help="Explicit v3 global_spine.sqlite path.")
-    parser.add_argument("--report", default="~/krw-ontology/mcp_subagent_loop_report.md")
+    parser.add_argument("--report", default=Path.home() / "krw-ontology" / "mcp_subagent_loop_report.md")
     parser.add_argument("--repeat-each", type=int, default=1)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--max-rounds", type=int, default=0, help="0이면 무한반복")

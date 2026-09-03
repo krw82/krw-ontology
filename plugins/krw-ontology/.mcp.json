@@ -4,15 +4,15 @@
       "command": "uv",
       "args": [
         "--directory",
-        "~/krw-ontology",
+        "${HOME}/krw-ontology",
         "run",
         "krw-ontology-mcp-stdio"
       ],
       "env": {
         "KRW_ONTOLOGY_ENV": "prod",
-        "KRW_ONTOLOGY_RELEASE_ROOT": "~/krw-ontology-data/releases/prod/current",
-        "KRW_ONTOLOGY_ROOT": "~/krw-ontology-data/releases/prod/current",
-        "KRW_ONTOLOGY_MANIFEST_PATH": "~/krw-ontology-data/releases/prod/current/manifest.json",
+        "KRW_ONTOLOGY_RELEASE_ROOT": "${HOME}/krw-ontology-data/releases/prod/current",
+        "KRW_ONTOLOGY_ROOT": "${HOME}/krw-ontology-data/releases/prod/current",
+        "KRW_ONTOLOGY_MANIFEST_PATH": "${HOME}/krw-ontology-data/releases/prod/current/manifest.json",
         "KRW_MCP_EXPECTED_CONTRACT_VERSION": "krw-ontology-mcp/v2"
       }
     }

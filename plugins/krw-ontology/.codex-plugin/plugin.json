@@ -6,8 +6,8 @@
     "name": "Jeong Woncheol",
     "email": "local@example.com"
   },
-  "homepage": "file://~/krw-ontology",
-  "repository": "file://~/krw-ontology",
+  "homepage": "file://${HOME}/krw-ontology",
+  "repository": "file://${HOME}/krw-ontology",
   "license": "UNLICENSED",
   "keywords": [
     "ontology",

@@ -4,14 +4,14 @@
       "command": "uv",
       "args": [
         "--directory",
-        "~/krw-ontology",
+        "${HOME}/krw-ontology",
         "run",
         "krw-guru-advisor-mcp"
       ],
       "env": {
         "KRW_GURU_ENV": "prod",
-        "KRW_GURU_DATA_ROOT": "~/krw-ontology-guru-data",
-        "KRW_GURU_RELEASE_ROOT": "~/krw-ontology-guru-data/releases/prod/current"
+        "KRW_GURU_DATA_ROOT": "${HOME}/krw-ontology-guru-data",
+        "KRW_GURU_RELEASE_ROOT": "${HOME}/krw-ontology-guru-data/releases/prod/current"
       }
     }
   }

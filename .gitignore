@@ -24,3 +24,9 @@ debug/
 *.log
 
 logs/
+
+# local build artifacts / tool state (never ship)
+indexes/*.sqlite
+indexes/*.sqlite-wal
+.lazyweb/
+.mimosa/

@@ -262,13 +262,74 @@ Plan 2b (sqlite-vec dense lane) proceeds: the binding rule requires
 post-change `mean_recall >= 0.7` on both residual strata, and candidate 2a
 leaves `vocabulary_mismatch` at 0.3750 and `multi_period` at 0.2500.
 
-Gate candidates against the v1.1 baseline report:
+Baseline v1.1-regold (same date/release; the v1.1 retrieval code re-run on the
+Task-7 reinforced gold, where multi_period historical items additionally
+accept the latest filing's comparative-row provenance as any-of anchors —
+produced by temporarily reverting the retrieval-path delta
+`store.py`/`spine_router.py`/`mcp_server/tools.py` to the v1.1 commit and
+restoring it afterwards; tree verified clean). Byte-identical to v1.1 on the
+old gold per-case: the gold reinforcement alone moves nothing on the old
+retrieval, so this report is the honest apples-to-apples baseline for the
+2a+ gate:
+
+| stratum | cases | pass_rate | mean_recall | zero_hit_rate |
+| --- | --- | --- | --- | --- |
+| overall | 736 | 0.8832 | 0.8852 | 0.0000 |
+| curated | 24 | 0.4583 | 0.5208 | 0.0000 |
+| dimensioned | 310 | 0.9065 | 0.9065 | 0.0000 |
+| fiscal_offset | 4 | 0.7500 | 0.7500 | 0.0000 |
+| multi_period | 4 | 0.0000 | 0.2500 | 0.0000 |
+| multi_span | 4 | 0.7500 | 0.8750 | 0.0000 |
+| not_disclosed | 4 | 1.0000 | 1.0000 | 0.0000 |
+| template | 402 | 0.8905 | 0.8905 | 0.0000 |
+| vocabulary_mismatch | 8 | 0.1250 | 0.1250 | 0.0000 |
+
+Candidate 2a+ (same date/release/reinforced gold; adds the alias metric floor
+for full-window single-period metric-less clauses, filing-bucket alignment
+for metric-channel rows, and the comparative-provenance anchors above. Gate
+vs v1.1-regold: exit 0, no regressions, 60 s wall clock):
+
+| stratum | cases | pass_rate | mean_recall | zero_hit_rate |
+| --- | --- | --- | --- | --- |
+| overall | 736 | 0.8899 | 0.8920 | 0.0000 |
+| curated | 24 | 0.6667 | 0.7292 | 0.0000 |
+| dimensioned | 310 | 0.9065 | 0.9065 | 0.0000 |
+| fiscal_offset | 4 | 0.7500 | 0.7500 | 0.0000 |
+| multi_period | 4 | 0.0000 | 0.2500 | 0.0000 |
+| multi_span | 4 | 0.7500 | 0.8750 | 0.0000 |
+| not_disclosed | 4 | 1.0000 | 1.0000 | 0.0000 |
+| template | 402 | 0.8905 | 0.8905 | 0.0000 |
+| vocabulary_mismatch | 8 | 0.7500 | 0.7500 | 0.0000 |
+
+Exactly 5 per-case flips vs v1.1-regold, all in `vocabulary_mismatch`
+(`aapl_top_line`, `meta_debt_load` from 2a; `wmt_operating_profit`,
+`amzn_profit_per_share`, `aapl_research_spending` from the alias floor);
+every other stratum is byte-identical.
+
+Post-2a+ 2b decision (binding rule: defer 2b only if BOTH strata reach
+mean_recall >= 0.7): `vocabulary_mismatch` = **0.7500** (>= 0.7) but
+`multi_period` = **0.2500** (< 0.7), so **Plan 2b proceeds**. Scope from the
+classified residual: the remaining `multi_period` misses are NOT a retrieval
+gap — every anchored row (own-filing or comparative) is retrieved into the
+clause window; the compiled `MetricObservation` evidence unit exposes the
+filing period as its top-level `period` (the observation period lives only in
+`metric_points`, which the harness adapter drops), so the grader's period
+filter rejects historical-year items. A dense lane cannot move that stratum;
+the fix is a compiler/grader period-contract change (separate deterministic
+work). The true dense-lane residual is `curated_vocab_meta_share_buybacks`
+(no dictionary alias for the phrase; text/claim anchors) plus
+`curated_vocab_msft_bottom_line` (wrong filing bucket survives
+`_query_metrics` value-identity dedupe, which keeps only the newest filing's
+row for a repeated observation).
+
+Gate candidates against the v1.1-regold baseline report (same reinforced
+gold):
 
 ```bash
 KRW_ONTOLOGY_RELEASE_ROOT=/path/to/releases/v2-dev/dev/<candidate-id> \
 uv run python scripts/benchmark_evidence_gold.py \
   --gold benchmarks/evidence_gold_v1.json --label candidate \
-  --baseline benchmarks/reports/evidence_gold_baseline_v1_1_20260908.json
+  --baseline benchmarks/reports/evidence_gold_baseline_v1_1_regold_20260908.json
 ```
 
 Read `vocabulary_mismatch` through `mean_recall`, not `zero_hit_rate`: the

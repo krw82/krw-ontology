@@ -239,6 +239,29 @@ recovered, all in `dimensioned`):
 | template | 402 | 0.8905 | 0.8905 | 0.0000 |
 | vocabulary_mismatch | 8 | 0.1250 | 0.1250 | 0.0000 |
 
+Candidate 2a (same date/release/gold; the deterministic similarity lane —
+metric-dictionary alias expansion for metric-less clauses, so a retrieval
+query naming an alias such as `top line` or `debt load` also runs the exact
+metric channel for the canonical metric, plus per-requested-period metric
+reservation at the fusion-window cut. Gate vs v1.1: exit 0, no regressions,
+58 s wall clock):
+
+| stratum | cases | pass_rate | mean_recall | zero_hit_rate |
+| --- | --- | --- | --- | --- |
+| overall | 736 | 0.8859 | 0.8879 | 0.0000 |
+| curated | 24 | 0.5417 | 0.6042 | 0.0000 |
+| dimensioned | 310 | 0.9065 | 0.9065 | 0.0000 |
+| fiscal_offset | 4 | 0.7500 | 0.7500 | 0.0000 |
+| multi_period | 4 | 0.0000 | 0.2500 | 0.0000 |
+| multi_span | 4 | 0.7500 | 0.8750 | 0.0000 |
+| not_disclosed | 4 | 1.0000 | 1.0000 | 0.0000 |
+| template | 402 | 0.8905 | 0.8905 | 0.0000 |
+| vocabulary_mismatch | 8 | 0.3750 | 0.3750 | 0.0000 |
+
+Plan 2b (sqlite-vec dense lane) proceeds: the binding rule requires
+post-change `mean_recall >= 0.7` on both residual strata, and candidate 2a
+leaves `vocabulary_mismatch` at 0.3750 and `multi_period` at 0.2500.
+
 Gate candidates against the v1.1 baseline report:
 
 ```bash

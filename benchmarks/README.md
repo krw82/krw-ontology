@@ -207,7 +207,7 @@ improvements never fail the run. Regenerate the deterministic template half
 with `scripts/generate_evidence_gold_templates.py generate --release-root
 <release> --per-ticker 2` (same seed reproduces the same cases byte-for-byte).
 
-Baseline (2026-09-08, release `20260830_193811`, 736 cases, ~58 s wall clock):
+Baseline v1.0 (2026-09-08, release `20260830_193811`, 736 cases, ~58 s wall clock; kept for history):
 
 | stratum | cases | pass_rate | mean_recall | zero_hit_rate |
 | --- | --- | --- | --- | --- |
@@ -220,6 +220,33 @@ Baseline (2026-09-08, release `20260830_193811`, 736 cases, ~58 s wall clock):
 | not_disclosed | 4 | 1.0000 | 1.0000 | 0.0000 |
 | template | 402 | 0.8905 | 0.8905 | 0.0000 |
 | vocabulary_mismatch | 8 | 0.1250 | 0.1250 | 0.0000 |
+
+Baseline v1.1 (same date/release/gold; the grader now treats bare `FY`/`CY`
+annual labels as label twins — `FY2024` matches gold `CY2024` — removing a
+measurement artifact where the anchored unit exposed the `FY` twin of the
+shard's `CY` filing key; quarter-suffixed labels stay strict. 4/736 cases
+recovered, all in `dimensioned`):
+
+| stratum | cases | pass_rate | mean_recall | zero_hit_rate |
+| --- | --- | --- | --- | --- |
+| overall | 736 | 0.8832 | 0.8852 | 0.0000 |
+| curated | 24 | 0.4583 | 0.5208 | 0.0000 |
+| dimensioned | 310 | 0.9065 | 0.9065 | 0.0000 |
+| fiscal_offset | 4 | 0.7500 | 0.7500 | 0.0000 |
+| multi_period | 4 | 0.0000 | 0.2500 | 0.0000 |
+| multi_span | 4 | 0.7500 | 0.8750 | 0.0000 |
+| not_disclosed | 4 | 1.0000 | 1.0000 | 0.0000 |
+| template | 402 | 0.8905 | 0.8905 | 0.0000 |
+| vocabulary_mismatch | 8 | 0.1250 | 0.1250 | 0.0000 |
+
+Gate candidates against the v1.1 baseline report:
+
+```bash
+KRW_ONTOLOGY_RELEASE_ROOT=/path/to/releases/v2-dev/dev/<candidate-id> \
+uv run python scripts/benchmark_evidence_gold.py \
+  --gold benchmarks/evidence_gold_v1.json --label candidate \
+  --baseline benchmarks/reports/evidence_gold_baseline_v1_1_20260908.json
+```
 
 Read `vocabulary_mismatch` through `mean_recall`, not `zero_hit_rate`: the
 colloquial-vocabulary plans deliberately omit the canonical metric, so the

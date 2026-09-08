@@ -41,6 +41,33 @@ def test_period_filter_enforced():
     assert match_expected(item, [_unit(period="FY2024")]) is None
 
 
+def test_period_label_fy_cy_equivalence():
+    from krw_ontology.eval_gold.grader import match_expected, normalize_period_label
+
+    # Pure function: bare FY/CY + 4-digit year collapse to the CY twin;
+    # every other shape (quarter-suffixed, free text) passes through unchanged.
+    assert normalize_period_label("FY2024") == "CY2024"
+    assert normalize_period_label("CY2024") == "CY2024"
+    assert normalize_period_label("CY2026Q1") == "CY2026Q1"
+    assert normalize_period_label("FY2024Q3") == "FY2024Q3"
+
+    # (a) label twins denote the same filing key: item CY2024 matches unit FY2024.
+    item = ExpectedEvidence(ticker="NVDA", period="CY2024", object_ids=["obj-1"])
+    assert match_expected(item, [_unit(period="FY2024")]) is not None
+
+    # (b) a different year is still not the same label.
+    assert match_expected(item, [_unit(period="FY2025")]) is None
+
+    # (c) quarter-suffixed labels stay strict: both forms are pass-through
+    # (non-matching regex), so CY2026Q1 vs FY2026Q1 does NOT match.
+    strict = ExpectedEvidence(ticker="NVDA", period="CY2026Q1", object_ids=["obj-1"])
+    assert match_expected(strict, [_unit(period="FY2026Q1")]) is None
+
+    # (d) absent item period keeps the filter inactive for any unit period.
+    no_period = ExpectedEvidence(ticker="NVDA", object_ids=["obj-1"])
+    assert match_expected(no_period, [_unit(period="FY2024")]) is not None
+
+
 def test_text_fragment_containment_on_title_summary():
     item = ExpectedEvidence(ticker="NVDA", text_fragments=["revenue grew 26%"])
     from krw_ontology.eval_gold.grader import match_expected

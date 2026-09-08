@@ -6,15 +6,36 @@ results are fully reproducible.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
 from krw_ontology.eval_gold.schema import EvidenceGoldCase, ExpectedEvidence
 
+# Bare annual labels only: ``FY2024``/``CY2024``. Quarter-suffixed and any
+# other shapes deliberately do NOT match, so they keep the strict comparison.
+_PERIOD_LABEL_RE = re.compile(r"^(FY|CY)(\d{4})$")
+
 
 def normalize_text(s: str) -> str:
     """Lowercase and collapse all whitespace runs to single spaces."""
     return " ".join(s.lower().split())
+
+
+def normalize_period_label(s: str) -> str:
+    """Collapse a bare annual period label to its ``CY`` form.
+
+    Shards key filings by CY-labeled periods while some evidence units expose
+    the ``FY`` twin of the same label, so ``FY2024`` and ``CY2024`` denote the
+    same filing key. This is label equivalence for that twin pair, NOT calendar
+    (fiscal-vs-calendar-year) equivalence: any other form — quarter-suffixed
+    labels like ``CY2026Q1``/``FY2024Q3``, free text — is returned unchanged.
+    Deterministic and pure.
+    """
+    match = _PERIOD_LABEL_RE.match(s)
+    if match:
+        return f"CY{match.group(2)}"
+    return s
 
 
 def _unit_text(unit: dict[str, Any]) -> str:
@@ -32,11 +53,16 @@ def match_expected(
     unit's ``object_id`` being listed in ``item.object_ids`` or any normalized
     ``item.text_fragments`` substring appearing in the unit's title+summary.
     """
+    item_period = normalize_period_label(item.period) if item.period else None
     for unit in units:
         if unit.get("ticker") != item.ticker:
             continue
-        if item.period and unit.get("period") != item.period:
-            continue
+        if item_period is not None:
+            unit_period = unit.get("period")
+            if not isinstance(unit_period, str):
+                continue
+            if normalize_period_label(unit_period) != item_period:
+                continue
         if item.object_ids and unit.get("object_id") in item.object_ids:
             return unit
         if item.text_fragments:

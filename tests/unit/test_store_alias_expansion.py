@@ -846,6 +846,32 @@ def test_single_bucket_metric_rows_keep_order_without_alignment_flag(floor_shard
     assert "period_reservations" not in diagnostics
 
 
+def test_concept_or_rung_leaves_alias_channel_unchanged(release_paths):
+    """Integration: singularized prefixes plus the concept-OR rung must not
+    disturb the alias channel.  ``sales`` keeps its integral ``s`` (the query
+    still emits ``sales*``), the concept-OR rung finds no qualitative hit in
+    this corpus, it must not capture the FTS-visible ``net_sales`` metric row
+    (metric attribution belongs to the exact/alias channels), and both alias
+    units still land under ``alias_expanded``."""
+    shard_path, _ = release_paths
+    with OntologyStore(shard_path) as store:
+        rows, diagnostics = _query(store)
+
+    assert diagnostics["lexical_terms"] == ["top", "line", "sales", "growth"]
+    assert diagnostics["concept_or_attempted"] is True
+    assert diagnostics["concept_or_result_count"] == 0
+    assert {row["id"] for row in _metric_rows(rows)} == METRIC_IDS
+    assert {row["planned_match_mode"] for row in _metric_rows(rows)} == {"alias_expanded"}
+    assert diagnostics["alias_expansions"] == [
+        {
+            "clause_id": "rev_growth",
+            "alias": "top-line sales",
+            "canonical_metric": "revenue",
+            "added_units": 2,
+        }
+    ]
+
+
 def test_router_batch_threads_clause_id_into_shard_diagnostics(release_paths):
     _, global_spine_path = release_paths
     with open_ontology_store(global_spine_path) as router:

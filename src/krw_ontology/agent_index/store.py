@@ -1665,6 +1665,17 @@ class OntologyStore:
         pass is kept separate and labelled ``relaxed`` so it can never be promoted
         to direct evidence by the response compiler.
 
+        Prefix terms are singularized at emission (``buybacks`` -> ``buyback*``):
+        the unicode61 tokenizer does not stem, so the singular stem is the only
+        prefix that covers both token forms.  Between strict and the gated
+        relaxed pass sits a concept-OR rung: when the clause declares two or
+        more hint terms and strict underfills the window, an OR restricted to
+        the clause's own declared terms (never foreign vocabulary, and never
+        metric observations, whose attribution belongs to the exact/alias
+        channels) recovers evidence satisfying a single declared concept.  It
+        is not gated by ``allow_relaxed`` — it is concept-scoped — and its
+        units are labelled ``relaxed`` exactly like the relaxed pass.
+
         One retrieval-side recall channel is added for metric-less clauses: when
         ``metrics`` is empty but ``retrieval_query`` names a metric-dictionary
         alias, the exact metric-lookup channel also runs for the mapped canonical
@@ -1706,6 +1717,8 @@ class OntologyStore:
                     "execution_mode": "planned_fts",
                     "strict_result_count": 0,
                     "relaxed_result_count": 0,
+                    "concept_or_attempted": False,
+                    "concept_or_result_count": 0,
                     "timing_ms": {"total": int((time.perf_counter() - started_at) * 1000)},
                 }
             )
@@ -1773,12 +1786,16 @@ class OntologyStore:
                 break
             metric_row_index += 1
 
-        strict_query = " ".join(f"{term}*" for term in lexical_terms)
+        # Prefix terms are emitted through the singularizing helper: the
+        # unicode61 tokenizer does not stem, so ``buyback*`` is needed to
+        # match both the singular and the plural ``buybacks`` token.
+        lexical_prefix_terms = _planned_fts_prefix_terms(lexical_terms)
+        strict_query = " ".join(lexical_prefix_terms)
         fts_started_at = time.perf_counter()
         predicate_query = " ".join(
             [
                 strict_query,
-                *[f"{term}*" for term in predicate_lexical_terms],
+                *_planned_fts_prefix_terms(predicate_lexical_terms),
             ]
         ).strip()
         fts_predicate_rows = (
@@ -1851,11 +1868,53 @@ class OntologyStore:
             if row["id"]
         }
         predicate_ids = {str(row["id"]) for row in fts_predicate_rows if row["id"]}
+        # Concept-OR rung: a clause declaring two or more hint terms demands
+        # every concept token in the strict AND, which silently excludes
+        # evidence that satisfies only one declared concept (the META share
+        # buybacks shape: the authorization anchor carries ``share`` but no
+        # buyback token).  An OR restricted to the clause's own declared
+        # terms is more conservative than the relaxed pass — it can never
+        # introduce vocabulary the plan did not declare — so it is NOT gated
+        # by ``allow_relaxed``.  Units recovered here are labelled
+        # ``relaxed`` exactly like the relaxed pass (they satisfy at most one
+        # declared concept and must not be promoted to direct evidence), and
+        # metric observations are skipped: metric attribution belongs to the
+        # exact/alias channels and their floor/reservation protections.
+        concept_or_ids: set[str] = set()
+        concept_or_attempted = False
+        concept_or_elapsed_ms = 0
+        if len(lexical_terms) >= 2 and len(ordered_rows) < result_limit:
+            concept_or_attempted = True
+            concept_or_started_at = time.perf_counter()
+            concept_or_query = " OR ".join(lexical_prefix_terms)
+            concept_or_rows = self._execute_fts(
+                concept_or_query,
+                tickers=available_tickers,
+                document_types=document_types,
+                periods=periods,
+                object_types=selected_types,
+                include_rejected=include_rejected,
+                limit=result_limit,
+            )
+            for row in concept_or_rows:
+                row_id = str(row["id"] or "")
+                if (
+                    not row_id
+                    or row_id in strict_ids
+                    or row_id in concept_or_ids
+                    or str(row["type"] or "") == "MetricObservation"
+                ):
+                    continue
+                concept_or_ids.add(row_id)
+                ordered_rows.append(row)
+                if len(ordered_rows) >= result_limit:
+                    break
+            concept_or_elapsed_ms = int((time.perf_counter() - concept_or_started_at) * 1000)
         relaxed_ids: set[str] = set()
         relaxed_elapsed_ms = 0
         if allow_relaxed and lexical_terms and len(ordered_rows) < result_limit:
             relaxed_started_at = time.perf_counter()
-            relaxed_query = " OR ".join(f"{term}*" for term in lexical_terms)
+            relaxed_query = " OR ".join(lexical_prefix_terms)
             relaxed_rows = self._execute_fts(
                 relaxed_query,
                 tickers=available_tickers,
@@ -1867,7 +1926,12 @@ class OntologyStore:
             )
             for row in relaxed_rows:
                 row_id = str(row["id"] or "")
-                if not row_id or row_id in strict_ids or row_id in relaxed_ids:
+                if (
+                    not row_id
+                    or row_id in strict_ids
+                    or row_id in concept_or_ids
+                    or row_id in relaxed_ids
+                ):
                     continue
                 relaxed_ids.add(row_id)
                 ordered_rows.append(row)
@@ -2108,7 +2172,11 @@ class OntologyStore:
                 1 for bundle in bundles if bool((bundle.get("object") or {}).get("metric_conflict"))
             ),
             "relaxed_enabled": bool(allow_relaxed),
-            "relaxed_result_count": len(relaxed_ids),
+            # Units carrying the ``relaxed`` match mode: appended by the
+            # concept-OR rung and/or the gated relaxed pass.
+            "relaxed_result_count": len(relaxed_ids | concept_or_ids),
+            "concept_or_attempted": concept_or_attempted,
+            "concept_or_result_count": len(concept_or_ids),
             "alias_expansion_used": bool(alias_terms),
             "alias_expanded_result_count": len(alias_row_ids),
             "result_count": len(bundles),
@@ -2119,6 +2187,7 @@ class OntologyStore:
             "timing_ms": {
                 "metric_lookup": metric_elapsed_ms,
                 "strict_fts": fts_elapsed_ms,
+                "concept_or_fts": concept_or_elapsed_ms,
                 "relaxed_fts": relaxed_elapsed_ms,
                 "total": int((time.perf_counter() - started_at) * 1000),
             },
@@ -7818,6 +7887,52 @@ def _planned_query_terms(value: str | None) -> list[str]:
     return _unique(
         term.casefold() for term in _PLANNED_TERM_RE.findall(value or "") if len(term) > 1
     )
+
+
+# ``object_fts`` tokenizes with ``unicode61`` (no stemming), so a plural hint
+# term emitted as ``buybacks*`` can never match the singular ``buyback`` token
+# in filing claims.  Stripping one trailing ``s`` before the prefix star is a
+# pure generalization — the stem is always a prefix of the plural token, so
+# ``buyback*`` matches everything ``buybacks*`` matched — but only when the
+# stem stays a real word of the planned-clause vocabulary.  ``sales`` is the
+# canonical revenue-clause plural-tantum and keeps its integral ``s``;
+# ``series`` is its own singular.  Derived from the gold-benchmark clause
+# vocabulary (benchmarks/evidence_gold_*.json, router_*_gold_v2.json) and the
+# unit-test fixtures.
+_PLANNED_SINGULAR_EXCLUSIONS = frozenset({"sales", "series"})
+# Block the stem shapes a single-'s' strip cannot produce honestly: the
+# double-s class (business/access/gross), the -is class (analysis/paris), the
+# -us class (status) and the -os class (chaos).
+_PLANNED_SINGULAR_BLOCKED_TAILS = frozenset({"i", "o", "s", "u"})
+
+
+def _planned_singular_stem(term: str) -> str:
+    """Return the singular stem for prefix emission when stripping is safe.
+
+    Deterministic pure-string logic: strip one trailing ``s`` only when the
+    remainder keeps at least four characters, does not end in one of the
+    blocked tails, and the token is not in the exclusion set.  Everything else
+    is returned untouched, so the emitted prefix can only widen recall.
+    """
+    if len(term) < 5 or not term.endswith("s"):
+        return term
+    stem = term[:-1]
+    if stem[-1] in _PLANNED_SINGULAR_BLOCKED_TAILS:
+        return term
+    if term in _PLANNED_SINGULAR_EXCLUSIONS:
+        return term
+    return stem
+
+
+def _planned_fts_prefix_terms(terms: Iterable[str]) -> list[str]:
+    """Emit deduped, singularized prefix terms for planned-clause FTS queries.
+
+    The raw token contract is untouched: ``_planned_query_terms`` keeps
+    returning the original tokens (they feed ``planned_evidence_terms`` and
+    the exact-token visibility check downstream); singularization applies only
+    at prefix-emission time.
+    """
+    return _unique(f"{_planned_singular_stem(term)}*" for term in terms)
 
 
 def _planned_metric_period_coordinates(

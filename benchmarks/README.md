@@ -149,3 +149,80 @@ uv run krw-ontology guru eval-quality \
   --budget-path benchmarks/guru_release_budget_v1.json \
   --output-path /path/to/candidate-guru-release/reports/guru-quality-gate.json
 ```
+
+## Evidence-gold gate (v1)
+
+The evidence-gold gate measures end-to-end retrieval quality through the real MCP
+`query_context_tool` path. Every case in `benchmarks/evidence_gold_v1.json`
+(format `krw-ontology-evidence-gold/v1`, bound to release `20260830_193811`)
+carries a validated `SearchPlan` plus expected evidence anchors (object ids from
+that release's shards, or text fragments, or `expect_not_disclosed` forbidden
+fragments). The harness runs each plan headlessly, grades the returned
+`evidence_units` against the anchors, and reports `pass_rate`, `mean_recall`,
+and `zero_hit_rate` overall and per stratum. Strata are `template` and
+`dimensioned` (deterministic samples from the shard manifest, 2 cases per
+ticker across all 356 tickers) plus the curated `vocabulary_mismatch`,
+`fiscal_offset`, `multi_period`, `multi_span`, and `not_disclosed` cases.
+`mean_recall` is the fraction of required anchors retrieved; `zero_hit_rate` is
+the fraction of cases returning no evidence units at all.
+
+Both runs read the runtime release from the `KRW_ONTOLOGY_*` environment
+(mirroring `scripts/benchmark_mcp_candidate.py`); nothing is rebuilt and the
+release is treated as read-only. Capture the committed baseline numbers first:
+
+```bash
+RELEASE=/path/to/releases/v2-dev/dev/20260830_193811
+KRW_ONTOLOGY_ENV=dev \
+KRW_ONTOLOGY_RELEASE_ROOT=$RELEASE \
+KRW_ONTOLOGY_ROOT=$RELEASE \
+KRW_ONTOLOGY_MANIFEST_PATH=$RELEASE/manifest.json \
+KRW_ONTOLOGY_GLOBAL_SPINE_PATH=$RELEASE/indexes/global_spine.sqlite \
+KRW_MCP_EXPECTED_CONTRACT_VERSION=krw-ontology-mcp/v2 \
+uv run python scripts/benchmark_evidence_gold.py \
+  --gold benchmarks/evidence_gold_v1.json --label baseline
+```
+
+Then gate a candidate against the accepted baseline report (same gold file,
+candidate release root):
+
+```bash
+RELEASE=/path/to/releases/v2-dev/dev/<candidate-id>
+KRW_ONTOLOGY_ENV=dev \
+KRW_ONTOLOGY_RELEASE_ROOT=$RELEASE \
+KRW_ONTOLOGY_ROOT=$RELEASE \
+KRW_ONTOLOGY_MANIFEST_PATH=$RELEASE/manifest.json \
+KRW_ONTOLOGY_GLOBAL_SPINE_PATH=$RELEASE/indexes/global_spine.sqlite \
+KRW_MCP_EXPECTED_CONTRACT_VERSION=krw-ontology-mcp/v2 \
+uv run python scripts/benchmark_evidence_gold.py \
+  --gold benchmarks/evidence_gold_v1.json --label candidate \
+  --baseline benchmarks/reports/evidence_gold_baseline_20260908.json
+```
+
+Exit status `2` means at least one metric regressed: overall or per-stratum
+`pass_rate`/`mean_recall` dropped below the baseline value (minus `--tolerance`).
+A stratum present in the baseline but absent from the candidate report compares
+against the baseline value itself, so shrinking the stratum set cannot hide a
+regression. Reports are written under `benchmarks/reports/`; only drops gate,
+improvements never fail the run. Regenerate the deterministic template half
+with `scripts/generate_evidence_gold_templates.py generate --release-root
+<release> --per-ticker 2` (same seed reproduces the same cases byte-for-byte).
+
+Baseline (2026-09-08, release `20260830_193811`, 736 cases, ~58 s wall clock):
+
+| stratum | cases | pass_rate | mean_recall | zero_hit_rate |
+| --- | --- | --- | --- | --- |
+| overall | 736 | 0.8777 | 0.8798 | 0.0000 |
+| curated | 24 | 0.4583 | 0.5208 | 0.0000 |
+| dimensioned | 310 | 0.8935 | 0.8935 | 0.0000 |
+| fiscal_offset | 4 | 0.7500 | 0.7500 | 0.0000 |
+| multi_period | 4 | 0.0000 | 0.2500 | 0.0000 |
+| multi_span | 4 | 0.7500 | 0.8750 | 0.0000 |
+| not_disclosed | 4 | 1.0000 | 1.0000 | 0.0000 |
+| template | 402 | 0.8905 | 0.8905 | 0.0000 |
+| vocabulary_mismatch | 8 | 0.1250 | 0.1250 | 0.0000 |
+
+Read `vocabulary_mismatch` through `mean_recall`, not `zero_hit_rate`: the
+colloquial-vocabulary plans deliberately omit the canonical metric, so the
+full-text lane still returns qualitative units (assumptions, claims, quotes)
+while the anchored `metric_observation` rows are never retrieved. The
+similarity-lane work should move that stratum's `mean_recall` and `pass_rate`.

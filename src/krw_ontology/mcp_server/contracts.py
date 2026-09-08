@@ -1470,12 +1470,15 @@ def _topic_evidence_candidate(row: Mapping[str, Any]) -> dict[str, Any] | None:
         source_ids.insert(0, object_id)
     ticker = _first_text(row, "ticker") or _ticker_from_object_id(object_id)
     row_period = _first_text(row, "period")
-    period = (
-        _first_text(row, "filing_period")
-        or _first_text(object_payload, "filing_period")
-        or row_period
+    # Period contract (cycle-2): a MetricObservation unit's `period` is the
+    # OBSERVATION period of the number (the store already sets row["period"]
+    # to it, e.g. FY2025).  The filing bucket that surfaced the row stays
+    # reachable as filing lineage through the synthesized source_label below.
+    period = row_period
+    filing_period = (
+        _first_text(row, "filing_period") or _first_text(object_payload, "filing_period")
         if object_type == "MetricObservation"
-        else row_period
+        else None
     )
     document_type = _first_text(row, "document_type")
     title = (
@@ -1549,7 +1552,13 @@ def _topic_evidence_candidate(row: Mapping[str, Any]) -> dict[str, Any] | None:
                 ),
             )
         )
-    source_label = _first_text(row, "source_label") or _source_label(ticker, period, document_type)
+    source_label = (
+        _first_text(row, "source_label")
+        # The source label names the source DOCUMENT (ticker + filing
+        # bucket + document type), so metric units keep their filing lineage
+        # even though `period` above now reports the observation period.
+        or _source_label(ticker, filing_period or period, document_type)
+    )
     occurrence_key = _occurrence_identity(ticker, object_id)
     unit = EvidenceUnit(
         evidence_id=_stable_id("ev", occurrence_key),

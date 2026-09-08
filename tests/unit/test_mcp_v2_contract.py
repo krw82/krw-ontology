@@ -1118,7 +1118,7 @@ def test_metric_calculation_rejects_conflicting_duplicates_and_non_finite_values
     assert any(part.code == "metric_calculation_unavailable" for part in state.missing_parts)
 
 
-def test_metric_points_use_observation_period_without_losing_filing_lineage() -> None:
+def test_metric_units_expose_observation_period_with_filing_lineage() -> None:
     plan = SearchPlan(
         question="Calculate annual revenue growth from one filing",
         intent="metric_series",
@@ -1152,10 +1152,19 @@ def test_metric_points_use_observation_period_without_losing_filing_lineage() ->
         release_id="release",
     )
 
-    assert {unit.period for unit in state.evidence_units} == {"CY2025"}
+    # Contract change (cycle-2 period contract): MetricObservation evidence
+    # units expose the OBSERVATION period (the economic period of the number),
+    # not the filing bucket that happened to surface the row.
+    assert {unit.period for unit in state.evidence_units} == {"FY2024", "FY2025"}
     assert {point.period for unit in state.evidence_units for point in unit.metric_points} == {
         "FY2024",
         "FY2025",
+    }
+    # Filing lineage survives: both observations came from the CY2025 filing,
+    # and that source document is still reachable via the synthesized
+    # source_label (ticker + filing period + document type).
+    assert {unit.source.source_label for unit in state.evidence_units} == {
+        "MSFT CY2025 10-K"
     }
     assert [value.value for value in state.computed_values] == [0.25]
 

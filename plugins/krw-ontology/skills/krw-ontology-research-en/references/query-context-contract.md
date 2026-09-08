@@ -344,6 +344,9 @@ evidence_units
   Deduplicated facts and metrics with clause support and traceable source IDs.
   Their operational identity is (ticker, object_id); a shared canonical ID may
   have a distinct occurrence in more than one company.
+  For metric observations, `period` is the OBSERVATION period (e.g. FY2025)
+  of the number; the filing bucket that surfaced the row remains reachable
+  through `source.source_label` and the metric_points lineage.
 
 computed_values / calculation_coverage
   Deterministic values plus covered/partial/missing calculation support for

@@ -14,6 +14,9 @@ SEC EDGAR ``companyfacts`` XBRL API:
   only break ties — see :func:`xbrl_lookup_detailed` for why).
 - :func:`compare_value` — verdict after shard-side unit conversion
   (K/M/B scale suffix on the shard side only; XBRL values are raw).
+  :func:`is_usd_unit` gates comparison: rows whose unit is not
+  USD-denominated (``percent``, ``shares``) get verdict ``non_usd_unit``
+  instead of a numeric verdict.
 - :func:`audit_shard_metrics` — deterministic sampling of accepted
   ``MetricObservation`` rows per ticker (seeded ``random.Random`` consumed in
   sorted-ticker order, candidates sorted by object id — the same contract as
@@ -110,6 +113,7 @@ _VERDICT_KEYS = (
     "tolerance",
     "mismatch",
     "missing_xbrl",
+    "non_usd_unit",
     "no_tag_map",
     "no_cik",
 )
@@ -192,6 +196,19 @@ def shard_unit_multiplier(unit: str) -> float:
         if multiplier is not None:
             return multiplier
     return 1.0
+
+
+def is_usd_unit(unit_label: str) -> bool:
+    """True if the shard unit labels a USD-denominated value.
+
+    Accepts composed labels whose first token is ``usd`` (``"USD"``,
+    ``"USD_per_share"``, ``"USD_millions"``); rejects ``"percent"``,
+    ``"shares"``, and empty labels.  Comparing such a row against a raw USD
+    XBRL fact is meaningless, so :func:`_audit_row` flags it
+    ``non_usd_unit`` instead of issuing a verdict.
+    """
+    tokens = re.split(r"[\s_/\-]+", str(unit_label).strip().lower())
+    return bool(tokens) and tokens[0] == "usd"
 
 
 def _relative_diff(converted: float, reference: float) -> float:
@@ -466,8 +483,8 @@ def audit_shard_metrics(
     Returns ``{"release_root", "seed", "per_ticker", "rows", "summary"}``
     where each row carries the sampled shard values, the best-ranked XBRL
     entry, and a verdict; ``summary`` counts
-    ``match/tolerance/mismatch/missing_xbrl/no_tag_map/no_cik`` (+ ``total``,
-    ``tickers``, ``sampled_rows``).
+    ``match/tolerance/mismatch/missing_xbrl/non_usd_unit/no_tag_map/no_cik``
+    (+ ``total``, ``tickers``, ``sampled_rows``).
     """
     release_root = Path(release_root)
     if per_ticker < 1:
@@ -542,6 +559,9 @@ def _audit_row(
     }
     if metric not in XBRL_TAG_MAP:
         row["verdict"] = "no_tag_map"
+        return row
+    if not is_usd_unit(candidate["unit_label"]):
+        row["verdict"] = "non_usd_unit"
         return row
     if facts is None:
         row["verdict"] = "no_cik"

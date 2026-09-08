@@ -345,3 +345,45 @@ colloquial-vocabulary plans deliberately omit the canonical metric, so the
 full-text lane still returns qualitative units (assumptions, claims, quotes)
 while the anchored `metric_observation` rows are never retrieved. The
 similarity-lane work should move that stratum's `mean_recall` and `pass_rate`.
+
+## Table audit (XBRL cross-validation)
+
+The table audit samples accepted `MetricObservation` rows from a release's
+shards and cross-validates each value against the SEC XBRL `companyfacts`
+API (cache-first, cache outside the repo; shards carry no CIK, so a
+ticker->CIK map is supplied via `--cik-map`). It measures value precision of
+the numeric table extraction and, separately, aggregates every shard's
+`documents` section-quality into table-heavy weak-spot statistics. Verdicts:
+`match` (<=0.1%), `tolerance` (<=1%), `mismatch`, `missing_xbrl`,
+`non_usd_unit` (unit not USD-denominated; skipped before comparison),
+`no_tag_map`, `no_cik`.
+
+```bash
+uv run python scripts/audit_table_extraction.py \
+  --release-root /path/to/releases/v2-dev/dev/20260830_193811 \
+  --tickers 30 \
+  --out benchmarks/reports/table_audit_20260908.json \
+  --cik-map ~/krw-ontology-data/cache/cik_map.json \
+  --cache-dir ~/krw-ontology-data/cache/sec-companyfacts
+```
+
+Committed report (2026-09-08, release `20260830_193811`, seed 20260908,
+150 rows = 30 tickers x 5, full reproduction commands inside the report):
+
+| slice | match | tolerance | mismatch | missing_xbrl |
+| --- | ---: | ---: | ---: | ---: |
+| all rows | 89 (59.3%) | 1 | 57 (38.0%) | 3 |
+| 10-K rows | 80 (84.2% of 96) | 1 | 12 | 3 |
+| 10-Q rows | 9 (16.7% of 54) | 0 | 45 | 0 |
+
+Mismatch taxonomy: 89.5% period/context (mostly the audit's fy-only lookup
+comparing quarterly rows against annual or adjacent-quarter references; 6
+rows are shard-side quarterly-column captures inside 10-Ks), 7.0%
+tag-mapping candidates, 3.5% genuine value errors, 0 unit errors. On clean
+annual same-tag comparisons value precision is 96.4% within 0.1% (97.6%
+within 1%) — the weakness is structural (section detection, period/column
+alignment), not numeric. Section weak spots (all 356 shards, 1899
+documents): document pass 90.3% / fail 5.4%; table-heavy sections ranked by
+fail rate — `item8` (Financial Statements) fail_rate 1.000 over 21 docs,
+always missing-never-warned; `item7a` 0.939 over 33; `part1_item1` (10-Q
+financial statements) 0.711 over 45.

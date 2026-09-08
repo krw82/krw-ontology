@@ -147,6 +147,7 @@ def audit(
                 "tolerance",
                 "mismatch",
                 "missing_xbrl",
+                "non_usd_unit",
                 "no_tag_map",
                 "no_cik",
             )

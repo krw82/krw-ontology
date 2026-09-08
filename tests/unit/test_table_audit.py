@@ -27,6 +27,7 @@ from krw_ontology.eval_gold.table_audit import (
     compare_value,
     fetch_companyfacts,
     is_table_heavy_section,
+    is_usd_unit,
     section_quality_stats,
     select_tickers,
     xbrl_lookup,
@@ -363,6 +364,30 @@ class TestCompareValue:
     def test_scale_conversion_uses_shard_side_only(self) -> None:
         # Shard 2.5 billions vs XBRL raw 2.4e9 -> ~4.2% -> mismatch.
         assert compare_value(2.5, 2.4e9, unit="USD_billions") == "mismatch"
+
+
+# ---------------------------------------------------------------------------
+# is_usd_unit
+# ---------------------------------------------------------------------------
+
+
+class TestIsUsdUnit:
+    def test_usd_family_units_accepted(self) -> None:
+        assert is_usd_unit("USD")
+        assert is_usd_unit("USD_per_share")
+        assert is_usd_unit("USD_millions")
+        assert is_usd_unit("usd/thousands")
+
+    def test_non_usd_units_rejected(self) -> None:
+        assert not is_usd_unit("percent")
+        assert not is_usd_unit("shares")
+        assert not is_usd_unit("EUR")
+        assert not is_usd_unit("")
+
+    def test_bare_scale_token_is_not_usd(self) -> None:
+        # A bare "millions" carries no currency; comparing it against a raw
+        # USD XBRL fact is not guaranteed meaningful, so it is not USD-labeled.
+        assert not is_usd_unit("millions")
 
 
 # ---------------------------------------------------------------------------
@@ -703,6 +728,47 @@ class TestAuditShardMetrics:
         )
         assert report["rows"] == []
         assert report["summary"]["total"] == 0
+
+    def test_non_usd_unit_row_flagged_not_compared(self, tmp_path: Path) -> None:
+        # A percent-unit row is flagged non_usd_unit even when companyfacts
+        # are available — comparing a percentage against a raw USD fact is
+        # meaningless, so the row must never reach the numeric verdict path.
+        release_root, cache_dir = self._setup(tmp_path)
+        facts = _facts_nvda_like()
+        (cache_dir / "PCT.json").write_text(json.dumps(facts), encoding="utf-8")
+        _write_shard(
+            release_root / "indexes" / "companies" / "PCT.sqlite",
+            [
+                _metric_json(
+                    ticker="PCT",
+                    metric="revenue",
+                    value=12.5,
+                    fiscal_year=2024,
+                    period="CY2024",
+                    unit="percent",
+                ),
+            ],
+        )
+        manifest_path = release_root / "indexes" / "shard_manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["shards"]["PCT"] = {"path": "companies/PCT.sqlite"}
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+        report = audit_shard_metrics(
+            release_root,
+            tickers=["PCT"],
+            seed=3,
+            per_ticker=5,
+            cache_dir=cache_dir,
+            ua="test-agent",
+        )
+        row = report["rows"][0]
+        assert row["verdict"] == "non_usd_unit"
+        assert row["xbrl_tag"] is None
+        assert row["xbrl_value"] is None
+        assert row["rel_diff"] is None
+        assert report["summary"]["non_usd_unit"] == 1
+        assert report["summary"]["match"] == 0
 
 
 # ---------------------------------------------------------------------------

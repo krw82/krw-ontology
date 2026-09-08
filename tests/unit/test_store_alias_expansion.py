@@ -368,6 +368,230 @@ def test_duplicate_aliases_for_one_canonical_run_once(release_paths):
     assert diagnostics["alias_expanded_result_count"] == 2
 
 
+# ---------------------------------------------------------------------------
+# Alias metric floor (full-window metric-less clauses)
+# ---------------------------------------------------------------------------
+
+FLOOR_QUOTE_COUNT = 4
+FLOOR_QUOTE_IDS = [
+    f"quote:{TICKER}:{PERIOD}:{DOC_TYPE_KEY}:floor:{index:04d}"
+    for index in range(FLOOR_QUOTE_COUNT)
+]
+FLOOR_SPAN_IDS = [
+    f"span:{TICKER}:{PERIOD}:{DOC_TYPE_KEY}:floor:{index:04d}" for index in range(FLOOR_QUOTE_COUNT)
+]
+FLOOR_REVENUE_CY2022_ID = f"metric_observation:{TICKER}:{PERIOD}:{DOC_TYPE_KEY}:revenue:2022"
+FLOOR_REVENUE_CY2023_ID = f"metric_observation:{TICKER}:{PERIOD}:{DOC_TYPE_KEY}:revenue:2023"
+FLOOR_METRIC_IDS = {FLOOR_REVENUE_CY2022_ID, FLOOR_REVENUE_CY2023_ID}
+
+# The floor recipe mirrors the period-equity shard: several qualitative quotes
+# whose text matches the alias-bearing query's lexical terms, so strict FTS
+# alone fills the window, plus two company-total revenue observations that only
+# the alias channel can reach.
+FLOOR_RETRIEVAL_QUERY = "top line sales growth"
+FLOOR_NO_ALIAS_QUERY = "sequential outlook widened note"
+
+
+def _floor_quote_text(index: int) -> str:
+    return f"Top line sales growth widened sequentially in outlook note {index + 1}."
+
+
+def _write_floor_artifacts(root: Path) -> None:
+    ontology_dir = root / "companies" / TICKER / "ontology" / DOC_TYPE_KEY / PERIOD
+    sources_dir = root / "companies" / TICKER / "sources" / DOC_TYPE_KEY / PERIOD
+    ontology_dir.mkdir(parents=True)
+    sources_dir.mkdir(parents=True)
+
+    spans = []
+    quotes = []
+    for index, (span_id, quote_id) in enumerate(zip(FLOOR_SPAN_IDS, FLOOR_QUOTE_IDS)):
+        spans.append(
+            {
+                "id": span_id,
+                "type": "SourceSpan",
+                "ticker": TICKER,
+                "source_document_id": SOURCE_DOCUMENT_ID,
+                "document_type": DOCUMENT_TYPE,
+                "period": PERIOD,
+                "section_name": "item7",
+                "section_key": "item7",
+                "span_index": index + 1,
+                "text": _floor_quote_text(index),
+                "review_status": "accepted",
+                "schema_version": "0.1.0",
+            }
+        )
+        quotes.append(
+            {
+                "id": quote_id,
+                "type": "EvidenceQuote",
+                "ticker": TICKER,
+                "source_document_id": SOURCE_DOCUMENT_ID,
+                "document_type": DOCUMENT_TYPE,
+                "period": PERIOD,
+                "source_span_id": span_id,
+                "quote_text": _floor_quote_text(index),
+                "quote_type": "business_update",
+                "section_name": "item7",
+                "review_status": "accepted",
+                "schema_version": "0.1.0",
+            }
+        )
+
+    write_jsonl(ontology_dir / "spans.jsonl", spans)
+    write_jsonl(ontology_dir / "evidence_quotes.jsonl", quotes)
+    write_jsonl(ontology_dir / "claims.jsonl", [])
+    write_jsonl(ontology_dir / "support_links.jsonl", [])
+    write_jsonl(
+        ontology_dir / "metric_observations.jsonl",
+        [
+            _metric_observation(
+                FLOOR_REVENUE_CY2022_ID, metric_name="revenue", year=2022, value=100.0
+            ),
+            _metric_observation(
+                FLOOR_REVENUE_CY2023_ID, metric_name="revenue", year=2023, value=125.0
+            ),
+        ],
+    )
+    atomic_write_json(
+        ontology_dir / "section_quality.json",
+        {"status": "pass", "missing_core_sections": [], "fail_reasons": []},
+    )
+    build_indexes(
+        ticker=TICKER,
+        period=PERIOD,
+        doc_type_key=DOC_TYPE_KEY,
+        ontology_dir=ontology_dir,
+        sources_dir=sources_dir,
+        output_dir=root,
+        document_type=DOCUMENT_TYPE,
+    )
+
+
+@pytest.fixture(scope="module")
+def floor_shard_path(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    root = tmp_path_factory.mktemp("alias-floor-release")
+    _write_floor_artifacts(root)
+    result = build_spine_shard_release_outputs(
+        root,
+        release_id="test-store-alias-floor",
+        workers=1,
+        no_cache=True,
+    )
+    shard_path = result.global_spine_path.parent / "companies" / f"{TICKER}.sqlite"
+    assert shard_path.is_file()
+    return shard_path
+
+
+def _floor_query(store: OntologyStore, **overrides):
+    kwargs = {
+        "clause_id": "rev_floor",
+        "retrieval_query": FLOOR_RETRIEVAL_QUERY,
+        "tickers": [TICKER],
+        "limit": FLOOR_QUOTE_COUNT,
+    }
+    kwargs.update(overrides)
+    return store.query_planned_compact_with_diagnostics(**kwargs)
+
+
+def test_full_window_metric_less_alias_clause_applies_alias_floor(floor_shard_path):
+    """Strict FTS alone fills the window, so pre-floor the alias channel could
+    only watch from ``alias_candidate_rows`` and ``added_units`` stayed 0 (the
+    wmt/amzn/aapl starvation).  The floor must guarantee both alias units."""
+    with OntologyStore(floor_shard_path) as store:
+        rows, diagnostics = _floor_query(store)
+
+    assert diagnostics["fts_strict_result_count"] == FLOOR_QUOTE_COUNT
+    assert len(rows) == FLOOR_QUOTE_COUNT
+    metric_rows = _metric_rows(rows)
+    assert {row["id"] for row in metric_rows} == FLOOR_METRIC_IDS
+    assert {row["planned_match_mode"] for row in metric_rows} == {"alias_expanded"}
+    # Floor units take the head positions in existing candidate order
+    # (latest observation first), exactly like Task-3 reservations.
+    assert [row["id"] for row in rows[:2]] == [FLOOR_REVENUE_CY2023_ID, FLOOR_REVENUE_CY2022_ID]
+    assert len([row for row in rows if row["type"] == "EvidenceQuote"]) == FLOOR_QUOTE_COUNT - 2
+
+    assert diagnostics["alias_floor_applied"] is True
+    assert diagnostics["alias_expansions"] == [
+        {
+            "clause_id": "rev_floor",
+            "alias": "top-line sales",
+            "canonical_metric": "revenue",
+            "added_units": 2,
+        }
+    ]
+    assert diagnostics["alias_expanded_result_count"] == 2
+    assert diagnostics["result_count"] == FLOOR_QUOTE_COUNT
+    # The floor is the single-period fallback: no period reservation fired.
+    assert "period_reservations" not in diagnostics
+
+
+def test_single_period_full_window_floor_keeps_scoped_alias_units(floor_shard_path):
+    """The wmt/amzn/aapl shape: one explicitly requested period, a full strict
+    window, and alias units that only cover that period."""
+    with OntologyStore(floor_shard_path) as store:
+        rows, diagnostics = _floor_query(store, periods=["CY2023"])
+
+    assert diagnostics["fts_strict_result_count"] == FLOOR_QUOTE_COUNT
+    assert len(rows) == FLOOR_QUOTE_COUNT
+    assert {row["id"] for row in _metric_rows(rows)} == {FLOOR_REVENUE_CY2023_ID}
+    assert diagnostics["alias_floor_applied"] is True
+    assert diagnostics["alias_expansions"][0]["added_units"] == 1
+    assert diagnostics["alias_expanded_result_count"] == 1
+
+
+def test_window_not_full_keeps_append_behaviour_without_floor_flag(floor_shard_path):
+    with OntologyStore(floor_shard_path) as store:
+        rows, diagnostics = _floor_query(store, limit=FLOOR_QUOTE_COUNT + 4)
+
+    assert len(rows) == FLOOR_QUOTE_COUNT + 2
+    assert {row["id"] for row in _metric_rows(rows)} == FLOOR_METRIC_IDS
+    assert "alias_floor_applied" not in diagnostics
+    assert diagnostics["alias_expansions"][0]["added_units"] == 2
+
+
+def test_partial_append_after_room_does_not_apply_floor(floor_shard_path):
+    """One free slot let the alias channel append its rank-first unit; the rest
+    became candidates only after the window filled.  The floor trigger is the
+    window state after strict+relaxed assembly, so nothing changes here."""
+    with OntologyStore(floor_shard_path) as store:
+        rows, diagnostics = _floor_query(store, limit=FLOOR_QUOTE_COUNT + 1)
+
+    assert len(rows) == FLOOR_QUOTE_COUNT + 1
+    assert {row["id"] for row in _metric_rows(rows)} == {FLOOR_REVENUE_CY2023_ID}
+    assert "alias_floor_applied" not in diagnostics
+    assert diagnostics["alias_expansions"][0]["added_units"] == 1
+
+
+def test_no_alias_metric_less_full_window_is_unchanged(floor_shard_path):
+    with OntologyStore(floor_shard_path) as store:
+        rows, diagnostics = _floor_query(
+            store,
+            clause_id="outlook",
+            retrieval_query=FLOOR_NO_ALIAS_QUERY,
+        )
+
+    assert len(rows) == FLOOR_QUOTE_COUNT
+    assert not _metric_rows(rows)
+    assert {row["planned_match_mode"] for row in rows} == {"strict"}
+    assert diagnostics["alias_expansion_used"] is False
+    assert "alias_expansions" not in diagnostics
+    assert "alias_floor_applied" not in diagnostics
+
+
+def test_clause_with_metrics_keeps_full_window_behaviour(floor_shard_path):
+    with OntologyStore(floor_shard_path) as store:
+        rows, diagnostics = _floor_query(store, metrics=["revenue"])
+
+    assert len(rows) == FLOOR_QUOTE_COUNT
+    metric_rows = _metric_rows(rows)
+    assert {row["id"] for row in metric_rows} == FLOOR_METRIC_IDS
+    assert {row["planned_match_mode"] for row in metric_rows} == {"strict"}
+    assert diagnostics["metric_lookup_used"] is True
+    assert diagnostics["alias_expansion_used"] is False
+    assert "alias_floor_applied" not in diagnostics
+
+
 def test_router_batch_threads_clause_id_into_shard_diagnostics(release_paths):
     _, global_spine_path = release_paths
     with open_ontology_store(global_spine_path) as router:

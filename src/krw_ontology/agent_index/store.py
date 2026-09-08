@@ -1672,6 +1672,13 @@ class OntologyStore:
         ``planned_match_mode="alias_expanded"``.  The plan is never rewritten and
         clauses that already carry ``metrics`` are never expanded.  ``clause_id``
         is only echoed into the ``alias_expansions`` diagnostics.
+
+        Alias metric floor: when such a clause names fewer than two periods and
+        the strict+relaxed assembly already filled the window, up to two
+        alias-expanded units are still guaranteed by displacing the
+        lowest-ranked non-protected tail rows, and the per-clause diagnostics
+        record ``alias_floor_applied: true``.  Multi-period clauses keep the
+        per-period reservation path instead.
         """
         started_at = time.perf_counter()
         result_limit = max(1, int(limit))
@@ -1855,21 +1862,26 @@ class OntologyStore:
         # order from the dictionary) and later aliases report zero, so the
         # ``added_units`` column sums to the real number of appended rows.
         # Units beyond the room are kept as ``alias_candidate_rows`` so the
-        # per-period reservation below can still see them; they are never
-        # appended here.
+        # per-period reservation below and the alias floor after it can still
+        # see them; they are never appended here.
         alias_terms = resolve_alias_terms(retrieval_query) if not requested_metrics else {}
         alias_row_ids: set[str] = set()
         alias_candidate_rows: list[sqlite3.Row] = []
         alias_candidate_ids: set[str] = set()
+        alias_candidate_canonical_by_id: dict[str, str] = {}
+        first_alias_by_canonical: dict[str, str] = {}
+        added_by_canonical: dict[str, int] = {}
         alias_expansions: list[dict[str, Any]] = []
         alias_elapsed_ms = 0
+        # The alias floor below only protects a window that the strict+relaxed
+        # assembly had already filled before the alias channel appended
+        # anything; a window with free slots keeps the append-only behaviour.
+        window_full_before_alias = len(ordered_rows) >= result_limit
         if alias_terms:
             alias_started_at = time.perf_counter()
             present_ids = {str(row["id"]) for row in ordered_rows if row["id"]}
-            first_alias_by_canonical: dict[str, str] = {}
             for alias, canonical in alias_terms.items():
                 first_alias_by_canonical.setdefault(canonical, alias)
-            added_by_canonical: dict[str, int] = {}
             for canonical in first_alias_by_canonical:
                 added_units = 0
                 alias_metric_rows = self._query_metrics(
@@ -1890,13 +1902,19 @@ class OntologyStore:
                     if len(ordered_rows) >= result_limit:
                         alias_candidate_ids.add(row_id)
                         alias_candidate_rows.append(row)
+                        alias_candidate_canonical_by_id[row_id] = canonical
                         continue
                     present_ids.add(row_id)
                     alias_row_ids.add(row_id)
                     ordered_rows.append(row)
                     added_units += 1
                 added_by_canonical[canonical] = added_units
-            alias_expansions = [
+            alias_elapsed_ms = int((time.perf_counter() - alias_started_at) * 1000)
+
+        def _alias_expansion_records() -> list[dict[str, Any]]:
+            # ``added_units`` counts the units that actually entered the
+            # window: appended by the alias channel or inserted by the floor.
+            return [
                 {
                     "clause_id": str(clause_id or ""),
                     "alias": alias,
@@ -1909,7 +1927,9 @@ class OntologyStore:
                 }
                 for alias, canonical in alias_terms.items()
             ]
-            alias_elapsed_ms = int((time.perf_counter() - alias_started_at) * 1000)
+
+        if alias_terms:
+            alias_expansions = _alias_expansion_records()
 
         # Per-requested-period metric reservation at the fusion window cut.
         # A clause that explicitly names two or more periods must not lose one
@@ -1951,6 +1971,36 @@ class OntologyStore:
                     strict_ids.add(row_id)
                 else:
                     alias_row_ids.add(row_id)
+
+        # Alias metric floor.  The per-period reservation above needs two or
+        # more requested periods; a metric-less clause that names fewer
+        # periods and fired the alias channel must still not lose every alias
+        # unit to a window the strict+relaxed assembly had already filled (the
+        # single-period alias starvation).  Displace the lowest-ranked
+        # non-protected tail rows -- the same droppable-tail machinery as the
+        # reservation -- to guarantee up to two alias metric units in existing
+        # candidate order.  The window total stays exactly ``result_limit``,
+        # the multi-period reservation keeps precedence, and clauses without
+        # alias candidates (no alias hit, metrics named, or a window with free
+        # slots) never enter this path.
+        alias_floor_applied = False
+        if alias_candidate_rows and window_full_before_alias and len(requested_periods_ordered) < 2:
+            floor_rows, floor_inserted = _insert_rows_with_droppable_tail(
+                base_rows=final_rows,
+                insert_rows=alias_candidate_rows[:2],
+                protected_ids=metric_ids | alias_row_ids,
+                result_limit=result_limit,
+            )
+            if floor_inserted:
+                final_rows = floor_rows
+                alias_floor_applied = True
+                for row in floor_inserted:
+                    row_id = str(row["id"] or "")
+                    alias_row_ids.add(row_id)
+                    canonical = alias_candidate_canonical_by_id.get(row_id)
+                    if canonical is not None:
+                        added_by_canonical[canonical] = added_by_canonical.get(canonical, 0) + 1
+                alias_expansions = _alias_expansion_records()
 
         bundles = self._compact_bundles_from_rows(final_rows)
         metric_channel_ids = metric_ids | alias_row_ids
@@ -2048,6 +2098,8 @@ class OntologyStore:
             diagnostics["timing_ms"]["alias_metric_lookup"] = alias_elapsed_ms
         if period_reservations:
             diagnostics["period_reservations"] = period_reservations
+        if alias_floor_applied:
+            diagnostics["alias_floor_applied"] = True
         if unavailable_tickers:
             diagnostics["warnings"].append("ticker_not_available")
             diagnostics["unavailable_tickers"] = unavailable_tickers
@@ -7935,6 +7987,43 @@ def _planned_metric_row_requested_period(
     return None
 
 
+def _insert_rows_with_droppable_tail(
+    *,
+    base_rows: Sequence[sqlite3.Row],
+    insert_rows: Sequence[sqlite3.Row],
+    protected_ids: set[str],
+    result_limit: int,
+) -> tuple[list[sqlite3.Row], list[sqlite3.Row]]:
+    """Fuse ``insert_rows`` into the window by dropping the lowest-ranked tail.
+
+    Shared displacement machinery for the fusion-window guarantees (the
+    per-period metric reservation and the alias metric floor).  Inserted rows
+    are accepted in their existing order while capacity allows: free window
+    slots first, then slots freed by dropping the lowest-ranked base rows
+    whose ids are not in ``protected_ids``.  The fused selection never exceeds
+    ``result_limit``; inserted rows keep priority over the surviving base rows
+    and appear before them.  Pure rank-order logic: no clocks, no randomness.
+    """
+    base = list(base_rows[:result_limit])
+    base_ids = {str(row["id"] or "") for row in base}
+    accepted = [
+        row for row in insert_rows if str(row["id"] or "") and str(row["id"] or "") not in base_ids
+    ]
+    free_slots = max(0, result_limit - len(base))
+    droppable_indices = [
+        index
+        for index in range(len(base) - 1, -1, -1)
+        if str(base[index]["id"] or "") not in protected_ids
+    ]
+    accepted = accepted[: free_slots + len(droppable_indices)]
+    if not accepted:
+        return base, []
+    displacement = max(0, len(accepted) - free_slots)
+    dropped = set(droppable_indices[:displacement])
+    fused = [*accepted, *(row for index, row in enumerate(base) if index not in dropped)]
+    return fused, accepted
+
+
 def _apply_requested_period_metric_reservation(
     *,
     ordered_rows: Sequence[sqlite3.Row],
@@ -7993,18 +8082,12 @@ def _apply_requested_period_metric_reservation(
             continue
         reserved.append(row)
 
-    free_slots = max(0, result_limit - len(base))
-    droppable_indices = [
-        index
-        for index in range(len(base) - 1, -1, -1)
-        if str(base[index]["id"] or "") not in protected_ids
-    ]
-    reserved = reserved[: free_slots + len(droppable_indices)]
-    if not reserved:
-        return base, [], []
-    displacement = max(0, len(reserved) - free_slots)
-    dropped = set(droppable_indices[:displacement])
-    final_rows = [*reserved, *(row for index, row in enumerate(base) if index not in dropped)]
+    final_rows, reserved = _insert_rows_with_droppable_tail(
+        base_rows=base,
+        insert_rows=reserved,
+        protected_ids=protected_ids,
+        result_limit=result_limit,
+    )
 
     reserved_counts: dict[str, int] = {}
     for row in reserved:

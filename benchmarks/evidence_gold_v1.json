@@ -42848,7 +42848,8 @@
           "period": "CY2024",
           "document_type": "10-K",
           "object_ids": [
-            "metric_observation:NVDA:CY2024:10K:b98bbb060aa325"
+            "metric_observation:NVDA:CY2024:10K:b98bbb060aa325",
+            "metric_observation:NVDA:CY2026:10K:3bc800086382d5"
           ]
         },
         {
@@ -42856,7 +42857,8 @@
           "period": "CY2025",
           "document_type": "10-K",
           "object_ids": [
-            "metric_observation:NVDA:CY2025:10K:5d586e80811c3f"
+            "metric_observation:NVDA:CY2025:10K:5d586e80811c3f",
+            "metric_observation:NVDA:CY2026:10K:3e699f89200945"
           ]
         },
         {
@@ -42868,7 +42870,7 @@
           ]
         }
       ],
-      "notes": "Three required items, one per filing period, anchored to each filing's own-year observation: FY2024 ($60.9B) in CY2024, FY2025 ($130.5B) in CY2025, FY2026 ($215.9B) in CY2026."
+      "notes": "Three required items, one per filing period, anchored to each filing's own-year observation: FY2024 ($60.9B) in CY2024, FY2025 ($130.5B) in CY2025, FY2026 ($215.9B) in CY2026. comparative-row provenance accepted (latest CY2026 filing restated) for the FY2024/FY2025 items: retrieval legitimately returns the latest filing's comparative (restated) row for a historical year, so both the year's own filing (primary anchor, kept first) and the CY2026 comparative row are valid any-of anchors for the same observation."
     },
     {
       "id": "curated_multiperiod_msft_revenue_fy2023_fy2025",
@@ -42910,7 +42912,8 @@
           "period": "CY2023",
           "document_type": "10-K",
           "object_ids": [
-            "metric_observation:MSFT:CY2023:10K:bdabcc448ca05c"
+            "metric_observation:MSFT:CY2023:10K:bdabcc448ca05c",
+            "metric_observation:MSFT:CY2025:10K:5200ea664ea11a"
           ]
         },
         {
@@ -42918,7 +42921,8 @@
           "period": "CY2024",
           "document_type": "10-K",
           "object_ids": [
-            "metric_observation:MSFT:CY2024:10K:48eb57dc136f39"
+            "metric_observation:MSFT:CY2024:10K:48eb57dc136f39",
+            "metric_observation:MSFT:CY2026:10K:4d028b1ebd765e"
           ]
         },
         {
@@ -42926,11 +42930,12 @@
           "period": "CY2025",
           "document_type": "10-K",
           "object_ids": [
-            "metric_observation:MSFT:CY2025:10K:b0a52210e40b9b"
+            "metric_observation:MSFT:CY2025:10K:b0a52210e40b9b",
+            "metric_observation:MSFT:CY2026:10K:86ac7be55c366b"
           ]
         }
       ],
-      "notes": "Three required items anchored to each filing's own-year observation: FY2023 ($211.9B) in CY2023, FY2024 ($245.1B) in CY2024, FY2025 ($281.7B) in CY2025."
+      "notes": "Three required items anchored to each filing's own-year observation: FY2023 ($211.9B) in CY2023, FY2024 ($245.1B) in CY2024, FY2025 ($281.7B) in CY2025. comparative-row provenance accepted (latest restating filing: CY2026 for FY2024/FY2025, CY2025 for FY2023) for all three items: the shard's latest 10-K is the CY2026 filing, which restates FY2024/FY2025 as comparative rows (its three-year income statement drops FY2023, whose latest restating filing is CY2025), and retrieval legitimately returns those comparative rows for a historical year, so both the year's own filing (primary anchor, kept first) and the latest restating filing's comparative row are valid any-of anchors for the same observation."
     },
     {
       "id": "curated_multiperiod_wmt_operating_income_fy2024_fy2026",
@@ -42972,7 +42977,8 @@
           "period": "CY2024",
           "document_type": "10-K",
           "object_ids": [
-            "metric_observation:WMT:CY2024:10K:2cabef9fee818c"
+            "metric_observation:WMT:CY2024:10K:2cabef9fee818c",
+            "metric_observation:WMT:CY2026:10K:caae5ef55ecb21"
           ]
         },
         {
@@ -42980,7 +42986,8 @@
           "period": "CY2025",
           "document_type": "10-K",
           "object_ids": [
-            "metric_observation:WMT:CY2025:10K:06636de9bc3566"
+            "metric_observation:WMT:CY2025:10K:06636de9bc3566",
+            "metric_observation:WMT:CY2026:10K:3f140b880c3fb4"
           ]
         },
         {
@@ -42992,7 +42999,7 @@
           ]
         }
       ],
-      "notes": "Three required items anchored to each filing's own-year observation: FY2024 ($27.0B) in CY2024, FY2025 ($29.3B) in CY2025, FY2026 ($29.8B) in CY2026."
+      "notes": "Three required items anchored to each filing's own-year observation: FY2024 ($27.0B) in CY2024, FY2025 ($29.3B) in CY2025, FY2026 ($29.8B) in CY2026. comparative-row provenance accepted (latest CY2026 filing restated) for the FY2024/FY2025 items: retrieval legitimately returns the latest filing's comparative (restated) row for a historical year, so both the year's own filing (primary anchor, kept first) and the CY2026 comparative row are valid any-of anchors for the same observation."
     },
     {
       "id": "curated_multiperiod_aapl_eps_fy2023_fy2025",
@@ -43034,7 +43041,8 @@
           "period": "CY2023",
           "document_type": "10-K",
           "object_ids": [
-            "metric_observation:AAPL:CY2023:10K:be1ae7dea21451"
+            "metric_observation:AAPL:CY2023:10K:be1ae7dea21451",
+            "metric_observation:AAPL:CY2025:10K:4334653cbc46fb"
           ]
         },
         {
@@ -43042,7 +43050,8 @@
           "period": "CY2024",
           "document_type": "10-K",
           "object_ids": [
-            "metric_observation:AAPL:CY2024:10K:ce7f5f23cab939"
+            "metric_observation:AAPL:CY2024:10K:ce7f5f23cab939",
+            "metric_observation:AAPL:CY2025:10K:d10127c2c0106a"
           ]
         },
         {
@@ -43054,7 +43063,7 @@
           ]
         }
       ],
-      "notes": "Three required items anchored to each filing's own-year observation: FY2023 ($6.16) in CY2023, FY2024 ($6.11) in CY2024, FY2025 ($7.49) in CY2025."
+      "notes": "Three required items anchored to each filing's own-year observation: FY2023 ($6.16) in CY2023, FY2024 ($6.11) in CY2024, FY2025 ($7.49) in CY2025. comparative-row provenance accepted (latest CY2025 filing restated) for the FY2023/FY2024 items: retrieval legitimately returns the latest filing's comparative (restated) row for a historical year, so both the year's own filing (primary anchor, kept first) and the CY2025 comparative row are valid any-of anchors for the same observation."
     }
   ]
 }

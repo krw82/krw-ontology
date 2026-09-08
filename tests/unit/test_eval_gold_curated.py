@@ -20,9 +20,7 @@ from pathlib import Path
 
 from krw_ontology.eval_gold.schema import load_evidence_gold
 
-GOLD_PATH = (
-    Path(__file__).resolve().parents[2] / "benchmarks" / "evidence_gold_curated_v1.json"
-)
+GOLD_PATH = Path(__file__).resolve().parents[2] / "benchmarks" / "evidence_gold_curated_v1.json"
 SOURCE_RELEASE_ID = "20260830_193811"
 
 MINIMUM_COUNTS = {
@@ -60,9 +58,7 @@ def test_every_case_tagged_curated():
 
 
 def test_per_stratum_minimum_counts():
-    counts = Counter(
-        stratum for case in _gold().cases for stratum in case.strata
-    )
+    counts = Counter(stratum for case in _gold().cases for stratum in case.strata)
     for stratum, minimum in MINIMUM_COUNTS.items():
         assert counts[stratum] >= minimum, (
             f"stratum {stratum}: {counts[stratum]} cases < minimum {minimum}"
@@ -121,8 +117,7 @@ def test_fiscal_offset_plans_leave_periods_unfiltered():
         if "fiscal_offset" not in case.strata:
             continue
         assert case.search_plan.get("periods") in ([], None), (
-            f"case {case.id}: fiscal_offset plan pins periods "
-            f"{case.search_plan.get('periods')}"
+            f"case {case.id}: fiscal_offset plan pins periods {case.search_plan.get('periods')}"
         )
 
 
@@ -134,3 +129,35 @@ def test_multi_period_cases_span_multiple_expected_periods():
         assert len(periods) >= 2, (
             f"case {case.id}: multi_period with expected periods {sorted(periods)}"
         )
+
+
+def test_multi_period_historical_items_accept_comparative_row_provenance():
+    """Historical-year items accept the latest filing's comparative row.
+
+    Retrieval legitimately returns the latest filing's comparative (restated)
+    row for a historical-year observation, so each expected item other than
+    the case's latest year carries >= 2 object ids: the year's own filing
+    object first (primary anchor), then the comparative-row alternative
+    (any-of semantics), with the curation rationale recorded in notes.
+    Existence of the ids against the source release is not re-asserted here
+    (see module docstring — anchors were shard-verified at curation time).
+    """
+    for case in _gold().cases:
+        if "multi_period" not in case.strata:
+            continue
+        assert "comparative-row provenance accepted" in case.notes, (
+            f"case {case.id}: notes do not record the comparative-row curation rationale"
+        )
+        periods = [item.period for item in case.expected if item.period]
+        latest_period = max(periods)
+        for item in case.expected:
+            if not item.object_ids:
+                continue
+            assert f":{item.period}:10K:" in item.object_ids[0], (
+                f"case {case.id}: first anchor for {item.period} is not the own-filing object"
+            )
+            if item.period == latest_period:
+                continue
+            assert len(item.object_ids) >= 2, (
+                f"case {case.id}: historical item {item.period} carries no comparative-row anchor"
+            )

@@ -11,7 +11,7 @@ import hashlib
 import json
 import re
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 from types import MappingProxyType
@@ -79,6 +79,40 @@ def _xbrl_keys(value: Any) -> tuple[str, ...]:
     return tuple(sorted(key for key in keys if key))
 
 
+_ALIAS_TERM_SEPARATOR = r"[\s\-_]+"
+
+
+def _alias_term_pattern(written: str) -> re.Pattern[str] | None:
+    """Compile a static alias term into a word-boundary match pattern.
+
+    Separator runs inside the written form (spaces, underscores, hyphens)
+    match any separator run in the text, so both ``debt load`` and
+    ``debt_load`` match the phrase ``debt load`` / ``debt-load``.  English
+    terms take an optional plural ``s`` without enumerating plural forms in
+    the dictionary; Korean terms are left untouched.
+    """
+    parts = [part for part in re.split(_ALIAS_TERM_SEPARATOR, written.casefold()) if part]
+    if not parts:
+        return None
+    body = _ALIAS_TERM_SEPARATOR.join(re.escape(part) for part in parts)
+    last_char = parts[-1][-1]
+    if "a" <= last_char <= "z" and last_char != "s":
+        body += "s?"
+    try:
+        return re.compile(rf"\b{body}\b", flags=re.IGNORECASE)
+    except re.error:
+        return None
+
+
+@dataclass(frozen=True)
+class MetricAliasTerm:
+    """One static alias entry: written form, canonical target, match pattern."""
+
+    written: str
+    canonical: str
+    pattern: re.Pattern[str] = field(compare=False, repr=False)
+
+
 @dataclass(frozen=True)
 class MetricDictionaryCatalog:
     path: Path
@@ -87,6 +121,7 @@ class MetricDictionaryCatalog:
     entries: Mapping[str, Mapping[str, Any]]
     aliases: Mapping[str, str]
     xbrl_tags: Mapping[str, str]
+    alias_terms: tuple[MetricAliasTerm, ...] = ()
 
     @property
     def binding(self) -> dict[str, Any]:
@@ -119,6 +154,28 @@ class MetricDictionaryCatalog:
         values.extend(str(value) for value in entry.get("xbrl_tags") or [])
         return tuple(dict.fromkeys(value for value in values if value))
 
+    def resolve_alias_terms(self, text: str) -> dict[str, str]:
+        """Resolve static alias terms in free text to canonical metric ids.
+
+        Matching is case-insensitive with word boundaries and plural forms;
+        several distinct hits are returned.  Terms are visited longest-first,
+        so an overlapping shorter alias (``earnings`` inside
+        ``earnings_per_share``) never shadows its longer form.  The result is
+        a pure function of (dictionary, text), sorted by written alias.
+        """
+        if not text:
+            return {}
+        resolved: dict[str, str] = {}
+        accepted_spans: list[tuple[int, int]] = []
+        for term in self.alias_terms:
+            for match in term.pattern.finditer(text):
+                start, end = match.span()
+                if any(start < span_end and span_start < end for span_start, span_end in accepted_spans):
+                    continue
+                accepted_spans.append((start, end))
+                resolved.setdefault(term.written, term.canonical)
+        return dict(sorted(resolved.items()))
+
 
 @lru_cache(maxsize=8)
 def _load_catalog(path_text: str, size: int, mtime_ns: int) -> MetricDictionaryCatalog:
@@ -137,6 +194,7 @@ def _load_catalog(path_text: str, size: int, mtime_ns: int) -> MetricDictionaryC
     entries: dict[str, Mapping[str, Any]] = {}
     aliases: dict[str, str] = {}
     xbrl_tags: dict[str, str] = {}
+    alias_written: dict[str, str] = {}
     for raw_canonical, raw_entry in raw_entries.items():
         canonical = _identity_key(raw_canonical)
         if not canonical:
@@ -145,6 +203,18 @@ def _load_catalog(path_text: str, size: int, mtime_ns: int) -> MetricDictionaryC
             raise ValueError(f"duplicate canonical metric {canonical!r}: {path}")
         entry = dict(raw_entry) if isinstance(raw_entry, Mapping) else {}
         entries[canonical] = MappingProxyType(entry)
+        # Text-matching terms cover the canonical id and every listed alias
+        # exactly as written in the dictionary (display names and XBRL tags
+        # stay out of free-text matching).
+        for written in (str(raw_canonical), *(str(value) for value in entry.get("aliases") or [])):
+            written = written.strip()
+            if not written:
+                continue
+            previous = alias_written.setdefault(written, canonical)
+            if previous != canonical:
+                raise ValueError(
+                    f"metric dictionary alias {written!r} maps to both {previous!r} and {canonical!r}"
+                )
         alias_values = [raw_canonical, entry.get("display_name"), *(entry.get("aliases") or [])]
         for alias in alias_values:
             key = _identity_key(alias)
@@ -168,6 +238,17 @@ def _load_catalog(path_text: str, size: int, mtime_ns: int) -> MetricDictionaryC
                         f"and {canonical!r}"
                     )
 
+    alias_terms = tuple(
+        sorted(
+            (
+                MetricAliasTerm(written=written, canonical=canonical, pattern=pattern)
+                for written, canonical in alias_written.items()
+                if (pattern := _alias_term_pattern(written)) is not None
+            ),
+            key=lambda term: (-len(term.written), term.written, term.canonical),
+        )
+    )
+
     return MetricDictionaryCatalog(
         path=path,
         schema_version=str(payload.get("schema_version") or ""),
@@ -175,6 +256,7 @@ def _load_catalog(path_text: str, size: int, mtime_ns: int) -> MetricDictionaryC
         entries=MappingProxyType(entries),
         aliases=MappingProxyType(aliases),
         xbrl_tags=MappingProxyType(xbrl_tags),
+        alias_terms=alias_terms,
     )
 
 
@@ -214,6 +296,11 @@ def canonical_metric_for_xbrl_tag(value: Any) -> str | None:
 
 def metric_aliases(canonical: str) -> tuple[str, ...]:
     return metric_dictionary_catalog().aliases_for(canonical)
+
+
+def resolve_alias_terms(text: str) -> dict[str, str]:
+    """Resolve alias terms in ``text`` against the packaged default dictionary."""
+    return metric_dictionary_catalog().resolve_alias_terms(text)
 
 
 def stable_binding_json(binding: Mapping[str, Any] | None = None) -> str:

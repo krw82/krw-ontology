@@ -7,7 +7,7 @@ canonical_metrics:
     category: revenue
     unit: USD
     description: "Total revenue from continuing operations."
-    aliases: [total_revenue, net_sales, sales]
+    aliases: [total_revenue, net_sales, sales, "top line", "top-line sales", 매출, 매출액]
     xbrl_tags: [us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax, us-gaap:Revenues, us-gaap:SalesRevenueNet]
 
   revenue_growth:
@@ -56,7 +56,7 @@ canonical_metrics:
     category: profitability
     unit: USD
     description: "Income from core business operations."
-    aliases: []
+    aliases: ["operating profit", 영업이익]
     xbrl_tags: [us-gaap:OperatingIncomeLoss]
 
   net_income:
@@ -64,7 +64,7 @@ canonical_metrics:
     category: profitability
     unit: USD
     description: "Bottom-line profit after all expenses and taxes."
-    aliases: [net_profit]
+    aliases: [net_profit, "bottom line", earnings, 순이익]
     xbrl_tags: [us-gaap:NetIncomeLoss]
 
   net_margin:
@@ -80,7 +80,7 @@ canonical_metrics:
     category: profitability
     unit: USD_per_share
     description: "Net income available to common shareholders divided by weighted average shares."
-    aliases: [earnings_per_share]
+    aliases: [earnings_per_share, "profit per share", 주당순이익]
     xbrl_tags: [us-gaap:EarningsPerShareBasic]
 
   # -- Costs (4) --
@@ -105,7 +105,7 @@ canonical_metrics:
     category: costs
     unit: USD
     description: "R&D expenditure."
-    aliases: [rd_expense, research_development_expense]
+    aliases: [rd_expense, research_development_expense, "research spending", 연구개발비, 연구개발]
     xbrl_tags: [us-gaap:ResearchAndDevelopmentExpense]
 
   selling_general_and_admin:
@@ -179,7 +179,7 @@ canonical_metrics:
     category: balance_sheet
     unit: USD
     description: "Short-term debt plus current portion of long-term debt plus long-term debt."
-    aliases: [debt]
+    aliases: [debt, "debt load", 차입금, 총차입금]
     xbrl_tags: [us-gaap:ShortTermBorrowings, us-gaap:LongTermDebt]
 
   shareholders_equity:

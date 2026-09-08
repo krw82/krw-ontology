@@ -402,7 +402,7 @@ def test_write_release_manifest_v3_includes_observations_sidecar(tmp_path: Path)
     assert observations["counts"]["observations"] == 2
     # Observation canonical metrics ride the bound metric dictionary (B2).
     assert observations["metric_dictionary"]["canonical_metric_count"] == 48
-    assert observations["metric_dictionary"]["sha256"].startswith("ffc8f3c1")
+    assert observations["metric_dictionary"]["sha256"].startswith("5774ade4")
 
     startup = verify_release_startup_v3(release_root, env="dev", check_sqlite=True)
     assert startup["ok"] is True, startup["errors"]

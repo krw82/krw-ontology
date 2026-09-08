@@ -4,7 +4,12 @@ Synthetic ``companyfacts`` dicts mirror the SEC shape
 (``facts.us-gaap.<Tag>.units.<unit>[entries]``) and a minimal hand-built
 release (shard manifest + objects-only sqlite shard) mirrors the real shard's
 ``MetricObservation`` json field names (``value``/``unit``/``scale``/
-``fiscal_year``/``dimensions``).
+``fiscal_year``/``dimensions``).  The ``documents`` fixtures mirror the real
+shard ``documents`` table DDL (release 20260830_193811), including
+``section_quality_status`` / ``section_quality_json`` with the observed json
+field names (``status`` / ``missing_core_sections`` /
+``low_confidence_core_sections`` / ``fail_reasons`` / ``warn_reasons`` /
+``section_count``).
 """
 
 from __future__ import annotations
@@ -13,11 +18,16 @@ import json
 import sqlite3
 from pathlib import Path
 
+import httpx
+
+import scripts.audit_table_extraction as audit_cli
 from krw_ontology.eval_gold.table_audit import (
     XBRL_TAG_MAP,
     audit_shard_metrics,
     compare_value,
     fetch_companyfacts,
+    is_table_heavy_section,
+    section_quality_stats,
     select_tickers,
     xbrl_lookup,
 )
@@ -215,13 +225,18 @@ def _write_shard(
 def _build_release(
     root: Path,
     *,
-    ticker_rows: dict[str, list[dict]],
+    ticker_rows: dict[str, list[dict]] | None = None,
+    document_rows: dict[str, list[dict]] | None = None,
 ) -> Path:
     release_root = root / "release"
     shards: dict[str, dict] = {}
-    for ticker, rows in ticker_rows.items():
+    for ticker in sorted(set(ticker_rows or {}) | set(document_rows or {})):
         shard_relpath = f"companies/{ticker}.sqlite"
-        _write_shard(release_root / "indexes" / shard_relpath, rows)
+        shard_path = release_root / "indexes" / shard_relpath
+        if ticker_rows and ticker in ticker_rows:
+            _write_shard(shard_path, ticker_rows[ticker])
+        if document_rows and ticker in document_rows:
+            _write_documents(shard_path, document_rows[ticker])
         shards[ticker] = {"path": shard_relpath}
     manifest_path = release_root / "indexes" / "shard_manifest.json"
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
@@ -230,6 +245,84 @@ def _build_release(
         encoding="utf-8",
     )
     return release_root
+
+
+# Mirrors the real shard ``documents`` DDL (release 20260830_193811).
+DOCUMENTS_DDL = """
+CREATE TABLE documents (
+            ticker TEXT NOT NULL,
+            document_type TEXT NOT NULL,
+            doc_type_key TEXT NOT NULL,
+            period TEXT NOT NULL,
+            artifact_index_path TEXT NOT NULL,
+            ontology_dir TEXT NOT NULL,
+            sources_json TEXT NOT NULL,
+            reports_json TEXT NOT NULL,
+            counts_json TEXT NOT NULL,
+            section_quality_status TEXT,
+            section_quality_json TEXT NOT NULL,
+            generated_at TEXT,
+            schema_version TEXT,
+            PRIMARY KEY (ticker, doc_type_key, period)
+        )
+"""
+
+
+def _section_quality_json(
+    *,
+    status: str,
+    document_type: str = "10-K",
+    missing: list[str] | None = None,
+    low_confidence: list[str] | None = None,
+    fail_reasons: list[str] | None = None,
+    warn_reasons: list[str] | None = None,
+    section_count: int = 17,
+) -> str:
+    return json.dumps(
+        {
+            "status": status,
+            "document_type": document_type,
+            "missing_core_sections": missing or [],
+            "low_confidence_core_sections": low_confidence or [],
+            "fail_reasons": fail_reasons or [],
+            "warn_reasons": warn_reasons or [],
+            "section_count": section_count,
+        }
+    )
+
+
+def _write_documents(path: Path, rows: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(path) as conn:
+        conn.execute(DOCUMENTS_DDL)
+        conn.executemany(
+            """
+            INSERT INTO documents (
+                ticker, document_type, doc_type_key, period,
+                artifact_index_path, ontology_dir, sources_json, reports_json,
+                counts_json, section_quality_status, section_quality_json,
+                generated_at, schema_version
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    row["ticker"],
+                    row["document_type"],
+                    row["doc_type_key"],
+                    row["period"],
+                    "unused",
+                    "unused",
+                    "{}",
+                    "[]",
+                    "{}",
+                    row["section_quality_status"],
+                    row["section_quality_json"],
+                    None,
+                    None,
+                )
+                for row in rows
+            ],
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -610,3 +703,338 @@ class TestAuditShardMetrics:
         )
         assert report["rows"] == []
         assert report["summary"]["total"] == 0
+
+
+# ---------------------------------------------------------------------------
+# is_table_heavy_section
+# ---------------------------------------------------------------------------
+
+
+class TestIsTableHeavySection:
+    def test_human_readable_titles_match_keywords(self) -> None:
+        assert is_table_heavy_section("Item 8. Financial Statements and Supplementary Data")
+        assert is_table_heavy_section("Consolidated Balance Sheets")
+        assert is_table_heavy_section("Income Taxes")
+        assert is_table_heavy_section("Consolidated Statements of Cash Flows")
+        assert is_table_heavy_section("Segment Information")
+        assert is_table_heavy_section("Quantitative and Qualitative Disclosures About Market Risk")
+
+    def test_matching_is_case_insensitive(self) -> None:
+        assert is_table_heavy_section("FINANCIAL STATEMENTS AND SUPPLEMENTARY DATA")
+        assert is_table_heavy_section("consolidated balance sheets")
+
+    def test_non_table_titles_do_not_match(self) -> None:
+        assert not is_table_heavy_section("Risk Factors")
+        assert not is_table_heavy_section("Business")
+        assert not is_table_heavy_section("Legal Proceedings")
+        assert not is_table_heavy_section("Controls and Procedures")
+
+    def test_real_shard_section_keys_match_via_canonical_titles(self) -> None:
+        # Real shards flag sections by key (release 20260830_193811); keys map
+        # to canonical SEC item titles for keyword matching.
+        assert is_table_heavy_section("item8")  # Financial Statements and Supplementary Data
+        assert is_table_heavy_section("item7a")  # Quantitative and Qualitative ...
+        assert is_table_heavy_section("part1_item1")  # 10-Q Financial Statements
+        assert not is_table_heavy_section("item1")  # Business
+        assert not is_table_heavy_section("item1a")  # Risk Factors
+        assert not is_table_heavy_section("part1_item2")  # MD&A
+        assert not is_table_heavy_section("part2_item1a")  # Risk Factors
+
+    def test_empty_name_is_not_table_heavy(self) -> None:
+        assert not is_table_heavy_section("")
+        assert not is_table_heavy_section("   ")
+
+
+# ---------------------------------------------------------------------------
+# section_quality_stats
+# ---------------------------------------------------------------------------
+
+
+def _doc_row(
+    *,
+    ticker: str,
+    document_type: str = "10-K",
+    doc_type_key: str = "10K",
+    period: str = "CY2024",
+    status: str,
+    missing: list[str] | None = None,
+    low_confidence: list[str] | None = None,
+    section_count: int = 17,
+) -> dict:
+    return {
+        "ticker": ticker,
+        "document_type": document_type,
+        "doc_type_key": doc_type_key,
+        "period": period,
+        "section_quality_status": status,
+        "section_quality_json": _section_quality_json(
+            status=status,
+            document_type=document_type,
+            missing=missing,
+            low_confidence=low_confidence,
+            section_count=section_count,
+        ),
+    }
+
+
+class TestSectionQualityStats:
+    def _release(self, tmp_path: Path) -> Path:
+        return _build_release(
+            tmp_path,
+            document_rows={
+                "AAA": [
+                    _doc_row(
+                        ticker="AAA",
+                        period="CY2024",
+                        status="fail",
+                        missing=["item8", "item1a"],
+                        low_confidence=["item7a"],
+                        section_count=5,
+                    ),
+                    _doc_row(
+                        ticker="AAA",
+                        document_type="10-Q",
+                        doc_type_key="10Q",
+                        period="CY2026Q1",
+                        status="warn",
+                        missing=["item8"],
+                        section_count=8,
+                    ),
+                ],
+                "BBB": [
+                    _doc_row(ticker="BBB", period="CY2024", status="pass", section_count=17),
+                ],
+            },
+        )
+
+    def test_totals_count_documents_by_status(self, tmp_path: Path) -> None:
+        stats = section_quality_stats(self._release(tmp_path))
+        totals = stats["totals"]
+        assert totals["documents"] == 3
+        assert totals["pass"] == 1
+        assert totals["warn"] == 1
+        assert totals["fail"] == 1
+        assert totals["fail_rate"] == 1 / 3
+        assert totals["warn_rate"] == 1 / 3
+
+    def test_per_section_counts_and_rates(self, tmp_path: Path) -> None:
+        stats = section_quality_stats(self._release(tmp_path))
+        sections = {entry["section_name"]: entry for entry in stats["sections"]}
+        assert set(sections) == {"item8", "item1a", "item7a"}
+
+        item8 = sections["item8"]
+        assert item8["documents"] == 2  # flagged by the failing 10-K and the warning 10-Q
+        assert item8["fail"] == 1
+        assert item8["warn"] == 1
+        assert item8["fail_rate"] == 0.5
+        assert item8["warn_rate"] == 0.5
+        assert item8["missing"] == 2
+        assert item8["low_confidence"] == 0
+        assert item8["table_heavy"] is True
+
+        item1a = sections["item1a"]
+        assert item1a["documents"] == 1
+        assert item1a["fail"] == 1
+        assert item1a["fail_rate"] == 1.0
+        assert item1a["warn_rate"] == 0.0
+        assert item1a["table_heavy"] is False
+
+        item7a = sections["item7a"]
+        assert item7a["documents"] == 1
+        assert item7a["low_confidence"] == 1
+        assert item7a["missing"] == 0
+        assert item7a["table_heavy"] is True
+
+    def test_sections_list_sorted_by_name(self, tmp_path: Path) -> None:
+        stats = section_quality_stats(self._release(tmp_path))
+        names = [entry["section_name"] for entry in stats["sections"]]
+        assert names == sorted(names)
+
+    def test_passing_documents_contribute_only_to_totals(self, tmp_path: Path) -> None:
+        stats = section_quality_stats(self._release(tmp_path))
+        # BBB passed with no flagged sections; every section entry comes from AAA.
+        for entry in stats["sections"]:
+            assert entry["documents"] <= 2
+
+    def test_table_heavy_ranked_orders_by_fail_rate_then_count(self, tmp_path: Path) -> None:
+        release_root = _build_release(
+            tmp_path,
+            document_rows={
+                # item8: fail_rate 1.0 over 2 docs -> rank 1.
+                "AAA": [
+                    _doc_row(ticker="AAA", period="CY2024", status="fail", missing=["item8"]),
+                    _doc_row(
+                        ticker="AAA",
+                        period="CY2025",
+                        status="fail",
+                        missing=["item8"],
+                    ),
+                ],
+                # part1_item1: fail_rate 1.0 over 1 doc -> rank 2 (count tiebreak).
+                "BBB": [
+                    _doc_row(
+                        ticker="BBB",
+                        document_type="10-Q",
+                        doc_type_key="10Q",
+                        period="CY2026Q1",
+                        status="fail",
+                        missing=["part1_item1"],
+                    ),
+                ],
+                # item7a: fail_rate 1/3 over 3 docs -> rank 3 despite most docs.
+                "CCC": [
+                    _doc_row(
+                        ticker="CCC",
+                        period="CY2024",
+                        status="fail",
+                        missing=["item7a"],
+                    ),
+                    _doc_row(
+                        ticker="CCC",
+                        period="CY2025",
+                        status="warn",
+                        missing=["item7a"],
+                    ),
+                    _doc_row(
+                        ticker="CCC",
+                        period="CY2026",
+                        status="warn",
+                        missing=["item7a"],
+                    ),
+                ],
+            },
+        )
+        stats = section_quality_stats(release_root)
+        ranked_names = [entry["section_name"] for entry in stats["table_heavy_ranked"]]
+        assert ranked_names == ["item8", "part1_item1", "item7a"]
+        # Non-table-heavy sections never enter the ranking.
+        assert "item1a" not in ranked_names
+
+    def test_deterministic_output(self, tmp_path: Path) -> None:
+        release_root = self._release(tmp_path)
+        assert section_quality_stats(release_root) == section_quality_stats(release_root)
+
+    def test_section_in_both_lists_counted_once_per_document(self, tmp_path: Path) -> None:
+        # The pipeline never emits a section in both lists, but corrupt or
+        # future rows might; documents must count the section once.
+        release_root = _build_release(
+            tmp_path,
+            document_rows={
+                "AAA": [
+                    _doc_row(
+                        ticker="AAA",
+                        status="warn",
+                        missing=["item8"],
+                        low_confidence=["item8"],
+                    ),
+                ],
+            },
+        )
+        stats = section_quality_stats(release_root)
+        entry = {e["section_name"]: e for e in stats["sections"]}["item8"]
+        assert entry["documents"] == 1
+        assert entry["missing"] == 1
+        assert entry["low_confidence"] == 1
+        assert entry["fail_rate"] == 0.0
+        assert entry["warn_rate"] == 1.0
+
+    def test_unparseable_json_still_counts_in_totals(self, tmp_path: Path) -> None:
+        release_root = _build_release(
+            tmp_path,
+            document_rows={
+                "AAA": [
+                    {
+                        "ticker": "AAA",
+                        "document_type": "10-K",
+                        "doc_type_key": "10K",
+                        "period": "CY2024",
+                        "section_quality_status": "fail",
+                        "section_quality_json": "{not json",
+                    },
+                ],
+            },
+        )
+        stats = section_quality_stats(release_root)
+        assert stats["totals"] == {
+            "documents": 1,
+            "pass": 0,
+            "warn": 0,
+            "fail": 1,
+            "fail_rate": 1.0,
+            "warn_rate": 0.0,
+        }
+        assert stats["sections"] == []
+
+    def test_missing_manifest_raises_file_not_found(self, tmp_path: Path) -> None:
+        try:
+            section_quality_stats(tmp_path / "no-such-release")
+        except FileNotFoundError:
+            pass
+        else:  # pragma: no cover - branch guard
+            raise AssertionError("expected FileNotFoundError for missing manifest")
+
+
+# ---------------------------------------------------------------------------
+# audit CLI: fetch-failure handling (httpx.HTTPError)
+# ---------------------------------------------------------------------------
+
+
+class TestAuditCliFetchFailure:
+    def test_http_error_aborts_cleanly_with_exit_1(self, tmp_path: Path, monkeypatch) -> None:
+        from typer.testing import CliRunner
+
+        release_root = _build_release(
+            tmp_path,
+            ticker_rows={
+                "NOC": [
+                    _metric_json(
+                        ticker="NOC",
+                        metric="revenue",
+                        value=1_000_000_000.0,
+                        fiscal_year=2024,
+                        period="CY2024",
+                    ),
+                ],
+            },
+        )
+        cache_dir = tmp_path / "empty-cache"
+        cache_dir.mkdir()
+        cik_map_path = tmp_path / "cik.json"
+        cik_map_path.write_text(json.dumps({"NOC": 1045810}), encoding="utf-8")
+
+        import krw_ontology.eval_gold.table_audit as table_audit
+
+        class _TimeoutClient:
+            def __init__(self, *args, **kwargs) -> None:
+                pass
+
+            def __enter__(self) -> "_TimeoutClient":
+                return self
+
+            def __exit__(self, *args) -> None:
+                return None
+
+            def get(self, url: str):
+                raise httpx.ConnectTimeout("simulated connection timeout")
+
+        monkeypatch.setattr(table_audit.httpx, "Client", _TimeoutClient)
+
+        result = CliRunner().invoke(
+            audit_cli.app,
+            [
+                "--release-root",
+                str(release_root),
+                "--tickers",
+                "NOC",
+                "--cache-dir",
+                str(cache_dir),
+                "--cik-map",
+                str(cik_map_path),
+                "--ua",
+                "test-agent",
+            ],
+        )
+        assert result.exit_code == 1
+        assert "audit failed" in result.output + result.stderr
+        # The HTTP error must be handled by the CLI, not propagate raw.
+        assert not isinstance(result.exception, httpx.ConnectTimeout)

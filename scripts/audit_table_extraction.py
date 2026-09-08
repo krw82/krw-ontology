@@ -18,6 +18,7 @@ import json
 from pathlib import Path
 from typing import Optional
 
+import httpx
 import typer
 
 from krw_ontology.eval_gold.table_audit import (
@@ -128,7 +129,7 @@ def audit(
             ua=ua,
             cik_map=_load_cik_map(cik_map_path),
         )
-    except (ValueError, FileNotFoundError) as exc:
+    except (ValueError, FileNotFoundError, httpx.HTTPError) as exc:
         typer.secho(f"audit failed: {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1) from exc
 

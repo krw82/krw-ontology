@@ -18,6 +18,10 @@ SEC EDGAR ``companyfacts`` XBRL API:
   ``MetricObservation`` rows per ticker (seeded ``random.Random`` consumed in
   sorted-ticker order, candidates sorted by object id — the same contract as
   :mod:`krw_ontology.eval_gold.templates`), then fetch/lookup/compare per row.
+- :func:`section_quality_stats` — read-only aggregation of every shard's
+  ``documents`` table into per-section weak-spot statistics plus a ranked
+  list of table-heavy sections (:data:`TABLE_HEAVY_KEYWORDS`,
+  :data:`SECTION_KEY_TITLES`, :func:`is_table_heavy_section`).
 
 Shard ground truth (release 20260830_193811): ``MetricObservation`` json rows
 carry the numeric value in ``value`` (already raw-scale floats), the unit in
@@ -109,6 +113,56 @@ _VERDICT_KEYS = (
     "no_tag_map",
     "no_cik",
 )
+
+#: Substring keywords (matched case-insensitively against the section name,
+#: or against the section's canonical title for key-style names) marking a
+#: section as table-heavy — the audit's weak-spot scope.
+TABLE_HEAVY_KEYWORDS: tuple[str, ...] = (
+    "financial statement",
+    "balance sheet",
+    "income",
+    "cash flow",
+    "segment",
+    "supplementary",
+    "quantitative",
+)
+
+#: Canonical SEC item titles for the section keys that ``section_quality_json``
+#: lists carry (release 20260830_193811 uses keys such as ``item8`` or
+#: ``part1_item2`` — see ``pipeline/document_profiles.py``).  Used only for
+#: keyword matching; the raw keys stay the aggregation identity.
+SECTION_KEY_TITLES: dict[str, str] = {
+    "item1": "Business",
+    "item1a": "Risk Factors",
+    "item1b": "Unresolved Staff Comments",
+    "item1c": "Cybersecurity",
+    "item2": "Properties",
+    "item7": "Management's Discussion and Analysis of Financial Condition and Results of Operations",
+    "item7a": "Quantitative and Qualitative Disclosures About Market Risk",
+    "item8": "Financial Statements and Supplementary Data",
+    "item9a": "Controls and Procedures",
+    "item9b": "Other Information",
+    "item10": "Directors, Executive Officers and Corporate Governance",
+    "item11": "Executive Compensation",
+    "item12": "Security Ownership of Certain Beneficial Owners and Management",
+    "item13": "Certain Relationships and Related Transactions, and Director Independence",
+    "item14": "Principal Accountant Fees and Services",
+    "item15": "Exhibits and Financial Statement Schedules",
+    "item16": "Form 10-K Summary",
+    "part1_item1": "Financial Statements",
+    "part1_item2": "Management's Discussion and Analysis of Financial Condition and Results of Operations",
+    "part1_item3": "Quantitative and Qualitative Disclosures About Market Risk",
+    "part1_item4": "Controls and Procedures",
+    "part2_item1": "Legal Proceedings",
+    "part2_item1a": "Risk Factors",
+    "part2_item2": "Unregistered Sales of Equity Securities and Use of Proceeds",
+    "part2_item3": "Defaults Upon Senior Securities",
+    "part2_item4": "Mine Safety Disclosures",
+    "part2_item5": "Other Information",
+    "part2_item6": "Exhibits",
+}
+
+_SECTION_STATUS_KEYS = ("pass", "warn", "fail")
 
 
 def resolve_user_agent(ua: str | None = None) -> str:
@@ -516,3 +570,147 @@ def _audit_row(
         }
     )
     return row
+
+
+# ---------------------------------------------------------------------------
+# Section-quality weak-spot statistics
+# ---------------------------------------------------------------------------
+
+
+def is_table_heavy_section(section_name: str) -> bool:
+    """True if the section name marks it as table-heavy.
+
+    Case-insensitive substring match of :data:`TABLE_HEAVY_KEYWORDS` against
+    the section name; key-style names (``"item8"``, ``"part1_item1"``) are
+    additionally matched against their canonical SEC item title from
+    :data:`SECTION_KEY_TITLES`, so both ``"item8"`` and
+    ``"Item 8. Financial Statements and Supplementary Data"`` classify as
+    table-heavy.
+    """
+    lowered = str(section_name).strip().lower()
+    if not lowered:
+        return False
+    title = SECTION_KEY_TITLES.get(lowered)
+    candidates = (lowered, title.lower()) if title else (lowered,)
+    return any(keyword in candidate for keyword in TABLE_HEAVY_KEYWORDS for candidate in candidates)
+
+
+def section_quality_stats(release_root: Path | str) -> dict[str, Any]:
+    """Aggregate every shard's ``documents`` section-quality rows.
+
+    Ground truth (release 20260830_193811): each shard's ``documents`` table
+    carries one row per (ticker, doc_type_key, period) with
+    ``section_quality_status`` in {``pass``, ``warn``, ``fail``} and a
+    ``section_quality_json`` object whose fields are ``status``,
+    ``document_type``, ``missing_core_sections`` (section keys the extractor
+    did NOT detect, e.g. ``"item8"``, ``"part1_item2"``),
+    ``low_confidence_core_sections`` (detected but all-low-confidence),
+    ``fail_reasons``, ``warn_reasons``, ``section_count``.  There is no
+    per-section detail for sections that extracted cleanly, so a section
+    enters the stats only when a document flags it (missing or
+    low-confidence).
+
+    Per-section semantics: ``documents`` counts documents flagging the
+    section; ``fail``/``warn`` count those documents' overall
+    ``section_quality_status``; ``missing``/``low_confidence`` count which
+    list flagged it; rates are counts over ``documents``.
+
+    Returns ``{"sections", "table_heavy_ranked", "totals"}``: ``sections``
+    sorted by section name; ``table_heavy_ranked`` the table-heavy subset
+    sorted by fail_rate desc, then documents desc, then section name (fully
+    deterministic); ``totals`` document-level pass/warn/fail counts and rates.
+    Read-only; shards are opened ``mode=ro`` and iterated in sorted-ticker
+    order.
+    """
+    release_root = Path(release_root)
+    manifest = _load_shard_manifest(release_root)
+    shards: dict[str, Any] = manifest["shards"]
+
+    status_totals = {key: 0 for key in _SECTION_STATUS_KEYS}
+    documents_total = 0
+    per_section: dict[str, dict[str, Any]] = {}
+
+    for ticker in sorted(shards):
+        shard_path = _resolve_shard_path(release_root, str(shards[ticker]["path"]))
+        with sqlite3.connect(f"file:{shard_path}?mode=ro", uri=True) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT ticker, document_type, doc_type_key, period,
+                       section_quality_status, section_quality_json
+                FROM documents
+                ORDER BY ticker, doc_type_key, period
+                """
+            ).fetchall()
+        for row in rows:
+            status = str(row["section_quality_status"] or "").strip().lower()
+            documents_total += 1
+            if status in _SECTION_STATUS_KEYS:
+                status_totals[status] += 1
+            try:
+                quality = json.loads(row["section_quality_json"])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(quality, dict):
+                continue
+            flagged: dict[str, dict[str, bool]] = {}
+            for field, flag_key in (
+                ("missing_core_sections", "missing"),
+                ("low_confidence_core_sections", "low_confidence"),
+            ):
+                values = quality.get(field)
+                if not isinstance(values, list):
+                    continue
+                for value in values:
+                    name = str(value).strip()
+                    if not name:
+                        continue
+                    flags = flagged.setdefault(name, {"missing": False, "low_confidence": False})
+                    flags[flag_key] = True
+            for name, flags in flagged.items():
+                entry = per_section.setdefault(
+                    name,
+                    {
+                        "section_name": name,
+                        "documents": 0,
+                        "fail": 0,
+                        "warn": 0,
+                        "fail_rate": 0.0,
+                        "warn_rate": 0.0,
+                        "missing": 0,
+                        "low_confidence": 0,
+                        "table_heavy": is_table_heavy_section(name),
+                    },
+                )
+                entry["documents"] += 1
+                if flags["missing"]:
+                    entry["missing"] += 1
+                if flags["low_confidence"]:
+                    entry["low_confidence"] += 1
+                if status == "fail":
+                    entry["fail"] += 1
+                elif status == "warn":
+                    entry["warn"] += 1
+
+    for entry in per_section.values():
+        docs = entry["documents"]
+        entry["fail_rate"] = entry["fail"] / docs if docs else 0.0
+        entry["warn_rate"] = entry["warn"] / docs if docs else 0.0
+
+    sections = [per_section[name] for name in sorted(per_section)]
+    table_heavy_ranked = sorted(
+        (entry for entry in sections if entry["table_heavy"]),
+        key=lambda entry: (-entry["fail_rate"], -entry["documents"], entry["section_name"]),
+    )
+    return {
+        "sections": sections,
+        "table_heavy_ranked": table_heavy_ranked,
+        "totals": {
+            "documents": documents_total,
+            "pass": status_totals["pass"],
+            "warn": status_totals["warn"],
+            "fail": status_totals["fail"],
+            "fail_rate": status_totals["fail"] / documents_total if documents_total else 0.0,
+            "warn_rate": status_totals["warn"] / documents_total if documents_total else 0.0,
+        },
+    }

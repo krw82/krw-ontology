@@ -4806,6 +4806,24 @@ class OntologyStore:
             params.extend([dimension_key, dimension_key])
         metric_placeholders = ",".join("?" for _ in metric_candidates)
         clauses[0] = clauses[0].format(metrics=metric_placeholders)
+        # Value-identity dedupe preference: when the clause requests periods,
+        # value-identical twins (the same observation restated across
+        # filings) must keep the row filed in a requested bucket instead of
+        # the newest filing's comparative copy.  Bound here because the
+        # window's ORDER BY placeholders appear in the SQL text before the
+        # trailing ``observation_rank <= ?`` parameter.  Without requested
+        # periods the preference term is omitted and the SQL is byte-identical
+        # to the previous newest-filing tie-break.
+        preferred_filing_buckets = _preferred_metric_filing_buckets(normalized_periods)
+        if preferred_filing_buckets:
+            duplicate_order_pref = (
+                "(filtered.filing_period IN ("
+                + ",".join("?" for _ in preferred_filing_buckets)
+                + ")) DESC, "
+            )
+            params.extend(preferred_filing_buckets)
+        else:
+            duplicate_order_pref = ""
         normalized_axes = {
             str(axis).strip().casefold() for axis in comparison_axes or [] if str(axis).strip()
         }
@@ -4862,7 +4880,7 @@ class OntologyStore:
                             filtered.observation_period_type,
                             filtered.observation_context_key,
                             filtered.value_identity
-                        ORDER BY filtered.filing_period DESC, filtered.object_id
+                        ORDER BY {duplicate_order_pref}filtered.filing_period DESC, filtered.object_id
                     ) AS duplicate_value_rank
                 FROM filtered
             ), context_variants AS (
@@ -7951,6 +7969,39 @@ def _planned_metric_period_coordinates(
         if value not in coordinates:
             coordinates.append(value)
     return coordinates
+
+
+def _preferred_metric_filing_buckets(periods: Iterable[str]) -> list[str]:
+    """Filing-bucket labels the value-identity dedupe should prefer.
+
+    The dedupe window inside ``_query_metrics`` breaks value-identical twins
+    (one observation restated across filings) with ``filing_period DESC``,
+    which always keeps the newest filing's comparative copy.  When a clause
+    requests periods, the survivor must instead be the twin filed in a
+    requested bucket.  Each requested label contributes itself plus its CY/FY
+    fiscal-coordinate twins (a requested FY2025 prefers a CY2025 bucket and
+    vice versa), mirroring the coordinate equivalence of
+    ``_planned_metric_row_matches_periods``.  Returns a sorted list for
+    deterministic SQL text and parameter binding; empty when no periods are
+    requested, in which case the SQL preference term is omitted entirely.
+    """
+    buckets: set[str] = set()
+    for period in periods:
+        label = str(period).strip().upper()
+        if not label:
+            continue
+        buckets.add(label)
+        match = re.search(
+            r"(?:CY|FY)?(19\d{2}|20\d{2})(?:Q([1-4]))?",
+            label,
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            continue
+        year = match.group(1)
+        quarter = f"Q{match.group(2)}" if match.group(2) else ""
+        buckets.update({f"CY{year}{quarter}", f"FY{year}{quarter}"})
+    return sorted(buckets)
 
 
 def _select_planned_metric_rows(

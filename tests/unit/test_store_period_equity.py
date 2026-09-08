@@ -265,3 +265,166 @@ def test_wide_limit_holds_everything_and_never_reserves(shard_path):
     assert len(rows) == 8
     assert {row["id"] for row in _metric_rows(rows)} == METRIC_IDS
     assert "period_reservations" not in diagnostics
+
+
+# ---------------------------------------------------------------------------
+# Value-identity dedupe vs the requested filing bucket (the msft_bottom_line
+# recovery).  Two value-identical twins observe FY2025: one filed in the
+# CY2025 bucket, its comparative copy filed in the CY2026 bucket.  They share
+# observation_context_key and value_identity, so the dedupe window inside
+# ``_query_metrics`` keeps exactly one of them.  Plain ``filing_period DESC``
+# always keeps the newest filing's comparative copy; a clause that requests a
+# period must instead keep the twin filed in that period's bucket.
+#
+# The retrieval query below deliberately does not lexically match the metric
+# observation text, so the fused window carries metric-channel rows only and
+# the assertions observe the dedupe decision itself.
+# ---------------------------------------------------------------------------
+
+TWINS_TICKER = "TW"
+TWINS_FILING_PERIODS = ("CY2025", "CY2026")
+TWINS_OBSERVATION_YEAR = 2025
+TWINS_METRIC_NAME = "net_income"
+TWINS_METRIC_VALUE = 101_832_000_000.0
+# No FTS row in the twins shard matches every token of this query.
+TWINS_RETRIEVAL_QUERY = "fiscal bottom line commentary"
+
+TWINS_METRIC_IDS = {
+    "metric_observation:TW:CY2025:10K:net_income:2025",
+    "metric_observation:TW:CY2026:10K:net_income:2025",
+}
+TWINS_FILED_IN_CY2025_ID = "metric_observation:TW:CY2025:10K:net_income:2025"
+TWINS_FILED_IN_CY2026_ID = "metric_observation:TW:CY2026:10K:net_income:2025"
+
+
+def _twins_metric_observation(*, filing_period: str) -> dict:
+    """One twin: same FY2025 observation (dates, value, context) filed in ``filing_period``."""
+    return {
+        "id": f"metric_observation:TW:{filing_period}:10K:net_income:2025",
+        "type": "MetricObservation",
+        "ticker": TWINS_TICKER,
+        "source_document_id": f"source:TW:{filing_period}:10K",
+        "document_type": DOCUMENT_TYPE,
+        "period": filing_period,
+        "metric_name": TWINS_METRIC_NAME,
+        "value": TWINS_METRIC_VALUE,
+        "unit": "USD",
+        "fiscal_year": TWINS_OBSERVATION_YEAR,
+        "period_type": "annual",
+        "period_start": f"{TWINS_OBSERVATION_YEAR}-01-01",
+        "period_end": f"{TWINS_OBSERVATION_YEAR}-12-31",
+        "source_type": "reported",
+        "review_status": "accepted",
+        "schema_version": "0.1.0",
+    }
+
+
+def _write_twins_artifacts(root: Path) -> None:
+    for filing_period in TWINS_FILING_PERIODS:
+        ontology_dir = root / "companies" / TWINS_TICKER / "ontology" / DOC_TYPE_KEY / filing_period
+        sources_dir = root / "companies" / TWINS_TICKER / "sources" / DOC_TYPE_KEY / filing_period
+        ontology_dir.mkdir(parents=True)
+        sources_dir.mkdir(parents=True)
+        write_jsonl(ontology_dir / "spans.jsonl", [])
+        write_jsonl(ontology_dir / "evidence_quotes.jsonl", [])
+        write_jsonl(ontology_dir / "claims.jsonl", [])
+        write_jsonl(ontology_dir / "support_links.jsonl", [])
+        write_jsonl(
+            ontology_dir / "metric_observations.jsonl",
+            [_twins_metric_observation(filing_period=filing_period)],
+        )
+        atomic_write_json(
+            ontology_dir / "section_quality.json",
+            {"status": "pass", "missing_core_sections": [], "fail_reasons": []},
+        )
+        build_indexes(
+            ticker=TWINS_TICKER,
+            period=filing_period,
+            doc_type_key=DOC_TYPE_KEY,
+            ontology_dir=ontology_dir,
+            sources_dir=sources_dir,
+            output_dir=root,
+            document_type=DOCUMENT_TYPE,
+        )
+
+
+@pytest.fixture(scope="module")
+def twins_shard_path(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    root = tmp_path_factory.mktemp("twins-dedupe-release")
+    _write_twins_artifacts(root)
+    result = build_spine_shard_release_outputs(
+        root,
+        release_id="test-store-twins-dedupe",
+        workers=1,
+        no_cache=True,
+    )
+    shard = result.global_spine_path.parent / "companies" / f"{TWINS_TICKER}.sqlite"
+    assert shard.is_file()
+    return shard
+
+
+def _twins_query(store: OntologyStore, **overrides):
+    kwargs = {
+        "clause_id": "twins_net_income",
+        "retrieval_query": TWINS_RETRIEVAL_QUERY,
+        "metrics": [TWINS_METRIC_NAME],
+        "tickers": [TWINS_TICKER],
+        "limit": 6,
+    }
+    kwargs.update(overrides)
+    return store.query_planned_compact_with_diagnostics(**kwargs)
+
+
+def _twins_metric_ids(rows):
+    return {row["id"] for row in rows if row["type"] == "MetricObservation"}
+
+
+def test_dedupe_prefers_requested_filing_bucket_twin(twins_shard_path):
+    """periods=[CY2025]: the dedupe survivor must be the twin filed in the
+    requested CY2025 bucket, not the CY2026 comparative copy that plain
+    ``filing_period DESC`` always picks."""
+    with OntologyStore(twins_shard_path) as store:
+        rows, diagnostics = _twins_query(store, periods=["CY2025"])
+
+    assert _twins_metric_ids(rows) == {TWINS_FILED_IN_CY2025_ID}
+    assert diagnostics["metric_result_count"] == 1
+
+
+def test_dedupe_without_requested_periods_keeps_newest_twin(twins_shard_path):
+    """No requested periods: the dedupe keeps the newest filing bucket,
+    byte-identical to the pre-change behaviour."""
+    with OntologyStore(twins_shard_path) as store:
+        rows, diagnostics = _twins_query(store)
+
+    assert _twins_metric_ids(rows) == {TWINS_FILED_IN_CY2026_ID}
+    assert diagnostics["metric_result_count"] == 1
+
+
+def test_dedupe_fy_request_prefers_matching_cy_filing_bucket(twins_shard_path):
+    """A fiscal-labeled request (FY2025) resolves through the fiscal-coordinate
+    equivalence to the CY2025 filing bucket, so the CY2025 twin wins over the
+    CY2026 comparative copy."""
+    with OntologyStore(twins_shard_path) as store:
+        rows, diagnostics = _twins_query(store, periods=["FY2025"])
+
+    assert _twins_metric_ids(rows) == {TWINS_FILED_IN_CY2025_ID}
+    assert diagnostics["metric_result_count"] == 1
+
+
+def test_alias_channel_dedupe_prefers_requested_filing_bucket_twin(twins_shard_path):
+    """The msft_bottom_line shape itself: a metric-less clause whose retrieval
+    query names the ``bottom line`` alias expands to net_income through the
+    alias metric channel, which shares ``_query_metrics`` and therefore the
+    same requested-bucket preference."""
+    with OntologyStore(twins_shard_path) as store:
+        rows, diagnostics = _twins_query(
+            store,
+            retrieval_query="bottom line",
+            metrics=None,
+            periods=["CY2025"],
+        )
+
+    by_id = {row["id"]: row for row in rows}
+    assert set(by_id) == {TWINS_FILED_IN_CY2025_ID}
+    assert by_id[TWINS_FILED_IN_CY2025_ID]["planned_match_mode"] == "alias_expanded"
+    assert diagnostics["alias_expansion_used"] is True

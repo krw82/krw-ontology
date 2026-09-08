@@ -30,3 +30,4 @@ indexes/*.sqlite
 indexes/*.sqlite-wal
 .lazyweb/
 .mimosa/
+.superpowers/

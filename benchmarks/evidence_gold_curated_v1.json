@@ -1,0 +1,841 @@
+{
+  "format_version": "krw-ontology-evidence-gold/v1",
+  "source_release": {
+    "release_id": "20260830_193811",
+    "source_manifest_hash": "e9882d79a418c4fa0e110f04f587b96444448d7f903552b774142b4639897b89"
+  },
+  "cases": [
+    {
+      "id": "curated_vocab_aapl_top_line",
+      "question": "What was Apple's top line for the year ended September 2025?",
+      "search_plan": {
+        "question": "What was Apple's top line for the year ended September 2025?",
+        "intent": "vocabulary_bridge",
+        "tickers": ["AAPL"],
+        "document_types": ["10-K"],
+        "periods": ["CY2025"],
+        "clauses": [
+          {
+            "clause_id": "aapl_top_line",
+            "retrieval_query": "Apple top line annual results for the year ended September 2025",
+            "required_concepts": ["top line"],
+            "tickers": ["AAPL"]
+          }
+        ]
+      },
+      "strata": ["vocabulary_mismatch", "curated"],
+      "expected": [
+        {
+          "ticker": "AAPL",
+          "period": "CY2025",
+          "document_type": "10-K",
+          "object_ids": [
+            "metric_observation:AAPL:CY2025:10K:c5305c29dae946"
+          ]
+        }
+      ],
+      "notes": "Colloquial 'top line' must bridge to canonical revenue; the plan deliberately omits the canonical metric. Anchor is the accepted FY2025 revenue observation (period_end 2025-09-27) in filing period CY2025."
+    },
+    {
+      "id": "curated_vocab_msft_bottom_line",
+      "question": "How much did Microsoft earn on the bottom line in fiscal year 2025?",
+      "search_plan": {
+        "question": "How much did Microsoft earn on the bottom line in fiscal year 2025?",
+        "intent": "vocabulary_bridge",
+        "tickers": ["MSFT"],
+        "document_types": ["10-K"],
+        "periods": ["CY2025"],
+        "clauses": [
+          {
+            "clause_id": "msft_bottom_line",
+            "retrieval_query": "Microsoft bottom line earnings for fiscal year 2025 annual results",
+            "required_concepts": ["bottom line"],
+            "tickers": ["MSFT"]
+          }
+        ]
+      },
+      "strata": ["vocabulary_mismatch", "curated"],
+      "expected": [
+        {
+          "ticker": "MSFT",
+          "period": "CY2025",
+          "document_type": "10-K",
+          "object_ids": [
+            "metric_observation:MSFT:CY2025:10K:77d1ebe33563fb"
+          ]
+        }
+      ],
+      "notes": "'Bottom line' is not a dictionary alias of net_income; anchor is the FY2025 net_income observation ($101.8B, period_end 2025-06-30) in filing period CY2025."
+    },
+    {
+      "id": "curated_vocab_wmt_operating_profit",
+      "question": "What operating profit did Walmart report for fiscal 2026?",
+      "search_plan": {
+        "question": "What operating profit did Walmart report for fiscal 2026?",
+        "intent": "vocabulary_bridge",
+        "tickers": ["WMT"],
+        "document_types": ["10-K"],
+        "periods": ["CY2026"],
+        "clauses": [
+          {
+            "clause_id": "wmt_operating_profit",
+            "retrieval_query": "Walmart operating profit for fiscal 2026 annual results",
+            "required_concepts": ["operating profit"],
+            "tickers": ["WMT"]
+          }
+        ]
+      },
+      "strata": ["vocabulary_mismatch", "curated"],
+      "expected": [
+        {
+          "ticker": "WMT",
+          "period": "CY2026",
+          "document_type": "10-K",
+          "object_ids": [
+            "metric_observation:WMT:CY2026:10K:8f3733fe0fa691"
+          ]
+        }
+      ],
+      "notes": "'Operating profit' has no dictionary alias mapping; anchor is the FY2026 operating_income observation (period_end 2026-01-31) in filing period CY2026."
+    },
+    {
+      "id": "curated_vocab_amzn_profit_per_share",
+      "question": "What was Amazon's profit per share in 2025?",
+      "search_plan": {
+        "question": "What was Amazon's profit per share in 2025?",
+        "intent": "vocabulary_bridge",
+        "tickers": ["AMZN"],
+        "document_types": ["10-K"],
+        "periods": ["CY2025"],
+        "clauses": [
+          {
+            "clause_id": "amzn_profit_per_share",
+            "retrieval_query": "Amazon profit per share for the 2025 annual period",
+            "required_concepts": ["profit per share"],
+            "tickers": ["AMZN"]
+          }
+        ]
+      },
+      "strata": ["vocabulary_mismatch", "curated"],
+      "expected": [
+        {
+          "ticker": "AMZN",
+          "period": "CY2025",
+          "document_type": "10-K",
+          "object_ids": [
+            "metric_observation:AMZN:CY2025:10K:a4db1118ecee6c"
+          ]
+        }
+      ],
+      "notes": "'Profit per share' (not the aliased 'earnings per share') must bridge to canonical eps; anchor is the CY2025 eps observation (7.29 USD_per_share, period_end 2025-12-31)."
+    },
+    {
+      "id": "curated_vocab_aapl_research_spending",
+      "question": "How big was Apple's research spending in fiscal 2025?",
+      "search_plan": {
+        "question": "How big was Apple's research spending in fiscal 2025?",
+        "intent": "vocabulary_bridge",
+        "tickers": ["AAPL"],
+        "document_types": ["10-K"],
+        "periods": ["CY2025"],
+        "clauses": [
+          {
+            "clause_id": "aapl_research_spending",
+            "retrieval_query": "Apple research spending for fiscal 2025 product development investment",
+            "required_concepts": ["research spending"],
+            "tickers": ["AAPL"]
+          }
+        ]
+      },
+      "strata": ["vocabulary_mismatch", "curated"],
+      "expected": [
+        {
+          "ticker": "AAPL",
+          "period": "CY2025",
+          "document_type": "10-K",
+          "object_ids": [
+            "metric_observation:AAPL:CY2025:10K:650659b9c7e5dc"
+          ]
+        }
+      ],
+      "notes": "'Research spending' is not a dictionary alias of research_and_development; anchor is the FY2025 observation ($34.5B) in filing period CY2025."
+    },
+    {
+      "id": "curated_vocab_meta_debt_load",
+      "question": "How heavy is Meta's debt load as of December 2025?",
+      "search_plan": {
+        "question": "How heavy is Meta's debt load as of December 2025?",
+        "intent": "vocabulary_bridge",
+        "tickers": ["META"],
+        "document_types": ["10-K"],
+        "periods": ["CY2025"],
+        "clauses": [
+          {
+            "clause_id": "meta_debt_load",
+            "retrieval_query": "Meta debt load and borrowings as of December 2025",
+            "required_concepts": ["debt load"],
+            "tickers": ["META"]
+          }
+        ]
+      },
+      "strata": ["vocabulary_mismatch", "curated"],
+      "expected": [
+        {
+          "ticker": "META",
+          "period": "CY2025",
+          "document_type": "10-K",
+          "object_ids": [
+            "metric_observation:META:CY2025:10K:680b7e7b899d65"
+          ]
+        }
+      ],
+      "notes": "'Debt load' must bridge to canonical total_debt (bare 'debt' is an alias and is deliberately avoided); anchor is the CY2025 observation ($58.7B, period_end 2025-12-31)."
+    },
+    {
+      "id": "curated_vocab_meta_share_buybacks",
+      "question": "How much stock did Meta buy back in 2025 and how much authorization remains?",
+      "search_plan": {
+        "question": "How much stock did Meta buy back in 2025 and how much authorization remains?",
+        "intent": "vocabulary_bridge",
+        "tickers": ["META"],
+        "document_types": ["10-K"],
+        "periods": ["CY2025"],
+        "clauses": [
+          {
+            "clause_id": "meta_share_buybacks",
+            "retrieval_query": "Meta share buybacks during 2025 and remaining buyback authorization",
+            "required_concepts": ["share buybacks"],
+            "tickers": ["META"]
+          }
+        ]
+      },
+      "strata": ["vocabulary_mismatch", "curated"],
+      "expected": [
+        {
+          "ticker": "META",
+          "period": "CY2025",
+          "document_type": "10-K",
+          "object_ids": [
+            "claim:META:CY2025:10K:meta-repurchased-26-264-million-of-its-shares-in-2025-and-29-754-million-in-2024",
+            "claim:META:CY2025:10K:as-of-december-31-2025-25-03-billion-remained-available-and-authorized-for-share"
+          ],
+          "text_fragments": ["repurchased", "remained available and authorized"]
+        }
+      ],
+      "notes": "There is no canonical repurchase metric in the dictionary; 'share buybacks' must bridge to repurchase-worded claims. Anchors are the 2025 repurchase claim and the remaining-authorization claim in the CY2025 10-K."
+    },
+    {
+      "id": "curated_vocab_amzn_stock_buyback_activity",
+      "question": "Did Amazon do any stock buybacks in 2025?",
+      "search_plan": {
+        "question": "Did Amazon do any stock buybacks in 2025?",
+        "intent": "vocabulary_bridge",
+        "tickers": ["AMZN"],
+        "document_types": ["10-K"],
+        "periods": ["CY2025"],
+        "clauses": [
+          {
+            "clause_id": "amzn_stock_buyback_activity",
+            "retrieval_query": "Amazon stock buyback activity in 2025 and remaining authorization under the buyback program",
+            "required_concepts": ["stock buyback"],
+            "tickers": ["AMZN"]
+          }
+        ]
+      },
+      "strata": ["vocabulary_mismatch", "curated"],
+      "expected": [
+        {
+          "ticker": "AMZN",
+          "period": "CY2025",
+          "document_type": "10-K",
+          "object_ids": [
+            "claim:AMZN:CY2025:10K:amazon-s-board-authorized-a-stock-repurchase-program-of-up-to-10-0-billion-in-ma"
+          ],
+          "text_fragments": ["repurchase program"]
+        }
+      ],
+      "notes": "'Stock buyback' wording must surface repurchase-worded disclosures; anchor is the CY2025 10-K claim covering the $10.0B repurchase program and the absence of 2023-2025 repurchases."
+    },
+    {
+      "id": "curated_fiscal_nvda_calendar_2025_revenue",
+      "question": "What revenue did NVIDIA record over calendar year 2025?",
+      "search_plan": {
+        "question": "What revenue did NVIDIA record over calendar year 2025?",
+        "intent": "fiscal_period_bridge",
+        "tickers": ["NVDA"],
+        "document_types": ["10-K"],
+        "clauses": [
+          {
+            "clause_id": "nvda_revenue_calendar_2025",
+            "retrieval_query": "NVIDIA revenue for the annual period covering calendar year 2025",
+            "metrics": ["revenue"],
+            "tickers": ["NVDA"]
+          }
+        ]
+      },
+      "strata": ["fiscal_offset", "curated"],
+      "expected": [
+        {
+          "ticker": "NVDA",
+          "period": "CY2026",
+          "document_type": "10-K",
+          "object_ids": [
+            "metric_observation:NVDA:CY2026:10K:3b7cb1e4060cf2"
+          ]
+        }
+      ],
+      "notes": "NVDA's fiscal year covering calendar 2025 is FY2026 (2025-01-26 to 2026-01-25), carried in shard filing period CY2026. A naive CY2025 filter returns the FY2025 observation (2024-01-29 to 2025-01-25), which covers mostly calendar 2024. The plan deliberately carries no period filter."
+    },
+    {
+      "id": "curated_fiscal_wmt_calendar_2025_revenue",
+      "question": "What was Walmart's revenue for calendar year 2025?",
+      "search_plan": {
+        "question": "What was Walmart's revenue for calendar year 2025?",
+        "intent": "fiscal_period_bridge",
+        "tickers": ["WMT"],
+        "document_types": ["10-K"],
+        "clauses": [
+          {
+            "clause_id": "wmt_revenue_calendar_2025",
+            "retrieval_query": "Walmart revenue for the annual period covering calendar year 2025",
+            "metrics": ["revenue"],
+            "tickers": ["WMT"]
+          }
+        ]
+      },
+      "strata": ["fiscal_offset", "curated"],
+      "expected": [
+        {
+          "ticker": "WMT",
+          "period": "CY2026",
+          "document_type": "10-K",
+          "object_ids": [
+            "metric_observation:WMT:CY2026:10K:0052918944a454"
+          ]
+        }
+      ],
+      "notes": "WMT's fiscal year covering calendar 2025 is FY2026 (2025-02-01 to 2026-01-31), carried in shard filing period CY2026; the CY2025-keyed filing holds FY2025 (mostly calendar 2024). Plan carries no period filter."
+    },
+    {
+      "id": "curated_fiscal_nvda_calendar_2024_eps",
+      "question": "What did NVIDIA earn per share over calendar year 2024?",
+      "search_plan": {
+        "question": "What did NVIDIA earn per share over calendar year 2024?",
+        "intent": "fiscal_period_bridge",
+        "tickers": ["NVDA"],
+        "document_types": ["10-K"],
+        "clauses": [
+          {
+            "clause_id": "nvda_eps_calendar_2024",
+            "retrieval_query": "NVIDIA earnings per share for the annual period covering calendar year 2024",
+            "metrics": ["eps"],
+            "tickers": ["NVDA"]
+          }
+        ]
+      },
+      "strata": ["fiscal_offset", "curated"],
+      "expected": [
+        {
+          "ticker": "NVDA",
+          "period": "CY2025",
+          "document_type": "10-K",
+          "object_ids": [
+            "metric_observation:NVDA:CY2025:10K:49efe6e77c20d5"
+          ]
+        }
+      ],
+      "notes": "Calendar 2024 is covered by NVDA FY2025 (2024-01-29 to 2025-01-25), carried in shard filing period CY2025; the CY2024-keyed filing holds FY2024 (mostly calendar 2023). Anchor is the FY2025 eps observation (2.97 USD_per_share)."
+    },
+    {
+      "id": "curated_fiscal_cost_twelve_months_aug_2025",
+      "question": "What was Costco's revenue for the twelve months ended August 2025?",
+      "search_plan": {
+        "question": "What was Costco's revenue for the twelve months ended August 2025?",
+        "intent": "fiscal_period_bridge",
+        "tickers": ["COST"],
+        "document_types": ["10-K"],
+        "clauses": [
+          {
+            "clause_id": "cost_revenue_ttm_aug_2025",
+            "retrieval_query": "Costco revenue for the annual period ended August 2025",
+            "metrics": ["revenue"],
+            "tickers": ["COST"]
+          }
+        ]
+      },
+      "strata": ["fiscal_offset", "curated"],
+      "expected": [
+        {
+          "ticker": "COST",
+          "period": "CY2025",
+          "document_type": "10-K",
+          "object_ids": [
+            "metric_observation:COST:CY2025:10K:876ec4aceb87c6"
+          ]
+        }
+      ],
+      "notes": "COST's fiscal year ends late August/early September (FY2025 ended 2025-08-31) and is keyed by the calendar year of the fiscal year-end; the CY2025 10-K also carries FY2024 (ended 2024-09-01) as a comparative, so the anchor pins the exact FY2025 observation ($275.2B). Plan carries no period filter."
+    },
+    {
+      "id": "curated_multispan_nvda_dc_growth_supply",
+      "question": "What drove NVIDIA data center revenue growth in fiscal 2026, and what supply risks could constrain it?",
+      "search_plan": {
+        "question": "What drove NVIDIA data center revenue growth in fiscal 2026, and what supply risks could constrain it?",
+        "intent": "multi_span_lookup",
+        "tickers": ["NVDA"],
+        "document_types": ["10-K"],
+        "periods": ["CY2026"],
+        "clauses": [
+          {
+            "clause_id": "nvda_dc_growth",
+            "retrieval_query": "NVIDIA data center revenue growth drivers fiscal 2026",
+            "required_concepts": ["data center revenue growth"],
+            "tickers": ["NVDA"]
+          },
+          {
+            "clause_id": "nvda_supply_risk",
+            "retrieval_query": "NVIDIA supply constraints and component availability risks",
+            "required_concepts": ["supply constraints"],
+            "tickers": ["NVDA"]
+          }
+        ]
+      },
+      "strata": ["multi_span", "curated"],
+      "expected": [
+        {
+          "ticker": "NVDA",
+          "period": "CY2026",
+          "document_type": "10-K",
+          "text_fragments": [
+            "Data Center revenue for fiscal year 2026 was up 68%",
+            "supply constraints or availability issues with respect to any single component"
+          ]
+        }
+      ],
+      "notes": "Single expected item whose two fragments live in different CY2026 10-K objects: the data-center growth claim (claim:NVDA:CY2026:10K:data-center-revenue-for-fiscal-year-2026-was-up-68-from-a-year-ago) and the component-supply risk claim (claim:NVDA:CY2026:10K:because-nvidia-s-products-are-part-of-complex-data-center-buildouts-supply-const)."
+    },
+    {
+      "id": "curated_multispan_amzn_aws_growth_capex",
+      "question": "How fast did AWS grow in 2025 and what investment plans support future capacity?",
+      "search_plan": {
+        "question": "How fast did AWS grow in 2025 and what investment plans support future capacity?",
+        "intent": "multi_span_lookup",
+        "tickers": ["AMZN"],
+        "document_types": ["10-K"],
+        "periods": ["CY2025"],
+        "clauses": [
+          {
+            "clause_id": "amzn_aws_growth",
+            "retrieval_query": "AWS net sales growth in 2025 full year results",
+            "required_concepts": ["AWS net sales growth"],
+            "tickers": ["AMZN"]
+          },
+          {
+            "clause_id": "amzn_capacity_investment",
+            "retrieval_query": "Amazon investment plans for technology infrastructure and fulfillment capacity in 2026",
+            "required_concepts": ["technology infrastructure"],
+            "tickers": ["AMZN"]
+          }
+        ]
+      },
+      "strata": ["multi_span", "curated"],
+      "expected": [
+        {
+          "ticker": "AMZN",
+          "period": "CY2025",
+          "document_type": "10-K",
+          "text_fragments": [
+            "AWS net sales grew from $107,556 million in 2024 to $128,725 million in 2025",
+            "technology infrastructure investments (primarily supporting AWS growth) and fulfillment network capacity investments to increase in 2026"
+          ]
+        }
+      ],
+      "notes": "Single expected item whose two fragments live in different CY2025 10-K objects: the AWS growth claim (claim:AMZN:CY2025:10K:aws-net-sales-grew-from-107-556-million-in-2024-to-128-725-million-in-2025-repre) and the 2026 investment-plan claim (claim:AMZN:CY2025:10K:amazon-expects-both-technology-infrastructure-investments-primarily-supporting-a)."
+    },
+    {
+      "id": "curated_multispan_wmt_ecommerce_labor",
+      "question": "How did Walmart's eCommerce perform in fiscal 2026 and what labor cost risks does it flag?",
+      "search_plan": {
+        "question": "How did Walmart's eCommerce perform in fiscal 2026 and what labor cost risks does it flag?",
+        "intent": "multi_span_lookup",
+        "tickers": ["WMT"],
+        "document_types": ["10-K"],
+        "periods": ["CY2026"],
+        "clauses": [
+          {
+            "clause_id": "wmt_ecommerce_performance",
+            "retrieval_query": "Walmart eCommerce sales strength in fiscal 2026",
+            "required_concepts": ["eCommerce sales"],
+            "tickers": ["WMT"]
+          },
+          {
+            "clause_id": "wmt_labor_risk",
+            "retrieval_query": "Walmart wage increases and benefit costs labor risk factors",
+            "required_concepts": ["wage increases"],
+            "tickers": ["WMT"]
+          }
+        ]
+      },
+      "strata": ["multi_span", "curated"],
+      "expected": [
+        {
+          "ticker": "WMT",
+          "period": "CY2026",
+          "document_type": "10-K",
+          "object_ids": [
+            "claim:WMT:CY2026:10K:both-fiscal-2026-and-2025-included-strength-in-ecommerce-as-well-as-strong-sales"
+          ],
+          "text_fragments": ["strength in eCommerce"]
+        },
+        {
+          "ticker": "WMT",
+          "period": "CY2026",
+          "document_type": "10-K",
+          "object_ids": [
+            "claim:WMT:CY2026:10K:failure-to-attract-and-retain-qualified-associates-increases-in-wage-and-benefit"
+          ],
+          "text_fragments": ["increases in wage and benefit costs"]
+        }
+      ],
+      "notes": "Two required expected items across sections: the MD&A eCommerce strength claim and the labor risk-factor claim, both in the CY2026 10-K. Both items must be retrieved for the case to pass."
+    },
+    {
+      "id": "curated_multispan_meta_users_capex",
+      "question": "How much did Meta's daily active people grow in 2025 and what capital spending is planned for 2026?",
+      "search_plan": {
+        "question": "How much did Meta's daily active people grow in 2025 and what capital spending is planned for 2026?",
+        "intent": "multi_span_lookup",
+        "tickers": ["META"],
+        "document_types": ["10-K"],
+        "periods": ["CY2025"],
+        "clauses": [
+          {
+            "clause_id": "meta_dap_growth",
+            "retrieval_query": "Meta daily active people growth in 2025",
+            "required_concepts": ["daily active people"],
+            "tickers": ["META"]
+          },
+          {
+            "clause_id": "meta_capex_2026",
+            "retrieval_query": "Meta planned capital expenditures for 2026 AI infrastructure",
+            "required_concepts": ["capital expenditures"],
+            "tickers": ["META"]
+          }
+        ]
+      },
+      "strata": ["multi_span", "curated"],
+      "expected": [
+        {
+          "ticker": "META",
+          "period": "CY2025",
+          "document_type": "10-K",
+          "object_ids": [
+            "claim:META:CY2025:10K:family-daily-active-people-dap-was-3-58-billion-on-average-for-december-2025-an"
+          ],
+          "text_fragments": ["3.58 billion on average for December 2025"]
+        },
+        {
+          "ticker": "META",
+          "period": "CY2025",
+          "document_type": "10-K",
+          "object_ids": [
+            "claim:META:CY2025:10K:the-company-anticipates-making-capital-expenditures-of-approximately-115-billion"
+          ],
+          "text_fragments": ["approximately $115 billion to $135 billion in 2026"]
+        }
+      ],
+      "notes": "Two required expected items across sections: the DAP engagement claim and the 2026 capex guidance claim, both in the CY2025 10-K. Both items must be retrieved for the case to pass."
+    },
+    {
+      "id": "curated_notdisclosed_nvda_quantum_revenue",
+      "question": "How much revenue does NVIDIA generate from quantum computing?",
+      "search_plan": {
+        "question": "How much revenue does NVIDIA generate from quantum computing?",
+        "intent": "absence_check",
+        "tickers": ["NVDA"],
+        "clauses": [
+          {
+            "clause_id": "nvda_quantum_revenue",
+            "retrieval_query": "NVIDIA quantum computing revenue breakdown by technology",
+            "required_concepts": ["quantum computing revenue"],
+            "tickers": ["NVDA"]
+          }
+        ]
+      },
+      "strata": ["not_disclosed", "curated"],
+      "expected": [],
+      "expect_not_disclosed": true,
+      "forbidden_fragments": [
+        "quantum computing revenue",
+        "quantum revenue"
+      ],
+      "notes": "NVDA does not disclose quantum revenue. Verified in the shard: zero metric_lookup rows with 'quantum' and the only 'quantum' text hits are the Quantum InfiniBand product name and a director's Quantum Corp. biography, neither of which contains the forbidden phrases. An answer citing a quantum revenue figure would be hallucinated."
+    },
+    {
+      "id": "curated_notdisclosed_amzn_prime_members",
+      "question": "How many Prime members does Amazon have?",
+      "search_plan": {
+        "question": "How many Prime members does Amazon have?",
+        "intent": "absence_check",
+        "tickers": ["AMZN"],
+        "clauses": [
+          {
+            "clause_id": "amzn_prime_member_count",
+            "retrieval_query": "Amazon Prime membership count and number of Prime members subscribers",
+            "required_concepts": ["Prime membership count"],
+            "tickers": ["AMZN"]
+          }
+        ]
+      },
+      "strata": ["not_disclosed", "curated"],
+      "expected": [],
+      "expect_not_disclosed": true,
+      "forbidden_fragments": [
+        "number of prime members",
+        "prime members worldwide",
+        "prime membership count"
+      ],
+      "notes": "AMZN discloses Prime membership fees and unearned revenue but no member counts. Verified in the shard: every 'Prime member' text hit is about membership fees/benefits, not counts. A specific membership number would be fabricated."
+    },
+    {
+      "id": "curated_notdisclosed_aapl_iphone_units",
+      "question": "How many iPhones did Apple sell in fiscal 2025?",
+      "search_plan": {
+        "question": "How many iPhones did Apple sell in fiscal 2025?",
+        "intent": "absence_check",
+        "tickers": ["AAPL"],
+        "clauses": [
+          {
+            "clause_id": "aapl_iphone_unit_sales",
+            "retrieval_query": "Apple iPhone unit sales volume for fiscal 2025",
+            "required_concepts": ["iPhone unit sales"],
+            "tickers": ["AAPL"]
+          }
+        ]
+      },
+      "strata": ["not_disclosed", "curated"],
+      "expected": [],
+      "expect_not_disclosed": true,
+      "forbidden_fragments": [
+        "iphone unit sales",
+        "iphone units sold",
+        "million iphones sold"
+      ],
+      "notes": "Apple stopped disclosing iPhone unit sales. Verified in the shard: zero objects matching 'unit sales', 'units sold', 'million iPhones', or 'iPhones sold'; only dollar net sales by segment are disclosed. Any unit-sales figure would be hallucinated."
+    },
+    {
+      "id": "curated_notdisclosed_msft_xbox_units",
+      "question": "How many Xbox consoles did Microsoft sell in fiscal 2025?",
+      "search_plan": {
+        "question": "How many Xbox consoles did Microsoft sell in fiscal 2025?",
+        "intent": "absence_check",
+        "tickers": ["MSFT"],
+        "clauses": [
+          {
+            "clause_id": "msft_xbox_unit_sales",
+            "retrieval_query": "Microsoft Xbox console unit sales volume for fiscal 2025",
+            "required_concepts": ["Xbox console unit sales"],
+            "tickers": ["MSFT"]
+          }
+        ]
+      },
+      "strata": ["not_disclosed", "curated"],
+      "expected": [],
+      "expect_not_disclosed": true,
+      "forbidden_fragments": [
+        "xbox unit sales",
+        "xbox units sold",
+        "million consoles sold"
+      ],
+      "notes": "MSFT discusses Xbox hardware revenue (including 'price of consoles sold') but discloses no console unit counts. Verified in the shard: zero matches for 'Xbox unit', 'console units', or 'Xbox consoles sold'. Chosen forbidden phrases do not collide with the legitimate consoles-sold revenue commentary."
+    },
+    {
+      "id": "curated_multiperiod_nvda_revenue_fy2024_fy2026",
+      "question": "How did NVIDIA's revenue grow from fiscal year 2024 through fiscal year 2026?",
+      "search_plan": {
+        "question": "How did NVIDIA's revenue grow from fiscal year 2024 through fiscal year 2026?",
+        "intent": "trend_lookup",
+        "tickers": ["NVDA"],
+        "document_types": ["10-K"],
+        "periods": ["CY2024", "CY2025", "CY2026"],
+        "clauses": [
+          {
+            "clause_id": "nvda_revenue_trend",
+            "retrieval_query": "NVIDIA revenue annual trend fiscal 2024 2025 2026",
+            "metrics": ["revenue"],
+            "tickers": ["NVDA"]
+          }
+        ]
+      },
+      "strata": ["multi_period", "curated"],
+      "expected": [
+        {
+          "ticker": "NVDA",
+          "period": "CY2024",
+          "document_type": "10-K",
+          "object_ids": [
+            "metric_observation:NVDA:CY2024:10K:b98bbb060aa325"
+          ]
+        },
+        {
+          "ticker": "NVDA",
+          "period": "CY2025",
+          "document_type": "10-K",
+          "object_ids": [
+            "metric_observation:NVDA:CY2025:10K:5d586e80811c3f"
+          ]
+        },
+        {
+          "ticker": "NVDA",
+          "period": "CY2026",
+          "document_type": "10-K",
+          "object_ids": [
+            "metric_observation:NVDA:CY2026:10K:3b7cb1e4060cf2"
+          ]
+        }
+      ],
+      "notes": "Three required items, one per filing period, anchored to each filing's own-year observation: FY2024 ($60.9B) in CY2024, FY2025 ($130.5B) in CY2025, FY2026 ($215.9B) in CY2026."
+    },
+    {
+      "id": "curated_multiperiod_msft_revenue_fy2023_fy2025",
+      "question": "How did Microsoft's revenue trend from fiscal year 2023 to fiscal year 2025?",
+      "search_plan": {
+        "question": "How did Microsoft's revenue trend from fiscal year 2023 to fiscal year 2025?",
+        "intent": "trend_lookup",
+        "tickers": ["MSFT"],
+        "document_types": ["10-K"],
+        "periods": ["CY2023", "CY2024", "CY2025"],
+        "clauses": [
+          {
+            "clause_id": "msft_revenue_trend",
+            "retrieval_query": "Microsoft revenue annual trend fiscal 2023 2024 2025",
+            "metrics": ["revenue"],
+            "tickers": ["MSFT"]
+          }
+        ]
+      },
+      "strata": ["multi_period", "curated"],
+      "expected": [
+        {
+          "ticker": "MSFT",
+          "period": "CY2023",
+          "document_type": "10-K",
+          "object_ids": [
+            "metric_observation:MSFT:CY2023:10K:bdabcc448ca05c"
+          ]
+        },
+        {
+          "ticker": "MSFT",
+          "period": "CY2024",
+          "document_type": "10-K",
+          "object_ids": [
+            "metric_observation:MSFT:CY2024:10K:48eb57dc136f39"
+          ]
+        },
+        {
+          "ticker": "MSFT",
+          "period": "CY2025",
+          "document_type": "10-K",
+          "object_ids": [
+            "metric_observation:MSFT:CY2025:10K:b0a52210e40b9b"
+          ]
+        }
+      ],
+      "notes": "Three required items anchored to each filing's own-year observation: FY2023 ($211.9B) in CY2023, FY2024 ($245.1B) in CY2024, FY2025 ($281.7B) in CY2025."
+    },
+    {
+      "id": "curated_multiperiod_wmt_operating_income_fy2024_fy2026",
+      "question": "How did Walmart's operating income change from fiscal year 2024 through fiscal year 2026?",
+      "search_plan": {
+        "question": "How did Walmart's operating income change from fiscal year 2024 through fiscal year 2026?",
+        "intent": "trend_lookup",
+        "tickers": ["WMT"],
+        "document_types": ["10-K"],
+        "periods": ["CY2024", "CY2025", "CY2026"],
+        "clauses": [
+          {
+            "clause_id": "wmt_operating_income_trend",
+            "retrieval_query": "Walmart operating income annual trend fiscal 2024 2025 2026",
+            "metrics": ["operating_income"],
+            "tickers": ["WMT"]
+          }
+        ]
+      },
+      "strata": ["multi_period", "curated"],
+      "expected": [
+        {
+          "ticker": "WMT",
+          "period": "CY2024",
+          "document_type": "10-K",
+          "object_ids": [
+            "metric_observation:WMT:CY2024:10K:2cabef9fee818c"
+          ]
+        },
+        {
+          "ticker": "WMT",
+          "period": "CY2025",
+          "document_type": "10-K",
+          "object_ids": [
+            "metric_observation:WMT:CY2025:10K:06636de9bc3566"
+          ]
+        },
+        {
+          "ticker": "WMT",
+          "period": "CY2026",
+          "document_type": "10-K",
+          "object_ids": [
+            "metric_observation:WMT:CY2026:10K:8f3733fe0fa691"
+          ]
+        }
+      ],
+      "notes": "Three required items anchored to each filing's own-year observation: FY2024 ($27.0B) in CY2024, FY2025 ($29.3B) in CY2025, FY2026 ($29.8B) in CY2026."
+    },
+    {
+      "id": "curated_multiperiod_aapl_eps_fy2023_fy2025",
+      "question": "How did Apple's earnings per share trend from fiscal year 2023 to fiscal year 2025?",
+      "search_plan": {
+        "question": "How did Apple's earnings per share trend from fiscal year 2023 to fiscal year 2025?",
+        "intent": "trend_lookup",
+        "tickers": ["AAPL"],
+        "document_types": ["10-K"],
+        "periods": ["CY2023", "CY2024", "CY2025"],
+        "clauses": [
+          {
+            "clause_id": "aapl_eps_trend",
+            "retrieval_query": "Apple eps annual trend fiscal 2023 2024 2025",
+            "metrics": ["eps"],
+            "tickers": ["AAPL"]
+          }
+        ]
+      },
+      "strata": ["multi_period", "curated"],
+      "expected": [
+        {
+          "ticker": "AAPL",
+          "period": "CY2023",
+          "document_type": "10-K",
+          "object_ids": [
+            "metric_observation:AAPL:CY2023:10K:be1ae7dea21451"
+          ]
+        },
+        {
+          "ticker": "AAPL",
+          "period": "CY2024",
+          "document_type": "10-K",
+          "object_ids": [
+            "metric_observation:AAPL:CY2024:10K:ce7f5f23cab939"
+          ]
+        },
+        {
+          "ticker": "AAPL",
+          "period": "CY2025",
+          "document_type": "10-K",
+          "object_ids": [
+            "metric_observation:AAPL:CY2025:10K:a78d1a3e181ae5"
+          ]
+        }
+      ],
+      "notes": "Three required items anchored to each filing's own-year observation: FY2023 ($6.16) in CY2023, FY2024 ($6.11) in CY2024, FY2025 ($7.49) in CY2025."
+    }
+  ]
+}

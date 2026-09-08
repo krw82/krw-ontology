@@ -108,7 +108,7 @@ def compare_to_baseline(
     for stratum, block in baseline.get("strata", {}).items():
         for key in ("pass_rate", "mean_recall"):
             a = block.get(key, 0.0)
-            b = report.get("strata", {}).get(stratum, {}).get(key, a)
+            b = report.get("strata", {}).get(stratum, {}).get(key, 0.0)
             if b < a - tolerance:
                 regressions.append(
                     f"strata[{stratum}].{key}: {b:.4f} < baseline {a:.4f}"

@@ -358,7 +358,7 @@ def test_compare_to_baseline_flags_only_regressions():
     assert regressions == []
 
 
-def test_compare_to_baseline_handles_new_strata_and_missing_keys():
+def test_compare_to_baseline_missing_stratum_is_strict_regression():
     baseline = {
         "overall": {"pass_rate": 1.0, "mean_recall": 1.0},
         "strata": {"template": {"pass_rate": 1.0, "mean_recall": 1.0}},
@@ -368,6 +368,33 @@ def test_compare_to_baseline_handles_new_strata_and_missing_keys():
         "strata": {"curated": {"pass_rate": 1.0, "mean_recall": 1.0}},
     }
     ok, regressions = harness.compare_to_baseline(report, baseline)
+    assert ok is False
+    assert any("strata[template].pass_rate" in item for item in regressions)
+    assert any("strata[template].mean_recall" in item for item in regressions)
+
+    # A baseline stratum already at the floor may vanish without a regression:
+    # strict scoring cannot drop it any lower.
+    floor_baseline = {
+        "overall": {"pass_rate": 1.0, "mean_recall": 1.0},
+        "strata": {"empty_lane": {"pass_rate": 0.0, "mean_recall": 0.0}},
+    }
+    floor_report = {
+        "overall": {"pass_rate": 1.0, "mean_recall": 1.0},
+        "strata": {},
+    }
+    ok, regressions = harness.compare_to_baseline(floor_report, floor_baseline)
+    assert ok is True
+    assert regressions == []
+
+    # Strata the baseline never had are new coverage, not regressions.
+    grown = {
+        "overall": {"pass_rate": 1.0, "mean_recall": 1.0},
+        "strata": {
+            "template": {"pass_rate": 1.0, "mean_recall": 1.0},
+            "curated": {"pass_rate": 1.0, "mean_recall": 1.0},
+        },
+    }
+    ok, regressions = harness.compare_to_baseline(grown, baseline)
     assert ok is True
     assert regressions == []
 

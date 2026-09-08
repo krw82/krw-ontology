@@ -538,6 +538,9 @@ def test_single_period_full_window_floor_keeps_scoped_alias_units(floor_shard_pa
     assert diagnostics["alias_floor_applied"] is True
     assert diagnostics["alias_expansions"][0]["added_units"] == 1
     assert diagnostics["alias_expanded_result_count"] == 1
+    # Both metric rows of this shard live in the single CY2023 filing bucket,
+    # so filing-bucket alignment is a no-op and must not raise its flag.
+    assert "filing_bucket_aligned" not in diagnostics
 
 
 def test_window_not_full_keeps_append_behaviour_without_floor_flag(floor_shard_path):
@@ -590,6 +593,257 @@ def test_clause_with_metrics_keeps_full_window_behaviour(floor_shard_path):
     assert diagnostics["metric_lookup_used"] is True
     assert diagnostics["alias_expansion_used"] is False
     assert "alias_floor_applied" not in diagnostics
+
+
+# ---------------------------------------------------------------------------
+# Filing-bucket alignment for metric-channel rows (Task 6)
+# ---------------------------------------------------------------------------
+
+# Two filing buckets for one ticker (the msft bottom-line shape).  The CY2025
+# bucket holds the as-originally-reported calendar-2025 net income; the CY2026
+# bucket holds the June-fiscal FY2025 comparative, which also observes the
+# requested CY2025 coordinate but lives in a later filing.  Pre-change the
+# metric channel ranked the FY-labeled comparative row first (its period key
+# sorts above CY2025), so the CY2026-bucket row won the slot even though the
+# clause explicitly requested CY2025.
+ALIGNMENT_FILING_CY2025 = "CY2025"
+ALIGNMENT_FILING_CY2026 = "CY2026"
+
+ALIGNMENT_NET_INCOME_CY2025_ID = (
+    f"metric_observation:{TICKER}:{ALIGNMENT_FILING_CY2025}:{DOC_TYPE_KEY}:net_income:reported"
+)
+ALIGNMENT_NET_INCOME_FY2025_ID = (
+    f"metric_observation:{TICKER}:{ALIGNMENT_FILING_CY2026}:{DOC_TYPE_KEY}:net_income:comparative"
+)
+ALIGNMENT_REVENUE_FY2025_ID = (
+    f"metric_observation:{TICKER}:{ALIGNMENT_FILING_CY2025}:{DOC_TYPE_KEY}:revenue:fiscal"
+)
+ALIGNMENT_REVENUE_CY2025_ID = (
+    f"metric_observation:{TICKER}:{ALIGNMENT_FILING_CY2026}:{DOC_TYPE_KEY}:revenue:calendar"
+)
+
+ALIGNMENT_RETRIEVAL_QUERY = "bottom line"
+
+
+def _bucket_metric_observation(
+    object_id: str,
+    *,
+    filing_period: str,
+    metric_name: str,
+    observation_start: str,
+    observation_end: str,
+    fiscal_year: int,
+    value: float,
+) -> dict:
+    """One company-total annual observation inside an explicit filing bucket.
+
+    Calendar-year dates derive a ``CY`` observation label; July--June dates
+    derive ``FY`` — the two label conventions that make the comparative row a
+    separate observation context instead of a duplicate value.
+    """
+    return {
+        "id": object_id,
+        "type": "MetricObservation",
+        "ticker": TICKER,
+        "source_document_id": f"source:{TICKER}:{filing_period}:{DOC_TYPE_KEY}",
+        "document_type": DOCUMENT_TYPE,
+        "period": filing_period,
+        "metric_name": metric_name,
+        "value": value,
+        "unit": "USD",
+        "fiscal_year": fiscal_year,
+        "period_type": "annual",
+        "period_start": observation_start,
+        "period_end": observation_end,
+        "source_type": "reported",
+        "review_status": "accepted",
+        "schema_version": "0.1.0",
+    }
+
+
+def _write_alignment_artifacts(root: Path) -> None:
+    for filing_period in (ALIGNMENT_FILING_CY2025, ALIGNMENT_FILING_CY2026):
+        ontology_dir = root / "companies" / TICKER / "ontology" / DOC_TYPE_KEY / filing_period
+        sources_dir = root / "companies" / TICKER / "sources" / DOC_TYPE_KEY / filing_period
+        ontology_dir.mkdir(parents=True)
+        sources_dir.mkdir(parents=True)
+        atomic_write_json(
+            ontology_dir / "section_quality.json",
+            {"status": "pass", "missing_core_sections": [], "fail_reasons": []},
+        )
+    cy2025_dir = root / "companies" / TICKER / "ontology" / DOC_TYPE_KEY / ALIGNMENT_FILING_CY2025
+    cy2026_dir = root / "companies" / TICKER / "ontology" / DOC_TYPE_KEY / ALIGNMENT_FILING_CY2026
+    write_jsonl(
+        cy2025_dir / "metric_observations.jsonl",
+        [
+            _bucket_metric_observation(
+                ALIGNMENT_NET_INCOME_CY2025_ID,
+                filing_period=ALIGNMENT_FILING_CY2025,
+                metric_name="net_income",
+                observation_start="2025-01-01",
+                observation_end="2025-12-31",
+                fiscal_year=2025,
+                value=100.0,
+            ),
+            _bucket_metric_observation(
+                ALIGNMENT_REVENUE_FY2025_ID,
+                filing_period=ALIGNMENT_FILING_CY2025,
+                metric_name="revenue",
+                observation_start="2024-07-01",
+                observation_end="2025-06-30",
+                fiscal_year=2025,
+                value=200.0,
+            ),
+        ],
+    )
+    write_jsonl(
+        cy2026_dir / "metric_observations.jsonl",
+        [
+            _bucket_metric_observation(
+                ALIGNMENT_NET_INCOME_FY2025_ID,
+                filing_period=ALIGNMENT_FILING_CY2026,
+                metric_name="net_income",
+                observation_start="2024-07-01",
+                observation_end="2025-06-30",
+                fiscal_year=2025,
+                value=110.0,
+            ),
+            _bucket_metric_observation(
+                ALIGNMENT_REVENUE_CY2025_ID,
+                filing_period=ALIGNMENT_FILING_CY2026,
+                metric_name="revenue",
+                observation_start="2025-01-01",
+                observation_end="2025-12-31",
+                fiscal_year=2025,
+                value=210.0,
+            ),
+        ],
+    )
+    for ontology_dir in (cy2025_dir, cy2026_dir):
+        build_indexes(
+            ticker=TICKER,
+            period=ontology_dir.name,
+            doc_type_key=DOC_TYPE_KEY,
+            ontology_dir=ontology_dir,
+            sources_dir=root / "companies" / TICKER / "sources" / DOC_TYPE_KEY / ontology_dir.name,
+            output_dir=root,
+            document_type=DOCUMENT_TYPE,
+        )
+
+
+@pytest.fixture(scope="module")
+def alignment_shard_path(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    root = tmp_path_factory.mktemp("filing-bucket-alignment-release")
+    _write_alignment_artifacts(root)
+    result = build_spine_shard_release_outputs(
+        root,
+        release_id="test-store-filing-bucket-alignment",
+        workers=1,
+        no_cache=True,
+    )
+    shard_path = result.global_spine_path.parent / "companies" / f"{TICKER}.sqlite"
+    assert shard_path.is_file()
+    return shard_path
+
+
+def _alignment_query(store: OntologyStore, **overrides):
+    kwargs = {
+        "clause_id": "bottom_line",
+        "retrieval_query": ALIGNMENT_RETRIEVAL_QUERY,
+        "tickers": [TICKER],
+        "limit": 2,
+    }
+    kwargs.update(overrides)
+    return store.query_planned_compact_with_diagnostics(**kwargs)
+
+
+def test_requested_period_prefers_same_filing_bucket_alias_row(alignment_shard_path):
+    """Two filing buckets both observe net income for the requested CY2025;
+    pre-change the CY2026-bucket comparative row ranked first and won the
+    slot, post-change the CY2025-bucket row ranks first."""
+    with OntologyStore(alignment_shard_path) as store:
+        rows, diagnostics = _alignment_query(store, periods=[ALIGNMENT_FILING_CY2025])
+
+    metric_rows = _metric_rows(rows)
+    assert len(metric_rows) == 2
+    assert {row["planned_match_mode"] for row in metric_rows} == {"alias_expanded"}
+    # The same-filing-bucket row ranks first; the comparative row follows.
+    assert [row["id"] for row in metric_rows] == [
+        ALIGNMENT_NET_INCOME_CY2025_ID,
+        ALIGNMENT_NET_INCOME_FY2025_ID,
+    ]
+    assert metric_rows[0]["filing_period"] == ALIGNMENT_FILING_CY2025
+    assert metric_rows[0]["period"] == "CY2025"
+    assert metric_rows[1]["filing_period"] == ALIGNMENT_FILING_CY2026
+    assert diagnostics["filing_bucket_aligned"] is True
+    assert diagnostics["alias_expansions"][0]["canonical_metric"] == "net_income"
+    assert diagnostics["alias_expansions"][0]["added_units"] == 2
+
+
+def test_metrics_channel_prefers_same_filing_bucket_rows_in_stable_order(alignment_shard_path):
+    """Stability: within the matching-bucket group the original relative order
+    is preserved (revenue-fiscal before net_income-reported, exactly their
+    pre-partition order), and the comparative CY2026-bucket rows follow.  The
+    existing per-metric round-robin then interleaves the two groups as
+    before."""
+    with OntologyStore(alignment_shard_path) as store:
+        rows, diagnostics = _alignment_query(
+            store,
+            clause_id="bottoms_up",
+            metrics=["net_income", "revenue"],
+            limit=6,
+            periods=[ALIGNMENT_FILING_CY2025],
+        )
+
+    metric_rows = _metric_rows(rows)
+    assert len(metric_rows) == 4
+    assert [row["id"] for row in metric_rows] == [
+        ALIGNMENT_REVENUE_FY2025_ID,
+        ALIGNMENT_NET_INCOME_CY2025_ID,
+        ALIGNMENT_REVENUE_CY2025_ID,
+        ALIGNMENT_NET_INCOME_FY2025_ID,
+    ]
+    assert [row["filing_period"] for row in metric_rows] == [
+        ALIGNMENT_FILING_CY2025,
+        ALIGNMENT_FILING_CY2025,
+        ALIGNMENT_FILING_CY2026,
+        ALIGNMENT_FILING_CY2026,
+    ]
+    assert {row["planned_match_mode"] for row in metric_rows} == {"strict"}
+    assert diagnostics["filing_bucket_aligned"] is True
+
+
+def test_clause_without_periods_keeps_latest_filing_rank(alignment_shard_path):
+    """A clause that names no period is untouched: the comparative FY-labeled
+    row keeps its existing first rank and no alignment flag is recorded."""
+    with OntologyStore(alignment_shard_path) as store:
+        rows, diagnostics = _alignment_query(store)
+
+    metric_rows = _metric_rows(rows)
+    assert [row["id"] for row in metric_rows] == [
+        ALIGNMENT_NET_INCOME_FY2025_ID,
+        ALIGNMENT_NET_INCOME_CY2025_ID,
+    ]
+    assert metric_rows[0]["filing_period"] == ALIGNMENT_FILING_CY2026
+    assert "filing_bucket_aligned" not in diagnostics
+
+
+def test_single_bucket_metric_rows_keep_order_without_alignment_flag(floor_shard_path):
+    """Single-bucket regression: every metric row lives in the CY2023 filing,
+    so the partition cannot change the sequence and no flag is recorded —
+    even with two explicitly requested periods."""
+    with OntologyStore(floor_shard_path) as store:
+        rows, diagnostics = _floor_query(
+            store, limit=FLOOR_QUOTE_COUNT + 4, periods=["CY2022", "CY2023"]
+        )
+
+    assert [row["id"] for row in _metric_rows(rows)] == [
+        FLOOR_REVENUE_CY2023_ID,
+        FLOOR_REVENUE_CY2022_ID,
+    ]
+    assert "filing_bucket_aligned" not in diagnostics
+    assert "alias_floor_applied" not in diagnostics
+    assert "period_reservations" not in diagnostics
 
 
 def test_router_batch_threads_clause_id_into_shard_diagnostics(release_paths):

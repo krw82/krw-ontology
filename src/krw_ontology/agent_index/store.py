@@ -1679,6 +1679,17 @@ class OntologyStore:
         lowest-ranked non-protected tail rows, and the per-clause diagnostics
         record ``alias_floor_applied: true``.  Multi-period clauses keep the
         per-period reservation path instead.
+
+        Filing-bucket alignment: when a clause explicitly names at least one
+        period, metric-channel rows (the exact ``metrics`` path and the
+        alias-expanded path) are stably partitioned so rows whose filing
+        bucket matches a requested period rank before comparative rows that
+        only observe the period from another filing, before anything else.
+        Existing relative order inside each group is preserved; the change is
+        purely candidate ordering — the append/floor/reservation selection
+        downstream is untouched — and the per-clause diagnostics record
+        ``filing_bucket_aligned: true`` only when the partition actually
+        changed a candidate sequence.
         """
         started_at = time.perf_counter()
         result_limit = max(1, int(limit))
@@ -1719,6 +1730,9 @@ class OntologyStore:
             term for value in predicate_terms or [] for term in _planned_query_terms(str(value))
         )[:32]
         metric_started_at = time.perf_counter()
+        requested_periods_ordered = _unique(
+            str(value).strip() for value in periods or [] if str(value).strip()
+        )
         queried_metric_rows = self._query_metrics(
             requested_metrics,
             tickers=available_tickers,
@@ -1730,6 +1744,15 @@ class OntologyStore:
             comparison_axes=requested_comparison_axes,
             limit_per_metric=result_limit,
         )
+        # Filing-bucket alignment of the exact metric channel: same-bucket
+        # rows first, comparative rows from other filings after.  This is the
+        # candidate order the strict assembly, the per-period reservation and
+        # the alias floor all consume.
+        queried_metric_rows, metrics_bucket_reordered = _order_metric_rows_by_filing_bucket(
+            queried_metric_rows,
+            requested_periods=requested_periods_ordered,
+        )
+        filing_bucket_aligned = metrics_bucket_reordered
         metric_elapsed_ms = int((time.perf_counter() - metric_started_at) * 1000)
         metric_groups_by_name: dict[str, list[sqlite3.Row]] = {}
         for row in queried_metric_rows:
@@ -1895,6 +1918,14 @@ class OntologyStore:
                     comparison_axes=requested_comparison_axes,
                     limit_per_metric=result_limit,
                 )
+                # Same filing-bucket alignment as the exact metric channel, so
+                # the alias appends, the per-period reservation and the alias
+                # floor all see same-bucket rows before comparative rows.
+                alias_metric_rows, alias_bucket_reordered = _order_metric_rows_by_filing_bucket(
+                    alias_metric_rows,
+                    requested_periods=requested_periods_ordered,
+                )
+                filing_bucket_aligned = filing_bucket_aligned or alias_bucket_reordered
                 for row in alias_metric_rows:
                     row_id = str(row["id"] or "")
                     if not row_id or row_id in present_ids or row_id in alias_candidate_ids:
@@ -1939,9 +1970,6 @@ class OntologyStore:
         # could not place (the metric round-robin tail and alias units beyond
         # the room).  Single-period and metric-less clauses never enter this
         # path, so their selection is byte-identical to the plain cut.
-        requested_periods_ordered = _unique(
-            str(value).strip() for value in periods or [] if str(value).strip()
-        )
         placed_row_ids = {str(row["id"] or "") for row in ordered_rows if row["id"]}
         queried_metric_ids = {str(row["id"] or "") for row in queried_metric_rows}
         reservation_pool: list[sqlite3.Row] = []
@@ -2100,6 +2128,8 @@ class OntologyStore:
             diagnostics["period_reservations"] = period_reservations
         if alias_floor_applied:
             diagnostics["alias_floor_applied"] = True
+        if filing_bucket_aligned:
+            diagnostics["filing_bucket_aligned"] = True
         if unavailable_tickers:
             diagnostics["warnings"].append("ticker_not_available")
             diagnostics["unavailable_tickers"] = unavailable_tickers
@@ -7985,6 +8015,71 @@ def _planned_metric_row_requested_period(
         if _planned_metric_row_matches_periods(row, [period]):
             return period
     return None
+
+
+def _planned_metric_row_filing_period_matches_periods(
+    row: sqlite3.Row,
+    periods: Sequence[str],
+) -> bool:
+    """True when the row's filing bucket equals an explicitly requested period."""
+    filing_period = str(row["planned_metric_filing_period"] or "").strip()
+    if not filing_period:
+        return False
+    coordinates = _planned_metric_period_coordinates(periods)
+    if not coordinates:
+        return False
+    match = re.search(
+        r"(?:CY|FY)?(19\d{2}|20\d{2})(?:Q([1-4]))?",
+        filing_period,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return filing_period.casefold() in {str(period).casefold() for period in periods}
+    coordinate = (int(match.group(1)), int(match.group(2)) if match.group(2) else None)
+    return coordinate in coordinates
+
+
+def _planned_metric_row_filing_bucket_rank(
+    row: sqlite3.Row,
+    requested_periods: Sequence[str],
+) -> int:
+    """Stable-partition rank for filing-bucket alignment.
+
+    ``0`` — the row's filing bucket matches a requested period;
+    ``1`` — comparative row: the observation matches a requested period but
+    the filing bucket does not;
+    ``2`` — everything else.
+    """
+    if _planned_metric_row_filing_period_matches_periods(row, requested_periods):
+        return 0
+    if _planned_metric_row_matches_periods(row, requested_periods):
+        return 1
+    return 2
+
+
+def _order_metric_rows_by_filing_bucket(
+    rows: Sequence[sqlite3.Row],
+    *,
+    requested_periods: Sequence[str],
+) -> tuple[list[sqlite3.Row], bool]:
+    """Stably partition metric-channel rows by filing-bucket alignment.
+
+    When a clause explicitly names at least one period, rows whose filing
+    bucket matches a requested period rank before comparative rows that only
+    observe the period from another filing, before anything else.  The sort is
+    stable, so the existing relative order inside each group is preserved —
+    purely candidate ordering: the append/floor/reservation selection that
+    consumes these rows is unchanged.  Returns the ordered rows and whether
+    the partition actually changed the candidate sequence.
+    """
+    if not requested_periods or len(rows) < 2:
+        return list(rows), False
+    ordered = sorted(
+        rows,
+        key=lambda row: _planned_metric_row_filing_bucket_rank(row, requested_periods),
+    )
+    changed = [str(row["id"] or "") for row in ordered] != [str(row["id"] or "") for row in rows]
+    return ordered, changed
 
 
 def _insert_rows_with_droppable_tail(

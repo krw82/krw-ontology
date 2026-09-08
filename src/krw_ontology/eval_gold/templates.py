@@ -4,8 +4,11 @@ Samples ``(ticker, metric, period)`` triples from the release's built company
 shards (``indexes/shard_manifest.json`` + per-ticker sqlite) and emits
 ``EvidenceGold`` cases whose expected anchors are the shard's own accepted
 metric objects.  Cases carry a single metric clause
-(``metrics=[canonical]``, ``tickers=[t]``, ``periods=[p]``) so the suite
-probes the serving index's metric-lookup floor.
+(``metrics=[canonical]``, ``tickers=[t]``, ``periods=[p]``,
+``metric_scope='any'``) so the suite probes the serving index's
+metric-lookup floor; ``metric_scope='any'`` keeps dimensioned anchors
+(``is_company_total = 0`` rows) reachable through the metric-lookup
+channel, which otherwise filters to company totals.
 
 Determinism contract: one ``random.Random(seed)`` instance is consumed in
 sorted-ticker order, every candidate list is sorted before sampling, and
@@ -187,6 +190,13 @@ def _search_plan(
                 "retrieval_query": f"{ticker} {display} {' '.join(periods)}",
                 "metrics": [metric],
                 "tickers": [ticker],
+                # Dimensioned-stratum anchors are is_company_total = 0 rows;
+                # the default company_total scope would filter them out of the
+                # metric-lookup channel (store.py appends
+                # metric_lookup.is_company_total = 1).  "any" imposes no
+                # company-total constraint, needs no metric_dimensions, and
+                # leaves company-total anchors reachable for other strata.
+                "metric_scope": "any",
             }
         ],
     }

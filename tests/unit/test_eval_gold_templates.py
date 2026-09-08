@@ -330,6 +330,21 @@ def test_dimensioned_and_multi_period_strata(release: Path):
             assert case.search_plan["periods"] == [case.expected[0].period]
 
 
+def test_dimensioned_stratum_clauses_use_metric_scope_any(release: Path):
+    gold = templates.generate_template_gold(release, seed=5, per_ticker=5, tickers=["SO"])
+
+    dimensioned_cases = [case for case in gold.cases if "dimensioned" in case.strata]
+    assert dimensioned_cases, "fixture must yield at least one dimensioned-stratum case"
+    # Dimensioned anchors are is_company_total = 0 rows; the default
+    # company_total scope would filter them out of the metric-lookup channel,
+    # so the clause must request the broad scope.
+    for case in dimensioned_cases:
+        clauses = case.search_plan["clauses"]
+        assert clauses
+        for clause in clauses:
+            assert clause["metric_scope"] == "any"
+
+
 def test_inspect_objects_returns_known_object_row(release: Path):
     rows = templates.inspect_objects(release, "SO", "revenue", "CY2023")
 

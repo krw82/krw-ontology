@@ -258,9 +258,16 @@ reservation at the fusion-window cut. Gate vs v1.1: exit 0, no regressions,
 | template | 402 | 0.8905 | 0.8905 | 0.0000 |
 | vocabulary_mismatch | 8 | 0.3750 | 0.3750 | 0.0000 |
 
-Plan 2b (sqlite-vec dense lane) proceeds: the binding rule requires
-post-change `mean_recall >= 0.7` on both residual strata, and candidate 2a
-leaves `vocabulary_mismatch` at 0.3750 and `multi_period` at 0.2500.
+Plan 2b (sqlite-vec dense lane) is DEFERRED. The multi_period residual is
+a period-contract issue — `EvidenceUnit.period` exposes the filing period,
+the harness adapter drops `metric_points`, and the grader's period filter
+rejects comparative rows — that a dense lane cannot move. The true
+dense-scope residual is 2 curated vocab cases (`meta_share_buybacks`: no
+dictionary canonical for the phrase; `msft_bottom_line`: value-identity
+dedupe keeps the newest filing's row). Revisit condition: after the three
+classified deterministic residuals are addressed (period-contract fix,
+buyback dictionary canonical, msft dedupe), if a meaningful residual
+remains.
 
 Baseline v1.1-regold (same date/release; the v1.1 retrieval code re-run on the
 Task-7 reinforced gold, where multi_period historical items additionally
@@ -308,7 +315,8 @@ every other stratum is byte-identical.
 
 Post-2a+ 2b decision (binding rule: defer 2b only if BOTH strata reach
 mean_recall >= 0.7): `vocabulary_mismatch` = **0.7500** (>= 0.7) but
-`multi_period` = **0.2500** (< 0.7), so **Plan 2b proceeds**. Scope from the
+`multi_period` = **0.2500** (< 0.7) — the mechanical rule would proceed,
+but the standing decision is **2b is DEFERRED**. Scope from the
 classified residual: the remaining `multi_period` misses are NOT a retrieval
 gap — every anchored row (own-filing or comparative) is retrieved into the
 clause window; the compiled `MetricObservation` evidence unit exposes the

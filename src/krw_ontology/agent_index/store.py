@@ -1968,8 +1968,10 @@ class OntologyStore:
         # slots per requested period and displace only the lowest-ranked base
         # rows.  Candidates are metric-channel rows the assembly ranked but
         # could not place (the metric round-robin tail and alias units beyond
-        # the room).  Single-period and metric-less clauses never enter this
-        # path, so their selection is byte-identical to the plain cut.
+        # the room).  Single-period and metric-less clauses never enter the
+        # reservation path; their selection through the reservation stage is
+        # byte-identical to the plain cut (the alias channel/floor may still
+        # modify them).
         placed_row_ids = {str(row["id"] or "") for row in ordered_rows if row["id"]}
         queried_metric_ids = {str(row["id"] or "") for row in queried_metric_rows}
         reservation_pool: list[sqlite3.Row] = []

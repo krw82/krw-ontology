@@ -1854,8 +1854,13 @@ class OntologyStore:
         # name it; its added units are attributed to the first alias (sorted
         # order from the dictionary) and later aliases report zero, so the
         # ``added_units`` column sums to the real number of appended rows.
+        # Units beyond the room are kept as ``alias_candidate_rows`` so the
+        # per-period reservation below can still see them; they are never
+        # appended here.
         alias_terms = resolve_alias_terms(retrieval_query) if not requested_metrics else {}
         alias_row_ids: set[str] = set()
+        alias_candidate_rows: list[sqlite3.Row] = []
+        alias_candidate_ids: set[str] = set()
         alias_expansions: list[dict[str, Any]] = []
         alias_elapsed_ms = 0
         if alias_terms:
@@ -1867,28 +1872,29 @@ class OntologyStore:
             added_by_canonical: dict[str, int] = {}
             for canonical in first_alias_by_canonical:
                 added_units = 0
-                if len(ordered_rows) < result_limit:
-                    alias_metric_rows = self._query_metrics(
-                        [canonical],
-                        tickers=available_tickers,
-                        document_types=document_types,
-                        periods=periods,
-                        metric_dimensions=metric_dimensions,
-                        metric_scope=metric_scope,
-                        calculation_window=calculation_window,
-                        comparison_axes=requested_comparison_axes,
-                        limit_per_metric=result_limit,
-                    )
-                    for row in alias_metric_rows:
-                        row_id = str(row["id"] or "")
-                        if not row_id or row_id in present_ids:
-                            continue
-                        if len(ordered_rows) >= result_limit:
-                            break
-                        present_ids.add(row_id)
-                        alias_row_ids.add(row_id)
-                        ordered_rows.append(row)
-                        added_units += 1
+                alias_metric_rows = self._query_metrics(
+                    [canonical],
+                    tickers=available_tickers,
+                    document_types=document_types,
+                    periods=periods,
+                    metric_dimensions=metric_dimensions,
+                    metric_scope=metric_scope,
+                    calculation_window=calculation_window,
+                    comparison_axes=requested_comparison_axes,
+                    limit_per_metric=result_limit,
+                )
+                for row in alias_metric_rows:
+                    row_id = str(row["id"] or "")
+                    if not row_id or row_id in present_ids or row_id in alias_candidate_ids:
+                        continue
+                    if len(ordered_rows) >= result_limit:
+                        alias_candidate_ids.add(row_id)
+                        alias_candidate_rows.append(row)
+                        continue
+                    present_ids.add(row_id)
+                    alias_row_ids.add(row_id)
+                    ordered_rows.append(row)
+                    added_units += 1
                 added_by_canonical[canonical] = added_units
             alias_expansions = [
                 {
@@ -1905,11 +1911,52 @@ class OntologyStore:
             ]
             alias_elapsed_ms = int((time.perf_counter() - alias_started_at) * 1000)
 
-        bundles = self._compact_bundles_from_rows(ordered_rows[:result_limit])
+        # Per-requested-period metric reservation at the fusion window cut.
+        # A clause that explicitly names two or more periods must not lose one
+        # period's metric observations to rank order: reserve up to two metric
+        # slots per requested period and displace only the lowest-ranked base
+        # rows.  Candidates are metric-channel rows the assembly ranked but
+        # could not place (the metric round-robin tail and alias units beyond
+        # the room).  Single-period and metric-less clauses never enter this
+        # path, so their selection is byte-identical to the plain cut.
+        requested_periods_ordered = _unique(
+            str(value).strip() for value in periods or [] if str(value).strip()
+        )
+        placed_row_ids = {str(row["id"] or "") for row in ordered_rows if row["id"]}
+        queried_metric_ids = {str(row["id"] or "") for row in queried_metric_rows}
+        reservation_pool: list[sqlite3.Row] = []
+        reservation_pool_ids: set[str] = set()
+        for row in [*queried_metric_rows, *alias_candidate_rows]:
+            row_id = str(row["id"] or "")
+            if not row_id or row_id in placed_row_ids or row_id in reservation_pool_ids:
+                continue
+            reservation_pool_ids.add(row_id)
+            reservation_pool.append(row)
+        final_rows = ordered_rows[:result_limit]
+        period_reservations: list[dict[str, Any]] = []
+        if len(requested_periods_ordered) >= 2 and reservation_pool:
+            final_rows, reserved_rows, period_reservations = (
+                _apply_requested_period_metric_reservation(
+                    ordered_rows=ordered_rows,
+                    candidate_rows=reservation_pool,
+                    requested_periods=requested_periods_ordered,
+                    result_limit=result_limit,
+                    metric_channel_ids=metric_ids | alias_row_ids,
+                )
+            )
+            for row in reserved_rows:
+                row_id = str(row["id"] or "")
+                if row_id in queried_metric_ids:
+                    metric_ids.add(row_id)
+                    strict_ids.add(row_id)
+                else:
+                    alias_row_ids.add(row_id)
+
+        bundles = self._compact_bundles_from_rows(final_rows)
         metric_channel_ids = metric_ids | alias_row_ids
         metric_metadata_by_id = {
             str(row["id"]): row
-            for row in ordered_rows
+            for row in final_rows
             if str(row["id"] or "") in metric_channel_ids
             and "planned_metric_is_company_total" in row.keys()
         }
@@ -1999,6 +2046,8 @@ class OntologyStore:
         if alias_expansions:
             diagnostics["alias_expansions"] = alias_expansions
             diagnostics["timing_ms"]["alias_metric_lookup"] = alias_elapsed_ms
+        if period_reservations:
+            diagnostics["period_reservations"] = period_reservations
         if unavailable_tickers:
             diagnostics["warnings"].append("ticker_not_available")
             diagnostics["unavailable_tickers"] = unavailable_tickers
@@ -7873,6 +7922,100 @@ def _planned_metric_row_matches_periods(
         else None,
     )
     return row_coordinate in coordinates
+
+
+def _planned_metric_row_requested_period(
+    row: sqlite3.Row,
+    requested_periods: Sequence[str],
+) -> str | None:
+    """Return the first explicitly requested period this metric row observes."""
+    for period in requested_periods:
+        if _planned_metric_row_matches_periods(row, [period]):
+            return period
+    return None
+
+
+def _apply_requested_period_metric_reservation(
+    *,
+    ordered_rows: Sequence[sqlite3.Row],
+    candidate_rows: Sequence[sqlite3.Row],
+    requested_periods: Sequence[str],
+    result_limit: int,
+    metric_channel_ids: set[str],
+) -> tuple[list[sqlite3.Row], list[sqlite3.Row], list[dict[str, Any]]]:
+    """Reserve minimum metric slots per explicitly requested period.
+
+    Trigger: the clause names at least two distinct periods and metric-channel
+    rows exist for at least two of them (placed in the fused window or sitting
+    in the unplaced candidate pool).  Each requested period then keeps up to
+    two metric observation slots: candidates are accepted in existing rank
+    order until every period reaches its quota, and the displaced rows are the
+    lowest-ranked base rows that are not themselves metric-channel rows of a
+    requested period.  The returned selection never exceeds ``result_limit``;
+    when capacity runs short, existing rank order decides which candidates
+    survive.  Pure rank-order logic: no clocks, no randomness.
+    """
+    base = list(ordered_rows[:result_limit])
+    placed_counts: dict[str, int] = {}
+    protected_ids: set[str] = set()
+    periods_with_metric_rows: set[str] = set()
+    for row in base:
+        row_id = str(row["id"] or "")
+        if not row_id or row_id not in metric_channel_ids:
+            continue
+        if "planned_metric_observation_period" not in row.keys():
+            continue
+        period = _planned_metric_row_requested_period(row, requested_periods)
+        if period is None:
+            continue
+        placed_counts[period] = placed_counts.get(period, 0) + 1
+        protected_ids.add(row_id)
+        periods_with_metric_rows.add(period)
+    for row in candidate_rows:
+        period = _planned_metric_row_requested_period(row, requested_periods)
+        if period is not None:
+            periods_with_metric_rows.add(period)
+    if len(periods_with_metric_rows) < 2:
+        return base, [], []
+
+    reserved: list[sqlite3.Row] = []
+    for row in candidate_rows:
+        period = _planned_metric_row_requested_period(row, requested_periods)
+        if period is None:
+            continue
+        quota = max(0, 2 - placed_counts.get(period, 0))
+        already = sum(
+            1
+            for kept in reserved
+            if _planned_metric_row_requested_period(kept, requested_periods) == period
+        )
+        if already >= quota:
+            continue
+        reserved.append(row)
+
+    free_slots = max(0, result_limit - len(base))
+    droppable_indices = [
+        index
+        for index in range(len(base) - 1, -1, -1)
+        if str(base[index]["id"] or "") not in protected_ids
+    ]
+    reserved = reserved[: free_slots + len(droppable_indices)]
+    if not reserved:
+        return base, [], []
+    displacement = max(0, len(reserved) - free_slots)
+    dropped = set(droppable_indices[:displacement])
+    final_rows = [*reserved, *(row for index, row in enumerate(base) if index not in dropped)]
+
+    reserved_counts: dict[str, int] = {}
+    for row in reserved:
+        period = _planned_metric_row_requested_period(row, requested_periods)
+        reserved_counts[period] = reserved_counts.get(period, 0) + 1
+    reservations = [
+        {"period": period, "reserved": reserved_counts[period]}
+        for period in requested_periods
+        if reserved_counts.get(period)
+    ]
+    return final_rows, reserved, reservations
 
 
 def _planned_metric_rows_match_window(

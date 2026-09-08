@@ -2080,6 +2080,7 @@ def _execute_search_plan(*, store: Any, search_plan: SearchPlan) -> dict[str, An
     filing_document_roles: dict[str, Any] = {}
     warnings: list[str] = []
     execution_routing: dict[str, Any] = {}
+    alias_expansions: list[dict[str, Any]] = []
     omitted_evidence_count = 0
     truncation_possible = False
     route_planned_tickers = getattr(store, "route_planned_tickers", None)
@@ -2136,6 +2137,9 @@ def _execute_search_plan(*, store: Any, search_plan: SearchPlan) -> dict[str, An
         shard_errors.update(_diagnostic_shard_errors(clause_diagnostics))
         warnings.extend(_diagnostic_warnings(clause_diagnostics))
         filing_document_roles.update(_diagnostic_filing_roles(clause_diagnostics))
+        alias_expansions.extend(
+            _diagnostic_alias_expansions(clause_diagnostics, clause_id=clause.clause_id)
+        )
         for raw_row in rows:
             row = dict(raw_row)
             object_id = str(row.get("id") or row.get("object_id") or "").strip()
@@ -2213,6 +2217,7 @@ def _execute_search_plan(*, store: Any, search_plan: SearchPlan) -> dict[str, An
         for clause in search_plan.clauses:
             rows, clause_diagnostics = _query_planned_compact(
                 store=store,
+                clause_id=clause.clause_id,
                 retrieval_query=clause.retrieval_query,
                 retrieval_terms=_clause_evidence_terms(clause),
                 predicate_terms=clause.required_predicates,
@@ -2302,6 +2307,18 @@ def _execute_search_plan(*, store: Any, search_plan: SearchPlan) -> dict[str, An
         truncation_possible=truncation_possible,
         total_ms=_elapsed_ms(started_at),
     )
+    search_diagnostics: dict[str, Any] = {
+        "mode": "explicit_search_plan_v2",
+        "clause_count": len(search_plan.clauses),
+        "diagnostic_count": len(diagnostics),
+        "routing": final_routing,
+        "telemetry": execution_telemetry,
+    }
+    merged_alias_expansions = _merge_alias_expansions(alias_expansions)
+    if merged_alias_expansions:
+        # Present only when the retrieval-side alias channel fired for at
+        # least one clause; the plan itself was executed exactly as written.
+        search_diagnostics["alias_expansions"] = merged_alias_expansions
     return {
         "results_by_ticker": results_by_ticker,
         "unknown_tickers": _dedupe_preserving_order(unknown_tickers),
@@ -2310,13 +2327,7 @@ def _execute_search_plan(*, store: Any, search_plan: SearchPlan) -> dict[str, An
         "truncation_possible": truncation_possible,
         "warnings": _dedupe_preserving_order(warnings),
         "recommended_tools": recommended_tools,
-        "search_diagnostics": {
-            "mode": "explicit_search_plan_v2",
-            "clause_count": len(search_plan.clauses),
-            "diagnostic_count": len(diagnostics),
-            "routing": final_routing,
-            "telemetry": execution_telemetry,
-        },
+        "search_diagnostics": search_diagnostics,
         "routing": final_routing,
     }
 
@@ -2369,12 +2380,14 @@ def _query_planned_compact(
     include_rejected: bool,
     allow_relaxed: bool,
     limit: int,
+    clause_id: str | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Call the v2 planned primitive without falling back to keyword routing."""
     planned_query = getattr(store, "query_planned_compact_with_diagnostics", None)
     if callable(planned_query):
         return planned_query(
             retrieval_query=retrieval_query,
+            clause_id=clause_id,
             retrieval_terms=retrieval_terms,
             predicate_terms=predicate_terms,
             metrics=metrics,
@@ -2397,6 +2410,7 @@ def _query_planned_compact(
         unavailable_tickers: list[str] = []
         strict_count = 0
         relaxed_count = 0
+        fanout_alias_expansions: list[dict[str, Any]] = []
         for ticker in tickers:
             try:
                 ticker_store = store_for_ticker(ticker)
@@ -2405,6 +2419,7 @@ def _query_planned_compact(
                 continue
             ticker_rows, ticker_diagnostics = ticker_store.query_planned_compact_with_diagnostics(
                 retrieval_query=retrieval_query,
+                clause_id=clause_id,
                 retrieval_terms=retrieval_terms,
                 predicate_terms=predicate_terms,
                 metrics=metrics,
@@ -2423,7 +2438,10 @@ def _query_planned_compact(
             rows.extend(ticker_rows)
             strict_count += int(ticker_diagnostics.get("strict_result_count") or 0)
             relaxed_count += int(ticker_diagnostics.get("relaxed_result_count") or 0)
-        return rows[:limit], {
+            fanout_alias_expansions.extend(
+                _diagnostic_alias_expansions(ticker_diagnostics, clause_id=clause_id)
+            )
+        fanout_diagnostics: dict[str, Any] = {
             "execution_mode": "planned_fts_company_fanout",
             "retrieval_query": retrieval_query,
             "strict_result_count": strict_count,
@@ -2435,6 +2453,10 @@ def _query_planned_compact(
             "keyword_expansion_used": False,
             "intent_reclassification_used": False,
         }
+        merged_alias_expansions = _merge_alias_expansions(fanout_alias_expansions)
+        if merged_alias_expansions:
+            fanout_diagnostics["alias_expansions"] = merged_alias_expansions
+        return rows[:limit], fanout_diagnostics
 
     return [], {
         "execution_mode": "planned_fts_unavailable",
@@ -2485,6 +2507,76 @@ def _diagnostic_shard_errors(diagnostics: Mapping[str, Any]) -> dict[str, str]:
             }
         )
     return values
+
+
+def _diagnostic_alias_expansions(
+    diagnostics: Mapping[str, Any],
+    *,
+    clause_id: str | None,
+) -> list[dict[str, Any]]:
+    """Collect store-emitted ``alias_expansions`` records for one clause.
+
+    The batch router nests each shard's store diagnostics under
+    ``shard_diagnostics``; the single-store path returns them directly.  Records
+    are normalized to the documented shape and stamped with the executing
+    clause id when the store did not receive one.
+    """
+    containers: list[Mapping[str, Any]] = [diagnostics]
+    shard_diagnostics = diagnostics.get("shard_diagnostics")
+    if isinstance(shard_diagnostics, Mapping):
+        containers.extend(
+            value for value in shard_diagnostics.values() if isinstance(value, Mapping)
+        )
+    records: list[dict[str, Any]] = []
+    for container in containers:
+        raw = container.get("alias_expansions")
+        if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)):
+            continue
+        for entry in raw:
+            if not isinstance(entry, Mapping):
+                continue
+            alias = str(entry.get("alias") or "").strip()
+            canonical = str(entry.get("canonical_metric") or "").strip()
+            if not alias or not canonical:
+                continue
+            try:
+                added_units = max(0, int(entry.get("added_units") or 0))
+            except (TypeError, ValueError):
+                added_units = 0
+            records.append(
+                {
+                    "clause_id": str(entry.get("clause_id") or clause_id or "").strip(),
+                    "alias": alias,
+                    "canonical_metric": canonical,
+                    "added_units": added_units,
+                }
+            )
+    return records
+
+
+def _merge_alias_expansions(records: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Sum per-shard ``added_units`` for identical (clause, alias, canonical) keys.
+
+    Output order is fixed by the key so the payload is deterministic regardless
+    of shard fan-out ordering.
+    """
+    merged: dict[tuple[str, str, str], int] = {}
+    for record in records:
+        key = (
+            str(record.get("clause_id") or ""),
+            str(record.get("alias") or ""),
+            str(record.get("canonical_metric") or ""),
+        )
+        merged[key] = merged.get(key, 0) + int(record.get("added_units") or 0)
+    return [
+        {
+            "clause_id": clause_id,
+            "alias": alias,
+            "canonical_metric": canonical,
+            "added_units": added_units,
+        }
+        for (clause_id, alias, canonical), added_units in sorted(merged.items())
+    ]
 
 
 def _planned_execution_telemetry(

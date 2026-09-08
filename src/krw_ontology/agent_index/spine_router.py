@@ -556,6 +556,7 @@ class OntologySpineRouter:
         self,
         *,
         retrieval_query: str,
+        clause_id: str | None = None,
         retrieval_terms: Iterable[str] | None = None,
         predicate_terms: Iterable[str] | None = None,
         metrics: Iterable[str] | None = None,
@@ -580,6 +581,7 @@ class OntologySpineRouter:
         def load_query(_ticker: str, store: OntologyStore) -> dict[str, Any]:
             rows, diagnostics = store.query_planned_compact_with_diagnostics(
                 retrieval_query=retrieval_query,
+                clause_id=clause_id,
                 retrieval_terms=retrieval_terms,
                 predicate_terms=predicate_terms,
                 metrics=metrics,
@@ -687,6 +689,7 @@ class OntologySpineRouter:
                     continue
                 rows, diagnostics = store.query_planned_compact_with_diagnostics(
                     retrieval_query=str(clause["retrieval_query"]),
+                    clause_id=clause_id,
                     retrieval_terms=clause.get("retrieval_terms"),
                     predicate_terms=clause.get("predicate_terms"),
                     metrics=clause.get("metrics"),

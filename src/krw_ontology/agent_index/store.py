@@ -18,6 +18,7 @@ from krw_ontology.agent_index.retrieval_text import format_metric_compact
 from krw_ontology.agent_index.metric_dictionary import (
     canonical_metric_name,
     normalize_dimension_key,
+    resolve_alias_terms,
 )
 from krw_ontology.agent_index.research_kernel import ResearchKernel, request_from_query_context_args
 from krw_ontology.agent_index.research_contexts import (
@@ -1640,6 +1641,7 @@ class OntologyStore:
         self,
         *,
         retrieval_query: str,
+        clause_id: str | None = None,
         retrieval_terms: Iterable[str] | None = None,
         predicate_terms: Iterable[str] | None = None,
         metrics: Iterable[str] | None = None,
@@ -1662,6 +1664,14 @@ class OntologyStore:
         FTS.  Strict results require every supplied lexical token.  An optional OR
         pass is kept separate and labelled ``relaxed`` so it can never be promoted
         to direct evidence by the response compiler.
+
+        One retrieval-side recall channel is added for metric-less clauses: when
+        ``metrics`` is empty but ``retrieval_query`` names a metric-dictionary
+        alias, the exact metric-lookup channel also runs for the mapped canonical
+        metric(s) and its units are appended after every existing row under
+        ``planned_match_mode="alias_expanded"``.  The plan is never rewritten and
+        clauses that already carry ``metrics`` are never expanded.  ``clause_id``
+        is only echoed into the ``alias_expansions`` diagnostics.
         """
         started_at = time.perf_counter()
         result_limit = max(1, int(limit))
@@ -1835,11 +1845,72 @@ class OntologyStore:
                     break
             relaxed_elapsed_ms = int((time.perf_counter() - relaxed_started_at) * 1000)
 
+        # Alias-expanded metric channel.  Only a metric-less clause qualifies:
+        # a clause with ``metrics`` is already served by the exact channel
+        # above and must never fire twice.  Every existing row (strict and
+        # relaxed) keeps priority; alias units are appended after object-id
+        # dedupe and only while the clause budget has room.  Canonicals are
+        # deduped so one canonical runs exactly once even when several aliases
+        # name it; its added units are attributed to the first alias (sorted
+        # order from the dictionary) and later aliases report zero, so the
+        # ``added_units`` column sums to the real number of appended rows.
+        alias_terms = resolve_alias_terms(retrieval_query) if not requested_metrics else {}
+        alias_row_ids: set[str] = set()
+        alias_expansions: list[dict[str, Any]] = []
+        alias_elapsed_ms = 0
+        if alias_terms:
+            alias_started_at = time.perf_counter()
+            present_ids = {str(row["id"]) for row in ordered_rows if row["id"]}
+            first_alias_by_canonical: dict[str, str] = {}
+            for alias, canonical in alias_terms.items():
+                first_alias_by_canonical.setdefault(canonical, alias)
+            added_by_canonical: dict[str, int] = {}
+            for canonical in first_alias_by_canonical:
+                added_units = 0
+                if len(ordered_rows) < result_limit:
+                    alias_metric_rows = self._query_metrics(
+                        [canonical],
+                        tickers=available_tickers,
+                        document_types=document_types,
+                        periods=periods,
+                        metric_dimensions=metric_dimensions,
+                        metric_scope=metric_scope,
+                        calculation_window=calculation_window,
+                        comparison_axes=requested_comparison_axes,
+                        limit_per_metric=result_limit,
+                    )
+                    for row in alias_metric_rows:
+                        row_id = str(row["id"] or "")
+                        if not row_id or row_id in present_ids:
+                            continue
+                        if len(ordered_rows) >= result_limit:
+                            break
+                        present_ids.add(row_id)
+                        alias_row_ids.add(row_id)
+                        ordered_rows.append(row)
+                        added_units += 1
+                added_by_canonical[canonical] = added_units
+            alias_expansions = [
+                {
+                    "clause_id": str(clause_id or ""),
+                    "alias": alias,
+                    "canonical_metric": canonical,
+                    "added_units": (
+                        added_by_canonical[canonical]
+                        if first_alias_by_canonical[canonical] == alias
+                        else 0
+                    ),
+                }
+                for alias, canonical in alias_terms.items()
+            ]
+            alias_elapsed_ms = int((time.perf_counter() - alias_started_at) * 1000)
+
         bundles = self._compact_bundles_from_rows(ordered_rows[:result_limit])
+        metric_channel_ids = metric_ids | alias_row_ids
         metric_metadata_by_id = {
             str(row["id"]): row
             for row in ordered_rows
-            if str(row["id"] or "") in metric_ids
+            if str(row["id"] or "") in metric_channel_ids
             and "planned_metric_is_company_total" in row.keys()
         }
         for bundle in bundles:
@@ -1881,7 +1952,12 @@ class OntologyStore:
                     obj["metric_conflict"] = True
                     obj["metric_conflict_value_count"] = conflict_count
                 bundle["object"] = obj
-            bundle["planned_match_mode"] = "strict" if row_id in strict_ids else "relaxed"
+            if row_id in strict_ids:
+                bundle["planned_match_mode"] = "strict"
+            elif row_id in alias_row_ids:
+                bundle["planned_match_mode"] = "alias_expanded"
+            else:
+                bundle["planned_match_mode"] = "relaxed"
             bundle["planned_lexical_terms"] = lexical_terms
             bundle["planned_evidence_terms"] = evidence_terms
 
@@ -1906,6 +1982,8 @@ class OntologyStore:
             ),
             "relaxed_enabled": bool(allow_relaxed),
             "relaxed_result_count": len(relaxed_ids),
+            "alias_expansion_used": bool(alias_terms),
+            "alias_expanded_result_count": len(alias_row_ids),
             "result_count": len(bundles),
             "compact_fast_path": True,
             "keyword_expansion_used": False,
@@ -1918,6 +1996,9 @@ class OntologyStore:
                 "total": int((time.perf_counter() - started_at) * 1000),
             },
         }
+        if alias_expansions:
+            diagnostics["alias_expansions"] = alias_expansions
+            diagnostics["timing_ms"]["alias_metric_lookup"] = alias_elapsed_ms
         if unavailable_tickers:
             diagnostics["warnings"].append("ticker_not_available")
             diagnostics["unavailable_tickers"] = unavailable_tickers

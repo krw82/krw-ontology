@@ -448,3 +448,278 @@ def test_alias_channel_dedupe_prefers_requested_filing_bucket_twin(twins_shard_p
     assert set(by_id) == {TWINS_FILED_IN_CY2025_ID}
     assert by_id[TWINS_FILED_IN_CY2025_ID]["planned_match_mode"] == "alias_expanded"
     assert diagnostics["alias_expansion_used"] is True
+
+
+# ---------------------------------------------------------------------------
+# Requested-filing-bucket contexts survive the metric bundle slice (the RMD
+# shareholders_equity shape).  June-FY companies key their 10-K filings by
+# calendar bucket while instant balance-sheet observations derive an
+# observation_period equal to the FILING bucket, so the same FY observation
+# restated across filings carries three different observation labels and three
+# different observation_context_keys.  The value-identity dedupe can therefore
+# never collapse the twins, and inside ``_select_planned_metric_rows`` the
+# per-series context ordering ``(fiscal_year, fiscal_quarter,
+# observation_period) DESC`` ranks the mislabeled newer-filing comparatives
+# above the requested bucket's own filing — ``representatives[:2]`` then cuts
+# the own-filing rows out of the window entirely.  Aligning the context
+# ordering with the requested filing bucket (the same partition the compiler
+# applies downstream) keeps the own-filing context inside the slice.
+# ---------------------------------------------------------------------------
+
+RELEASE_SHAPE_TICKER = "RC"
+RELEASE_SHAPE_METRIC = "shareholders_equity"
+RELEASE_SHAPE_FILING_PERIODS = ("CY2024", "CY2025", "CY2026")
+RELEASE_SHAPE_FISCAL_YEAR = 2024
+RELEASE_SHAPE_VALUE = 4_864_043_000.0
+# No FTS row matches every token of this query.
+RELEASE_SHAPE_RETRIEVAL_QUERY = "balance sheet equity commentary"
+
+RELEASE_SHAPE_OWN_FILING_ID = f"metric_observation:RC:CY2024:10K:shareholders_equity"
+
+
+def _release_shape_observation(filing_period: str) -> dict:
+    """One restatement twin: the same FY2024 instant filed in ``filing_period``."""
+    return {
+        "id": f"metric_observation:RC:{filing_period}:10K:shareholders_equity",
+        "type": "MetricObservation",
+        "ticker": RELEASE_SHAPE_TICKER,
+        "source_document_id": f"source:RC:{filing_period}:10K",
+        "document_type": DOCUMENT_TYPE,
+        "period": filing_period,
+        "metric_name": RELEASE_SHAPE_METRIC,
+        "value": RELEASE_SHAPE_VALUE,
+        "unit": "USD",
+        "fiscal_year": RELEASE_SHAPE_FISCAL_YEAR,
+        "period_type": "instant",
+        "period_end": "2024-06-30",
+        "source_type": "reported",
+        "review_status": "accepted",
+        "schema_version": "0.1.0",
+    }
+
+
+FALLBACK_TICKER = "NK"
+FALLBACK_METRIC = "total_debt"
+FALLBACK_FILING_PERIOD = "CY2026Q1"
+# No FTS row matches every token of this query.
+FALLBACK_RETRIEVAL_QUERY = "debt maturity wall commentary"
+
+FALLBACK_METRIC_ID = f"metric_observation:NK:CY2026Q1:10Q:total_debt"
+
+
+def _fallback_observation() -> dict:
+    """The NKE shape: the only metric observation filed in the CY2026Q1 10-Q
+    observes the prior fiscal year-end instant (2025-05-31), so its derived
+    observation_period is CY2025Q2 with fiscal coordinates (2025, Q1) and the
+    observation-semantics period clause can never match a CY2026Q1 request."""
+    return {
+        "id": FALLBACK_METRIC_ID,
+        "type": "MetricObservation",
+        "ticker": FALLBACK_TICKER,
+        "source_document_id": f"source:NK:{FALLBACK_FILING_PERIOD}:10Q",
+        "document_type": "10-Q",
+        "period": FALLBACK_FILING_PERIOD,
+        "metric_name": FALLBACK_METRIC,
+        "value": 5_000_000.0,
+        "unit": "USD",
+        "fiscal_year": 2025,
+        "period_type": "instant",
+        "period_end": "2025-05-31",
+        "source_type": "reported",
+        "review_status": "accepted",
+        "schema_version": "0.1.0",
+    }
+
+
+def _write_observation_only_document(
+    root: Path,
+    *,
+    ticker: str,
+    doc_type_key: str,
+    document_type: str,
+    filing_period: str,
+    observation: dict,
+) -> None:
+    ontology_dir = root / "companies" / ticker / "ontology" / doc_type_key / filing_period
+    sources_dir = root / "companies" / ticker / "sources" / doc_type_key / filing_period
+    ontology_dir.mkdir(parents=True)
+    sources_dir.mkdir(parents=True)
+    write_jsonl(ontology_dir / "spans.jsonl", [])
+    write_jsonl(ontology_dir / "evidence_quotes.jsonl", [])
+    write_jsonl(ontology_dir / "claims.jsonl", [])
+    write_jsonl(ontology_dir / "support_links.jsonl", [])
+    write_jsonl(ontology_dir / "metric_observations.jsonl", [observation])
+    atomic_write_json(
+        ontology_dir / "section_quality.json",
+        {"status": "pass", "missing_core_sections": [], "fail_reasons": []},
+    )
+    build_indexes(
+        ticker=ticker,
+        period=filing_period,
+        doc_type_key=doc_type_key,
+        ontology_dir=ontology_dir,
+        sources_dir=sources_dir,
+        output_dir=root,
+        document_type=document_type,
+    )
+
+
+@pytest.fixture(scope="module")
+def release_shape_shard_path(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    root = tmp_path_factory.mktemp("release-shape-release")
+    for filing_period in RELEASE_SHAPE_FILING_PERIODS:
+        _write_observation_only_document(
+            root,
+            ticker=RELEASE_SHAPE_TICKER,
+            doc_type_key=DOC_TYPE_KEY,
+            document_type=DOCUMENT_TYPE,
+            filing_period=filing_period,
+            observation=_release_shape_observation(filing_period),
+        )
+    result = build_spine_shard_release_outputs(
+        root,
+        release_id="test-store-release-shape",
+        workers=1,
+        no_cache=True,
+    )
+    shard = result.global_spine_path.parent / "companies" / f"{RELEASE_SHAPE_TICKER}.sqlite"
+    assert shard.is_file()
+    return shard
+
+
+@pytest.fixture(scope="module")
+def fallback_shard_path(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    root = tmp_path_factory.mktemp("filing-bucket-fallback-release")
+    _write_observation_only_document(
+        root,
+        ticker=FALLBACK_TICKER,
+        doc_type_key="10Q",
+        document_type="10-Q",
+        filing_period=FALLBACK_FILING_PERIOD,
+        observation=_fallback_observation(),
+    )
+    result = build_spine_shard_release_outputs(
+        root,
+        release_id="test-store-filing-bucket-fallback",
+        workers=1,
+        no_cache=True,
+    )
+    shard = result.global_spine_path.parent / "companies" / f"{FALLBACK_TICKER}.sqlite"
+    assert shard.is_file()
+    return shard
+
+
+def test_release_shape_fixture_carries_filing_bucket_observation_labels(release_shape_shard_path):
+    """Guard the fixture: instant observations in annual filing buckets derive
+    observation_period == filing bucket (the release-data mislabel the fix
+    must tolerate), so the restatement twins hold distinct contexts."""
+    import sqlite3
+
+    with sqlite3.connect(f"file:{release_shape_shard_path}?mode=ro", uri=True) as conn:
+        rows = conn.execute(
+            "SELECT filing_period, observation_period, fiscal_year, fiscal_quarter "
+            "FROM metric_lookup WHERE ticker = ?",
+            (RELEASE_SHAPE_TICKER,),
+        ).fetchall()
+    assert {row[0] for row in rows} == set(RELEASE_SHAPE_FILING_PERIODS)
+    for filing_period, observation_period, fiscal_year, fiscal_quarter in rows:
+        assert observation_period == filing_period
+        assert fiscal_year == RELEASE_SHAPE_FISCAL_YEAR
+        assert fiscal_quarter is None
+
+
+def test_requested_bucket_own_filing_context_survives_the_bundle_slice(release_shape_shard_path):
+    """periods=[CY2024]: the metric window must keep the CY2024 filing's own
+    row; the mislabeled CY2026/CY2025 comparative twins must not displace it
+    from the per-series representative slice."""
+    with OntologyStore(release_shape_shard_path) as store:
+        rows, diagnostics = store.query_planned_compact_with_diagnostics(
+            clause_id="rc_equity",
+            retrieval_query=RELEASE_SHAPE_RETRIEVAL_QUERY,
+            metrics=[RELEASE_SHAPE_METRIC],
+            tickers=[RELEASE_SHAPE_TICKER],
+            document_types=[DOCUMENT_TYPE],
+            periods=["CY2024"],
+            limit=6,
+        )
+
+    metric_ids = {row["id"] for row in rows if row["type"] == "MetricObservation"}
+    assert RELEASE_SHAPE_OWN_FILING_ID in metric_ids
+    assert diagnostics["metric_result_count"] >= 1
+
+
+def test_no_requested_periods_keeps_pre_change_release_shape_window(release_shape_shard_path):
+    """Without requested periods the behaviour is unchanged: the per-series
+    representative slice keeps the two newest-labelled contexts (CY2026 and
+    CY2025 filing buckets), never the requested-bucket alignment."""
+    with OntologyStore(release_shape_shard_path) as store:
+        rows, _diagnostics = store.query_planned_compact_with_diagnostics(
+            clause_id="rc_equity",
+            retrieval_query=RELEASE_SHAPE_RETRIEVAL_QUERY,
+            metrics=[RELEASE_SHAPE_METRIC],
+            tickers=[RELEASE_SHAPE_TICKER],
+            limit=6,
+        )
+
+    metric_ids = {row["id"] for row in rows if row["type"] == "MetricObservation"}
+    assert metric_ids == {
+        "metric_observation:RC:CY2026:10K:shareholders_equity",
+        "metric_observation:RC:CY2025:10K:shareholders_equity",
+    }
+
+
+def test_fallback_fixture_observation_never_matches_requested_period(fallback_shard_path):
+    """Guard the fixture: the CY2026Q1 filing's observation carries CY2025Q2
+    with fiscal coordinates (2025, 1), so the observation-semantics clause for
+    CY2026Q1 cannot match it."""
+    import sqlite3
+
+    with sqlite3.connect(f"file:{fallback_shard_path}?mode=ro", uri=True) as conn:
+        row = conn.execute(
+            "SELECT observation_period, fiscal_year, fiscal_quarter FROM metric_lookup "
+            "WHERE ticker = ?",
+            (FALLBACK_TICKER,),
+        ).fetchone()
+    assert row == ("CY2025Q2", 2025, 1)
+
+
+def test_empty_metric_window_falls_back_to_requested_filing_bucket(fallback_shard_path):
+    """periods=[CY2026Q1]: the observation-semantics window is empty, so the
+    filing-bucket fallback must surface the metric observation filed in the
+    requested bucket, with its true observation period exposed on the unit."""
+    with OntologyStore(fallback_shard_path) as store:
+        rows, diagnostics = store.query_planned_compact_with_diagnostics(
+            clause_id="nk_debt",
+            retrieval_query=FALLBACK_RETRIEVAL_QUERY,
+            metrics=[FALLBACK_METRIC],
+            tickers=[FALLBACK_TICKER],
+            document_types=["10-Q"],
+            periods=[FALLBACK_FILING_PERIOD],
+            limit=6,
+        )
+
+    by_id = {row["id"]: row for row in rows}
+    assert FALLBACK_METRIC_ID in by_id
+    assert by_id[FALLBACK_METRIC_ID]["period"] == "CY2025Q2"
+    assert by_id[FALLBACK_METRIC_ID]["object"]["filing_period"] == FALLBACK_FILING_PERIOD
+    assert diagnostics["metric_result_count"] == 1
+
+
+def test_observation_matched_window_skips_the_filing_bucket_fallback(fallback_shard_path):
+    """A request the observation semantics already answers (CY2025Q2) returns
+    the same rows with or without the fallback: it only fires on an empty
+    observation-semantics window."""
+    with OntologyStore(fallback_shard_path) as store:
+        rows, diagnostics = store.query_planned_compact_with_diagnostics(
+            clause_id="nk_debt",
+            retrieval_query=FALLBACK_RETRIEVAL_QUERY,
+            metrics=[FALLBACK_METRIC],
+            tickers=[FALLBACK_TICKER],
+            document_types=["10-Q"],
+            periods=["CY2025Q2"],
+            limit=6,
+        )
+
+    by_id = {row["id"]: row for row in rows}
+    assert set(by_id) == {FALLBACK_METRIC_ID}
+    assert diagnostics["metric_result_count"] == 1

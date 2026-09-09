@@ -4800,25 +4800,27 @@ class OntologyStore:
         normalized_periods = _unique(
             str(value).strip() for value in periods or [] if str(value).strip()
         )
+        period_where_sql: str | None = None
+        period_where_params: list[Any] = []
         if normalized_periods:
             period_clauses = [
                 "metric_lookup.observation_period IN ("
                 + ",".join("?" for _ in normalized_periods)
                 + ")"
             ]
-            params.extend(normalized_periods)
+            period_where_params.extend(normalized_periods)
             for year, quarter in _planned_metric_period_coordinates(normalized_periods):
                 if quarter is None:
                     period_clauses.append(
                         "(metric_lookup.fiscal_year = ? AND metric_lookup.fiscal_quarter IS NULL)"
                     )
-                    params.append(year)
+                    period_where_params.append(year)
                 else:
                     period_clauses.append(
                         "(metric_lookup.fiscal_year = ? AND metric_lookup.fiscal_quarter = ?)"
                     )
-                    params.extend([year, quarter])
-            clauses.append("(" + " OR ".join(period_clauses) + ")")
+                    period_where_params.extend([year, quarter])
+            period_where_sql = "(" + " OR ".join(period_clauses) + ")"
         if normalized_scope == "company_total":
             clauses.append("metric_lookup.is_company_total = 1")
         elif normalized_scope == "dimensioned":
@@ -4854,6 +4856,17 @@ class OntologyStore:
         # text before the trailing ``observation_rank <= ?`` parameter.
         # Without requested periods both preference terms are omitted and the
         # SQL is byte-identical to the previous newest-filing tie-break.
+        # Depth admission: release data that labels a restated instant's
+        # observation_period with the filing bucket (the RMD
+        # shareholders_equity shape) gives the newer filings' comparative
+        # copies lexicographically higher observation labels, so the plain
+        # fiscal-coordinate DESC ranking spends the ``observation_rank`` depth
+        # budget on comparatives and cuts the requested bucket's own filing
+        # out of the window entirely.  Rows filed in a requested bucket are
+        # therefore ADMITTED past the depth cut via an OR term — admission
+        # only, never reordering, so every existing row sequence is unchanged
+        # and the requested-bucket starvation guard inside
+        # ``_select_planned_metric_rows`` keeps such rows in the slice.
         preferred_filing_buckets = _preferred_metric_filing_buckets(normalized_periods)
         if preferred_filing_buckets:
             duplicate_order_pref = (
@@ -4862,9 +4875,14 @@ class OntologyStore:
                 + ")) DESC, "
                 + _metric_own_filing_pref_sql()
             )
-            params.extend(preferred_filing_buckets)
+            depth_admission_sql = (
+                " OR (ranked.filing_period IN ("
+                + ",".join("?" for _ in preferred_filing_buckets)
+                + "))"
+            )
         else:
             duplicate_order_pref = ""
+            depth_admission_sql = ""
         normalized_axes = {
             str(axis).strip().casefold() for axis in comparison_axes or [] if str(axis).strip()
         }
@@ -4876,114 +4894,151 @@ class OntologyStore:
             4 if temporal else 2,
             len(normalized_periods),
         )
-        params.append(observation_depth)
-        rows = self.conn.execute(
-            f"""
-            WITH filtered AS (
+
+        def _execute_window(
+            extra_where_sql: str | None,
+            extra_where_params: list[Any],
+        ) -> list[sqlite3.Row]:
+            window_clauses = list(clauses)
+            window_params = list(params)
+            if extra_where_sql:
+                window_clauses.append(extra_where_sql)
+                window_params.extend(extra_where_params)
+            if preferred_filing_buckets:
+                # The preferred-bucket IN group appears once inside the
+                # ``ranked`` CTE (the dedupe ordering) and once in the outer
+                # depth-admission OR, so the bucket params bind once per
+                # textual occurrence, around the depth parameter.
+                window_params.extend(preferred_filing_buckets)
+            window_params.append(observation_depth)
+            if preferred_filing_buckets:
+                window_params.extend(preferred_filing_buckets)
+            return self.conn.execute(
+                f"""
+                WITH filtered AS (
+                    SELECT
+                        metric_lookup.*,
+                        lower(COALESCE(
+                            metric_lookup.canonical_metric,
+                            metric_lookup.metric_name,
+                            ''
+                        )) AS metric_key,
+                        CASE
+                            WHEN metric_lookup.value_numeric IS NOT NULL
+                                THEN 'n:' || printf('%.17g', metric_lookup.value_numeric)
+                            ELSE 't:' || COALESCE(metric_lookup.value_text, '__NULL__')
+                        END AS value_identity
+                    FROM metric_lookup
+                    WHERE {" AND ".join(window_clauses)}
+                ), ranked AS (
+                    SELECT
+                        filtered.*,
+                        DENSE_RANK() OVER (
+                            PARTITION BY
+                                filtered.ticker,
+                                filtered.metric_key,
+                                COALESCE(filtered.unit, ''),
+                                COALESCE(filtered.dimensions_json, ''),
+                                filtered.is_company_total,
+                                filtered.observation_period_type
+                            ORDER BY
+                                COALESCE(filtered.fiscal_year, 0) DESC,
+                                COALESCE(filtered.fiscal_quarter, 0) DESC,
+                                filtered.observation_period DESC,
+                                filtered.observation_context_key DESC
+                        ) AS observation_rank,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY
+                                filtered.ticker,
+                                filtered.metric_key,
+                                COALESCE(filtered.unit, ''),
+                                COALESCE(filtered.dimensions_json, ''),
+                                filtered.is_company_total,
+                                filtered.observation_period_type,
+                                filtered.observation_context_key,
+                                filtered.value_identity
+                            ORDER BY {duplicate_order_pref}filtered.filing_period DESC, filtered.object_id
+                        ) AS duplicate_value_rank
+                    FROM filtered
+                ), context_variants AS (
+                    SELECT
+                        ticker,
+                        metric_key,
+                        COALESCE(unit, '') AS unit_key,
+                        COALESCE(dimensions_json, '') AS dimensions_key,
+                        is_company_total,
+                        observation_period_type,
+                        observation_context_key,
+                        COUNT(DISTINCT value_identity) AS conflict_value_count
+                    FROM filtered
+                    GROUP BY
+                        ticker,
+                        metric_key,
+                        COALESCE(unit, ''),
+                        COALESCE(dimensions_json, ''),
+                        is_company_total,
+                        observation_period_type,
+                        observation_context_key
+                )
                 SELECT
-                    metric_lookup.*,
-                    lower(COALESCE(
-                        metric_lookup.canonical_metric,
-                        metric_lookup.metric_name,
-                        ''
-                    )) AS metric_key,
-                    CASE
-                        WHEN metric_lookup.value_numeric IS NOT NULL
-                            THEN 'n:' || printf('%.17g', metric_lookup.value_numeric)
-                        ELSE 't:' || COALESCE(metric_lookup.value_text, '__NULL__')
-                    END AS value_identity
-                FROM metric_lookup
-                WHERE {" AND ".join(clauses)}
-            ), ranked AS (
-                SELECT
-                    filtered.*,
-                    DENSE_RANK() OVER (
-                        PARTITION BY
-                            filtered.ticker,
-                            filtered.metric_key,
-                            COALESCE(filtered.unit, ''),
-                            COALESCE(filtered.dimensions_json, ''),
-                            filtered.is_company_total,
-                            filtered.observation_period_type
-                        ORDER BY
-                            COALESCE(filtered.fiscal_year, 0) DESC,
-                            COALESCE(filtered.fiscal_quarter, 0) DESC,
-                            filtered.observation_period DESC,
-                            filtered.observation_context_key DESC
-                    ) AS observation_rank,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY
-                            filtered.ticker,
-                            filtered.metric_key,
-                            COALESCE(filtered.unit, ''),
-                            COALESCE(filtered.dimensions_json, ''),
-                            filtered.is_company_total,
-                            filtered.observation_period_type,
-                            filtered.observation_context_key,
-                            filtered.value_identity
-                        ORDER BY {duplicate_order_pref}filtered.filing_period DESC, filtered.object_id
-                    ) AS duplicate_value_rank
-                FROM filtered
-            ), context_variants AS (
-                SELECT
-                    ticker,
-                    metric_key,
-                    COALESCE(unit, '') AS unit_key,
-                    COALESCE(dimensions_json, '') AS dimensions_key,
-                    is_company_total,
-                    observation_period_type,
-                    observation_context_key,
-                    COUNT(DISTINCT value_identity) AS conflict_value_count
-                FROM filtered
-                GROUP BY
-                    ticker,
-                    metric_key,
-                    COALESCE(unit, ''),
-                    COALESCE(dimensions_json, ''),
-                    is_company_total,
-                    observation_period_type,
-                    observation_context_key
+                    objects.*,
+                    ranked.is_company_total AS planned_metric_is_company_total,
+                    ranked.dimensions_json AS planned_metric_dimensions_json,
+                    ranked.canonical_metric AS planned_metric_canonical_metric,
+                    ranked.unit AS planned_metric_unit,
+                    ranked.filing_period AS planned_metric_filing_period,
+                    ranked.observation_period AS planned_metric_observation_period,
+                    ranked.observation_period_type AS planned_metric_observation_period_type,
+                    ranked.observation_start_date AS planned_metric_observation_start_date,
+                    ranked.observation_end_date AS planned_metric_observation_end_date,
+                    ranked.observation_context_key AS planned_metric_observation_context_key,
+                    ranked.fiscal_year AS planned_metric_fiscal_year,
+                    ranked.fiscal_quarter AS planned_metric_fiscal_quarter,
+                    context_variants.conflict_value_count AS planned_metric_conflict_value_count
+                FROM ranked
+                JOIN objects ON objects.id = ranked.object_id
+                JOIN context_variants
+                  ON context_variants.ticker = ranked.ticker
+                 AND context_variants.metric_key = ranked.metric_key
+                 AND context_variants.unit_key = COALESCE(ranked.unit, '')
+                 AND context_variants.dimensions_key = COALESCE(ranked.dimensions_json, '')
+                 AND context_variants.is_company_total = ranked.is_company_total
+                 AND context_variants.observation_period_type = ranked.observation_period_type
+                 AND context_variants.observation_context_key = ranked.observation_context_key
+                WHERE ranked.observation_rank <= ?{depth_admission_sql}
+                  AND ranked.duplicate_value_rank = 1
+                  AND (objects.review_status IS NULL OR objects.review_status != 'rejected')
+                ORDER BY
+                    (context_variants.conflict_value_count > 1) DESC,
+                    ranked.observation_rank,
+                    ranked.ticker,
+                    ranked.metric_key,
+                    ranked.dimensions_json,
+                    ranked.observation_period DESC,
+                    ranked.value_identity,
+                    ranked.object_id
+                """,
+                window_params,
+            ).fetchall()
+
+        rows = _execute_window(period_where_sql, period_where_params)
+        if not rows and period_where_sql is not None and preferred_filing_buckets:
+            # Period-as-filing-bucket fallback (the NKE total_debt shape): a
+            # filing whose only metric observations carry comparative periods
+            # (prior year-end columns) can never satisfy the observation-
+            # semantics clause for its own bucket, so the metric channel
+            # returns nothing for a request naming that bucket.  Retry the
+            # window once with the period clause replaced by a filing-bucket
+            # membership test on the same preferred buckets the dedupe uses;
+            # the surfaced units keep their true observation periods, so the
+            # contract stays honest.  Empty-result-only: any query the
+            # observation semantics already answers is byte-identical.
+            rows = _execute_window(
+                "metric_lookup.filing_period IN ("
+                + ",".join("?" for _ in preferred_filing_buckets)
+                + ")",
+                list(preferred_filing_buckets),
             )
-            SELECT
-                objects.*,
-                ranked.is_company_total AS planned_metric_is_company_total,
-                ranked.dimensions_json AS planned_metric_dimensions_json,
-                ranked.canonical_metric AS planned_metric_canonical_metric,
-                ranked.unit AS planned_metric_unit,
-                ranked.filing_period AS planned_metric_filing_period,
-                ranked.observation_period AS planned_metric_observation_period,
-                ranked.observation_period_type AS planned_metric_observation_period_type,
-                ranked.observation_start_date AS planned_metric_observation_start_date,
-                ranked.observation_end_date AS planned_metric_observation_end_date,
-                ranked.observation_context_key AS planned_metric_observation_context_key,
-                ranked.fiscal_year AS planned_metric_fiscal_year,
-                ranked.fiscal_quarter AS planned_metric_fiscal_quarter,
-                context_variants.conflict_value_count AS planned_metric_conflict_value_count
-            FROM ranked
-            JOIN objects ON objects.id = ranked.object_id
-            JOIN context_variants
-              ON context_variants.ticker = ranked.ticker
-             AND context_variants.metric_key = ranked.metric_key
-             AND context_variants.unit_key = COALESCE(ranked.unit, '')
-             AND context_variants.dimensions_key = COALESCE(ranked.dimensions_json, '')
-             AND context_variants.is_company_total = ranked.is_company_total
-             AND context_variants.observation_period_type = ranked.observation_period_type
-             AND context_variants.observation_context_key = ranked.observation_context_key
-            WHERE ranked.observation_rank <= ?
-              AND ranked.duplicate_value_rank = 1
-              AND (objects.review_status IS NULL OR objects.review_status != 'rejected')
-            ORDER BY
-                (context_variants.conflict_value_count > 1) DESC,
-                ranked.observation_rank,
-                ranked.ticker,
-                ranked.metric_key,
-                ranked.dimensions_json,
-                ranked.observation_period DESC,
-                ranked.value_identity,
-                ranked.object_id
-            """,
-            params,
-        ).fetchall()
         return _select_planned_metric_rows(
             rows,
             limit_per_group=max(1, int(limit_per_metric)),
@@ -8167,6 +8222,45 @@ def _select_planned_metric_rows(
                 or _planned_metric_row_matches_periods(values[0], requested_periods)
             ]
             considered = requested_contexts or context_rows
+            if requested_periods:
+                # Requested-bucket starvation guard at the slice point (the
+                # RMD shareholders_equity shape): release data that labels a
+                # restated instant's observation_period with the filing bucket
+                # gives the newer filings' comparative copies lexicographically
+                # higher observation labels, so the period-key DESC context
+                # order can spend the whole ``representatives`` slice on
+                # comparatives and cut the requested bucket's own filing out
+                # of the window.  When — and only when — the plain slice would
+                # exclude every context filed in a requested bucket, promote
+                # the first such context into the slice; sequences whose slice
+                # already contains a requested-bucket context are untouched,
+                # preserving the relative order the downstream filing-bucket
+                # alignment partitions.
+                slice_size = max(2, len(requested_periods))
+                if len(considered) > slice_size and not any(
+                    _planned_metric_row_filing_bucket_rank(values[0], requested_periods) == 0
+                    for values in considered[:slice_size]
+                ):
+                    rank0_context = next(
+                        (
+                            values
+                            for values in considered
+                            if _planned_metric_row_filing_bucket_rank(
+                                values[0], requested_periods
+                            )
+                            == 0
+                        ),
+                        None,
+                    )
+                    if rank0_context is not None:
+                        considered = [
+                            rank0_context,
+                            *(
+                                values
+                                for values in considered
+                                if values is not rank0_context
+                            ),
+                        ]
             conflict_contexts = [
                 values
                 for values in considered

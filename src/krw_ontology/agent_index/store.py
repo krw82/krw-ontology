@@ -4845,17 +4845,22 @@ class OntologyStore:
         # Value-identity dedupe preference: when the clause requests periods,
         # value-identical twins (the same observation restated across
         # filings) must keep the row filed in a requested bucket instead of
-        # the newest filing's comparative copy.  Bound here because the
-        # window's ORDER BY placeholders appear in the SQL text before the
-        # trailing ``observation_rank <= ?`` parameter.  Without requested
-        # periods the preference term is omitted and the SQL is byte-identical
-        # to the previous newest-filing tie-break.
+        # the newest filing's comparative copy.  Within that preference group
+        # the own-filing twin (filing bucket == CY-coordinate twin of the
+        # observation period) outranks the generic ``filing_period DESC``
+        # tie-break, so an intermediate requested-bucket comparative can no
+        # longer displace the row the observation actually belongs to.  Bound
+        # here because the window's ORDER BY placeholders appear in the SQL
+        # text before the trailing ``observation_rank <= ?`` parameter.
+        # Without requested periods both preference terms are omitted and the
+        # SQL is byte-identical to the previous newest-filing tie-break.
         preferred_filing_buckets = _preferred_metric_filing_buckets(normalized_periods)
         if preferred_filing_buckets:
             duplicate_order_pref = (
                 "(filtered.filing_period IN ("
                 + ",".join("?" for _ in preferred_filing_buckets)
                 + ")) DESC, "
+                + _metric_own_filing_pref_sql()
             )
             params.extend(preferred_filing_buckets)
         else:
@@ -8081,6 +8086,30 @@ def _preferred_metric_filing_buckets(periods: Iterable[str]) -> list[str]:
         quarter = f"Q{match.group(2)}" if match.group(2) else ""
         buckets.update({f"CY{year}{quarter}", f"FY{year}{quarter}"})
     return sorted(buckets)
+
+
+def _metric_own_filing_pref_sql() -> str:
+    """Secondary dedupe ORDER key: prefer the own-filing twin.
+
+    Inside the requested-bucket preference group the generic
+    ``filing_period DESC`` tie-break keeps the newest PREFERRED bucket, which
+    can be an intermediate filing's comparative copy (the msft multi_period
+    shave: an FY2024 observation survived as its CY2025-bucket comparative
+    instead of its own CY2024 filing).  Rows whose filing bucket equals the
+    CY-coordinate twin of their own observation period — the own-filing row —
+    rank before that generic tie-break.  The twin uses the same coordinate
+    translation as ``_preferred_metric_filing_buckets`` (``FY2024`` ->
+    ``CY2024``, ``CY2024Q2`` -> ``CY2024Q2``), applied to the
+    ``observation_period`` column: the equality can only fire on normalized
+    ``CY|FY`` year (quarter) labels, and every other observation-period shape
+    fails closed to plain ``filing_period DESC``.  Emitted only alongside the
+    requested-bucket preference; the empty-prefs SQL stays byte-identical.
+    """
+    return (
+        "(filtered.filing_period = 'CY' || substr(filtered.observation_period, 3) "
+        "AND (filtered.observation_period GLOB '[CF]Y[12][0-9][0-9][0-9]' "
+        "OR filtered.observation_period GLOB '[CF]Y[12][0-9][0-9][0-9]Q[1-4]')) DESC, "
+    )
 
 
 def _select_planned_metric_rows(

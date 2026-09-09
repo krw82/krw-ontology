@@ -282,7 +282,10 @@ def test_wide_limit_holds_everything_and_never_reserves(shard_path):
 # ---------------------------------------------------------------------------
 
 TWINS_TICKER = "TW"
-TWINS_FILING_PERIODS = ("CY2025", "CY2026")
+# CY2025 is the own-filing bucket (filing bucket == CY-coordinate twin of the
+# observed FY2025); CY2026 is an intermediate comparative bucket; CY2027 is
+# the newest restating bucket outside any requested preference group below.
+TWINS_FILING_PERIODS = ("CY2025", "CY2026", "CY2027")
 TWINS_OBSERVATION_YEAR = 2025
 TWINS_METRIC_NAME = "net_income"
 TWINS_METRIC_VALUE = 101_832_000_000.0
@@ -292,9 +295,11 @@ TWINS_RETRIEVAL_QUERY = "fiscal bottom line commentary"
 TWINS_METRIC_IDS = {
     "metric_observation:TW:CY2025:10K:net_income:2025",
     "metric_observation:TW:CY2026:10K:net_income:2025",
+    "metric_observation:TW:CY2027:10K:net_income:2025",
 }
 TWINS_FILED_IN_CY2025_ID = "metric_observation:TW:CY2025:10K:net_income:2025"
 TWINS_FILED_IN_CY2026_ID = "metric_observation:TW:CY2026:10K:net_income:2025"
+TWINS_FILED_IN_CY2027_ID = "metric_observation:TW:CY2027:10K:net_income:2025"
 
 
 def _twins_metric_observation(*, filing_period: str) -> dict:
@@ -391,12 +396,27 @@ def test_dedupe_prefers_requested_filing_bucket_twin(twins_shard_path):
 
 
 def test_dedupe_without_requested_periods_keeps_newest_twin(twins_shard_path):
-    """No requested periods: the dedupe keeps the newest filing bucket,
-    byte-identical to the pre-change behaviour."""
+    """No requested periods: the dedupe keeps the newest filing bucket (CY2027
+    after the fixture extension), byte-identical to the pre-change behaviour."""
     with OntologyStore(twins_shard_path) as store:
         rows, diagnostics = _twins_query(store)
 
-    assert _twins_metric_ids(rows) == {TWINS_FILED_IN_CY2026_ID}
+    assert _twins_metric_ids(rows) == {TWINS_FILED_IN_CY2027_ID}
+    assert diagnostics["metric_result_count"] == 1
+
+
+def test_dedupe_prefers_own_filing_twin_over_newer_preferred_comparative(twins_shard_path):
+    """The msft multi_period shape: the request spans the own-filing bucket
+    (CY2025) AND one comparative bucket (CY2026), so both twins sit inside the
+    requested-bucket preference group.  Within that group the survivor must be
+    the own-filing row — the row whose filing bucket equals the CY-coordinate
+    twin of its own observed FY2025 — not the newer CY2026 comparative copy
+    that plain ``filing_period DESC`` keeps; the newest twin (CY2027, outside
+    the preference group) never competes."""
+    with OntologyStore(twins_shard_path) as store:
+        rows, diagnostics = _twins_query(store, periods=["CY2025", "CY2026"])
+
+    assert _twins_metric_ids(rows) == {TWINS_FILED_IN_CY2025_ID}
     assert diagnostics["metric_result_count"] == 1
 
 

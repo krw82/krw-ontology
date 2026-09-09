@@ -1667,7 +1667,12 @@ class OntologyStore:
 
         Prefix terms are singularized at emission (``buybacks`` -> ``buyback*``):
         the unicode61 tokenizer does not stem, so the singular stem is the only
-        prefix that covers both token forms.  Between strict and the gated
+        prefix that covers both token forms.  The singularized strict path is
+        an original-first merge: the strict FTS also executes with the original
+        plural prefixes, original-term rows keep their bm25 order first and
+        singularized-only rows append within the remaining budget — they never
+        displace original carriers from a window the original terms filled.
+        Between strict and the gated
         relaxed pass sits a concept-OR rung: when the clause declares two or
         more hint terms and strict underfills the window, an OR restricted to
         the clause's own declared terms (never foreign vocabulary, and never
@@ -1788,10 +1793,55 @@ class OntologyStore:
 
         # Prefix terms are emitted through the singularizing helper: the
         # unicode61 tokenizer does not stem, so ``buyback*`` is needed to
-        # match both the singular and the plural ``buybacks`` token.
+        # match both the singular and the plural ``buybacks`` token.  The
+        # singularized strict path is an ORIGINAL-FIRST MERGE, not a
+        # replacement: the strict FTS executes with the original plural
+        # prefixes AND with the singularized prefixes; original-term rows
+        # keep their bm25 order first (stable object-id dedupe) and
+        # singularized-only rows append within the remaining window budget.
+        # A window the original terms already filled is therefore identical
+        # to the pre-singularization order — a generalized prefix can never
+        # displace an original carrier — while a sparse original window
+        # still recovers singular-token carriers in the tail.  Clauses whose
+        # prefixes singularize to themselves run a single execution exactly
+        # as before.
+        original_strict_query = " ".join(_planned_fts_original_prefix_terms(lexical_terms))
         lexical_prefix_terms = _planned_fts_prefix_terms(lexical_terms)
         strict_query = " ".join(lexical_prefix_terms)
         fts_started_at = time.perf_counter()
+
+        def _strict_fts_rows(query: str) -> list[sqlite3.Row]:
+            return self._execute_fts(
+                query,
+                tickers=available_tickers,
+                document_types=document_types,
+                periods=periods,
+                object_types=selected_types,
+                include_rejected=include_rejected,
+                limit=result_limit,
+            )
+
+        def _original_first_strict_rows(
+            *,
+            original_query: str,
+            singularized_query: str,
+        ) -> list[sqlite3.Row]:
+            if not singularized_query:
+                return []
+            if original_query == singularized_query:
+                return _strict_fts_rows(singularized_query)
+            return _merge_original_first_strict_rows(
+                _strict_fts_rows(original_query),
+                _strict_fts_rows(singularized_query),
+                limit=result_limit,
+            )
+
+        original_predicate_query = " ".join(
+            [
+                original_strict_query,
+                *_planned_fts_original_prefix_terms(predicate_lexical_terms),
+            ]
+        ).strip()
         predicate_query = " ".join(
             [
                 strict_query,
@@ -1799,30 +1849,16 @@ class OntologyStore:
             ]
         ).strip()
         fts_predicate_rows = (
-            self._execute_fts(
-                predicate_query,
-                tickers=available_tickers,
-                document_types=document_types,
-                periods=periods,
-                object_types=selected_types,
-                include_rejected=include_rejected,
-                limit=result_limit,
+            _original_first_strict_rows(
+                original_query=original_predicate_query,
+                singularized_query=predicate_query,
             )
             if strict_query and predicate_lexical_terms
             else []
         )
-        fts_strict_rows = (
-            self._execute_fts(
-                strict_query,
-                tickers=available_tickers,
-                document_types=document_types,
-                periods=periods,
-                object_types=selected_types,
-                include_rejected=include_rejected,
-                limit=result_limit,
-            )
-            if strict_query
-            else []
+        fts_strict_rows = _original_first_strict_rows(
+            original_query=original_strict_query,
+            singularized_query=strict_query,
         )
         fts_elapsed_ms = int((time.perf_counter() - fts_started_at) * 1000)
 
@@ -7951,6 +7987,49 @@ def _planned_fts_prefix_terms(terms: Iterable[str]) -> list[str]:
     at prefix-emission time.
     """
     return _unique(f"{_planned_singular_stem(term)}*" for term in terms)
+
+
+def _planned_fts_original_prefix_terms(terms: Iterable[str]) -> list[str]:
+    """Emit deduped prefix terms WITHOUT singularization.
+
+    This is the pre-singularization prefix form: ``constraints*`` matches the
+    plural ``constraints`` token only.  It is the original-term baseline of
+    the original-first strict merge — the match set whose bm25 order a
+    singularized strict window must preserve at its head.
+    """
+    return _unique(f"{term}*" for term in terms)
+
+
+def _merge_original_first_strict_rows(
+    original_rows: Sequence[sqlite3.Row],
+    singularized_rows: Sequence[sqlite3.Row],
+    *,
+    limit: int,
+) -> list[sqlite3.Row]:
+    """Merge original-term strict rows first, singularized-only rows after.
+
+    Singularization is a pure superset in MATCH terms, but under a fixed
+    window + bm25 a superset re-ranks: newly-matching rows can displace
+    original-term carriers that the original conjunction ranked inside the
+    window (the nvda multispan regression).  Rows returned by the
+    original-prefix query keep their bm25 order; rows recovered only by the
+    singularized prefixes append (stable object-id dedupe) within the
+    remaining ``limit`` budget and are cut when the original rows already
+    filled it — so a generalized prefix can widen a sparse window but can
+    never change a full one.
+    """
+    merged: list[sqlite3.Row] = []
+    seen_ids: set[str] = set()
+    row_budget = max(1, int(limit))
+    for row in (*original_rows, *singularized_rows):
+        row_id = str(row["id"] or "")
+        if not row_id or row_id in seen_ids:
+            continue
+        seen_ids.add(row_id)
+        merged.append(row)
+        if len(merged) >= row_budget:
+            break
+    return merged
 
 
 def _planned_metric_period_coordinates(

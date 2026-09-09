@@ -30,6 +30,7 @@ import pytest
 from krw_ontology.agent_index.spine_builder import build_spine_shard_release_outputs
 from krw_ontology.agent_index.store import (
     OntologyStore,
+    _planned_fts_original_prefix_terms,
     _planned_fts_prefix_terms,
     _planned_query_terms,
 )
@@ -124,6 +125,20 @@ def test_singularized_prefix_still_covers_the_plural_token():
 
 def test_prefix_term_dedupe_collapses_singular_plural_pairs():
     assert _planned_fts_prefix_terms(["cost", "costs"]) == ["cost*"]
+
+
+def test_original_prefix_terms_keep_the_plural_token():
+    """The original-term strict baseline carries the untouched plural token:
+    ``constraints*`` matches the plural ``constraints`` token only, which is
+    exactly the pre-singularization match set the original-first merge must
+    preserve at the head of every singularized strict window."""
+    assert _planned_fts_original_prefix_terms(["constraints"]) == ["constraints*"]
+    assert _planned_fts_original_prefix_terms(["buybacks"]) == ["buybacks*"]
+    # Non-plural terms emit identically in both forms (no merge needed).
+    assert _planned_fts_original_prefix_terms(["revenue", "supply"]) == [
+        "revenue*",
+        "supply*",
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -308,3 +323,200 @@ def test_concept_or_not_gated_by_allow_relaxed(shard_path):
     # The relaxed pass only appends unseen rows: same window, no duplicates.
     assert {row["id"] for row in gated} == {row["id"] for row in relaxed}
     assert len(relaxed) == len({row["id"] for row in relaxed})
+
+
+# ---------------------------------------------------------------------------
+# Original-first merge for the singularized strict path (the nvda multispan
+# window regression).  Singularization is a pure superset in MATCH terms, but
+# under a fixed window + bm25 a superset re-ranks: newly-matching rows
+# (singular-token carriers) can displace original-term carriers that the
+# pre-singularization query ranked inside the window.  The strict FTS now
+# executes with the ORIGINAL prefixes AND the SINGULARIZED prefixes; the
+# original-term rows keep their bm25 order first (stable object-id dedupe)
+# and singularized-only rows append within the remaining budget.  A window
+# the original terms already filled is therefore identical to the
+# pre-singularization order — a generalized prefix never displaces an
+# original carrier — while a sparse original window still recovers
+# singular-token carriers in the tail (the META buyback anchor shape).
+#
+# Shard recipe: one plural carrier pair (P1 outranks P2 under the original
+# ``supply* constraints*`` conjunction) plus a singular-token carrier whose
+# dense ``supply constraint`` repetition outranks BOTH plural carriers under
+# the singularized ``supply* constraint*`` conjunction.
+# ---------------------------------------------------------------------------
+
+SNG_TICKER = "SNG"
+
+# Plural carriers: match both the original and the singularized prefix AND.
+SNG_P1_QUOTE_ID = f"quote:{SNG_TICKER}:{PERIOD}:{DOC_TYPE_KEY}:0001"
+SNG_P1_QUOTE_TEXT = (
+    "Supply constraints widened in the outlook as supply constraints "
+    "persisted across component vendors."
+)
+SNG_P2_QUOTE_ID = f"quote:{SNG_TICKER}:{PERIOD}:{DOC_TYPE_KEY}:0002"
+SNG_P2_QUOTE_TEXT = (
+    "Supply constraints appeared once in the annual report of the "
+    "diversified manufacturer."
+)
+# Singular-token carrier: matches ONLY the singularized prefix AND and would
+# rank first under it, displacing P2 from a full window pre-merge.
+SNG_SINGULAR_QUOTE_ID = f"quote:{SNG_TICKER}:{PERIOD}:{DOC_TYPE_KEY}:0003"
+SNG_SINGULAR_QUOTE_TEXT = (
+    "Supply constraint risk supply constraint risk supply constraint risk "
+    "supply constraint risk supply constraint risk."
+)
+
+SNG_QUOTE_TEXTS = {
+    SNG_P1_QUOTE_ID: SNG_P1_QUOTE_TEXT,
+    SNG_P2_QUOTE_ID: SNG_P2_QUOTE_TEXT,
+    SNG_SINGULAR_QUOTE_ID: SNG_SINGULAR_QUOTE_TEXT,
+}
+
+
+def _write_sng_artifacts(root: Path) -> None:
+    ontology_dir = root / "companies" / SNG_TICKER / "ontology" / DOC_TYPE_KEY / PERIOD
+    sources_dir = root / "companies" / SNG_TICKER / "sources" / DOC_TYPE_KEY / PERIOD
+    ontology_dir.mkdir(parents=True)
+    sources_dir.mkdir(parents=True)
+
+    spans = []
+    quotes = []
+    for index, (quote_id, text) in enumerate(SNG_QUOTE_TEXTS.items()):
+        span_id = f"span:{SNG_TICKER}:{PERIOD}:{DOC_TYPE_KEY}:item7:{index:04d}"
+        spans.append(
+            {
+                "id": span_id,
+                "type": "SourceSpan",
+                "ticker": SNG_TICKER,
+                "source_document_id": f"source:{SNG_TICKER}:{PERIOD}:{DOC_TYPE_KEY}",
+                "document_type": DOCUMENT_TYPE,
+                "period": PERIOD,
+                "section_name": "item7",
+                "section_key": "item7",
+                "span_index": index + 1,
+                "text": text,
+                "review_status": "accepted",
+                "schema_version": "0.1.0",
+            }
+        )
+        quotes.append(
+            {
+                "id": quote_id,
+                "type": "EvidenceQuote",
+                "ticker": SNG_TICKER,
+                "source_document_id": f"source:{SNG_TICKER}:{PERIOD}:{DOC_TYPE_KEY}",
+                "document_type": DOCUMENT_TYPE,
+                "period": PERIOD,
+                "source_span_id": span_id,
+                "quote_text": text,
+                "quote_type": "business_update",
+                "section_name": "item7",
+                "review_status": "accepted",
+                "schema_version": "0.1.0",
+            }
+        )
+
+    write_jsonl(ontology_dir / "spans.jsonl", spans)
+    write_jsonl(ontology_dir / "evidence_quotes.jsonl", quotes)
+    write_jsonl(ontology_dir / "claims.jsonl", [])
+    write_jsonl(ontology_dir / "support_links.jsonl", [])
+    write_jsonl(ontology_dir / "metric_observations.jsonl", [])
+    atomic_write_json(
+        ontology_dir / "section_quality.json",
+        {"status": "pass", "missing_core_sections": [], "fail_reasons": []},
+    )
+    build_indexes(
+        ticker=SNG_TICKER,
+        period=PERIOD,
+        doc_type_key=DOC_TYPE_KEY,
+        ontology_dir=ontology_dir,
+        sources_dir=sources_dir,
+        output_dir=root,
+        document_type=DOCUMENT_TYPE,
+    )
+
+
+@pytest.fixture(scope="module")
+def sng_shard_path(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    root = tmp_path_factory.mktemp("fts-original-first-release")
+    _write_sng_artifacts(root)
+    result = build_spine_shard_release_outputs(
+        root,
+        release_id="test-store-fts-original-first",
+        workers=1,
+        no_cache=True,
+    )
+    shard = result.global_spine_path.parent / "companies" / f"{SNG_TICKER}.sqlite"
+    assert shard.is_file()
+    return shard
+
+
+def _sng_query(store: OntologyStore, **overrides):
+    kwargs = {
+        "clause_id": "sng_supply_constraints",
+        "retrieval_query": "supply constraints outlook",
+        "retrieval_terms": ["supply constraints"],
+        "tickers": [SNG_TICKER],
+    }
+    kwargs.update(overrides)
+    return store.query_planned_compact_with_diagnostics(**kwargs)
+
+
+def test_full_original_window_is_not_displaced_by_singularized_rows(sng_shard_path):
+    """Regression pin (nvda multispan shape): the original ``supply*
+    constraints*`` conjunction fills the window (limit=2 → P1, P2 in bm25
+    order), and the singular-token carrier — which the singularized
+    conjunction ranks FIRST — must NOT displace P2.  The window content and
+    order are identical to the pre-singularization window."""
+    with OntologyStore(sng_shard_path) as store:
+        rows, diagnostics = _sng_query(store, limit=2)
+
+    assert [row["id"] for row in rows] == [SNG_P1_QUOTE_ID, SNG_P2_QUOTE_ID]
+    assert {row["planned_match_mode"] for row in rows} == {"strict"}
+    # The window is full of original rows: no lower rung fires.
+    assert diagnostics["concept_or_attempted"] is False
+    assert diagnostics["fts_strict_result_count"] == 2
+
+
+def test_sparse_original_window_appends_singularized_only_rows(sng_shard_path):
+    """Recovery pin (META buyback shape): the original conjunction returns
+    only two rows for a three-slot window, so the singularized-only carrier
+    is APPENDED after them — original rows keep their order and the anchor
+    enters the tail instead of outranking them."""
+    with OntologyStore(sng_shard_path) as store:
+        rows, diagnostics = _sng_query(store, limit=3)
+
+    assert [row["id"] for row in rows] == [
+        SNG_P1_QUOTE_ID,
+        SNG_P2_QUOTE_ID,
+        SNG_SINGULAR_QUOTE_ID,
+    ]
+    # The appended carrier is a strict conjunction hit, not a relaxed unit.
+    by_id = {row["id"]: row for row in rows}
+    assert by_id[SNG_SINGULAR_QUOTE_ID]["planned_match_mode"] == "strict"
+    assert diagnostics["concept_or_attempted"] is False
+
+
+def test_non_plural_clause_runs_a_single_strict_execution(sng_shard_path):
+    """Clauses whose prefixes singularize to themselves (``supply*``) skip the
+    second FTS execution: the merged window equals the plain singularized
+    window — every carrier is strict, in plain bm25 order."""
+    with OntologyStore(sng_shard_path) as store:
+        rows, diagnostics = _sng_query(
+            store,
+            clause_id="sng_supply_exposure",
+            retrieval_query="supplier concentration exposure",
+            retrieval_terms=["supply"],
+            limit=3,
+        )
+
+    # Every row carries the token; nothing is displaced or appended and the
+    # dense singular-token carrier legitimately ranks first under bm25.
+    assert [row["id"] for row in rows] == [
+        SNG_SINGULAR_QUOTE_ID,
+        SNG_P1_QUOTE_ID,
+        SNG_P2_QUOTE_ID,
+    ]
+    assert {row["planned_match_mode"] for row in rows} == {"strict"}
+    # Single declared term: the concept-OR rung never fires.
+    assert diagnostics["concept_or_attempted"] is False

@@ -1524,7 +1524,6 @@ def _topic_evidence_candidate(row: Mapping[str, Any]) -> dict[str, Any] | None:
         _first_text(object_payload, "observation_period")
         or _first_text(row, "planned_metric_observation_period")
         or row_period
-        or period
     )
     if object_type == "MetricObservation" and observation_period:
         metric_context = _mapping(object_payload.get("context"))
@@ -2484,23 +2483,30 @@ def _source_anchors(
     # The v2 planned path deliberately bypasses the legacy keyword-based
     # "current filing" classifier.  Preserve neutral document anchors directly
     # from selected evidence instead of guessing annual/current roles.
-    seen: set[tuple[str, str | None, str | None]] = set()
+    # Dedupe by source_label, not (ticker, period, document_type): a metric
+    # unit's top-level period is its observation period while its source
+    # label names the filing bucket, so keying on the period would mint two
+    # anchors that carry the same label but contradict it with different
+    # periods (e.g. FY2024/FY2025 comparatives from one CY2024Q4 filing).
+    seen_labels: set[str] = set()
     for unit in units:
         if not unit.ticker:
             continue
-        key = (unit.ticker, unit.period, unit.document_type)
-        if key in seen:
+        source_label = (
+            unit.source.source_label
+            or _source_label(unit.ticker, unit.period, unit.document_type)
+            or unit.ticker
+        )
+        if source_label in seen_labels:
             continue
-        seen.add(key)
+        seen_labels.add(source_label)
         anchors.append(
             SourceAnchor(
                 ticker=unit.ticker,
                 period=unit.period,
                 document_type=unit.document_type,
                 role="retrieved_evidence",
-                source_label=unit.source.source_label
-                or _source_label(unit.ticker, unit.period, unit.document_type)
-                or unit.ticker,
+                source_label=source_label,
             )
         )
         if len(anchors) >= 16:

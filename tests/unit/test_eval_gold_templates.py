@@ -375,3 +375,45 @@ def test_cli_help_exits_zero():
     assert proc.returncode == 0, proc.stderr
     assert "generate" in proc.stdout
     assert "inspect-objects" in proc.stdout
+
+
+@pytest.mark.parametrize("command", ["generate", "inspect-objects"])
+def test_cli_corrupt_shard_aborts_cleanly_with_exit_1(
+    tmp_path: Path, command: str
+):
+    """A shard that is not a sqlite database surfaces as a clean exit 1
+    (``sqlite3.Error`` in the CLI's except tuples), never a traceback."""
+    import sqlite3
+
+    from typer.testing import CliRunner
+
+    import scripts.generate_evidence_gold_templates as templates_cli
+
+    release_root = tmp_path / "release"
+    indexes = release_root / "indexes"
+    indexes.mkdir(parents=True)
+    (indexes / "SO.sqlite").write_text(
+        "this is not a sqlite database", encoding="utf-8"
+    )
+    (indexes / "shard_manifest.json").write_text(
+        json.dumps(
+            {
+                "release_id": "templates-cli-test",
+                "shards": {"SO": {"path": "SO.sqlite"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    args = [command, "--release-root", str(release_root)]
+    if command == "generate":
+        args += ["--out", str(tmp_path / "gold.json")]
+    else:
+        args += ["SO", "revenue", "CY2023"]
+
+    result = CliRunner().invoke(templates_cli.app, args)
+    assert result.exit_code == 1
+    failure_prefix = {"generate": "generation", "inspect-objects": "inspect"}[command]
+    assert f"{failure_prefix} failed" in (result.output + result.stderr)
+    assert isinstance(result.exception, SystemExit)
+    assert not isinstance(result.exception, sqlite3.Error)

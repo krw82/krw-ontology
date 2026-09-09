@@ -16,6 +16,9 @@ import sys
 from pathlib import Path
 
 import pytest
+from typer.testing import CliRunner
+
+import scripts.benchmark_evidence_gold as benchmark_cli
 
 from krw_ontology.agent_index import build_spine_shard_release_outputs
 from krw_ontology.eval_gold import harness
@@ -427,3 +430,161 @@ def test_cli_help_exits_zero():
     assert proc.returncode == 0, proc.stderr
     assert "--gold" in proc.stdout
     assert "--baseline" in proc.stdout
+
+
+def test_gate_decision_flags_regression_and_stamps_report(tmp_path: Path):
+    """The CLI's exit-2 gate, factored into the harness: a report gated
+    against a strictly stronger baseline must return ``ok=False`` with the
+    regressed metrics and stamp the auditable ``baseline_gate`` block."""
+    _build_runtime(tmp_path)
+    gold_path = _write_gold(tmp_path)
+    report = harness.run_harness(gold_path, label="gate-test")
+
+    # Stronger baseline: every stratum fully passing with full recall, so
+    # compare_to_baseline must find regressions against the real report.
+    stronger_baseline = {
+        "overall": {"pass_rate": 1.0, "mean_recall": 1.0},
+        "strata": {
+            stratum: {"pass_rate": 1.0, "mean_recall": 1.0}
+            for stratum in report["strata"]
+        },
+    }
+
+    ok, regressions = harness.gate_decision(
+        report, stronger_baseline, tolerance=0.0, baseline_path=str(gold_path)
+    )
+
+    assert ok is False
+    assert regressions
+    assert any("overall.pass_rate" in item for item in regressions)
+    assert any("strata[vocabulary_mismatch].pass_rate" in item for item in regressions)
+    assert report["baseline_gate"] == {
+        "baseline_path": str(gold_path),
+        "tolerance": 0.0,
+        "ok": False,
+        "regressions": regressions,
+    }
+
+    # A self-gate (the report as its own baseline) stays green.
+    ok, regressions = harness.gate_decision(report, report, tolerance=0.0)
+    assert ok is True
+    assert regressions == []
+    assert report["baseline_gate"]["ok"] is True
+
+
+def test_cli_exit_code_delegates_to_gate_decision(tmp_path: Path, monkeypatch):
+    """Library-level exit-2 pin: the CLI calls ``gate_decision`` and exits
+    with code 2 exactly when the gate fails — never otherwise."""
+    canned_report = {
+        "label": "gate-test",
+        "gold_path": "unused",
+        "source_release": {"release_id": "unused"},
+        "overall": {
+            "cases": 2,
+            "pass_rate": 0.5,
+            "mean_recall": 0.5,
+            "zero_hit_rate": 0.0,
+        },
+        "strata": {
+            "template": {
+                "cases": 2,
+                "pass_rate": 0.5,
+                "mean_recall": 0.5,
+                "zero_hit_rate": 0.0,
+            }
+        },
+        "cases": {},
+    }
+    monkeypatch.setattr(
+        benchmark_cli, "run_harness", lambda gold, label: copy.deepcopy(canned_report)
+    )
+
+    gold = tmp_path / "gold.json"
+    gold.write_text("{}", encoding="utf-8")  # run_harness is stubbed; never read
+
+    def _baseline(pass_rate: float) -> Path:
+        path = tmp_path / f"baseline-{pass_rate}.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "overall": {"pass_rate": pass_rate, "mean_recall": pass_rate},
+                    "strata": {"template": {"pass_rate": pass_rate, "mean_recall": pass_rate}},
+                }
+            ),
+            encoding="utf-8",
+        )
+        return path
+
+    runner = CliRunner()
+
+    # Stronger baseline -> gate fails -> exit 2 (report files still written).
+    result = runner.invoke(
+        benchmark_cli.app,
+        [
+            "--gold", str(gold),
+            "--label", "gate-test",
+            "--baseline", str(_baseline(1.0)),
+            "--report-dir", str(tmp_path / "reports"),
+        ],
+    )
+    assert result.exit_code == 2
+    written = list((tmp_path / "reports").glob("evidence_gold_gate-test_*.json"))
+    assert len(written) == 1
+    assert json.loads(written[0].read_text(encoding="utf-8"))["baseline_gate"][
+        "ok"
+    ] is False
+
+    # Equal baseline -> no drop anywhere -> exit 0.
+    result = runner.invoke(
+        benchmark_cli.app,
+        [
+            "--gold", str(gold),
+            "--label", "gate-test",
+            "--baseline", str(_baseline(0.5)),
+            "--report-dir", str(tmp_path / "reports"),
+        ],
+    )
+    assert result.exit_code == 0
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param("{not valid json", id="malformed-json"),
+        pytest.param(
+            json.dumps({"format_version": "krw-ontology-evidence-gold/v0"}),
+            id="wrong-format-version",
+        ),
+        pytest.param(
+            json.dumps(
+                {
+                    "format_version": "krw-ontology-evidence-gold/v1",
+                    "source_release": {"release_id": ""},
+                    "cases": [],
+                }
+            ),
+            id="validation-error",
+        ),
+    ],
+)
+def test_cli_invalid_gold_exits_one_cleanly(tmp_path: Path, payload: str):
+    """Invalid gold input (malformed JSON / wrong format_version / pydantic
+    validation error) is a clean exit 1 with a stderr message, symmetric
+    with the baseline reader — never a traceback."""
+    gold = tmp_path / "gold.json"
+    gold.write_text(payload, encoding="utf-8")
+
+    result = CliRunner().invoke(
+        benchmark_cli.app,
+        [
+            "--gold", str(gold),
+            "--label", "invalid",
+            "--report-dir", str(tmp_path / "reports"),
+        ],
+    )
+
+    assert result.exit_code == 1
+    # A handled typer.Exit surfaces as SystemExit; an escaping traceback
+    # would leave the original ValueError/JSONDecodeError here instead.
+    assert isinstance(result.exception, SystemExit)
+    assert f"invalid gold input {gold}" in result.output

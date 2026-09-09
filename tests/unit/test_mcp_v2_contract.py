@@ -494,6 +494,64 @@ def test_query_context_returns_only_compact_v2_research_state(
     }.intersection(payload)
 
 
+def test_source_anchor_fallback_dedupes_by_source_label_not_observation_period() -> None:
+    """Fallback anchors dedupe on ``source_label``: two metric units from the
+    same filing bucket share one label while exposing different observation
+    periods, and keying on (ticker, period, document_type) would emit two
+    anchors that carry the same filing label contradicted by two different
+    periods.  One label, one anchor."""
+    plan = SearchPlan(
+        question="How did VG revenue change across fiscal years?",
+        intent="comparison",
+        tickers=["VG"],
+        clauses=[
+            QueryClause(
+                clause_id="revenue",
+                retrieval_query="VG revenue",
+                metrics=["revenue"],
+            )
+        ],
+    )
+
+    def comparative_row(period: str, value: int) -> dict[str, object]:
+        row = _metric_observation(
+            ticker="VG",
+            period=period,
+            value=value,
+            clause_id="revenue",
+            suffix=period,
+        )
+        # Both observations live in the same filing bucket: the CY2024Q4 10-K
+        # carries the FY2024 original and the FY2025 restated comparative.
+        row["filing_period"] = "CY2024Q4"
+        return row
+
+    state = compile_research_state(
+        search_plan=plan,
+        raw_payload={
+            "results_by_ticker": {
+                "VG": [
+                    comparative_row("FY2024", 100),
+                    comparative_row("FY2025", 110),
+                ],
+            }
+        },
+        release_id="release",
+    )
+
+    # The units expose their observation periods but share the filing label.
+    assert {unit.period for unit in state.evidence_units} == {"FY2024", "FY2025"}
+    assert {unit.source.source_label for unit in state.evidence_units} == {
+        "VG CY2024Q4 10-K"
+    }
+
+    # No roles/current anchors in raw, so the fallback fired: one anchor per
+    # source label, not one per (ticker, period, document_type).
+    anchors = state.source_anchors
+    assert [anchor.role for anchor in anchors] == ["retrieved_evidence"]
+    assert anchors[0].source_label == "VG CY2024Q4 10-K"
+
+
 def test_plan_requirement_does_not_promote_related_evidence_to_direct() -> None:
     plan = SearchPlan(
         question="Does the filing directly support the requested exposure?",

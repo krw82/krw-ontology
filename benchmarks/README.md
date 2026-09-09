@@ -399,7 +399,8 @@ isolation on the full gold, worktree + `PYTHONPATH`, release read-only):
 
 2b FINAL decision (cycle 2, binding rule: close 2b when
 `vocabulary_mismatch` AND `multi_period` mean_recall both >= 0.9):
-`vocabulary_mismatch` = **1.0000**, `multi_period` = **0.9167** — both
+`vocabulary_mismatch` = **1.0000**, `multi_period` = **1.0000** (candidate
+3b below; the interim candidate-3 `multi_period` was **0.9167**) — both
 thresholds met, so **2b is CLOSED** (DEFERRED→CLOSED; revisit condition =
 re-measure the residual strata only when the serving model is replaced).
 Remaining residuals (8 failing cases) are classified in the cycle-2 task

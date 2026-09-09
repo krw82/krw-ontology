@@ -325,6 +325,80 @@ def test_concept_or_not_gated_by_allow_relaxed(shard_path):
     assert len(relaxed) == len({row["id"] for row in relaxed})
 
 
+def test_singular_plural_pair_collapses_to_one_prefix_and_skips_concept_or(shard_path):
+    """The concept-OR gate counts PREFIX-DEDUPED terms: a raw singular+plural
+    pair (``buyback`` + ``buybacks``) is one ``buyback*`` prefix, so the OR
+    would degenerate to that single prefix (wider than the strict AND while
+    expressing no second concept) and the rung must stay off."""
+    with OntologyStore(shard_path) as store:
+        rows, diagnostics = _query(
+            store,
+            retrieval_terms=["buyback", "buybacks"],
+        )
+
+    assert diagnostics["lexical_terms"] == ["buyback", "buybacks"]
+    assert _planned_fts_prefix_terms(diagnostics["lexical_terms"]) == ["buyback*"]
+    assert diagnostics["concept_or_attempted"] is False
+    assert diagnostics["concept_or_result_count"] == 0
+    # Strict matching itself is untouched: both token-form carriers still hit.
+    ids = {row["id"] for row in rows}
+    assert {BUYBACK_QUOTE_ID, PLURAL_QUOTE_ID} <= ids
+    assert all(row["planned_match_mode"] == "strict" for row in rows)
+
+
+def test_relaxed_pass_reuses_concept_or_rows_without_second_execution(shard_path):
+    """When the gated relaxed pass would re-execute the concept-OR rung's
+    exact OR query, it reuses the rung's rows instead: the identical OR query
+    executes exactly once per clause, and the reused window is identical
+    (deterministic FTS, same row filter as before the reuse)."""
+    with OntologyStore(shard_path) as store:
+        original_execute_fts = store._execute_fts
+        executed_queries: list[str] = []
+
+        def _recording_execute_fts(fts_query, **kwargs):
+            executed_queries.append(fts_query)
+            return original_execute_fts(fts_query, **kwargs)
+
+        store._execute_fts = _recording_execute_fts
+        rows, diagnostics = _query(store, allow_relaxed=True)
+
+    or_query = "share* OR buyback*"
+    assert diagnostics["concept_or_attempted"] is True
+    assert diagnostics["relaxed_enabled"] is True
+    assert diagnostics["relaxed_reused_or_rows"] is True
+    assert executed_queries.count(or_query) == 1
+
+    # The reused window still carries the concept-OR recovery, deduped.
+    ids = [row["id"] for row in rows]
+    assert AUTHORIZATION_QUOTE_ID in ids
+    assert len(ids) == len(set(ids))
+    assert {row["planned_match_mode"] for row in rows} <= {"strict", "relaxed"}
+
+    # A clause whose concept-OR rung did not fire still executes its own
+    # relaxed OR (single declared concept): the reuse is conditional.
+    with OntologyStore(shard_path) as store:
+        original_execute_fts = store._execute_fts
+        single_term_queries: list[str] = []
+
+        def _recording_execute_fts(fts_query, **kwargs):
+            single_term_queries.append(fts_query)
+            return original_execute_fts(fts_query, **kwargs)
+
+        store._execute_fts = _recording_execute_fts
+        _, single_diagnostics = _query(
+            store,
+            clause_id="demand",
+            retrieval_query="data center demand",
+            retrieval_terms=["demand"],
+            allow_relaxed=True,
+        )
+
+    assert single_diagnostics["concept_or_attempted"] is False
+    assert single_diagnostics["relaxed_enabled"] is True
+    assert single_diagnostics["relaxed_reused_or_rows"] is False
+    assert single_term_queries.count("demand*") >= 1
+
+
 # ---------------------------------------------------------------------------
 # Original-first merge for the singularized strict path (the nvda multispan
 # window regression).  Singularization is a pure superset in MATCH terms, but

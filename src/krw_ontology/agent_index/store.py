@@ -1674,12 +1674,17 @@ class OntologyStore:
         displace original carriers from a window the original terms filled.
         Between strict and the gated
         relaxed pass sits a concept-OR rung: when the clause declares two or
-        more hint terms and strict underfills the window, an OR restricted to
+        more distinct hint terms (counted after prefix dedupe, so a raw
+        singular+plural pair is one term) and strict underfills the window, an
+        OR restricted to
         the clause's own declared terms (never foreign vocabulary, and never
         metric observations, whose attribution belongs to the exact/alias
         channels) recovers evidence satisfying a single declared concept.  It
         is not gated by ``allow_relaxed`` — it is concept-scoped — and its
-        units are labelled ``relaxed`` exactly like the relaxed pass.
+        units are labelled ``relaxed`` exactly like the relaxed pass.  The
+        gated relaxed pass reuses the concept-OR rung's rows when it would
+        otherwise re-execute the identical OR query (same prefix terms), so
+        the second pass costs no extra FTS execution.
 
         One retrieval-side recall channel is added for metric-less clauses: when
         ``metrics`` is empty but ``retrieval_query`` names a metric-dictionary
@@ -1722,6 +1727,7 @@ class OntologyStore:
                     "execution_mode": "planned_fts",
                     "strict_result_count": 0,
                     "relaxed_result_count": 0,
+                    "relaxed_reused_or_rows": False,
                     "concept_or_attempted": False,
                     "concept_or_result_count": 0,
                     "timing_ms": {"total": int((time.perf_counter() - started_at) * 1000)},
@@ -1919,10 +1925,17 @@ class OntologyStore:
         concept_or_ids: set[str] = set()
         concept_or_attempted = False
         concept_or_elapsed_ms = 0
-        if len(lexical_terms) >= 2 and len(ordered_rows) < result_limit:
+        concept_or_rows: list[sqlite3.Row] = []
+        concept_or_query = " OR ".join(lexical_prefix_terms)
+        # The gate counts PREFIX-DEDUPED terms, not raw terms: a raw
+        # singular+plural pair (``cost`` + ``costs``) collapses to the single
+        # ``cost*`` prefix, and an OR over one prefix is just that prefix —
+        # wider than the strict AND without expressing a second declared
+        # concept — so the rung must stay off.  Genuine multi-concept clauses
+        # (``share* OR buyback*``) still fire.
+        if len(lexical_prefix_terms) >= 2 and len(ordered_rows) < result_limit:
             concept_or_attempted = True
             concept_or_started_at = time.perf_counter()
-            concept_or_query = " OR ".join(lexical_prefix_terms)
             concept_or_rows = self._execute_fts(
                 concept_or_query,
                 tickers=available_tickers,
@@ -1948,18 +1961,29 @@ class OntologyStore:
             concept_or_elapsed_ms = int((time.perf_counter() - concept_or_started_at) * 1000)
         relaxed_ids: set[str] = set()
         relaxed_elapsed_ms = 0
+        relaxed_reused_or_rows = False
         if allow_relaxed and lexical_terms and len(ordered_rows) < result_limit:
             relaxed_started_at = time.perf_counter()
             relaxed_query = " OR ".join(lexical_prefix_terms)
-            relaxed_rows = self._execute_fts(
-                relaxed_query,
-                tickers=available_tickers,
-                document_types=document_types,
-                periods=periods,
-                object_types=selected_types,
-                include_rejected=include_rejected,
-                limit=result_limit,
-            )
+            if concept_or_attempted and relaxed_query == concept_or_query:
+                # The concept-OR rung above already executed this exact OR
+                # query (both are built from the same prefix terms).  Reuse
+                # its rows instead of re-running the identical FTS: the
+                # result set is byte-identical, and this pass's own row
+                # filter (it admits MetricObservation rows the concept-OR
+                # rung skips) keeps its exact behavior at zero extra cost.
+                relaxed_rows = concept_or_rows
+                relaxed_reused_or_rows = True
+            else:
+                relaxed_rows = self._execute_fts(
+                    relaxed_query,
+                    tickers=available_tickers,
+                    document_types=document_types,
+                    periods=periods,
+                    object_types=selected_types,
+                    include_rejected=include_rejected,
+                    limit=result_limit,
+                )
             for row in relaxed_rows:
                 row_id = str(row["id"] or "")
                 if (
@@ -2213,6 +2237,9 @@ class OntologyStore:
             "relaxed_result_count": len(relaxed_ids | concept_or_ids),
             "concept_or_attempted": concept_or_attempted,
             "concept_or_result_count": len(concept_or_ids),
+            # True when the gated relaxed pass reused the concept-OR rung's
+            # rows instead of re-executing the identical OR query.
+            "relaxed_reused_or_rows": relaxed_reused_or_rows,
             "alias_expansion_used": bool(alias_terms),
             "alias_expanded_result_count": len(alias_row_ids),
             "result_count": len(bundles),

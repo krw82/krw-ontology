@@ -15,6 +15,7 @@ cache-miss ticker is skipped with reason ``no_cik``.
 from __future__ import annotations
 
 import json
+import sqlite3
 from pathlib import Path
 from typing import Optional
 
@@ -129,7 +130,7 @@ def audit(
             ua=ua,
             cik_map=_load_cik_map(cik_map_path),
         )
-    except (ValueError, FileNotFoundError, httpx.HTTPError) as exc:
+    except (ValueError, FileNotFoundError, sqlite3.Error, httpx.HTTPError) as exc:
         typer.secho(f"audit failed: {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1) from exc
 

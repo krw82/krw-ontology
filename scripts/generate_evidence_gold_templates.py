@@ -14,6 +14,7 @@ text) as a curation helper for hand-written gold cases.
 from __future__ import annotations
 
 import json
+import sqlite3
 from pathlib import Path
 from typing import Optional
 
@@ -82,7 +83,7 @@ def generate(
         gold = generate_template_gold(
             root, seed=seed, per_ticker=per_ticker, tickers=ticker_list
         )
-    except (ValueError, FileNotFoundError) as exc:
+    except (ValueError, FileNotFoundError, sqlite3.Error) as exc:
         typer.secho(f"generation failed: {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1) from exc
 
@@ -113,7 +114,7 @@ def inspect_objects_command(
     root = _resolve_release_root(release_root)
     try:
         rows = inspect_objects(root, ticker, metric, period, limit=limit)
-    except (ValueError, FileNotFoundError) as exc:
+    except (ValueError, FileNotFoundError, sqlite3.Error) as exc:
         typer.secho(f"inspect failed: {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1) from exc
     if not rows:

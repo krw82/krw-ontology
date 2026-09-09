@@ -116,6 +116,31 @@ def compare_to_baseline(
     return (not regressions), regressions
 
 
+def gate_decision(
+    report: dict[str, Any],
+    baseline: dict[str, Any],
+    *,
+    tolerance: float = 0.0,
+    baseline_path: str = "",
+) -> tuple[bool, list[str]]:
+    """Decide the benchmark CLI's exit-2 gate for a finished report.
+
+    Runs :func:`compare_to_baseline` and stamps the resulting
+    ``baseline_gate`` block onto ``report`` (the block is part of the JSON
+    artifact the CLI writes, so the gate decision itself stays auditable).
+    Returns ``(ok, regressions)``; the CLI exits with code 2 exactly when
+    ``ok`` is ``False`` and only then.
+    """
+    ok, regressions = compare_to_baseline(report, baseline, tolerance=tolerance)
+    report["baseline_gate"] = {
+        "baseline_path": baseline_path,
+        "tolerance": tolerance,
+        "ok": ok,
+        "regressions": regressions,
+    }
+    return ok, regressions
+
+
 def _fmt(value: Any) -> str:
     return f"{float(value):.4f}"
 

@@ -22,7 +22,7 @@ from typing import Optional
 import typer
 
 from krw_ontology.eval_gold.harness import (
-    compare_to_baseline,
+    gate_decision,
     render_report_markdown,
     run_harness,
 )
@@ -90,9 +90,15 @@ def main(
         typer.secho(f"gold file not found: {gold}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1)
 
-    report = run_harness(gold, label=label)
+    try:
+        report = run_harness(gold, label=label)
+    except (OSError, ValueError) as exc:
+        typer.secho(f"invalid gold input {gold}: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
 
     gated = False
+    gate_ok = False
+    gate_regressions: list[str] = []
     if baseline is not None:
         if not baseline.is_file():
             typer.secho(
@@ -100,15 +106,12 @@ def main(
             )
             raise typer.Exit(code=1)
         baseline_payload = _read_json(baseline)
-        ok, regressions = compare_to_baseline(
-            report, baseline_payload, tolerance=tolerance
+        gate_ok, gate_regressions = gate_decision(
+            report,
+            baseline_payload,
+            tolerance=tolerance,
+            baseline_path=str(baseline),
         )
-        report["baseline_gate"] = {
-            "baseline_path": str(baseline),
-            "tolerance": tolerance,
-            "ok": ok,
-            "regressions": regressions,
-        }
         gated = True
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -131,8 +134,8 @@ def main(
     typer.echo(f"report: {json_path}")
     typer.echo(f"markdown: {markdown_path}")
 
-    if gated and not report["baseline_gate"]["ok"]:
-        for item in report["baseline_gate"]["regressions"]:
+    if gated and not gate_ok:
+        for item in gate_regressions:
             typer.secho(f"regression: {item}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=2)
 

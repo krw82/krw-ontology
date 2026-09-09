@@ -1104,3 +1104,40 @@ class TestAuditCliFetchFailure:
         assert "audit failed" in result.output + result.stderr
         # The HTTP error must be handled by the CLI, not propagate raw.
         assert not isinstance(result.exception, httpx.ConnectTimeout)
+
+    def test_corrupt_shard_aborts_cleanly_with_exit_1(self, tmp_path: Path) -> None:
+        """A shard that is not a sqlite database surfaces as a clean exit 1
+        (``sqlite3.Error`` in the CLI's except tuple), never a traceback."""
+        from typer.testing import CliRunner
+
+        release_root = tmp_path / "release"
+        indexes = release_root / "indexes"
+        indexes.mkdir(parents=True)
+        (indexes / "NOC.sqlite").write_text(
+            "this is not a sqlite database", encoding="utf-8"
+        )
+        (indexes / "shard_manifest.json").write_text(
+            json.dumps(
+                {
+                    "release_id": "table-audit-test",
+                    "shards": {"NOC": {"path": "companies/NOC.sqlite"}},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        result = CliRunner().invoke(
+            audit_cli.app,
+            [
+                "--release-root",
+                str(release_root),
+                "--tickers",
+                "NOC",
+                "--cache-dir",
+                str(tmp_path / "empty-cache"),
+            ],
+        )
+        assert result.exit_code == 1
+        assert "audit failed" in result.output + result.stderr
+        assert isinstance(result.exception, SystemExit)
+        assert not isinstance(result.exception, sqlite3.Error)

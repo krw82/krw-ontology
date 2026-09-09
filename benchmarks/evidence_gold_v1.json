@@ -12247,7 +12247,7 @@
       "expected": [
         {
           "ticker": "DIS",
-          "period": "CY2026Q2",
+          "period": "CY2026Q1",
           "document_type": null,
           "object_ids": [
             "xbrl:DIS:CY2026Q2:10Q:LongTermDebt:a873c40e",
@@ -12259,7 +12259,7 @@
       ],
       "expect_not_disclosed": false,
       "forbidden_fragments": [],
-      "notes": "template sample from shard companies/DIS.sqlite; anchors are the accepted metric objects for (DIS, total_debt, CY2026Q2)"
+      "notes": "template sample from shard companies/DIS.sqlite; anchors are the accepted metric objects for (DIS, total_debt, CY2026Q2). cycle-3 task-1 re-anchored the expected period to CY2026Q1: release-data period-key inconsistency, parser-cycle material — the shard rows key the filing bucket CY2026Q2 (objects.period) while the anchors' XBRL context instants (2026-02-26) derive observation_period CY2026Q1, and the evidence-unit contract exposes the observation period, so a CY2026Q2 expectation can never match the retrieved units."
     },
     {
       "id": "template:DIS:cost_of_revenue:CY2026Q1",
@@ -28350,7 +28350,7 @@
       "expected": [
         {
           "ticker": "NKE",
-          "period": "CY2026Q1",
+          "period": "CY2025Q2",
           "document_type": null,
           "object_ids": [
             "metric_observation:NKE:CY2026Q1:10Q:4e8c4a772754f4"
@@ -28361,7 +28361,7 @@
       ],
       "expect_not_disclosed": false,
       "forbidden_fragments": [],
-      "notes": "template sample from shard companies/NKE.sqlite; anchors are the accepted metric objects for (NKE, total_debt, CY2026Q1)"
+      "notes": "template sample from shard companies/NKE.sqlite; anchors are the accepted metric objects for (NKE, total_debt, CY2026Q1). cycle-3 task-1 re-anchored the expected period to CY2025Q2: release-data period-key inconsistency, parser-cycle material — the CY2026Q1 10-Q's only total_debt observation is the prior fiscal year-end comparative column (instant 2025-05-31 -> observation_period CY2025Q2 with fiscal coordinates (2025, Q1) derived from the filing bucket), and the evidence-unit contract exposes the observation period. The case passes via the cycle-3 store fix that lets an empty observation-semantics metric window fall back to the requested filing bucket."
     },
     {
       "id": "template:NOC:net_income:CY2025",
@@ -42376,11 +42376,12 @@
           "period": "CY2025",
           "document_type": "10-K",
           "object_ids": [
-            "metric_observation:NVDA:CY2025:10K:49efe6e77c20d5"
+            "metric_observation:NVDA:CY2025:10K:49efe6e77c20d5",
+            "metric_observation:NVDA:CY2026:10K:80173618b0ac7b"
           ]
         }
       ],
-      "notes": "Calendar 2024 is covered by NVDA FY2025 (2024-01-29 to 2025-01-25), carried in shard filing period CY2025; the CY2024-keyed filing holds FY2024 (mostly calendar 2023). Anchor is the FY2025 eps observation (2.97 USD_per_share)."
+      "notes": "Calendar 2024 is covered by NVDA FY2025 (2024-01-29 to 2025-01-25), carried in shard filing period CY2025; the CY2024-keyed filing holds FY2024 (mostly calendar 2023). Anchor is the FY2025 eps observation (2.97 USD_per_share). comparative-row provenance accepted: the plan deliberately omits periods (fiscal_offset stratum), so the newest-filing window legitimately returns the CY2026 10-K's comparative row for the same FY2025 observation (same value 2.97 USD_per_share, same observation period FY2025 / end 2025-01-26); both the year's own filing (primary anchor, kept first) and the CY2026 comparative row are valid any-of anchors."
     },
     {
       "id": "curated_fiscal_cost_twelve_months_aug_2025",
@@ -42599,7 +42600,7 @@
           ]
         }
       ],
-      "notes": "Two required expected items across sections: the MD&A eCommerce strength claim and the labor risk-factor claim, both in the CY2026 10-K. Both items must be retrieved for the case to pass."
+      "notes": "Two required expected items across sections: the MD&A eCommerce strength claim and the labor risk-factor claim, both in the CY2026 10-K. Both items must be retrieved for the case to pass. KNOWN RESIDUAL FAILURE (cycle-3 task-1, lexically-reachable-but-window-excluded): every carrier of the fragment 'strength in eCommerce' with period CY2026 is strict-FTS reachable under the clause's declared concepts (eCommerce sales) but ranks below the 12-unit window cut (the anchor claim itself ranks 14th; business_activity ecommerce 17th; quote item7_00:0031:003 34th), and the eCommerce-sales->revenue alias floor is not the deciding factor (it displaces rank 11). No minimal deterministic fix exists without global bm25 re-ranking, and swapping the fragment for text carried by in-window quotes would weaken the expectation — the case is kept failing at recall 0.5 by curation discipline (do not inflate pass rate)."
     },
     {
       "id": "curated_multispan_meta_users_capex",

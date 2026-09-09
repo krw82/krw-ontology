@@ -12247,7 +12247,7 @@
       "expected": [
         {
           "ticker": "DIS",
-          "period": "CY2026Q2",
+          "period": "CY2026Q1",
           "document_type": null,
           "object_ids": [
             "xbrl:DIS:CY2026Q2:10Q:LongTermDebt:a873c40e",
@@ -12259,7 +12259,7 @@
       ],
       "expect_not_disclosed": false,
       "forbidden_fragments": [],
-      "notes": "template sample from shard companies/DIS.sqlite; anchors are the accepted metric objects for (DIS, total_debt, CY2026Q2)"
+      "notes": "template sample from shard companies/DIS.sqlite; anchors are the accepted metric objects for (DIS, total_debt, CY2026Q2). cycle-3 task-1 re-anchored the expected period to CY2026Q1: release-data period-key inconsistency, parser-cycle material — the shard rows key the filing bucket CY2026Q2 (objects.period) while the anchors' XBRL context instants (2026-02-26) derive observation_period CY2026Q1, and the evidence-unit contract exposes the observation period, so a CY2026Q2 expectation can never match the retrieved units."
     },
     {
       "id": "template:DIS:cost_of_revenue:CY2026Q1",
@@ -28350,7 +28350,7 @@
       "expected": [
         {
           "ticker": "NKE",
-          "period": "CY2026Q1",
+          "period": "CY2025Q2",
           "document_type": null,
           "object_ids": [
             "metric_observation:NKE:CY2026Q1:10Q:4e8c4a772754f4"
@@ -28361,7 +28361,7 @@
       ],
       "expect_not_disclosed": false,
       "forbidden_fragments": [],
-      "notes": "template sample from shard companies/NKE.sqlite; anchors are the accepted metric objects for (NKE, total_debt, CY2026Q1)"
+      "notes": "template sample from shard companies/NKE.sqlite; anchors are the accepted metric objects for (NKE, total_debt, CY2026Q1). cycle-3 task-1 re-anchored the expected period to CY2025Q2: release-data period-key inconsistency, parser-cycle material — the CY2026Q1 10-Q's only total_debt observation is the prior fiscal year-end comparative column (instant 2025-05-31 -> observation_period CY2025Q2 with fiscal coordinates (2025, Q1) derived from the filing bucket), and the evidence-unit contract exposes the observation period. The case passes via the cycle-3 store fix that lets an empty observation-semantics metric window fall back to the requested filing bucket."
     },
     {
       "id": "template:NOC:net_income:CY2025",

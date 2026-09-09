@@ -330,6 +330,89 @@ work). The true dense-lane residual is `curated_vocab_meta_share_buybacks`
 `_query_metrics` value-identity dedupe, which keeps only the newest filing's
 row for a repeated observation).
 
+Candidate 3 / cycle 2 (2026-09-09, same release/reinforced gold; the three
+classified deterministic fixes — MetricObservation evidence units expose the
+observation period, singularized FTS prefix terms + concept-OR strategy rung,
+and value-dedupe preferring the requested filing bucket. Gate vs v1.1-regold:
+**exit 2** — one stratum regressed (`multi_span` 0.7500→0.5000 pass,
+0.8750→0.6250 recall, a single case; see below) while overall improved
+0.8832→0.9891 pass / 0.8852→0.9907 recall, 59 s wall clock, deterministic
+across two runs):
+
+| stratum | cases | pass_rate | mean_recall | zero_hit_rate |
+| --- | --- | --- | --- | --- |
+| overall | 736 | 0.9891 | 0.9907 | 0.0000 |
+| curated | 24 | 0.8333 | 0.8819 | 0.0000 |
+| dimensioned | 310 | 0.9871 | 0.9871 | 0.0000 |
+| fiscal_offset | 4 | 0.7500 | 0.7500 | 0.0000 |
+| multi_period | 4 | 0.7500 | 0.9167 | 0.0000 |
+| multi_span | 4 | 0.5000 | 0.6250 | 0.0000 |
+| not_disclosed | 4 | 1.0000 | 1.0000 | 0.0000 |
+| template | 402 | 1.0000 | 1.0000 | 0.0000 |
+| vocabulary_mismatch | 8 | 1.0000 | 1.0000 | 0.0000 |
+
+Per-case vs v1.1-regold: 85 recoveries (3/4 multi_period fully plus the
+msft case partially at 0.667, all 8 vocabulary_mismatch including
+`meta_share_buybacks` and `msft_bottom_line`, and 74 template/dimensioned
+cases) and exactly 1 regression, the same single case vs candidate 2a+ (74
+recoveries there too). Commit-by-commit attribution (each commit re-run in
+isolation on the full gold, worktree + `PYTHONPATH`, release read-only):
+
+| run | overall p/r | multi_period p/r | multi_span p/r | vocab p/r | template p/r | dimensioned p/r |
+| --- | --- | --- | --- | --- | --- | --- |
+| 2a+ (pre-cycle) | 0.8899/0.8920 | 0.00/0.25 | 0.75/0.875 | 0.75/0.75 | 0.8905 | 0.9065 |
+| + period contract (`ed9444c`) | 0.8899/0.8906 | **1.00/1.00** | 0.75/0.875 | 0.75/0.75 | 0.8831 | 0.9032 |
+| + FTS singularization/concept-OR (`2e93ecc`) | 0.8899/0.8906 | 1.00/1.00 | **0.50/0.625** | 0.88/0.875 | 0.8831 | 0.9032 |
+| + dedupe bucket preference (`bb797ec` = c3) | **0.9891/0.9907** | 0.75/0.9167 | 0.50/0.625 | **1.00/1.00** | **1.0000** | **0.9871** |
+
+- The period contract alone recovered **all four** multi_period cases
+  (recall 0.25→1.00) at the cost of 4 template cases whose gold anchors are
+  filing-period-keyed (`template:AMT/AWK/DUK/MMM` fell 1.0→0.0 when units
+  began exposing the observation period) — the anticipated contract risk.
+- The FTS singularization recovered `meta_share_buybacks` (vocab → 0.875)
+  and caused the cycle's only hard regression,
+  `curated_multispan_nvda_dc_growth_supply` (1.000→0.000): singularized
+  strict prefix terms (`constraint*`, `component*`, `risk*` …) broadened the
+  FTS match set, so bm25 re-ranked the already-full 12-row clause window and
+  displaced the expected item's sole matching carrier
+  (`claim:NVDA:CY2026:10K:because-nvidia-s-products-…-supply-const`,
+  previously rank ~8/12; the concept-OR rung never fired because the strict
+  window was full). The match-set change is a pure superset, but under a
+  fixed window + bm25 a superset re-ranks — the unit-level "pure
+  generalization" pin did not cover window displacement. The case is also
+  fragile by construction: the other expected fragment's carrier claim
+  exists in the index (accepted, high confidence) but its text contains no
+  "growth" token, so the strict AND for the growth clause can never return
+  it (it never ranked in any run, passing or failing).
+- The dedupe bucket preference recovered `msft_bottom_line` (vocab → 1.00)
+  plus **73 template/dimensioned cases** (template → 1.00, dimensioned →
+  0.9871; includes the 4 contract-risk cases above — these anchors live in
+  the requested filing bucket and previously lost value-identity dedupe to
+  newest-filing comparative twins). It also shaved the msft multi_period
+  case from 1.0 back to 0.667: within the preferred filing buckets the
+  `filing_period DESC` tie-break still picks the newest preferred twin —
+  the intermediate CY2025-filing FY2024 comparative row — over both the
+  own-filing CY2024 row and the latest-restating CY2026 row, and the
+  reinforced gold accepts only own-or-latest provenance. Deterministic
+  tie-break refinement (exact requested bucket first, then latest), not a
+  retrieval gap.
+
+2b FINAL decision (cycle 2, binding rule: close 2b when
+`vocabulary_mismatch` AND `multi_period` mean_recall both >= 0.9):
+`vocabulary_mismatch` = **1.0000**, `multi_period` = **0.9167** — both
+thresholds met, so **2b is CLOSED** (DEFERRED→CLOSED; revisit condition =
+re-measure the residual strata only when the serving model is replaced).
+Remaining residuals (8 failing cases) are classified in the cycle-2 task
+report: the new `multi_span` window-displacement case above
+(retrieval-shaped, dense-addressable in principle, plus a serving-side
+ranking trade-off), the msft multi_period partial (deterministic dedupe
+tie-break provenance, not dense-addressable), the pre-existing
+`fiscal_offset` NVDA calendar-EPS case, the pre-existing partial
+`multi_span` WMT case, and the 4 pre-existing dimensioned balance-sheet
+cases (DIS/NKE total_debt, RMD shareholders_equity, SYY total_assets).
+Only the multi_span pair is dense-addressable; the rest go to the ablation
+queue as deterministic work items.
+
 Gate candidates against the v1.1-regold baseline report (same reinforced
 gold):
 

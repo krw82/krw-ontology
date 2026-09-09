@@ -723,3 +723,102 @@ def test_observation_matched_window_skips_the_filing_bucket_fallback(fallback_sh
     by_id = {row["id"]: row for row in rows}
     assert set(by_id) == {FALLBACK_METRIC_ID}
     assert diagnostics["metric_result_count"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Depth-admission precedence guard.  The admission term is an OR appended to
+# the depth predicate, so the rendered WHERE must parenthesize the
+# disjunction: AND binds tighter than OR, and an unparenthesized
+# ``rank <= ? OR (bucket) AND dup = 1 AND ok`` lets in-depth rows bypass the
+# duplicate-value dedupe and the rejected-objects filter.  The bypass is
+# observable when the lexicographically-smallest value-identical twin is NOT
+# the dedupe-preferred twin: ``_select_planned_metric_rows`` picks each
+# context's representative by smallest row id, so the wrong filing's restated
+# copy would silently surface.  The fixture below files the same FY2026
+# observation (shared context key, shared value) in CY2025 (comparative,
+# smaller id) and CY2026 (own filing) and requests FY2026, whose preferred
+# buckets {CY2026, FY2026} must keep the CY2026 twin.  Both twins sit within
+# the depth window, so only the dedupe filter can enforce the preference.
+# The same SQL template renders the NKE fallback window, so this guard covers
+# both executions.
+# ---------------------------------------------------------------------------
+
+PRECEDENCE_TICKER = "GP"
+PRECEDENCE_METRIC = "net_income"
+PRECEDENCE_VALUE = 101_832_000_000.0
+PRECEDENCE_FILING_PERIODS = ("CY2025", "CY2026")
+# No FTS row matches every token of this query.
+PRECEDENCE_RETRIEVAL_QUERY = "guard precedence commentary"
+
+PRECEDENCE_FILED_IN_CY2025_ID = f"metric_observation:GP:CY2025:10K:net_income"
+PRECEDENCE_FILED_IN_CY2026_ID = f"metric_observation:GP:CY2026:10K:net_income"
+
+
+def _precedence_observation(filing_period: str) -> dict:
+    """One value-identical twin: the same FY2026 annual observation (calendar
+    dates, shared context identity) filed in ``filing_period``."""
+    return {
+        "id": f"metric_observation:GP:{filing_period}:10K:net_income",
+        "type": "MetricObservation",
+        "ticker": PRECEDENCE_TICKER,
+        "source_document_id": f"source:GP:{filing_period}:10K",
+        "document_type": DOCUMENT_TYPE,
+        "period": filing_period,
+        "metric_name": PRECEDENCE_METRIC,
+        "value": PRECEDENCE_VALUE,
+        "unit": "USD",
+        "fiscal_year": 2026,
+        "period_type": "annual",
+        "period_start": "2026-01-01",
+        "period_end": "2026-12-31",
+        "source_type": "reported",
+        "review_status": "accepted",
+        "schema_version": "0.1.0",
+    }
+
+
+@pytest.fixture(scope="module")
+def precedence_shard_path(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    root = tmp_path_factory.mktemp("depth-admission-precedence-release")
+    for filing_period in PRECEDENCE_FILING_PERIODS:
+        _write_observation_only_document(
+            root,
+            ticker=PRECEDENCE_TICKER,
+            doc_type_key=DOC_TYPE_KEY,
+            document_type=DOCUMENT_TYPE,
+            filing_period=filing_period,
+            observation=_precedence_observation(filing_period),
+        )
+    result = build_spine_shard_release_outputs(
+        root,
+        release_id="test-store-depth-admission-precedence",
+        workers=1,
+        no_cache=True,
+    )
+    shard = result.global_spine_path.parent / "companies" / f"{PRECEDENCE_TICKER}.sqlite"
+    assert shard.is_file()
+    return shard
+
+
+def test_depth_admission_preserves_dedupe_precedence_within_depth(precedence_shard_path):
+    """periods=[FY2026]: both value-identical twins sit within the depth
+    window, so only ``duplicate_value_rank = 1`` can enforce the requested-
+    bucket preference.  The surfaced twin must be the CY2026 own filing —
+    NOT the lexicographically-smaller CY2025 comparative copy that the
+    per-context smallest-id representative would pick if the dedupe filter
+    were bypassed by the admission OR."""
+    # Guard the guard: the comparative twin really is the smaller id.
+    assert PRECEDENCE_FILED_IN_CY2025_ID < PRECEDENCE_FILED_IN_CY2026_ID
+    with OntologyStore(precedence_shard_path) as store:
+        rows, diagnostics = store.query_planned_compact_with_diagnostics(
+            clause_id="gp_net_income",
+            retrieval_query=PRECEDENCE_RETRIEVAL_QUERY,
+            metrics=[PRECEDENCE_METRIC],
+            tickers=[PRECEDENCE_TICKER],
+            periods=["FY2026"],
+            limit=6,
+        )
+
+    metric_ids = {row["id"] for row in rows if row["type"] == "MetricObservation"}
+    assert metric_ids == {PRECEDENCE_FILED_IN_CY2026_ID}
+    assert diagnostics["metric_result_count"] == 1

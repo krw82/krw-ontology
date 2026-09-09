@@ -4866,7 +4866,14 @@ class OntologyStore:
         # therefore ADMITTED past the depth cut via an OR term — admission
         # only, never reordering, so every existing row sequence is unchanged
         # and the requested-bucket starvation guard inside
-        # ``_select_planned_metric_rows`` keeps such rows in the slice.
+        # ``_select_planned_metric_rows`` keeps such rows in the slice.  The
+        # disjunction MUST stay parenthesized in the rendered WHERE: AND
+        # binds tighter than OR, and an unparenthesized form would let
+        # in-depth rows bypass ``duplicate_value_rank = 1`` and the rejected
+        # filter, letting the per-context smallest-id twin override the
+        # dedupe preference (guarded by
+        # ``test_depth_admission_preserves_dedupe_precedence_within_depth``;
+        # the same template renders the filing-bucket fallback window).
         preferred_filing_buckets = _preferred_metric_filing_buckets(normalized_periods)
         if preferred_filing_buckets:
             duplicate_order_pref = (
@@ -5005,7 +5012,7 @@ class OntologyStore:
                  AND context_variants.is_company_total = ranked.is_company_total
                  AND context_variants.observation_period_type = ranked.observation_period_type
                  AND context_variants.observation_context_key = ranked.observation_context_key
-                WHERE ranked.observation_rank <= ?{depth_admission_sql}
+                WHERE (ranked.observation_rank <= ?{depth_admission_sql})
                   AND ranked.duplicate_value_rank = 1
                   AND (objects.review_status IS NULL OR objects.review_status != 'rejected')
                 ORDER BY

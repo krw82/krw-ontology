@@ -413,6 +413,47 @@ cases (DIS/NKE total_debt, RMD shareholders_equity, SYY total_assets).
 Only the multi_span pair is dense-addressable; the rest go to the ablation
 queue as deterministic work items.
 
+Candidate 3b / cycle-2 fix round (2026-09-09, same release/gold; the two
+deterministic fixes for the candidate-3 residuals. The singularized strict
+FTS path became an **original-first merge** — the strict FTS executes with
+the original plural prefixes AND the singularized prefixes, original-term
+rows keep their bm25 order first (stable object-id dedupe) and
+singularized-only rows append within the remaining window budget, so a
+generalized prefix can widen a sparse window but never displace an
+original carrier from a full one. The metric value-dedupe gained an
+**own-filing secondary tie-break** — within the requested-bucket preference
+group, the row whose filing bucket equals the CY-coordinate twin of its own
+observation period outranks generic `filing_period DESC`. Gate vs
+v1.1-regold: **exit 0** — overall 0.9918 pass / 0.9925 recall, ~60 s,
+deterministic):
+
+| stratum | cases | pass_rate | mean_recall | zero_hit_rate |
+| --- | --- | --- | --- | --- |
+| overall | 736 | 0.9918 | 0.9925 | 0.0000 |
+| curated | 24 | 0.9167 | 0.9375 | 0.0000 |
+| dimensioned | 310 | 0.9871 | 0.9871 | 0.0000 |
+| fiscal_offset | 4 | 0.7500 | 0.7500 | 0.0000 |
+| multi_period | 4 | 1.0000 | 1.0000 | 0.0000 |
+| multi_span | 4 | 0.7500 | 0.8750 | 0.0000 |
+| not_disclosed | 4 | 1.0000 | 1.0000 | 0.0000 |
+| template | 402 | 1.0000 | 1.0000 | 0.0000 |
+| vocabulary_mismatch | 8 | 1.0000 | 1.0000 | 0.0000 |
+
+Per-case vs candidate-3: exactly **2 recoveries, 0 regressions, 0 recall
+deltas** — `curated_multispan_nvda_dc_growth_supply` 0.0→1.0 (the
+original-first merge restored the pre-singularization window; the
+meta-style recovery keeps working because the sparse original window still
+appends singularized-only carriers) and
+`curated_multiperiod_msft_revenue_fy2023_fy2025` 0.667→1.0 (the own-filing
+CY2024 row now survives over the intermediate CY2025 comparative; the
+no-preference path is byte-identical). `multi_span` returns to the baseline
+0.75/0.875, `multi_period` reaches 1.00/1.00 (amending the 2b decision
+figure), `vocabulary_mismatch` holds 1.00/1.00, and template/dimensioned
+hold 1.0000/0.9871. The failing set is the **6 pre-existing deterministic
+residuals** (fiscal_offset NVDA calendar-EPS, the WMT multi_span partial at
+0.5, and the 4 dimensioned balance-sheet cases DIS/NKE/RMD/SYY); the
+cycle-2 new-regression and partial-recovery cases are both resolved.
+
 Gate candidates against the v1.1-regold baseline report (same reinforced
 gold):
 

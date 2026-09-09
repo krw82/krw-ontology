@@ -4,20 +4,22 @@
 
 ## 1. 이전 → 이후 (검색 품질, 736케이스 동일 골드·동일 릴리스 20260830_193811)
 
-| 지표 | 이전 (베이스라인 v1.0) | 측정정합화 (v1.1) | 이후 (2a) | 이후 (2a+) | 사이클 2 (candidate-3) | 변화 (v1.0→사이클2) |
+| 지표 | 이전 (베이스라인 v1.0) | 측정정합화 (v1.1) | 이후 (2a) | 이후 (2a+) | 사이클 2 (candidate-3b) | 변화 (v1.0→사이클2) |
 |---|---|---|---|---|---|---|
-| overall pass_rate | 0.8777 | 0.8832 | — | 0.8899 | **0.9891** | **+11.1pp** |
-| overall mean_recall | 0.8798 | 0.8852 | — | 0.8920 | **0.9907** | **+11.1pp** |
+| overall pass_rate | 0.8777 | 0.8832 | — | 0.8899 | **0.9918** | **+11.4pp** |
+| overall mean_recall | 0.8798 | 0.8852 | — | 0.8920 | **0.9925** | **+11.3pp** |
 | vocabulary_mismatch pass/recall | **0.125** | 0.125 | 0.375 | 0.750 | **1.000** | **+87.5pp (8배)** |
-| multi_period recall | 0.25 | 0.25 | 0.25 | 0.25 | **0.9167** | **+66.7pp** |
-| multi_span recall | 0.875 | 0.875 | 0.875 | 0.875 | **0.625** | **−25.0pp (사이클 2 회귀 1건)** |
-| dimensioned / template / 나머지 | — | — | — | 무열화 (전 성층) | template 1.000, dimensioned 0.9871 | 게이트 exit 2 (multi_span 단일 케이스) |
+| multi_period recall | 0.25 | 0.25 | 0.25 | 0.25 | **1.000** | **+75.0pp** |
+| multi_span recall | 0.875 | 0.875 | 0.875 | 0.875 | **0.875** | **±0.0pp (3b에서 수복)** |
+| dimensioned / template / 나머지 | — | — | — | 무열화 (전 성층) | template 1.000, dimensioned 0.9871 | 게이트 exit 0 |
 
 핵심: **어휘 불일치 격차의 71%를 임베딩 없이(정적 별칭 사전 + 결정론 채널 3종) 닫았다.** 개선 경로: 그레이더 FY/CY 라벨 정합화(+0.7pp) → 별칭 확장 채널(+2케이스) → 별칭 하한·파딩 버킷 정렬·골드 근원 보강(+3케이스). 회귀 0 (게이트 exit 0, 전 성층 프로그래매틱 검증).
 
 ### 사이클 2 (2026-09-09, candidate-3)
 
 기간 계약(관측 기간 노출) + FTS 단수화·concept-OR + 파딩 버킷 dedupe 선호 3건 적용. overall 0.8899→**0.9891**, vocabulary_mismatch 0.750→**1.000**(잔여 2건 전부 회복), multi_period recall 0.25→**0.9167**, template 0.8905→**1.000**, dimensioned 0.9065→**0.9871**. 커밋별 기여(각 커밋을 골드 전체에 고립 재실행): 기간 계약 단독으로 multi_period 4건 전부 회복(recall 1.00, 대가로 파딩-기간 앵커 템플릿 4건 AMT/AWK/DUK/MMM 일시 하락) → FTS 커밋이 meta_share_buybacks 회복 → dedupe 커밋이 msft_bottom_line + 템플릿/디멘전 73건 회복(계약 리스크 4건 포함). **게이트 exit 2**: multi_span 1케이스 회귀(`curated_multispan_nvda_dc_growth_supply` 1.000→0.000) — 단수화된 strict 접두사가 매치 집합을 순수 확장하면서 bm25 재순위로 꽉 찬 12행 윈도에서 유일 앵커 캐리어가 밀려남(FTS 커밋 `2e93ecc` 발생; concept-OR 러그는 미발동). 부수로 dedupe 커밋이 MSFT multi_period를 1.0→0.667로 깎음(선호 버킷 내 `filing_period DESC` 동률결이 소유 파딩(CY2024)·최신 재작성(CY2026) 대신 중간 파딩(CY2025) 비교행 트윈을 남김 — 골드는 소유-또는-최신 근원만 허용; 결정론적 tie-break 정제 과제). **2b 최종 결정: CLOSED** (vocab 1.000 ≥ 0.9, multi_period recall 0.9167 ≥ 0.9; 재방문 조건 = 서빙 모델 교체 시 재측정만). 잔여 8케이스 분류는 `benchmarks/reports/evidence_gold_candidate_3_20260909` 및 사이클 2 태스크 리포트 참조.
+
+**수정 라운드 candidate-3b (동일일, 게이트 exit 0)**: 위 2건의 진단에 대한 결정론 수정 — (1) 단수화 strict 경로를 원어-우선 병합(original-first merge)으로 전환(원본 복수 접두사 실행 결과가 bm25 순서를 유지하고 단수화 전용 행은 남은 윈도 예산 안에서만 추가 — 꽉 찬 윈도에서는 배제되어 치환 불가) → nvda multi_span 1.000 수복, (2) dedupe ROW_NUMBER에 소유-파딩 2차 정렬 키 추가(선호 그룹 내에서 관측 기간의 CY-좌표 트윈 버킷 = 소유 파딩 행을 `filing_period DESC`보다 선호, 무기간 요청은 바이트 동일) → msft multi_period 1.000 수복. overall **0.9918/0.9925**, multi_period **1.000**, multi_span **0.875**(베이스라인 동률), 케이스별 candidate-3 대비 **회복 2 / 회귀 0 / 리콜 변동 0**; 잔여 실패는 기존 6건(재정성층)뿐. 리포트: `benchmarks/reports/evidence_gold_candidate_3b_20260909`.
 
 **multi_period 불변의 정직한 이유**: 검색은 모든 기간의 행을 반환하지만 EvidenceUnit.period가 파딩 기간을 노출하는 3점 계약(contracts.py:1471 + 하니스 _UNIT_KEYS + 그레이더 period 필터)이 비교 행을 거부 — 임베딩으로도 못 고치는 계약 문제로 분류됨(2b DEFERRED의 근거).
 
